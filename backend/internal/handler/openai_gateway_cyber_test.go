@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -16,6 +19,65 @@ func newTestGinContext() *gin.Context {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	return c
+}
+
+type cyberHandlerSettingRepo struct {
+	service.SettingRepository
+	values map[string]string
+}
+
+func (r *cyberHandlerSettingRepo) GetValue(_ context.Context, key string) (string, error) {
+	if value, ok := r.values[key]; ok {
+		return value, nil
+	}
+	return "", service.ErrSettingNotFound
+}
+
+func (r *cyberHandlerSettingRepo) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
+	result := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if value, ok := r.values[key]; ok {
+			result[key] = value
+		}
+	}
+	return result, nil
+}
+
+type cyberHandlerGatewayCache struct {
+	service.GatewayCache
+	blocked    map[string]bool
+	readCalls  int
+	writeCalls int
+}
+
+func (c *cyberHandlerGatewayCache) SetCyberSessionBlocked(_ context.Context, key string, _ time.Duration) error {
+	c.writeCalls++
+	if c.blocked == nil {
+		c.blocked = make(map[string]bool)
+	}
+	c.blocked[key] = true
+	return nil
+}
+
+func (c *cyberHandlerGatewayCache) IsCyberSessionBlocked(_ context.Context, key string) (bool, error) {
+	c.readCalls++
+	return c.blocked[key], nil
+}
+
+func newCyberScopedHandler(groupIDs string) (*OpenAIGatewayHandler, *cyberHandlerGatewayCache) {
+	settingSvc := service.NewSettingService(&cyberHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyCyberSessionBlockEnabled:    "true",
+		service.SettingKeyCyberSessionBlockTTLSeconds: "60",
+		service.SettingKeyCyberSessionBlockAllGroups:  "false",
+		service.SettingKeyCyberSessionBlockGroupIDs:   groupIDs,
+	}}, nil)
+	cache := &cyberHandlerGatewayCache{blocked: make(map[string]bool)}
+	gatewaySvc := service.NewOpenAIGatewayService(
+		nil, nil, nil, nil, nil, nil,
+		cache, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		settingSvc, nil,
+	)
+	return &OpenAIGatewayHandler{gatewayService: gatewaySvc}, cache
 }
 
 // TestRecordCyberPolicyIfMarked_NoMark verifies that when no cyber mark is set,
@@ -137,6 +199,89 @@ func TestRejectIfCyberSessionBlocked_FailOpen(t *testing.T) {
 	h2 := &OpenAIGatewayHandler{gatewayService: nil}
 	key := &service.APIKey{ID: 1}
 	require.False(t, h2.rejectIfCyberSessionBlocked(c, key, []byte(`{}`), "gpt-5", cyberBlockFormatResponses), "nil gateway service → pass")
+}
+
+func TestRejectIfCyberSessionBlocked_GroupScopeAcrossHTTPFormats(t *testing.T) {
+	h, cache := newCyberScopedHandler(`[12]`)
+	group12 := int64(12)
+	group13 := int64(13)
+
+	plusRecorder := httptest.NewRecorder()
+	plusCtx, _ := gin.CreateTestContext(plusRecorder)
+	plusCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	plusCtx.Request.Header.Set("session_id", "plus-existing-session")
+	plusKey := &service.APIKey{ID: 2, GroupID: &group13}
+	cache.blocked[service.CyberSessionBlockKey(plusKey.ID, plusCtx, nil)] = true
+
+	require.False(t, h.rejectIfCyberSessionBlocked(plusCtx, plusKey, nil, "gpt-5", cyberBlockFormatResponses))
+	require.Zero(t, cache.readCalls, "out-of-scope requests must not query Redis")
+	require.Equal(t, http.StatusOK, plusRecorder.Code)
+
+	for _, tc := range []struct {
+		name      string
+		path      string
+		format    cyberSessionBlockFormat
+		anthropic bool
+	}{
+		{name: "responses", path: "/v1/responses", format: cyberBlockFormatResponses},
+		{name: "chat_completions", path: "/v1/chat/completions", format: cyberBlockFormatChat},
+		{name: "messages", path: "/v1/messages", format: cyberBlockFormatAnthropic, anthropic: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{}`))
+			c.Request.Header.Set("session_id", "pro-session-"+tc.name)
+			apiKey := &service.APIKey{ID: 7, GroupID: &group12}
+			cache.blocked[service.CyberSessionBlockKey(apiKey.ID, c, nil)] = true
+
+			require.True(t, h.rejectIfCyberSessionBlocked(c, apiKey, nil, "gpt-5", tc.format))
+			require.Equal(t, http.StatusForbidden, recorder.Code)
+			if tc.anthropic {
+				require.Contains(t, recorder.Body.String(), `"type":"error"`)
+				require.NotContains(t, recorder.Body.String(), `session_blocked_by_cyber_policy`)
+			} else {
+				require.Contains(t, recorder.Body.String(), `"code":"session_blocked_by_cyber_policy"`)
+			}
+		})
+	}
+	require.Equal(t, 3, cache.readCalls)
+}
+
+func TestCyberSessionBlockWebSocketScopeAndConnectionState(t *testing.T) {
+	h, cache := newCyberScopedHandler(`[12]`)
+	group12 := int64(12)
+	group13 := int64(13)
+
+	c := newTestGinContext()
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	c.Request.Header.Set("session_id", "shared-ws-session")
+
+	proKey := &service.APIKey{ID: 7, GroupID: &group12}
+	plusKey := &service.APIKey{ID: 2, GroupID: &group13}
+	require.NotEmpty(t, h.cyberSessionBlockKeyForAPIKey(c, proKey, nil))
+	require.Empty(t, h.cyberSessionBlockKeyForAPIKey(c, plusKey, nil), "out-of-scope WS handshake must not derive a block key")
+	require.Zero(t, cache.readCalls)
+
+	cyberBlockedThisConn := false
+	cyberBlockedThisConn = nextCyberBlockedThisConn(cyberBlockedThisConn, true, h.gatewayService.CyberSessionBlockEnabledForGroup(c.Request.Context(), plusKey.GroupID))
+	require.False(t, cyberBlockedThisConn, "Plus cyber hit must not block a later turn on the same connection")
+
+	cyberBlockedThisConn = nextCyberBlockedThisConn(cyberBlockedThisConn, true, h.gatewayService.CyberSessionBlockEnabledForGroup(c.Request.Context(), proKey.GroupID))
+	require.True(t, cyberBlockedThisConn, "in-scope cyber hit must block a later turn on the same connection")
+	require.True(t, nextCyberBlockedThisConn(cyberBlockedThisConn, false, false), "connection-local block remains sticky")
+}
+
+func TestRecordCyberPolicyIfMarked_OutOfScopeStillActivatesAuditGuard(t *testing.T) {
+	c := newTestGinContext()
+	service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Message: "flagged", UpstreamStatus: http.StatusForbidden})
+	group13 := int64(13)
+	h := &OpenAIGatewayHandler{}
+
+	require.NotPanics(t, func() {
+		h.recordCyberPolicyIfMarked(c, &service.APIKey{ID: 2, GroupID: &group13}, nil, nil, "gpt-5", true, "", service.ChannelUsageFields{}, "")
+	})
+	require.True(t, c.GetBool(cyberPolicyRecordedKey), "scope must not suppress real cyber audit handling")
 }
 
 // TestRecordCyberPolicyIfMarked_BlockKeyPlumbed verifies the 6th param is

@@ -59,12 +59,22 @@ func TestCyberSessionBlockKey(t *testing.T) {
 // --- fakes ---
 
 type fakeCyberBlockStore struct {
-	blocked map[string]bool
+	blocked    map[string]bool
+	readCalls  int
+	writeCalls int
+	readErr    error
+	writeErr   error
+	lastTTL    time.Duration
 }
 
 var _ CyberSessionBlockStore = (*fakeCyberBlockStore)(nil)
 
-func (f *fakeCyberBlockStore) SetCyberSessionBlocked(_ context.Context, key string, _ time.Duration) error {
+func (f *fakeCyberBlockStore) SetCyberSessionBlocked(_ context.Context, key string, ttl time.Duration) error {
+	f.writeCalls++
+	f.lastTTL = ttl
+	if f.writeErr != nil {
+		return f.writeErr
+	}
 	if f.blocked == nil {
 		f.blocked = map[string]bool{}
 	}
@@ -73,17 +83,23 @@ func (f *fakeCyberBlockStore) SetCyberSessionBlocked(_ context.Context, key stri
 }
 
 func (f *fakeCyberBlockStore) IsCyberSessionBlocked(_ context.Context, key string) (bool, error) {
+	f.readCalls++
+	if f.readErr != nil {
+		return false, f.readErr
+	}
 	return f.blocked[key], nil
 }
 
 // fakeSettingRepo is a minimal SettingRepository stub for unit tests.
-// Only GetValue is exercised by GetCyberSessionBlockRuntime; all other methods
-// panic so accidental calls are caught immediately.
 type fakeSettingRepo struct {
 	vals map[string]string
+	errs map[string]error
 }
 
 func (r *fakeSettingRepo) GetValue(_ context.Context, key string) (string, error) {
+	if err := r.errs[key]; err != nil {
+		return "", err
+	}
 	v, ok := r.vals[key]
 	if !ok {
 		return "", ErrSettingNotFound
@@ -96,8 +112,17 @@ func (r *fakeSettingRepo) Get(_ context.Context, _ string) (*Setting, error) {
 func (r *fakeSettingRepo) Set(_ context.Context, _, _ string) error {
 	panic("fakeSettingRepo.Set not implemented")
 }
-func (r *fakeSettingRepo) GetMultiple(_ context.Context, _ []string) (map[string]string, error) {
-	panic("fakeSettingRepo.GetMultiple not implemented")
+func (r *fakeSettingRepo) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
+	result := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if err := r.errs[key]; err != nil {
+			return nil, err
+		}
+		if value, ok := r.vals[key]; ok {
+			result[key] = value
+		}
+	}
+	return result, nil
 }
 func (r *fakeSettingRepo) SetMultiple(_ context.Context, _ map[string]string) error {
 	panic("fakeSettingRepo.SetMultiple not implemented")
@@ -146,12 +171,12 @@ func (c *comboCacheAndStore) IsCyberSessionBlocked(ctx context.Context, key stri
 // empty key, nil service, store missing → always false / no panic.
 func TestIsCyberSessionBlocked_EmptyKeyAndNilService(t *testing.T) {
 	var nilSvc *OpenAIGatewayService
-	require.False(t, nilSvc.IsCyberSessionBlocked(context.Background(), "k"))
-	require.NotPanics(t, func() { nilSvc.MarkCyberSessionBlocked(context.Background(), "k") })
+	require.False(t, nilSvc.IsCyberSessionBlocked(context.Background(), nil, "k"))
+	require.NotPanics(t, func() { nilSvc.MarkCyberSessionBlocked(context.Background(), nil, "k") })
 
 	svc := &OpenAIGatewayService{}
-	require.False(t, svc.IsCyberSessionBlocked(context.Background(), ""))
-	require.False(t, svc.IsCyberSessionBlocked(context.Background(), "k"), "no store + no settings → fail-open false")
+	require.False(t, svc.IsCyberSessionBlocked(context.Background(), nil, ""))
+	require.False(t, svc.IsCyberSessionBlocked(context.Background(), nil, "k"), "no store + no settings → fail-open false")
 }
 
 // TestCyberSessionBlock_RoundTrip exercises the type-assertion success path:
@@ -178,15 +203,106 @@ func TestCyberSessionBlock_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	const testKey = "deadbeef1234"
 
-	// Before marking: not blocked.
-	require.False(t, svc.IsCyberSessionBlocked(ctx, testKey))
+	groupID := int64(12)
+
+	// Before marking: not blocked. Missing scope keys retain the legacy all-groups behavior.
+	require.False(t, svc.IsCyberSessionBlocked(ctx, &groupID, testKey))
 
 	// Mark as blocked.
-	svc.MarkCyberSessionBlocked(ctx, testKey)
+	svc.MarkCyberSessionBlocked(ctx, &groupID, testKey)
 
 	// After marking: blocked.
-	require.True(t, svc.IsCyberSessionBlocked(ctx, testKey))
+	require.True(t, svc.IsCyberSessionBlocked(ctx, &groupID, testKey))
 
 	// Different key: still not blocked.
-	require.False(t, svc.IsCyberSessionBlocked(ctx, "other-key"))
+	require.False(t, svc.IsCyberSessionBlocked(ctx, &groupID, "other-key"))
+	require.Equal(t, time.Minute, combo.store.lastTTL)
+}
+
+func TestCyberSessionBlock_AllGroupsIncludesGroupedAndUngroupedKeys(t *testing.T) {
+	settingSvc := &SettingService{settingRepo: &fakeSettingRepo{vals: map[string]string{
+		SettingKeyCyberSessionBlockEnabled:    "true",
+		SettingKeyCyberSessionBlockTTLSeconds: "60",
+		SettingKeyCyberSessionBlockAllGroups:  "true",
+		SettingKeyCyberSessionBlockGroupIDs:   `[]`,
+	}}}
+	combo := &comboCacheAndStore{}
+	svc := &OpenAIGatewayService{cache: combo, settingService: settingSvc}
+
+	group12 := int64(12)
+	group13 := int64(13)
+	for i, groupID := range []*int64{&group12, &group13, nil} {
+		key := []string{"group-12", "group-13", "ungrouped"}[i]
+		svc.MarkCyberSessionBlocked(context.Background(), groupID, key)
+		require.True(t, svc.IsCyberSessionBlocked(context.Background(), groupID, key))
+	}
+	require.Equal(t, 3, combo.store.writeCalls)
+	require.Equal(t, 3, combo.store.readCalls)
+}
+
+func TestCyberSessionBlock_ScopedGroupSkipsRedisForOutOfScopeKeys(t *testing.T) {
+	settingSvc := &SettingService{settingRepo: &fakeSettingRepo{vals: map[string]string{
+		SettingKeyCyberSessionBlockEnabled:    "true",
+		SettingKeyCyberSessionBlockTTLSeconds: "60",
+		SettingKeyCyberSessionBlockAllGroups:  "false",
+		SettingKeyCyberSessionBlockGroupIDs:   `[12]`,
+	}}}
+	combo := &comboCacheAndStore{store: fakeCyberBlockStore{blocked: map[string]bool{
+		"plus-existing": true,
+	}}}
+	svc := &OpenAIGatewayService{cache: combo, settingService: settingSvc}
+	group12 := int64(12)
+	group13 := int64(13)
+
+	require.True(t, svc.CyberSessionBlockEnabledForGroup(context.Background(), &group12))
+	require.False(t, svc.CyberSessionBlockEnabledForGroup(context.Background(), &group13))
+	require.False(t, svc.CyberSessionBlockEnabledForGroup(context.Background(), nil))
+
+	svc.MarkCyberSessionBlocked(context.Background(), &group13, "plus-new")
+	svc.MarkCyberSessionBlocked(context.Background(), nil, "ungrouped-new")
+	require.Zero(t, combo.store.writeCalls, "out-of-scope groups must not write Redis")
+
+	require.False(t, svc.IsCyberSessionBlocked(context.Background(), &group13, "plus-existing"))
+	require.False(t, svc.IsCyberSessionBlocked(context.Background(), nil, "plus-existing"))
+	require.Zero(t, combo.store.readCalls, "out-of-scope groups must not query Redis, even for existing keys")
+
+	svc.MarkCyberSessionBlocked(context.Background(), &group12, "pro-new")
+	require.True(t, svc.IsCyberSessionBlocked(context.Background(), &group12, "pro-new"))
+	require.Equal(t, 1, combo.store.writeCalls)
+	require.Equal(t, 1, combo.store.readCalls)
+}
+
+func TestCyberSessionBlock_SettingReadFailureFailsOpenBeforeRedis(t *testing.T) {
+	dbErr := errors.New("settings unavailable")
+	settingSvc := &SettingService{settingRepo: &fakeSettingRepo{
+		vals: map[string]string{},
+		errs: map[string]error{SettingKeyCyberSessionBlockEnabled: dbErr},
+	}}
+	combo := &comboCacheAndStore{store: fakeCyberBlockStore{blocked: map[string]bool{"existing": true}}}
+	svc := &OpenAIGatewayService{cache: combo, settingService: settingSvc}
+	groupID := int64(12)
+
+	svc.MarkCyberSessionBlocked(context.Background(), &groupID, "new")
+	require.False(t, svc.IsCyberSessionBlocked(context.Background(), &groupID, "existing"))
+	require.Zero(t, combo.store.writeCalls)
+	require.Zero(t, combo.store.readCalls)
+}
+
+func TestCyberSessionBlock_RedisFailureFailsOpen(t *testing.T) {
+	settingSvc := &SettingService{settingRepo: &fakeSettingRepo{vals: map[string]string{
+		SettingKeyCyberSessionBlockEnabled:    "true",
+		SettingKeyCyberSessionBlockTTLSeconds: "60",
+		SettingKeyCyberSessionBlockAllGroups:  "true",
+	}}}
+	redisErr := errors.New("redis unavailable")
+	combo := &comboCacheAndStore{store: fakeCyberBlockStore{readErr: redisErr, writeErr: redisErr}}
+	svc := &OpenAIGatewayService{cache: combo, settingService: settingSvc}
+	groupID := int64(12)
+
+	require.NotPanics(t, func() {
+		svc.MarkCyberSessionBlocked(context.Background(), &groupID, "new")
+	})
+	require.False(t, svc.IsCyberSessionBlocked(context.Background(), &groupID, "existing"))
+	require.Equal(t, 1, combo.store.writeCalls)
+	require.Equal(t, 1, combo.store.readCalls)
 }

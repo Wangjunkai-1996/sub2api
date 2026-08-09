@@ -241,7 +241,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		}()
 		cyberBlockKeyChat := ""
 		if service.GetOpsCyberPolicy(c) != nil {
-			cyberBlockKeyChat = service.CyberSessionBlockKey(apiKey.ID, c, body)
+			cyberBlockKeyChat = h.cyberSessionBlockKeyForAPIKey(c, apiKey, body)
 		}
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockKeyChat, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
 

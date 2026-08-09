@@ -239,6 +239,10 @@ vi.mock("vue-i18n", async () => {
     "admin.settings.defaults.platformQuotaNotice": "月限额为 30 天滚动窗口，非自然月",
     "admin.settings.authSourceDefaults.platformQuotasOverride": "平台限额覆盖",
     "admin.settings.authSourceDefaults.platformQuotasOverrideHint": "留空的字段继承「系统默认平台限额」；填 0 表示禁止该窗口使用。",
+    "admin.settings.features.riskControl.cyberSessionBlockScopeHint":
+      "此范围只控制 cyber_policy 命中后的本地会话屏蔽。无论是否屏蔽，真实 Cyber 事件仍会保留审计记录。",
+    "admin.settings.features.riskControl.cyberSessionBlockGroupsRequired":
+      "Cyber 本地会话屏蔽选择指定分组时，至少需要选择一个分组。",
   };
   return {
     ...actual,
@@ -465,6 +469,11 @@ const baseSettingsResponse = {
   antigravity_user_agent_version: "",
   openai_codex_user_agent: "",
   payment_enabled: true,
+  risk_control_enabled: true,
+  cyber_session_block_enabled: false,
+  cyber_session_block_ttl_seconds: 3600,
+  cyber_session_block_all_groups: true,
+  cyber_session_block_group_ids: [],
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -569,6 +578,16 @@ async function openSecurityTab(wrapper: ReturnType<typeof mountView>) {
 
   expect(securityTabButton).toBeDefined();
   await securityTabButton?.trigger("click");
+  await flushPromises();
+}
+
+async function openFeaturesTab(wrapper: ReturnType<typeof mountView>) {
+  const featuresTabButton = wrapper
+    .findAll("button")
+    .find((node) => node.text().includes("admin.settings.tabs.features"));
+
+  expect(featuresTabButton).toBeDefined();
+  await featuresTabButton?.trigger("click");
   await flushPromises();
 }
 
@@ -699,6 +718,111 @@ describe("admin SettingsView payment visible method controls", () => {
 
     expect(updateSettings).toHaveBeenCalledWith(
       expect.objectContaining({ compact_home_enabled: true }),
+    );
+  });
+
+  it("loads the full admin group list and persists a specific Cyber block scope", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      cyber_session_block_enabled: true,
+      cyber_session_block_all_groups: false,
+      cyber_session_block_group_ids: [12],
+    });
+    getGroups.mockResolvedValueOnce([
+      {
+        id: 12,
+        name: "Pro",
+        description: "Pro subscription",
+        platform: "openai",
+        subscription_type: "subscription",
+        status: "active",
+      },
+      {
+        id: 13,
+        name: "Plus",
+        description: "Plus standard group",
+        platform: "openai",
+        subscription_type: "standard",
+        status: "inactive",
+      },
+    ]);
+
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+
+    const scope = wrapper.get('[data-testid="cyber-session-block-scope"]');
+    expect(scope.get('[data-testid="cyber-session-block-scope-note"]').text()).toContain(
+      "真实 Cyber 事件仍会保留审计记录",
+    );
+    const pro = scope.get('[data-testid="cyber-session-block-group-12"]');
+    const plus = scope.get('[data-testid="cyber-session-block-group-13"]');
+    expect((pro.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true);
+    expect((plus.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(false);
+    expect(plus.text()).toContain("Plus");
+
+    await scope.get('[data-testid="cyber-session-block-group-search"]').setValue("Plus");
+    expect(scope.find('[data-testid="cyber-session-block-group-12"]').exists()).toBe(false);
+    expect(scope.find('[data-testid="cyber-session-block-group-13"]').exists()).toBe(true);
+    await scope.get('[data-testid="cyber-session-block-group-search"]').setValue("");
+    await scope
+      .get('[data-testid="cyber-session-block-group-12"] input[type="checkbox"]')
+      .setValue(false);
+    await scope
+      .get('[data-testid="cyber-session-block-group-13"] input[type="checkbox"]')
+      .setValue(true);
+
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cyber_session_block_enabled: true,
+        cyber_session_block_all_groups: false,
+        cyber_session_block_group_ids: [13],
+      }),
+    );
+  });
+
+  it("rejects an empty specific-group Cyber block scope", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      cyber_session_block_enabled: false,
+      cyber_session_block_all_groups: false,
+      cyber_session_block_group_ids: [],
+    });
+
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).not.toHaveBeenCalled();
+    expect(showError).toHaveBeenCalledWith(
+      "Cyber 本地会话屏蔽选择指定分组时，至少需要选择一个分组。",
+    );
+  });
+
+  it("defaults a legacy Cyber block scope to all groups", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      cyber_session_block_enabled: true,
+      cyber_session_block_all_groups: undefined,
+      cyber_session_block_group_ids: undefined,
+    });
+
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cyber_session_block_all_groups: true,
+        cyber_session_block_group_ids: [],
+      }),
     );
   });
 

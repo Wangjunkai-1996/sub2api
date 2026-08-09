@@ -50,6 +50,10 @@ type openAIWSTurnChannelMappingSnapshot struct {
 	mapping service.ChannelMappingResult
 }
 
+func nextCyberBlockedThisConn(current, cyberMarked, blockEnabledForGroup bool) bool {
+	return current || (cyberMarked && blockEnabledForGroup)
+}
+
 var errOpenAIWSUnsupportedModelSwitch = errors.New("selected account does not support websocket model switch")
 
 func newOpenAIWSUnsupportedModelSwitchError(model string) error {
@@ -557,7 +561,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}()
 		cyberBlockKeyHTTP := ""
 		if service.GetOpsCyberPolicy(c) != nil {
-			cyberBlockKeyHTTP = service.CyberSessionBlockKey(apiKey.ID, c, sessionHashBody)
+			cyberBlockKeyHTTP = h.cyberSessionBlockKeyForAPIKey(c, apiKey, sessionHashBody)
 		}
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockKeyHTTP, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
@@ -1112,7 +1116,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		}()
 		cyberBlockKeyMsg := ""
 		if service.GetOpsCyberPolicy(c) != nil {
-			cyberBlockKeyMsg = service.CyberSessionBlockKey(apiKey.ID, c, body)
+			cyberBlockKeyMsg = h.cyberSessionBlockKeyForAPIKey(c, apiKey, body)
 		}
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockKeyMsg, clientRequestedUsageFields(c, channelMappingMsg, reqModel, ""), service.HashUsageRequestPayload(body))
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
@@ -1734,8 +1738,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 	// F5a: 握手层会话屏蔽检查。WS 握手无 body，显式标识仅来自握手 header
 	// （session_id / conversation_id）；无标识则放行，连接内仍有本地 flag 兜底。
-	cyberBlockKey := service.CyberSessionBlockKey(apiKey.ID, c, nil)
-	if cyberBlockKey != "" && h.gatewayService.IsCyberSessionBlocked(c.Request.Context(), cyberBlockKey) {
+	cyberBlockKey := h.cyberSessionBlockKeyForAPIKey(c, apiKey, nil)
+	if cyberBlockKey != "" && h.gatewayService.IsCyberSessionBlocked(c.Request.Context(), apiKey.GroupID, cyberBlockKey) {
 		writeCyberSessionBlockedWSError(c.Request.Context(), wsConn)
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "session blocked by cyber-security policy")
 		h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, reqModel, cyberBlockKey)
@@ -2131,10 +2135,16 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					turnUpstreamModel = turnRequestedModel
 				}
 				turnUsageFields := turnMapping.ToUsageFields(turnRequestedModel, turnUpstreamModel)
-				h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, turnRequestedModel, turnErr != nil, cyberBlockKey, turnUsageFields, requestPayloadHash)
-				if service.GetOpsCyberPolicy(c) != nil {
-					cyberBlockedThisConn = true
+				cyberMarked := service.GetOpsCyberPolicy(c) != nil
+				if cyberMarked {
+					cyberBlockKey = h.cyberSessionBlockKeyForAPIKey(c, apiKey, nil)
 				}
+				h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, turnRequestedModel, turnErr != nil, cyberBlockKey, turnUsageFields, requestPayloadHash)
+				blockEnabledForGroup := false
+				if cyberMarked {
+					blockEnabledForGroup = h.gatewayService.CyberSessionBlockEnabledForGroup(ctx, apiKey.GroupID)
+				}
+				cyberBlockedThisConn = nextCyberBlockedThisConn(cyberBlockedThisConn, cyberMarked, blockEnabledForGroup)
 				if turnErr != nil {
 					if result == nil || result.ImageCount <= 0 {
 						return
@@ -3068,15 +3078,11 @@ func (h *OpenAIGatewayHandler) rejectIfCyberSessionBlocked(c *gin.Context, apiKe
 	if h == nil || h.gatewayService == nil || apiKey == nil {
 		return false
 	}
-	// 开关默认关：先走 ~ns 级缓存开关检查，再付出 key 派生(gjson+sha256)成本。
-	if enabled, _ := h.gatewayService.CyberSessionBlockRuntime(c.Request.Context()); !enabled {
-		return false
-	}
-	key := service.CyberSessionBlockKey(apiKey.ID, c, body)
+	key := h.cyberSessionBlockKeyForAPIKey(c, apiKey, body)
 	if key == "" {
 		return false
 	}
-	if !h.gatewayService.IsCyberSessionBlocked(c.Request.Context(), key) {
+	if !h.gatewayService.IsCyberSessionBlocked(c.Request.Context(), apiKey.GroupID, key) {
 		return false
 	}
 	// body-signal compact 心跳可能已把响应头提交为 200（cyber 检查在用户槽位
@@ -3104,6 +3110,19 @@ func (h *OpenAIGatewayHandler) rejectIfCyberSessionBlocked(c *gin.Context, apiKe
 	}
 	h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, model, key)
 	return true
+}
+
+// cyberSessionBlockKeyForAPIKey applies the independent Cyber session-block
+// scope before deriving a session key. Out-of-scope requests therefore avoid
+// both session parsing/hashing and all Redis access.
+func (h *OpenAIGatewayHandler) cyberSessionBlockKeyForAPIKey(c *gin.Context, apiKey *service.APIKey, body []byte) string {
+	if h == nil || h.gatewayService == nil || c == nil || c.Request == nil || apiKey == nil {
+		return ""
+	}
+	if !h.gatewayService.CyberSessionBlockEnabledForGroup(c.Request.Context(), apiKey.GroupID) {
+		return ""
+	}
+	return service.CyberSessionBlockKey(apiKey.ID, c, body)
 }
 
 // enqueueCyberSessionBlockedOpsEntry captures request meta and enqueues the
@@ -3269,7 +3288,7 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 			})
 		}
 		if gwSvc != nil && cyberBlockKey != "" {
-			gwSvc.MarkCyberSessionBlocked(ctx, cyberBlockKey)
+			gwSvc.MarkCyberSessionBlocked(ctx, groupID, cyberBlockKey)
 		}
 		if opsSvc != nil {
 			enqueueOpsErrorLog(opsSvc, buildCyberPolicyOpsErrorEntry(opsMeta, mark))

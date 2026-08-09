@@ -265,6 +265,8 @@ func (h *SettingHandler) GetSettings(c *gin.Context) {
 		RiskControlEnabled:                                     settings.RiskControlEnabled,
 		CyberSessionBlockEnabled:                               settings.CyberSessionBlockEnabled,
 		CyberSessionBlockTTLSeconds:                            settings.CyberSessionBlockTTLSeconds,
+		CyberSessionBlockAllGroups:                             settings.CyberSessionBlockAllGroups,
+		CyberSessionBlockGroupIDs:                              settings.CyberSessionBlockGroupIDs,
 		AffiliateRebateRate:                                    settings.AffiliateRebateRate,
 		AffiliateRebateFreezeHours:                             settings.AffiliateRebateFreezeHours,
 		AffiliateRebateDurationDays:                            settings.AffiliateRebateDurationDays,

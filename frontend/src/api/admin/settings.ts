@@ -605,6 +605,8 @@ export interface SystemSettings {
   // Cyber session block
   cyber_session_block_enabled: boolean;
   cyber_session_block_ttl_seconds: number;
+  cyber_session_block_all_groups: boolean;
+  cyber_session_block_group_ids: number[];
 
   payment_min_amount: number;
   payment_max_amount: number;
@@ -908,6 +910,8 @@ export interface UpdateSettingsRequest {
   // Cyber session block
   cyber_session_block_enabled?: boolean;
   cyber_session_block_ttl_seconds?: number;
+  cyber_session_block_all_groups?: boolean;
+  cyber_session_block_group_ids?: number[];
 
   payment_min_amount?: number;
   payment_max_amount?: number;

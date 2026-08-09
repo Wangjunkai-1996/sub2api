@@ -344,9 +344,11 @@ type UpdateSettingsRequest struct {
 	// 风控中心功能开关
 	RiskControlEnabled *bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    *bool `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds *int  `json:"cyber_session_block_ttl_seconds"`
+	// cyber 会话屏蔽开关、TTL 与独立分组范围
+	CyberSessionBlockEnabled    *bool    `json:"cyber_session_block_enabled"`
+	CyberSessionBlockTTLSeconds *int     `json:"cyber_session_block_ttl_seconds"`
+	CyberSessionBlockAllGroups  *bool    `json:"cyber_session_block_all_groups"`
+	CyberSessionBlockGroupIDs   *[]int64 `json:"cyber_session_block_group_ids"`
 
 	// OpenAI fast/flex policy (optional, only updated when provided)
 	OpenAIFastPolicySettings *dto.OpenAIFastPolicySettings `json:"openai_fast_policy_settings,omitempty"`
@@ -1473,6 +1475,27 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		response.BadRequest(c, "cyber_session_block_ttl_seconds must be > 0")
 		return
 	}
+	cyberSessionBlockAllGroups := previousSettings.CyberSessionBlockAllGroups
+	if req.CyberSessionBlockAllGroups != nil {
+		cyberSessionBlockAllGroups = *req.CyberSessionBlockAllGroups
+	}
+	cyberSessionBlockGroupIDs := append([]int64(nil), previousSettings.CyberSessionBlockGroupIDs...)
+	if req.CyberSessionBlockGroupIDs != nil {
+		cyberSessionBlockGroupIDs = append([]int64(nil), (*req.CyberSessionBlockGroupIDs)...)
+	}
+	if !cyberSessionBlockAllGroups {
+		hasPositiveGroupID := false
+		for _, groupID := range cyberSessionBlockGroupIDs {
+			if groupID > 0 {
+				hasPositiveGroupID = true
+				break
+			}
+		}
+		if !hasPositiveGroupID {
+			response.BadRequest(c, "cyber_session_block_group_ids must contain at least one positive group ID when cyber_session_block_all_groups is false")
+			return
+		}
+	}
 
 	settings := &service.SystemSettings{
 		// 系统全局 platform quota 默认值（整体替换语义）
@@ -1908,6 +1931,8 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.CyberSessionBlockTTLSeconds
 		}(),
+		CyberSessionBlockAllGroups: cyberSessionBlockAllGroups,
+		CyberSessionBlockGroupIDs:  cyberSessionBlockGroupIDs,
 	}
 
 	// req.AuthSourceXxxPlatformQuotas 为 nil 表示本次请求未包含该 source 的 quota 配置（保留 previousAuthSourceDefaults 中的值）；
@@ -2304,6 +2329,8 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		RiskControlEnabled:          updatedSettings.RiskControlEnabled,
 		CyberSessionBlockEnabled:    updatedSettings.CyberSessionBlockEnabled,
 		CyberSessionBlockTTLSeconds: updatedSettings.CyberSessionBlockTTLSeconds,
+		CyberSessionBlockAllGroups:  updatedSettings.CyberSessionBlockAllGroups,
+		CyberSessionBlockGroupIDs:   updatedSettings.CyberSessionBlockGroupIDs,
 		AllowUserViewErrorRequests:  updatedSettings.AllowUserViewErrorRequests,
 	}
 	if fastPolicy, err := h.settingService.GetOpenAIFastPolicySettings(c.Request.Context()); err != nil {

@@ -169,6 +169,8 @@ type SystemSettings struct {
 	RiskControlEnabled           bool
 	CyberSessionBlockEnabled     bool
 	CyberSessionBlockTTLSeconds  int
+	CyberSessionBlockAllGroups   bool
+	CyberSessionBlockGroupIDs    []int64
 	AffiliateEnabled             bool
 	AffiliateRebateRate          float64
 	AffiliateRebateFreezeHours   int
