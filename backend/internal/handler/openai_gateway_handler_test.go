@@ -1333,7 +1333,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 	_, payload, readErr := clientConn.Read(readCtx)
 	cancelRead()
 	if readErr == nil {
-		require.Contains(t, string(payload), "content_policy_violation")
+		require.Contains(t, string(payload), "request_policy_blocked")
 		require.Contains(t, string(payload), "内容审计测试阻断")
 	} else {
 		var closeErr coderws.CloseError
@@ -1346,7 +1346,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 		logs = repo.logSnapshot()
 		return len(logs) == 1
 	}, time.Second, 10*time.Millisecond)
-	require.True(t, logs[0].Flagged)
+	require.False(t, logs[0].Flagged)
 	require.Equal(t, service.ContentModerationActionBlock, logs[0].Action)
 	require.Equal(t, "bad prompt", logs[0].InputExcerpt)
 }

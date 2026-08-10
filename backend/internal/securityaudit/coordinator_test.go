@@ -16,8 +16,16 @@ import (
 type fakeLegacyEngine struct {
 	decision *LegacyDecision
 	err      error
+	strict   bool
+	scopeErr error
 	calls    atomic.Int64
+	scopes   atomic.Int64
 	check    func(context.Context, Request) (*LegacyDecision, error)
+}
+
+func (f *fakeLegacyEngine) BlockingApplies(context.Context, Request) (bool, error) {
+	f.scopes.Add(1)
+	return f.strict, f.scopeErr
 }
 
 func (f *fakeLegacyEngine) Check(ctx context.Context, req Request) (*LegacyDecision, error) {
@@ -57,6 +65,93 @@ func TestCoordinatorNilReceiverFailsClosed(t *testing.T) {
 	require.Equal(t, ErrorCodeAuditUnavailable, decision.ErrorCode)
 }
 
+func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *testing.T) {
+	groupID := int64(12)
+
+	t.Run("legacy allow creates lineage summary with prompt audit off", func(t *testing.T) {
+		legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+			require.True(t, req.Strict)
+			require.NotNil(t, req.Document)
+			require.True(t, req.Document.Complete)
+			return &LegacyDecision{Allowed: true}, nil
+		}}
+		prompt := &fakePromptEngine{mode: ModeOff}
+		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses", Body: []byte(`{"input":"safe"}`),
+		})
+
+		require.True(t, decision.AllowNextStage)
+		require.Equal(t, DecisionAllow, decision.Kind)
+		require.NotNil(t, decision.Audit)
+		require.Equal(t, int64(0), decision.Audit.ConfigVersion)
+		require.Equal(t, AuditVerdictAllow, decision.Audit.Verdict)
+		require.True(t, decision.Audit.ContextComplete)
+		require.Equal(t, int64(1), legacy.calls.Load())
+		require.Zero(t, prompt.evaluates.Load())
+	})
+
+	t.Run("incomplete input stops before every auditor", func(t *testing.T) {
+		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
+		prompt := &fakePromptEngine{mode: ModeOff}
+		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
+			Body: []byte(`{"input":[{"type":"future_item","payload":"opaque"}]}`),
+		})
+
+		require.Equal(t, DecisionInvalid, decision.Kind)
+		require.Equal(t, http.StatusUnprocessableEntity, decision.HTTPStatus)
+		require.Equal(t, ErrorCodeContextIncomplete, decision.ErrorCode)
+		require.Zero(t, legacy.calls.Load())
+		require.Zero(t, prompt.evaluates.Load())
+	})
+
+	t.Run("legacy audit error fails closed", func(t *testing.T) {
+		legacy := &fakeLegacyEngine{strict: true, err: errors.New("moderation 429")}
+		prompt := &fakePromptEngine{mode: ModeOff}
+		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses", Body: []byte(`{"input":"safe"}`),
+		})
+
+		require.Equal(t, DecisionUnavailable, decision.Kind)
+		require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+		require.Equal(t, ErrorCodeAuditUnavailable, decision.ErrorCode)
+		require.Equal(t, int64(1), legacy.calls.Load())
+		require.Zero(t, prompt.evaluates.Load())
+	})
+
+	t.Run("scope lookup error fails closed before parsing and auditors", func(t *testing.T) {
+		legacy := &fakeLegacyEngine{scopeErr: errors.New("settings unavailable")}
+		prompt := &fakePromptEngine{mode: ModeOff}
+		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses", Body: []byte(`{"input":"safe"}`),
+		})
+
+		require.Equal(t, DecisionUnavailable, decision.Kind)
+		require.Equal(t, ErrorCodeAuditUnavailable, decision.ErrorCode)
+		require.Zero(t, legacy.calls.Load())
+		require.Zero(t, prompt.evaluates.Load())
+	})
+}
+
+func TestCoordinatorContentModerationOutOfScopeRemainsNonStrict(t *testing.T) {
+	plusGroupID := int64(13)
+	legacy := &fakeLegacyEngine{check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+		require.False(t, req.Strict)
+		require.Nil(t, req.Document)
+		return &LegacyDecision{Allowed: true}, nil
+	}}
+	prompt := &fakePromptEngine{mode: ModeOff}
+	decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+		GroupID: &plusGroupID, Protocol: "openai_responses",
+		Body: []byte(`{"input":[{"type":"future_item","payload":"opaque"}]}`),
+	})
+
+	require.True(t, decision.AllowNextStage)
+	require.Nil(t, decision.Audit)
+	require.Equal(t, int64(1), legacy.calls.Load())
+	require.Zero(t, prompt.evaluates.Load())
+}
+
 func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 	groupID := int64(12)
 	strict := true
@@ -73,32 +168,32 @@ func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 	}{
 		{
 			name: "unknown item rejected before engines", body: `{"input":[{"type":"future_item","payload":"opaque"}]}`,
-			legacy: &fakeLegacyEngine{}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
+			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
 			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
 		},
 		{
 			name: "nonempty empty context rejected before engines", body: `{"model":"gpt-test"}`,
-			legacy: &fakeLegacyEngine{}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
+			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
 			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
 		},
 		{
 			name: "tool output without lineage rejected before engines", body: `{"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`,
-			legacy: &fakeLegacyEngine{}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
+			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
 			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
 		},
 		{
 			name: "legacy error is unavailable", body: `{"input":"hello"}`,
-			legacy: &fakeLegacyEngine{err: errors.New("429")}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}},
+			legacy: &fakeLegacyEngine{strict: true, err: errors.New("429")}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}},
 			wantKind: DecisionUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeAuditUnavailable, legacyCall: 1, promptCall: 0,
 		},
 		{
 			name: "prompt flag is blocked", body: `{"input":"hello"}`,
-			legacy: &fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionFlag, AllowNextStage: true}},
+			legacy: &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionFlag, AllowNextStage: true}},
 			wantKind: DecisionBlock, wantStatus: http.StatusForbidden, wantCode: ErrorCodePolicyBlocked, legacyCall: 1, promptCall: 1,
 		},
 		{
 			name: "prompt outage is unavailable", body: `{"input":"hello"}`,
-			legacy: &fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, err: errors.New("timeout")},
+			legacy: &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, err: errors.New("timeout")},
 			wantKind: DecisionUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeAuditUnavailable, legacyCall: 1, promptCall: 1,
 		},
 	}
@@ -122,7 +217,7 @@ func TestCoordinatorStrictAllowExposesStableAuditSummaryOnlyForProtectedGroup(t 
 	groupID := int64(12)
 	strictMode := true
 	decision := NewCoordinator(
-		&fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}},
+		&fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}},
 		&fakePromptEngine{mode: ModeBlocking, strict: &strictMode, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true, ConfigVersion: 42}},
 	).Check(context.Background(), Request{
 		APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
@@ -175,7 +270,7 @@ func TestCoordinatorLineageIsResolvedBeforeEnginesAndBoundOnlyFromAllowSummary(t
 		RedactedContext: "parent context", PromptHash: "parent-hash",
 	}}
 	coordinator := NewCoordinator(
-		&fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}},
+		&fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}},
 		&fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true, ConfigVersion: 4}},
 	).SetLineageStore(store)
 	decision := coordinator.Check(context.Background(), Request{
@@ -189,7 +284,7 @@ func TestCoordinatorLineageIsResolvedBeforeEnginesAndBoundOnlyFromAllowSummary(t
 	require.Equal(t, "resp_child", store.responseID)
 	require.Equal(t, AuditVerdictAllow, store.bound.Verdict)
 
-	missing := NewCoordinator(&fakeLegacyEngine{}, &fakePromptEngine{mode: ModeBlocking, strict: &strict}).SetLineageStore(&fakeLineageStore{loadErr: ErrLineageNotFound})
+	missing := NewCoordinator(&fakeLegacyEngine{strict: true}, &fakePromptEngine{mode: ModeBlocking, strict: &strict}).SetLineageStore(&fakeLineageStore{loadErr: ErrLineageNotFound})
 	missingDecision := missing.Check(context.Background(), Request{
 		APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
 		Body: []byte(`{"previous_response_id":"missing","input":"child"}`),
@@ -207,7 +302,7 @@ func TestCoordinatorStrictLineageAllowsMediaOnlyParent(t *testing.T) {
 		APIKeyID: 7, GroupID: &groupID, PromptHash: "parent-hash", MediaDigests: []string{mediaDigest},
 	}}
 	decision := NewCoordinator(
-		&fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}},
+		&fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}},
 		&fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true, ConfigVersion: 4}},
 	).SetLineageStore(store).Check(context.Background(), Request{
 		APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
@@ -229,7 +324,7 @@ func TestCoordinatorStrictLineageFeedsCumulativeContextToEveryRequiredAuditor(t 
 			Verdict: AuditVerdictAllow, ContextComplete: true, APIKeyID: 7, GroupID: &groupID,
 			RedactedContext: "cy", PromptHash: "parent-hash",
 		}}
-		legacy := &fakeLegacyEngine{check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+		legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
 			require.Equal(t, "cy\nber", req.AuditContext)
 			require.Contains(t, string(req.Body), `"input":"ber"`)
 			if strings.Contains(strings.ToLower(auditinput.FoldForMatching(req.AuditContext)), "cyber") {
@@ -253,7 +348,7 @@ func TestCoordinatorStrictLineageFeedsCumulativeContextToEveryRequiredAuditor(t 
 			Verdict: AuditVerdictAllow, ContextComplete: true, APIKeyID: 7, GroupID: &groupID,
 			RedactedContext: "harmful", PromptHash: "parent-hash",
 		}}
-		legacy := &fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}}
+		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
 		prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, evaluate: func(_ context.Context, req Request) (*PromptDecision, error) {
 			require.Equal(t, "harmful\nrequest", req.AuditContext)
 			return &PromptDecision{Kind: DecisionBlock}, nil

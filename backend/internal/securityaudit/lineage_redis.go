@@ -158,7 +158,7 @@ func (s *RedisStrictAuditLineageStore) key(groupID *int64, apiKeyID int64, respo
 func validStrictAuditLineageLedger(ledger strictAuditLineageLedger) bool {
 	return ledger.Version == strictAuditLineageLedgerVersion &&
 		strings.TrimSpace(ledger.ParserVersion) != "" &&
-		ledger.ConfigVersion > 0 &&
+		ledger.ConfigVersion >= 0 &&
 		strings.TrimSpace(ledger.PromptHash) != "" &&
 		strings.TrimSpace(ledger.DocumentHash) != "" &&
 		(strings.TrimSpace(ledger.Context) != "" || len(ledger.MediaDigests) > 0) &&

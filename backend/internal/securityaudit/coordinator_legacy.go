@@ -2,6 +2,7 @@ package securityaudit
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -12,6 +13,13 @@ type LegacyModerationAdapter struct {
 
 func NewLegacyModerationAdapter(svc *service.ContentModerationService) LegacyEngine {
 	return &LegacyModerationAdapter{service: svc}
+}
+
+func (a *LegacyModerationAdapter) BlockingApplies(ctx context.Context, req Request) (bool, error) {
+	if a == nil || a.service == nil {
+		return false, errors.New("strict content moderation service unavailable")
+	}
+	return a.service.StrictPreBlockApplies(ctx, cloneInt64Ptr(req.GroupID))
 }
 
 func (a *LegacyModerationAdapter) Check(ctx context.Context, req Request) (*LegacyDecision, error) {

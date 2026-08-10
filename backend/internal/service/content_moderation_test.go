@@ -572,6 +572,53 @@ func TestContentModerationCheck_PlusGroupOutsideStrictScopeSkipsAudit(t *testing
 	require.Contains(t, slogOutput.String(), "configured_group_ids=[12]")
 }
 
+func TestContentModerationStrictPreBlockAppliesUsesEffectiveGroupScope(t *testing.T) {
+	proGroupID := int64(12)
+	plusGroupID := int64(13)
+	tests := []struct {
+		name        string
+		groupID     *int64
+		riskEnabled bool
+		configure   func(*ContentModerationConfig)
+		want        bool
+	}{
+		{name: "pro group", groupID: &proGroupID, riskEnabled: true, want: true},
+		{name: "plus group remains out of scope", groupID: &plusGroupID, riskEnabled: true, want: false},
+		{name: "risk control disabled", groupID: &proGroupID, want: false},
+		{name: "moderation disabled", groupID: &proGroupID, riskEnabled: true, configure: func(cfg *ContentModerationConfig) {
+			cfg.Enabled = false
+		}},
+		{name: "observe mode", groupID: &proGroupID, riskEnabled: true, configure: func(cfg *ContentModerationConfig) {
+			cfg.Mode = ContentModerationModeObserve
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.Mode = ContentModerationModePreBlock
+			cfg.AllGroups = false
+			cfg.GroupIDs = []int64{proGroupID}
+			if tt.configure != nil {
+				tt.configure(cfg)
+			}
+			rawCfg, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			svc := &ContentModerationService{
+				settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+					SettingKeyRiskControlEnabled:      fmt.Sprintf("%t", tt.riskEnabled),
+					SettingKeyContentModerationConfig: string(rawCfg),
+				}},
+				repo: &contentModerationTestRepo{},
+			}
+
+			applies, err := svc.StrictPreBlockApplies(context.Background(), tt.groupID)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, applies)
+		})
+	}
+}
+
 func TestContentModerationCheck_KeywordsIgnoredInObserveMode(t *testing.T) {
 	upstreamHits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1454,6 +1501,97 @@ func TestContentModerationCheck_StrictFindingsLogWithoutUserSideEffects(t *testi
 		cfg.BanThreshold = 1
 		svc, repo, userRepo, invalidator := newService(t, cfg, server.Client())
 		assertBlockedWithoutSideEffects(t, svc, repo, userRepo, invalidator, []byte(`{"input":"clean request"}`))
+	})
+}
+
+func TestContentModerationCheck_StrictAuditUsesAtMostTwoKeysPerRequest(t *testing.T) {
+	groupID := int64(12)
+	body, err := json.Marshal(map[string]string{
+		"input": strings.Repeat("a", maxModerationInputRunes*2+1),
+	})
+	require.NoError(t, err)
+
+	newService := func(t *testing.T, server *httptest.Server) *ContentModerationService {
+		t.Helper()
+		cfg := defaultContentModerationConfig()
+		cfg.Enabled = true
+		cfg.AllGroups = false
+		cfg.GroupIDs = []int64{groupID}
+		cfg.BaseURL = server.URL
+		cfg.APIKeys = []string{"sk-primary", "sk-backup", "sk-third"}
+		cfg.RetryCount = 2
+		rawCfg, marshalErr := json.Marshal(cfg)
+		require.NoError(t, marshalErr)
+		return &ContentModerationService{
+			settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+				SettingKeyRiskControlEnabled:      "true",
+				SettingKeyContentModerationConfig: string(rawCfg),
+			}},
+			repo:       &contentModerationTestRepo{},
+			httpClient: server.Client(),
+			asyncQueue: make(chan contentModerationTask, 4),
+			keyHealth:  make(map[string]*contentModerationKeyHealth),
+		}
+	}
+	check := func(svc *ContentModerationService) (*ContentModerationDecision, error) {
+		return svc.Check(context.Background(), ContentModerationCheckInput{
+			Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
+			Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+		})
+	}
+
+	t.Run("successful key is reused for every unit", func(t *testing.T) {
+		var mu sync.Mutex
+		var authorizations []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			authorizations = append(authorizations, r.Header.Get("Authorization"))
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{}}})
+		}))
+		defer server.Close()
+
+		decision, err := check(newService(t, server))
+		require.NoError(t, err)
+		require.True(t, decision.Allowed)
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, []string{"Bearer sk-primary", "Bearer sk-primary", "Bearer sk-primary"}, authorizations)
+	})
+
+	t.Run("failed keys are never retried and a third key is never selected", func(t *testing.T) {
+		var mu sync.Mutex
+		var authorizations []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			authorizations = append(authorizations, r.Header.Get("Authorization"))
+			call := len(authorizations)
+			mu.Unlock()
+			switch call {
+			case 2:
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			case 4:
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":{"message":"unavailable"}}`))
+			default:
+				_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{}}})
+			}
+		}))
+		defer server.Close()
+
+		decision, err := check(newService(t, server))
+		require.Error(t, err)
+		require.Nil(t, decision)
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, []string{
+			"Bearer sk-primary",
+			"Bearer sk-primary",
+			"Bearer sk-backup",
+			"Bearer sk-backup",
+		}, authorizations)
+		require.NotContains(t, authorizations, "Bearer sk-third")
 	})
 }
 

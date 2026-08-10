@@ -117,3 +117,19 @@ func TestRedisStrictAuditLineageStoreAllowsMediaOnlyContext(t *testing.T) {
 	require.Empty(t, loaded.RedactedContext)
 	require.Equal(t, summary.MediaDigests, loaded.MediaDigests)
 }
+
+func TestRedisStrictAuditLineageStoreAllowsLegacyOnlyConfigVersion(t *testing.T) {
+	store, _ := newStrictAuditLineageTestStore(t, time.Hour)
+	summary := allowedStrictAuditSummary(12)
+	summary.ConfigVersion = 0
+
+	require.NoError(t, store.BindAllowedResponse(context.Background(), summary, "resp_legacy_only"))
+	loaded, err := store.Load(context.Background(), LineageLookup{
+		GroupID: summary.GroupID, APIKeyID: summary.APIKeyID, PreviousResponseID: "resp_legacy_only",
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), loaded.ConfigVersion)
+
+	summary.ConfigVersion = -1
+	require.ErrorIs(t, store.BindAllowedResponse(context.Background(), summary, "resp_invalid_version"), ErrLineageInvalid)
+}

@@ -23,8 +23,12 @@ type PromptEngine interface {
 	Evaluate(ctx context.Context, req Request) (*PromptDecision, error)
 }
 
-type blockingScope interface {
+type promptBlockingScope interface {
 	BlockingApplies(req Request) bool
+}
+
+type legacyBlockingScope interface {
+	BlockingApplies(ctx context.Context, req Request) (bool, error)
 }
 
 type Coordinator struct {
@@ -45,13 +49,22 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 	if c.prompt != nil {
 		mode = c.prompt.EffectiveMode()
 	}
-	strict := mode == ModeBlocking && c.blockingApplies(req)
+	strict, err := c.legacyBlockingApplies(ctx, req)
+	if err != nil {
+		return auditUnavailableDecision(nil, nil)
+	}
 	if strict {
 		prepared, rejected := c.prepareStrict(ctx, req)
 		if rejected != nil {
 			return *rejected
 		}
 		req = prepared
+		promptRequired := mode == ModeBlocking && c.promptBlockingApplies(req)
+		decision := c.checkStrict(ctx, req, promptRequired)
+		if decision.AllowNextStage && mode == ModeAsync && c.prompt != nil {
+			_ = c.prompt.Enqueue(ctx, req.Clone())
+		}
+		return decision
 	}
 	switch mode {
 	case ModeAsync:
@@ -59,18 +72,28 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 		legacy, _ := c.checkLegacy(ctx, req)
 		return prioritize(legacy, nil, false, nil)
 	case ModeBlocking:
-		return c.checkBlocking(ctx, req, strict)
+		return c.checkBlocking(ctx, req)
 	default:
 		legacy, _ := c.checkLegacy(ctx, req)
 		return prioritize(legacy, nil, false, nil)
 	}
 }
 
-func (c *Coordinator) blockingApplies(req Request) bool {
+func (c *Coordinator) legacyBlockingApplies(ctx context.Context, req Request) (bool, error) {
+	if c == nil || c.legacy == nil {
+		return false, nil
+	}
+	if scoped, ok := c.legacy.(legacyBlockingScope); ok {
+		return scoped.BlockingApplies(ctx, req)
+	}
+	return false, nil
+}
+
+func (c *Coordinator) promptBlockingApplies(req Request) bool {
 	if c == nil || c.prompt == nil {
 		return false
 	}
-	if scoped, ok := c.prompt.(blockingScope); ok {
+	if scoped, ok := c.prompt.(promptBlockingScope); ok {
 		return scoped.BlockingApplies(req)
 	}
 	return false
@@ -145,13 +168,7 @@ func sameGroupID(left, right *int64) bool {
 	return *left == *right
 }
 
-func (c *Coordinator) checkBlocking(ctx context.Context, req Request, strict bool) Decision {
-	if strict && c.legacy == nil {
-		return auditUnavailableDecision(nil, nil)
-	}
-	if strict {
-		return c.checkStrictBlocking(ctx, req)
-	}
+func (c *Coordinator) checkBlocking(ctx context.Context, req Request) Decision {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var legacy *LegacyDecision
@@ -188,13 +205,21 @@ func (c *Coordinator) checkBlocking(ctx context.Context, req Request, strict boo
 	return prioritize(legacy, prompt, false, nil)
 }
 
-func (c *Coordinator) checkStrictBlocking(ctx context.Context, req Request) Decision {
+func (c *Coordinator) checkStrict(ctx context.Context, req Request, promptRequired bool) Decision {
 	legacy, err := c.checkLegacy(ctx, req.Clone())
 	if err != nil || legacy == nil || legacy.Unavailable || (!legacy.Allowed && !legacy.Blocked && !legacy.Flagged) {
 		return auditUnavailableDecision(legacy, nil)
 	}
 	if legacy.Blocked || legacy.Flagged {
 		return policyBlockedDecision(legacy, nil)
+	}
+	if !promptRequired {
+		decision := allowDecision(legacy, nil)
+		decision.Audit = buildAuditSummary(req, nil)
+		if decision.Audit == nil {
+			return auditUnavailableDecision(legacy, nil)
+		}
+		return decision
 	}
 	if c.prompt == nil {
 		return auditUnavailableDecision(legacy, nil)
@@ -315,8 +340,15 @@ func unavailablePromptDecision(code string) *PromptDecision {
 }
 
 func buildAuditSummary(req Request, prompt *PromptDecision) *AuditSummary {
-	if !req.Strict || req.Document == nil || !req.Document.Complete || prompt == nil || prompt.Kind != DecisionAllow || !prompt.AllowNextStage {
+	if !req.Strict || req.Document == nil || !req.Document.Complete {
 		return nil
+	}
+	configVersion := int64(0)
+	if prompt != nil {
+		if prompt.Kind != DecisionAllow || !prompt.AllowNextStage {
+			return nil
+		}
+		configVersion = prompt.ConfigVersion
 	}
 	priorContext := ""
 	parentPromptHash := ""
@@ -334,7 +366,7 @@ func buildAuditSummary(req Request, prompt *PromptDecision) *AuditSummary {
 		mediaDigests = append(mediaDigests, media.Digest)
 	}
 	return &AuditSummary{
-		ParserVersion: auditinput.ParserVersion, ConfigVersion: prompt.ConfigVersion,
+		ParserVersion: auditinput.ParserVersion, ConfigVersion: configVersion,
 		APIKeyID: req.APIKeyID, GroupID: cloneInt64Ptr(req.GroupID), PreviousResponseID: req.Document.PreviousResponseID,
 		PromptHash: hashAuditContext(contextText, mediaDigests), ParentPromptHash: parentPromptHash, DocumentHash: req.Document.Hash,
 		NormalizedContext: contextText, RedactedContext: RedactContext(contextText),

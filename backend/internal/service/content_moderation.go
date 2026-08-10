@@ -816,6 +816,29 @@ func (s *ContentModerationService) TestAPIKeys(ctx context.Context, input TestCo
 	return &TestContentModerationAPIKeysResult{Items: items, AuditResult: auditResult, ImageCount: imageCount}, nil
 }
 
+// StrictPreBlockApplies reports whether the effective Content Moderation
+// configuration requires strict admission for the request group. The remaining
+// strict prerequisites are validated by checkStrict so a partial configuration
+// fails closed instead of silently falling back to legacy moderation.
+func (s *ContentModerationService) StrictPreBlockApplies(ctx context.Context, groupID *int64) (bool, error) {
+	if s == nil || s.settingRepo == nil || s.repo == nil {
+		return false, errors.New("strict content moderation service unavailable")
+	}
+	runtimeSnapshot, err := s.loadRuntimeSnapshot(ctx)
+	if err != nil {
+		return false, fmt.Errorf("load strict content moderation scope: %w", err)
+	}
+	return contentModerationStrictPreBlockApplies(runtimeSnapshot, groupID), nil
+}
+
+func contentModerationStrictPreBlockApplies(runtimeSnapshot *contentModerationRuntimeSnapshot, groupID *int64) bool {
+	if runtimeSnapshot == nil || !runtimeSnapshot.riskControlEnabled || runtimeSnapshot.config == nil {
+		return false
+	}
+	cfg := runtimeSnapshot.config
+	return cfg.Enabled && cfg.Mode == ContentModerationModePreBlock && cfg.includesGroup(groupID)
+}
+
 func (s *ContentModerationService) Check(ctx context.Context, input ContentModerationCheckInput) (*ContentModerationDecision, error) {
 	if input.Strict {
 		return s.checkStrict(ctx, input)
@@ -1072,9 +1095,9 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 		return nil, fmt.Errorf("load strict content moderation config: %w", err)
 	}
 	cfg := runtimeSnapshot.config
-	if !runtimeSnapshot.riskControlEnabled || cfg == nil || !cfg.Enabled || cfg.Mode != ContentModerationModePreBlock ||
+	if !contentModerationStrictPreBlockApplies(runtimeSnapshot, input.GroupID) ||
 		cfg.SampleRate != 100 || cfg.KeywordBlockingMode != ContentModerationKeywordModeKeywordAndAPI ||
-		!cfg.includesGroup(input.GroupID) || !cfg.includesModel(input.Model) {
+		!cfg.includesModel(input.Model) {
 		return nil, errors.New("strict content moderation is not fully configured for request")
 	}
 	content := contentModerationInputFromDocument(document)
@@ -1121,8 +1144,11 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 	if len(units) == 0 {
 		return nil, errors.New("strict content moderation produced no auditable unit")
 	}
+	strictKeyState := newStrictModerationKeyState(cfg)
 	for _, unit := range units {
-		decision := s.checkSync(ctx, input, cfg, unit, hashText, nil, true, true)
+		decision := s.checkSync(ctx, input, cfg, unit, hashText, nil, true, contentModerationSyncOptions{
+			strictKeyState: strictKeyState,
+		})
 		if decision == nil || decision.Unavailable {
 			return nil, errors.New("strict content moderation audit API unavailable")
 		}
@@ -1190,9 +1216,17 @@ func strictModerationUnits(document *auditinput.Document) []ContentModerationInp
 	return units
 }
 
-func (s *ContentModerationService) checkSync(ctx context.Context, input ContentModerationCheckInput, cfg *ContentModerationConfig, content ContentModerationInput, hashText string, queueDelay *int, allowBlock bool, failClosed ...bool) *ContentModerationDecision {
+type contentModerationSyncOptions struct {
+	strictKeyState *strictModerationKeyState
+}
+
+func (s *ContentModerationService) checkSync(ctx context.Context, input ContentModerationCheckInput, cfg *ContentModerationConfig, content ContentModerationInput, hashText string, queueDelay *int, allowBlock bool, options ...contentModerationSyncOptions) *ContentModerationDecision {
 	allow := &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}
-	strictFailure := len(failClosed) > 0 && failClosed[0]
+	var option contentModerationSyncOptions
+	if len(options) > 0 {
+		option = options[0]
+	}
+	strictFailure := option.strictKeyState != nil
 	trackPreBlock := queueDelay == nil && allowBlock && cfg != nil && cfg.Mode == ContentModerationModePreBlock
 	if trackPreBlock {
 		s.preBlockActive.Add(1)
@@ -1202,7 +1236,7 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 	var result *moderationAPIResult
 	var err error
 	if strictFailure {
-		result, err = s.callModerationStrict(ctx, cfg, content.ModerationInput(), trackPreBlock)
+		result, err = s.callModerationStrict(ctx, cfg, content.ModerationInput(), option.strictKeyState, trackPreBlock)
 	} else {
 		result, err = s.callModeration(ctx, cfg, content.ModerationInput(), trackPreBlock)
 	}
@@ -1892,24 +1926,62 @@ func (s *ContentModerationService) callModeration(ctx context.Context, cfg *Cont
 	return nil, lastErr
 }
 
-func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg *ContentModerationConfig, input any, trackKeyLoad ...bool) (*moderationAPIResult, error) {
-	attempts := cfg.RetryCount + 1
-	if attempts <= 0 {
-		attempts = 1
+type strictModerationKeyState struct {
+	currentKey   string
+	selectedKeys map[string]struct{}
+	maxKeys      int
+}
+
+func newStrictModerationKeyState(cfg *ContentModerationConfig) *strictModerationKeyState {
+	maxKeys := 1
+	if cfg != nil && cfg.RetryCount > 0 {
+		maxKeys = 2
 	}
-	if attempts > 2 {
-		attempts = 2
+	return &strictModerationKeyState{selectedKeys: make(map[string]struct{}, maxKeys), maxKeys: maxKeys}
+}
+
+func (s *ContentModerationService) nextStrictModerationAPIKey(cfg *ContentModerationConfig, state *strictModerationKeyState) (string, bool) {
+	if state == nil {
+		return "", false
+	}
+	if state.currentKey != "" {
+		if !s.isAPIKeyFrozen(state.currentKey, time.Now()) {
+			return state.currentKey, true
+		}
+		state.currentKey = ""
+	}
+	if len(state.selectedKeys) >= state.maxKeys {
+		return "", false
+	}
+	key, ok := s.nextUsableAPIKeyExcluding(cfg, state.selectedKeys)
+	if !ok {
+		return "", false
+	}
+	state.selectedKeys[key] = struct{}{}
+	state.currentKey = key
+	return key, true
+}
+
+func (state *strictModerationKeyState) markFailed(key string) {
+	if state != nil && state.currentKey == key {
+		state.currentKey = ""
+	}
+}
+
+func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg *ContentModerationConfig, input any, state *strictModerationKeyState, trackKeyLoad ...bool) (*moderationAPIResult, error) {
+	if state == nil {
+		state = newStrictModerationKeyState(cfg)
 	}
 	trackLoad := len(trackKeyLoad) > 0 && trackKeyLoad[0]
-	usedKeys := make(map[string]struct{}, attempts)
 	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		key, ok := s.nextUsableAPIKeyExcluding(cfg, usedKeys)
+	for {
+		key, ok := s.nextStrictModerationAPIKey(cfg, state)
 		if !ok {
-			lastErr = errors.New("no distinct moderation api key available")
-			break
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, errors.New("no distinct moderation api key available")
 		}
-		usedKeys[key] = struct{}{}
 		if trackLoad {
 			s.beginModerationAPIKeyCall(key)
 		}
@@ -1929,11 +2001,8 @@ func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg
 		}
 		s.markAPIKeyError(key, err.Error(), latency, httpStatus)
 		lastErr = err
-		if httpStatus == http.StatusBadRequest || attempt == attempts-1 {
-			break
-		}
+		state.markFailed(key)
 	}
-	return nil, lastErr
 }
 
 func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Context, cfg *ContentModerationConfig, apiKey string, input any, httpStatus *int) (*moderationAPIResult, error) {

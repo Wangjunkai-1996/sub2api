@@ -217,6 +217,12 @@ func TestSecurityAuditBlockingFailuresLeaveAllDownstreamCountersAtZero(t *testin
 type handlerLegacyEngine struct {
 	decision *securityaudit.LegacyDecision
 	err      error
+	strict   bool
+	scopeErr error
+}
+
+func (e *handlerLegacyEngine) BlockingApplies(context.Context, securityaudit.Request) (bool, error) {
+	return e.strict, e.scopeErr
 }
 
 func (e *handlerLegacyEngine) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
@@ -234,26 +240,23 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 	}{
 		{
 			name: "policy block", body: `{"model":"gpt-test","input":"blocked"}`,
-			legacy:     &handlerLegacyEngine{decision: &securityaudit.LegacyDecision{Blocked: true, Flagged: true}},
+			legacy:     &handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Blocked: true, Flagged: true}},
 			wantStatus: http.StatusForbidden, wantCode: securityaudit.ErrorCodePolicyBlocked,
 		},
 		{
 			name: "context incomplete", body: `{"model":"gpt-test","input":[{"type":"future_item"}]}`,
-			legacy:     &handlerLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}},
+			legacy:     &handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
 			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
 		},
 		{
 			name: "audit unavailable", body: `{"model":"gpt-test","input":"safe"}`,
-			legacy:     &handlerLegacyEngine{err: errors.New("moderation 429")},
+			legacy:     &handlerLegacyEngine{strict: true, err: errors.New("moderation 429")},
 			wantStatus: http.StatusServiceUnavailable, wantCode: securityaudit.ErrorCodeAuditUnavailable,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			prompt := &handlerPromptEngine{
-				mode: securityaudit.ModeBlocking, strict: true,
-				decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionAllow, AllowNextStage: true, ConfigVersion: 1},
-			}
+			prompt := &handlerPromptEngine{mode: securityaudit.ModeOff}
 			h := &OpenAIGatewayHandler{
 				gatewayService:           &service.OpenAIGatewayService{},
 				billingCacheService:      &service.BillingCacheService{},
@@ -282,6 +285,8 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 				"strict rejection must not touch the deliberately uninitialized scheduler, concurrency, billing, or upstream internals")
 			require.Equal(t, tt.wantStatus, recorder.Code)
 			require.Contains(t, recorder.Body.String(), tt.wantCode)
+			evaluated, _, _ := prompt.snapshot()
+			require.Zero(t, evaluated, "Prompt Audit must not be required when it is off")
 		})
 	}
 }
@@ -302,7 +307,7 @@ func TestOpenAIResponsesWebSocketStrictBlockHasZeroDownstreamSideEffects(t *test
 		billingCacheService:      &service.BillingCacheService{},
 		apiKeyService:            &service.APIKeyService{},
 		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
-		securityAuditCoordinator: securityaudit.NewCoordinator(&handlerLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}}, prompt),
+		securityAuditCoordinator: securityaudit.NewCoordinator(&handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}}, prompt),
 		maxAccountSwitches:       1,
 	}
 
