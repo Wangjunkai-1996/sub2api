@@ -29,6 +29,22 @@ func TestAppendResponsesOutputExtendsCumulativeContextAndHashes(t *testing.T) {
 	require.Equal(t, summary.RedactedContext, "prior request", "input summary must remain immutable")
 }
 
+func TestAppendResponsesOutputAcceptsLegacyAuditAndCurrentMessageShape(t *testing.T) {
+	groupID := int64(12)
+	summary := AuditSummary{
+		ParserVersion: "auditinput/v1", ConfigVersion: 0, APIKeyID: 7, GroupID: &groupID,
+		PromptHash: strings.Repeat("a", 64), DocumentHash: strings.Repeat("b", 64),
+		NormalizedContext: "Reply TRACE", RedactedContext: "Reply TRACE",
+		ContextComplete: true, Verdict: AuditVerdictAllow,
+	}
+	augmented, err := AppendResponsesOutput(summary, []byte(`[
+		{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"TRACE"}],"phase":"final_answer","role":"assistant"}
+	]`))
+
+	require.NoError(t, err)
+	require.Contains(t, augmented.RedactedContext, "TRACE")
+}
+
 func TestAppendResponsesOutputFailsClosedForUnknownMediaAndLimits(t *testing.T) {
 	summary := AuditSummary{
 		ParserVersion: "auditinput/v1", ConfigVersion: 9, APIKeyID: 7,

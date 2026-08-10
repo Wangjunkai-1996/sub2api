@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
@@ -49,21 +50,21 @@ func (c *Coordinator) BindAllowedResponse(ctx context.Context, summary AuditSumm
 // so the next continuation re-audits the complete cumulative context.
 func AppendResponsesOutput(summary AuditSummary, output []byte) (AuditSummary, error) {
 	if summary.Verdict != AuditVerdictAllow || !summary.ContextComplete || strings.TrimSpace(summary.PromptHash) == "" {
-		return AuditSummary{}, ErrLineageInvalid
+		return AuditSummary{}, fmt.Errorf("%w: request summary is incomplete", ErrLineageInvalid)
 	}
 	document := auditinput.ParseResponsesOutput(output)
 	if document == nil || !document.Complete {
-		return AuditSummary{}, ErrLineageInvalid
+		return AuditSummary{}, fmt.Errorf("%w: response output is incomplete", ErrLineageInvalid)
 	}
 	// A digest alone cannot prove that a model-generated image was audited on
 	// the next turn. Until lineage can carry an independently verified media
 	// artifact, any response media makes the continuation context incomplete.
 	if len(document.Media) > 0 {
-		return AuditSummary{}, ErrLineageInvalid
+		return AuditSummary{}, fmt.Errorf("%w: response output contains media", ErrLineageInvalid)
 	}
 	contextText, ok := cumulativeContext(summary.RedactedContext, document.NormalizedText)
 	if !ok {
-		return AuditSummary{}, ErrLineageInvalid
+		return AuditSummary{}, fmt.Errorf("%w: cumulative context exceeds limit", ErrLineageInvalid)
 	}
 	augmented := summary.Clone()
 	augmented.ParentPromptHash = strings.TrimSpace(summary.PromptHash)
@@ -73,7 +74,7 @@ func AppendResponsesOutput(summary AuditSummary, output []byte) (AuditSummary, e
 	documentHash := sha256.Sum256([]byte(auditinput.ParserVersion + "\nrequest:" + strings.TrimSpace(summary.DocumentHash) + "\nresponse:" + document.Hash))
 	augmented.DocumentHash = hex.EncodeToString(documentHash[:])
 	if !auditSummaryHasContext(augmented) {
-		return AuditSummary{}, ErrLineageInvalid
+		return AuditSummary{}, fmt.Errorf("%w: cumulative context is empty", ErrLineageInvalid)
 	}
 	return augmented, nil
 }
