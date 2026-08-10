@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
@@ -27,6 +28,23 @@ type openAIResponsesFailoverCancelUpstream struct {
 	mu         sync.Mutex
 	accountIDs []int64
 	onFirstDo  func()
+}
+
+type openAIResponsesStrictStickyCache struct {
+	service.GatewayCache
+	accountID int64
+}
+
+func (c *openAIResponsesStrictStickyCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	return c.accountID, nil
+}
+
+func (c *openAIResponsesStrictStickyCache) SetSessionAccountID(context.Context, int64, string, int64, time.Duration) error {
+	return nil
+}
+
+func (c *openAIResponsesStrictStickyCache) RefreshSessionTTL(context.Context, int64, string, time.Duration) error {
+	return nil
 }
 
 func (u *openAIResponsesFailoverCancelUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
@@ -121,6 +139,75 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 	return handler
 }
 
+func newOpenAIResponsesStrictFailoverTestHandler(t *testing.T, upstream service.HTTPUpstream, groupID int64) *OpenAIGatewayHandler {
+	t.Helper()
+	accounts := []service.Account{
+		{
+			ID: 1, Name: "strict-producing-account", Platform: service.PlatformOpenAI,
+			Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
+			Concurrency: 0, Priority: 0, GroupIDs: []int64{groupID},
+			Credentials: map[string]any{
+				"api_key":                      "sk-producing",
+				"base_url":                     "https://api.example.test",
+				"pool_mode":                    true,
+				"pool_mode_retry_count":        float64(1),
+				"pool_mode_retry_status_codes": []any{float64(520)},
+			},
+			Extra: map[string]any{
+				"openai_passthrough":         true,
+				"openai_ws_force_http":       true,
+				"openai_responses_supported": true,
+			},
+		},
+		{
+			ID: 2, Name: "strict-backup-account", Platform: service.PlatformOpenAI,
+			Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
+			Concurrency: 0, Priority: 1, GroupIDs: []int64{groupID},
+			Credentials: map[string]any{
+				"api_key":  "sk-backup",
+				"base_url": "https://api.example.test",
+			},
+			Extra: map[string]any{
+				"openai_passthrough":         true,
+				"openai_responses_supported": true,
+			},
+		},
+	}
+	accountRepo := &openAIWSFailoverHandlerAccountRepoStub{accounts: accounts}
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	cfg.Default.RateMultiplier = 1
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Gateway.MaxAccountSwitches = 3
+	billingService := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	t.Cleanup(billingService.Stop)
+	gatewayService := service.NewOpenAIGatewayService(
+		accountRepo, nil, nil, nil, nil, nil,
+		&openAIResponsesStrictStickyCache{accountID: 1}, cfg, nil, nil,
+		service.NewBillingService(cfg, nil), nil, billingService, upstream,
+		&service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil,
+	)
+	handler := NewOpenAIGatewayHandler(
+		gatewayService,
+		service.NewConcurrencyService(nil),
+		billingService,
+		service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg),
+		nil,
+		nil,
+		nil,
+		nil,
+		cfg,
+	)
+	handler.securityAuditCoordinator = securityaudit.NewCoordinator(
+		&handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
+		&handlerPromptEngine{mode: securityaudit.ModeOff},
+	).SetLineageStore(&handlerAllowLineageStore{summary: securityaudit.AuditSummary{
+		Verdict: securityaudit.AuditVerdictAllow, ContextComplete: true,
+		APIKeyID: 99, GroupID: &groupID, PromptHash: "parent-hash", RedactedContext: "parent context",
+	}})
+	handler.maxAccountSwitches = 3
+	return handler
+}
+
 func newOpenAIResponsesFailoverTestContext(t *testing.T, ctx context.Context) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
 	groupID := int64(3131)
@@ -191,6 +278,24 @@ func TestOpenAIGatewayHandlerResponses_FailoverContinuesForConnectedClient(t *te
 	handler.Responses(c)
 
 	require.Equal(t, []int64{1, 2}, upstream.calls(), "在线客户端应正常切换账号")
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+}
+
+func TestOpenAIGatewayHandlerResponses_StrictContinuationNeverRetriesOrSwitchesAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(3131)
+	upstream := &openAIResponsesFailoverCancelUpstream{}
+	handler := newOpenAIResponsesStrictFailoverTestHandler(t, upstream, groupID)
+	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader([]byte(
+		`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_parent","input":"hello"}`,
+	)))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Responses(c)
+
+	require.Equal(t, []int64{1}, upstream.calls(), "strict continuation must neither replay the pool account nor switch to account 2")
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
 }

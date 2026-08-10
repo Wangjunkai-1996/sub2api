@@ -186,6 +186,15 @@ func openAIResponsesRequiredCapability(imageIntent bool, platform string) servic
 	return service.OpenAIEndpointCapabilityChatCompletions
 }
 
+func (h *OpenAIGatewayHandler) rejectOpenAIStrictContinuation(c *gin.Context) {
+	h.openAISecurityAuditError(c, &securityaudit.Decision{
+		Kind:          securityaudit.DecisionInvalid,
+		HTTPStatus:    http.StatusUnprocessableEntity,
+		ErrorCode:     securityaudit.ErrorCodeContextIncomplete,
+		ClientMessage: "请求上下文无法完整审计，请重新发起完整请求",
+	})
+}
+
 func allowOpenAICompatibleMessagesDispatch(apiKey *service.APIKey) bool {
 	if apiKey == nil || apiKey.Group == nil {
 		return true
@@ -369,6 +378,23 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "previous_response_id is only supported on Responses WebSocket v2")
 		return
 	}
+	strictHTTPContinuation := previousResponseID != "" && securityAuditSummary != nil
+	requireCompact := isOpenAIRemoteCompactPath(c)
+	if strictHTTPContinuation {
+		strictCtx := service.WithOpenAIStrictHTTPContinuation(c.Request.Context())
+		c.Request = c.Request.WithContext(strictCtx)
+		if err := h.gatewayService.ValidateStrictHTTPContinuationAccount(
+			strictCtx,
+			apiKey.GroupID,
+			previousResponseID,
+			reqModel,
+			requireCompact,
+		); err != nil {
+			reqLog.Warn("openai.strict_http_continuation_preflight_failed", zap.Error(err))
+			h.rejectOpenAIStrictContinuation(c)
+			return
+		}
+	}
 
 	// 使用 IsExplicitImageGenerationIntent 排除被动 image_gen namespace 声明。
 	// Codex 在所有请求中被动声明 image_gen namespace，宽泛检测会导致禁了生图的
@@ -437,8 +463,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	if h.rejectIfCyberSessionBlocked(c, apiKey, sessionHashBody, reqModel, cyberBlockFormatResponses) {
 		return
 	}
-	requireCompact := isOpenAIRemoteCompactPath(c)
-
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	firstOutputTimeoutSwitchCount := 0
@@ -459,6 +483,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// A strict continuation may only use a native Responses-capable account.
 		// Chat fallback synthesizes response IDs and cannot prove complete lineage.
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
+	}
+	requiredTransport := service.OpenAIUpstreamTransportAny
+	if strictHTTPContinuation {
+		requiredTransport = service.OpenAIUpstreamTransportHTTPSSE
 	}
 
 	// 分组利润控制：请求级装配定价上下文——pricingAt 固定本请求的
@@ -484,7 +512,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			sessionHash,
 			reqModel,
 			failedAccountIDs,
-			service.OpenAIUpstreamTransportAny,
+			requiredTransport,
 			requiredCapability,
 			requireCompact,
 			false,
@@ -492,6 +520,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
+			if strictHTTPContinuation && errors.Is(err, service.ErrOpenAIPreviousResponseAccountUnavailable) {
+				h.rejectOpenAIStrictContinuation(c)
+				return
+			}
 			if failoverClientGone(c) {
 				reqLog.Info("openai.account_select_aborted_client_disconnected", zap.Error(err))
 				return
@@ -521,11 +553,22 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 		if selection == nil || selection.Account == nil {
+			if strictHTTPContinuation {
+				h.rejectOpenAIStrictContinuation(c)
+				return
+			}
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
 			}
 			h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
+			return
+		}
+		if strictHTTPContinuation && !scheduleDecision.StickyPreviousHit {
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			h.rejectOpenAIStrictContinuation(c)
 			return
 		}
 		if previousResponseID != "" && selection != nil && selection.Account != nil {
@@ -547,6 +590,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if slotResult == openAISlotAcquireProfitVetoed {
+			if strictHTTPContinuation {
+				h.rejectOpenAIStrictContinuation(c)
+				return
+			}
 			// 利润终检否决：排除该账号重新选号，全池耗尽由下一轮选号报错；
 			// 否决次数达上限则直接终止，避免排队抢槽后才终检的延迟放大。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
@@ -628,6 +675,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						return
 					}
 					if openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
+						h.handleFailoverExhausted(c, failoverErr, streamStarted)
+						return
+					}
+					if strictHTTPContinuation {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}

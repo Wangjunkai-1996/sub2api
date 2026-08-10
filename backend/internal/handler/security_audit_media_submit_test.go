@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type handlerPromptEngine struct {
@@ -229,6 +231,68 @@ func (e *handlerLegacyEngine) Check(context.Context, securityaudit.Request) (*se
 	return e.decision, e.err
 }
 
+type handlerAllowLineageStore struct {
+	summary securityaudit.AuditSummary
+	loads   atomic.Int32
+	lookup  securityaudit.LineageLookup
+}
+
+func (s *handlerAllowLineageStore) Load(_ context.Context, lookup securityaudit.LineageLookup) (*securityaudit.AuditSummary, error) {
+	s.loads.Add(1)
+	s.lookup = lookup
+	result := s.summary.Clone()
+	return &result, nil
+}
+
+func (s *handlerAllowLineageStore) BindAllowedResponse(context.Context, securityaudit.AuditSummary, string) error {
+	return nil
+}
+
+type strictContinuationGatewayCacheSpy struct {
+	service.GatewayCache
+	responseLookups atomic.Int32
+}
+
+func (s *strictContinuationGatewayCacheSpy) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	s.responseLookups.Add(1)
+	return 0, service.ErrStickySessionNotFound
+}
+
+type strictContinuationAccountRepoSpy struct {
+	service.AccountRepository
+	calls atomic.Int32
+}
+
+func (s *strictContinuationAccountRepoSpy) GetByID(context.Context, int64) (*service.Account, error) {
+	s.calls.Add(1)
+	return nil, errors.New("unexpected account lookup")
+}
+
+func (s *strictContinuationAccountRepoSpy) ListSchedulableByGroupIDAndPlatform(context.Context, int64, string) ([]service.Account, error) {
+	s.calls.Add(1)
+	return nil, errors.New("unexpected account selection")
+}
+
+func (s *strictContinuationAccountRepoSpy) ListSchedulableByPlatform(context.Context, string) ([]service.Account, error) {
+	s.calls.Add(1)
+	return nil, errors.New("unexpected account selection")
+}
+
+func (s *strictContinuationAccountRepoSpy) ListSchedulableUngroupedByPlatform(context.Context, string) ([]service.Account, error) {
+	s.calls.Add(1)
+	return nil, errors.New("unexpected account selection")
+}
+
+type strictContinuationBillingCacheSpy struct {
+	service.BillingCache
+	balanceCalls atomic.Int32
+}
+
+func (s *strictContinuationBillingCacheSpy) GetUserBalance(context.Context, int64) (float64, error) {
+	s.balanceCalls.Add(1)
+	return 0, errors.New("unexpected billing check")
+}
+
 func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
@@ -289,6 +353,88 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 			require.Zero(t, evaluated, "Prompt Audit must not be required when it is off")
 		})
 	}
+}
+
+func TestOpenAIResponsesStrictContinuationStickyMissStopsBeforeAllDownstreamDependencies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(12)
+	lineage := &handlerAllowLineageStore{summary: securityaudit.AuditSummary{
+		Verdict: securityaudit.AuditVerdictAllow, ContextComplete: true,
+		APIKeyID: 9, GroupID: &groupID, PromptHash: "parent-hash", RedactedContext: "parent context",
+	}}
+	accountRepo := &strictContinuationAccountRepoSpy{}
+	gatewayCache := &strictContinuationGatewayCacheSpy{}
+	billingCache := &strictContinuationBillingCacheSpy{}
+	cfg := &config.Config{Gateway: config.GatewayConfig{ImageConcurrency: config.ImageConcurrencyConfig{
+		Enabled: true, MaxConcurrentRequests: 1, OverflowMode: config.ImageConcurrencyOverflowModeReject,
+	}}}
+	billing := service.NewBillingCacheService(billingCache, nil, nil, nil, nil, nil, cfg, nil)
+	t.Cleanup(billing.Stop)
+	concurrencyCache := &concurrencyCacheMock{
+		acquireUserSlotFn:    func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) { return true, nil },
+	}
+	concurrency := service.NewConcurrencyService(concurrencyCache)
+	upstream := &openAIHTTPPassthroughFailoverUpstream{}
+	gateway := service.NewOpenAIGatewayService(
+		accountRepo, nil, nil, nil, nil, nil, gatewayCache, cfg, nil, concurrency, nil, nil,
+		billing, upstream, nil, nil, nil, nil, nil, nil, nil, nil,
+	)
+	limiter := &imageConcurrencyLimiter{}
+	occupiedRelease, occupied := limiter.TryAcquire(true, 1)
+	require.True(t, occupied)
+	t.Cleanup(occupiedRelease)
+	h := &OpenAIGatewayHandler{
+		gatewayService:      gateway,
+		billingCacheService: billing,
+		apiKeyService:       &service.APIKeyService{},
+		concurrencyHelper:   NewConcurrencyHelper(concurrency, SSEPingFormatComment, time.Second),
+		securityAuditCoordinator: securityaudit.NewCoordinator(
+			&handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
+			&handlerPromptEngine{mode: securityaudit.ModeOff},
+		).SetLineageStore(lineage),
+		cfg:          cfg,
+		imageLimiter: limiter,
+	}
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		user := &service.User{ID: 7, Username: "strict-user", Status: service.StatusActive}
+		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+			ID: 9, UserID: user.ID, User: user, GroupID: &groupID,
+			Group: &service.Group{
+				ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive, AllowImageGeneration: true,
+			},
+		})
+		c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: user.ID, Concurrency: 2})
+		c.Next()
+	})
+	router.POST("/v1/responses", h.Responses)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(
+		`{"model":"gpt-5.4","previous_response_id":"resp_parent","input":"draw","tools":[{"type":"image_generation"}]}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	require.NotPanics(t, func() { router.ServeHTTP(recorder, request) })
+	require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
+	require.Equal(t, securityaudit.ErrorCodeContextIncomplete, gjson.GetBytes(recorder.Body.Bytes(), "error.code").String())
+	require.Equal(t, int32(1), lineage.loads.Load())
+	require.Equal(t, int64(9), lineage.lookup.APIKeyID)
+	require.Equal(t, groupID, *lineage.lookup.GroupID)
+	require.Equal(t, "resp_parent", lineage.lookup.PreviousResponseID)
+	require.Equal(t, int32(1), gatewayCache.responseLookups.Load(), "preflight must perform one read-only response binding lookup")
+	require.Zero(t, accountRepo.calls.Load())
+	require.Zero(t, concurrencyCache.acquireUserCalled)
+	require.Zero(t, concurrencyCache.releaseUserCalled)
+	require.Zero(t, concurrencyCache.acquireAccountCalled)
+	require.Zero(t, concurrencyCache.releaseAccountCalled)
+	require.Zero(t, billingCache.balanceCalls.Load())
+	require.Empty(t, upstream.calls())
+	limiter.mu.Lock()
+	require.Equal(t, 1, limiter.active, "request must not touch the preoccupied image slot")
+	require.Zero(t, limiter.waiting)
+	limiter.mu.Unlock()
 }
 
 func TestOpenAIResponsesWebSocketStrictBlockHasZeroDownstreamSideEffects(t *testing.T) {

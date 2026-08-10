@@ -77,13 +77,35 @@ type OpenAIAccountScheduleRequest struct {
 	PreserveStickyBinding   bool
 	PreviousResponseID      string
 	PreviousResponseCanMove bool
-	UseUpstreamTokenCost    bool
-	RequestedModel          string
-	RequiredTransport       OpenAIUpstreamTransport
-	RequiredCapability      OpenAIEndpointCapability
-	RequiredImageCapability OpenAIImagesCapability
-	RequireCompact          bool
-	ExcludedIDs             map[int64]struct{}
+	// RequirePreviousResponseAccount makes the previous-response binding a hard
+	// routing requirement. It is only set for audited HTTP continuations.
+	RequirePreviousResponseAccount bool
+	UseUpstreamTokenCost           bool
+	RequestedModel                 string
+	RequiredTransport              OpenAIUpstreamTransport
+	RequiredCapability             OpenAIEndpointCapability
+	RequiredImageCapability        OpenAIImagesCapability
+	RequireCompact                 bool
+	ExcludedIDs                    map[int64]struct{}
+}
+
+type openAIStrictHTTPContinuationContextKey struct{}
+
+// WithOpenAIStrictHTTPContinuation marks an audited HTTP continuation whose
+// response/account binding must never fall back to another account.
+func WithOpenAIStrictHTTPContinuation(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIStrictHTTPContinuationContextKey{}, true)
+}
+
+func openAIStrictHTTPContinuationRequired(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	required, _ := ctx.Value(openAIStrictHTTPContinuationContextKey{}).(bool)
+	return required
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -379,7 +401,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 
 	previousResponseID := strings.TrimSpace(req.PreviousResponseID)
 	if previousResponseID != "" && normalizeOpenAICompatiblePlatform(req.Platform) == PlatformOpenAI &&
-		(!req.StickyWeighted || !req.PreviousResponseCanMove) {
+		(req.RequirePreviousResponseAccount || !req.StickyWeighted || !req.PreviousResponseCanMove) {
 		selection, err := s.service.selectAccountByPreviousResponseIDForCapability(
 			ctx,
 			req.GroupID,
@@ -387,6 +409,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			req.RequestedModel,
 			req.ExcludedIDs,
 			req.RequiredCapability,
+			req.RequiredTransport,
 			req.RequireCompact,
 		)
 		if err != nil {
@@ -409,6 +432,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 				_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, selection.Account.ID)
 			}
 			return selection, decision, nil
+		}
+		if req.RequirePreviousResponseAccount {
+			return nil, decision, ErrOpenAIPreviousResponseAccountUnavailable
 		}
 	}
 
@@ -2098,6 +2124,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
+	requirePreviousResponseAccount := openAIStrictHTTPContinuationRequired(ctx)
 	// 分组利润控制：唯一文本调度入口的防御性装门。handler 文本
 	// 入口已在请求开始经 WithOpenAIRequestPricingContext 装门并固定 pricingAt，
 	// 此处对同分组门直接复用（failover 重入阈值稳定），仅为不经 handler 装配的
@@ -2106,13 +2133,39 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	// 当前仅显式生图意图的 /v1/responses 设置（HTTP openAIResponsesRequiredCapability
 	// 与 WS 桥同款判定），同样不装门——若未来把该 capability 用于非生图流量，
 	// 需要同步收窄本条件（有测试钉死该映射）。
-	if requiredImageCapability == "" && requiredCapability != OpenAIEndpointCapabilityResponses {
+	if requiredImageCapability == "" && (requiredCapability != OpenAIEndpointCapabilityResponses || requirePreviousResponseAccount) {
 		ctx = s.withOpenAIProfitControlGate(ctx, groupID)
 	}
 	platform = normalizeOpenAICompatiblePlatform(platform)
 	decision := OpenAIAccountScheduleDecision{}
+	if requirePreviousResponseAccount && (strings.TrimSpace(previousResponseID) == "" || platform != PlatformOpenAI) {
+		return nil, decision, ErrOpenAIPreviousResponseAccountUnavailable
+	}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
+		if requirePreviousResponseAccount {
+			selection, err := s.selectAccountByPreviousResponseIDForCapability(
+				ctx,
+				groupID,
+				previousResponseID,
+				requestedModel,
+				excludedIDs,
+				requiredCapability,
+				requiredTransport,
+				requireCompact,
+			)
+			if err != nil {
+				return nil, decision, err
+			}
+			if selection == nil || selection.Account == nil {
+				return nil, decision, ErrOpenAIPreviousResponseAccountUnavailable
+			}
+			decision.Layer = openAIAccountScheduleLayerPreviousResponse
+			decision.StickyPreviousHit = true
+			decision.SelectedAccountID = selection.Account.ID
+			decision.SelectedAccountType = selection.Account.Type
+			return selection, decision, nil
+		}
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
 		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
 			effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
@@ -2183,26 +2236,36 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	subscriptionPriority := s.isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx)
 	stickyPreviousAccountID := int64(0)
 	if stickyWeighted && previousResponseCanMove && strings.TrimSpace(previousResponseID) != "" && platform == PlatformOpenAI {
-		stickyPreviousAccountID = s.ResolveAccountIDByPreviousResponseIDForScheduler(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
+		stickyPreviousAccountID = s.ResolveAccountIDByPreviousResponseIDForScheduler(
+			ctx,
+			groupID,
+			previousResponseID,
+			requestedModel,
+			excludedIDs,
+			requiredCapability,
+			requiredTransport,
+			requireCompact,
+		)
 	}
 
 	return scheduler.Select(ctx, OpenAIAccountScheduleRequest{
-		GroupID:                 groupID,
-		Platform:                platform,
-		SessionHash:             sessionHash,
-		StickyAccountID:         stickyAccountID,
-		StickyPreviousAccountID: stickyPreviousAccountID,
-		StickyWeighted:          stickyWeighted,
-		SubscriptionPriority:    subscriptionPriority,
-		PreviousResponseID:      previousResponseID,
-		PreviousResponseCanMove: previousResponseCanMove,
-		UseUpstreamTokenCost:    useUpstreamTokenCost,
-		RequestedModel:          requestedModel,
-		RequiredTransport:       requiredTransport,
-		RequiredCapability:      requiredCapability,
-		RequiredImageCapability: requiredImageCapability,
-		RequireCompact:          requireCompact,
-		ExcludedIDs:             excludedIDs,
+		GroupID:                        groupID,
+		Platform:                       platform,
+		SessionHash:                    sessionHash,
+		StickyAccountID:                stickyAccountID,
+		StickyPreviousAccountID:        stickyPreviousAccountID,
+		StickyWeighted:                 stickyWeighted,
+		SubscriptionPriority:           subscriptionPriority,
+		PreviousResponseID:             previousResponseID,
+		PreviousResponseCanMove:        previousResponseCanMove,
+		RequirePreviousResponseAccount: requirePreviousResponseAccount,
+		UseUpstreamTokenCost:           useUpstreamTokenCost,
+		RequestedModel:                 requestedModel,
+		RequiredTransport:              requiredTransport,
+		RequiredCapability:             requiredCapability,
+		RequiredImageCapability:        requiredImageCapability,
+		RequireCompact:                 requireCompact,
+		ExcludedIDs:                    excludedIDs,
 	})
 }
 

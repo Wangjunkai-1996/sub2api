@@ -415,6 +415,10 @@ var defaultOpenAICodexSnapshotPersistThrottle = newAccountWriteThrottle(openAICo
 // support but no compatible account is available.
 var ErrNoAvailableCompactAccounts = errors.New("no available accounts support /responses/compact")
 
+// ErrOpenAIPreviousResponseAccountUnavailable means a continuation cannot be
+// routed back to the account that produced its previous response.
+var ErrOpenAIPreviousResponseAccountUnavailable = errors.New("previous response account unavailable")
+
 // OpenAIGatewayService handles OpenAI API gateway operations
 type OpenAIGatewayService struct {
 	accountRepo           AccountRepository
