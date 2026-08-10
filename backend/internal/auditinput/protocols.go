@@ -82,7 +82,7 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 	if !typeValid || !roleValid || !nameValid {
 		return
 	}
-	for _, field := range []string{"id", "status"} {
+	for _, field := range []string{"id", "status", "phase"} {
 		if _, valid := b.optionalStringField(item, field, path); !valid {
 			return
 		}
@@ -227,8 +227,8 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 }
 
 func (b *builder) rejectUnknownResponsesItemFields(item map[string]any, path string, fields ...string) {
-	allowed := make([]string, 0, len(fields)+4)
-	allowed = append(allowed, "type", "id", "status", "role")
+	allowed := make([]string, 0, len(fields)+5)
+	allowed = append(allowed, "type", "id", "status", "phase", "role")
 	allowed = append(allowed, fields...)
 	b.rejectUnknownFields(item, path, allowed...)
 }

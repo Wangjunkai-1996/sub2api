@@ -833,6 +833,15 @@ func TestParseResponsesOutputUsesStrictResponsesItemRules(t *testing.T) {
 	require.True(t, nonArray.HasIssue(IssueInvalidShape), "%+v", nonArray.Issues)
 }
 
+func TestParseResponsesOutputAcceptsCompletedMessagePhase(t *testing.T) {
+	doc := ParseResponsesOutput([]byte(`[
+		{"id":"msg_1","type":"message","status":"completed","phase":"final_answer","role":"assistant","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"OK"}]}
+	]`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Equal(t, "OK", doc.NormalizedText)
+}
+
 func FuzzParseNeverPanics(f *testing.F) {
 	f.Add(ProtocolOpenAIResponses, []byte(`{"input":"hello"}`))
 	f.Add(ProtocolOpenAIChat, []byte(`{"messages":[]}`))
