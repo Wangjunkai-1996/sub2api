@@ -3,6 +3,9 @@ package securityaudit
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -64,12 +67,6 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 		logGuardFailure(snapshot, cfg, DecisionUnavailable, ErrorCodeUnavailable, "", g.clock.Now().Sub(start))
 		return nil, &GuardError{Code: ErrorCodeUnavailable}
 	}
-	timeout := time.Duration(endpoints[0].TimeoutMS) * time.Millisecond
-	if timeout <= 0 {
-		timeout = DefaultTimeoutMS * time.Millisecond
-	}
-	evalCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	inputLimit := minimumInputLimit(endpoints)
 	chunks := SplitRunes(snapshot.ScanText, inputLimit)
 	if len(chunks) == 0 {
@@ -87,7 +84,7 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 			"chunk_chars": len([]rune(chunk)), "input_chars": snapshot.PromptLength, "input_limit": inputLimit,
 			"status": "started",
 		}))
-		result, err := g.scanChunk(evalCtx, cfg, endpoints, chunk)
+		result, err := g.scanChunk(ctx, cfg, endpoints, chunk)
 		if err != nil {
 			code := guardErrorCode(err)
 			LogWarn(EventChunkFailed, mergeLogFields(baseFields, map[string]any{
@@ -188,14 +185,19 @@ func logGuardFailure(snapshot PromptSnapshot, cfg ActiveConfig, kind DecisionKin
 }
 
 func (g *GuardEvaluator) scanChunk(ctx context.Context, cfg ActiveConfig, endpoints []ActiveEndpoint, chunk string) (*NormalizedResult, error) {
+	endpoints = independentGuardEndpoints(endpoints)
 	var lastErr error
 	for index, endpoint := range endpoints {
+		attemptCtx, cancel := context.WithTimeout(ctx, guardEndpointTimeout(endpoint))
 		semaphore := g.nodeSemaphore(endpoint.ID)
 		select {
 		case semaphore <- struct{}{}:
-		case <-ctx.Done():
-			return nil, &GuardError{Code: ErrorCodeUnavailable, Retryable: true, Timeout: errors.Is(ctx.Err(), context.DeadlineExceeded), Cause: ctx.Err()}
+		case <-attemptCtx.Done():
+			attemptErr := attemptCtx.Err()
+			cancel()
+			return nil, &GuardError{Code: ErrorCodeUnavailable, Retryable: true, Timeout: errors.Is(attemptErr, context.DeadlineExceeded), Cause: attemptErr}
 		default:
+			cancel()
 			if g.metrics != nil {
 				g.metrics.IncBulkheadFull()
 			}
@@ -205,17 +207,36 @@ func (g *GuardEvaluator) scanChunk(ctx context.Context, cfg ActiveConfig, endpoi
 			}
 			continue
 		}
-		result, err := callPromptScanner(ctx, g.scanner, endpoint, chunk, cfg.Scanners)
+		result, err := callPromptScanner(attemptCtx, g.scanner, endpoint, chunk, cfg.Scanners)
+		attemptErr := attemptCtx.Err()
 		<-semaphore
+		cancel()
 		if err == nil && result != nil {
 			return result, nil
 		}
 		if err == nil {
-			err = &GuardError{Code: ErrorCodeInvalidResponse, Retryable: false}
+			err = &GuardError{Code: ErrorCodeInvalidResponse, Retryable: true}
+		} else {
+			var explicit *GuardError
+			if errors.As(err, &explicit) && explicit.Code == ErrorCodeInvalidResponse {
+				err = &GuardError{
+					Code:       explicit.Code,
+					HTTPStatus: explicit.HTTPStatus,
+					Retryable:  true,
+					Timeout:    explicit.Timeout,
+					Cause:      explicit.Cause,
+				}
+			} else if !errors.As(err, &explicit) {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(attemptErr, context.DeadlineExceeded) {
+					err = &GuardError{Code: ErrorCodeUnavailable, Retryable: true, Timeout: true, Cause: context.DeadlineExceeded}
+				} else if errors.Is(err, context.Canceled) || errors.Is(attemptErr, context.Canceled) {
+					err = &GuardError{Code: ErrorCodeUnavailable, Retryable: true, Cause: context.Canceled}
+				}
+			}
 		}
 		lastErr = err
 		var guardErr *GuardError
-		if !errors.As(err, &guardErr) || !guardErr.Retryable {
+		if !errors.As(err, &guardErr) || !guardEndpointFailoverEligible(guardErr) {
 			return nil, err
 		}
 		if index < len(endpoints)-1 && g.metrics != nil {
@@ -228,11 +249,64 @@ func (g *GuardEvaluator) scanChunk(ctx context.Context, cfg ActiveConfig, endpoi
 	return nil, lastErr
 }
 
+func guardEndpointFailoverEligible(err *GuardError) bool {
+	if err == nil {
+		return false
+	}
+	return err.Retryable || err.HTTPStatus == http.StatusUnauthorized || err.HTTPStatus == http.StatusForbidden
+}
+
+func guardEndpointTimeout(endpoint ActiveEndpoint) time.Duration {
+	timeout := time.Duration(endpoint.TimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		return DefaultTimeoutMS * time.Millisecond
+	}
+	return timeout
+}
+
+func independentGuardEndpoints(endpoints []ActiveEndpoint) []ActiveEndpoint {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	selected := []ActiveEndpoint{endpoints[0]}
+	primary := endpoints[0]
+	primaryURL := normalizedGuardBaseURL(primary.BaseURL)
+	for _, candidate := range endpoints[1:] {
+		if strings.TrimSpace(candidate.ID) == strings.TrimSpace(primary.ID) {
+			continue
+		}
+		candidateURL := normalizedGuardBaseURL(candidate.BaseURL)
+		if primaryURL != "" && candidateURL == primaryURL {
+			continue
+		}
+		if primary.Token != "" && candidate.Token == primary.Token {
+			continue
+		}
+		selected = append(selected, candidate)
+		break
+	}
+	return selected
+}
+
+func normalizedGuardBaseURL(value string) string {
+	value = strings.TrimSpace(value)
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.ToLower(strings.TrimRight(value, "/"))
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String()
+}
+
 func callPromptScanner(ctx context.Context, scanner PromptScanner, endpoint ActiveEndpoint, chunk string, scanners []string) (result *NormalizedResult, err error) {
 	defer func() {
 		if recover() != nil {
 			result = nil
-			err = &GuardError{Code: ErrorCodeUnavailable, Retryable: false}
+			err = &GuardError{Code: ErrorCodeUnavailable, Retryable: true}
 		}
 	}()
 	return scanner.Scan(ctx, endpoint, chunk, scanners)

@@ -3,6 +3,7 @@ package service
 import (
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,4 +177,18 @@ func TestExtractContentModerationInput_ResponsesLastIsAssistantSkipped(t *testin
 
 	require.Empty(t, input.Text)
 	require.Empty(t, input.Images)
+}
+
+func TestStrictContentModerationDocumentScansSplitLineageKeywordWithoutMutatingCurrentDocument(t *testing.T) {
+	document := auditinput.Parse(ContentModerationProtocolOpenAIResponses, []byte(`{"input":"ber"}`))
+	require.True(t, document.Complete)
+
+	auditDocument, err := strictContentModerationDocument(document, "cy\nber")
+	require.NoError(t, err)
+	require.Equal(t, "cy\nber", auditDocument.NormalizedText)
+	require.Equal(t, "cyber", auditDocument.FoldedText)
+	keyword, blocked := strictBlockedKeyword(auditDocument, []string{"cyber"})
+	require.True(t, blocked)
+	require.Equal(t, "cyber", keyword)
+	require.Equal(t, "ber", document.NormalizedText, "the canonical current-turn document must remain immutable")
 }

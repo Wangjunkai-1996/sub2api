@@ -107,6 +107,20 @@ func (s *PromptService) EffectiveMode() Mode {
 	return s.config.EffectiveMode()
 }
 
+func (s *PromptService) BlockingApplies(req Request) bool {
+	if s == nil || s.config == nil || s.EffectiveMode() != ModeBlocking {
+		return false
+	}
+	cfg, ok := s.config.Active()
+	if !ok {
+		// Never expand strict blocking to groups that are not present in a
+		// trusted snapshot. ConfigManager retains last-known-good state for the
+		// configured protected groups during transient reload failures.
+		return false
+	}
+	return cfg.EffectiveMode() == ModeBlocking && cfg.IncludesGroup(req.GroupID)
+}
+
 func (s *PromptService) Enqueue(_ context.Context, req Request) error {
 	if s == nil || s.enqueuer == nil || s.EffectiveMode() != ModeAsync {
 		return nil
@@ -156,14 +170,23 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	if cfg.EffectiveMode() != ModeBlocking || !cfg.IncludesGroup(req.GroupID) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	snapshot, err := ExtractBlockingPromptSnapshot(req, cfg.BlockingLatestTurnOnly)
+	// Strict blocking always scans the complete model-visible document. The
+	// historical latest-turn setting remains relevant only to old config views.
+	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
 	if errors.Is(err, ErrNoPromptText) {
-		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+		if req.Document != nil && req.Document.Complete && len(req.Document.Media) > 0 {
+			return &PromptDecision{Kind: DecisionAllow, ConfigVersion: cfg.ConfigVersion, AllowNextStage: true}, nil
+		}
+		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
 	}
 	if err != nil {
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
 	}
-	return s.evaluator.Evaluate(ctx, cfg, snapshot)
+	decision, err := s.evaluator.Evaluate(ctx, cfg, snapshot)
+	if decision != nil {
+		decision.ConfigVersion = cfg.ConfigVersion
+	}
+	return decision, err
 }
 
 func (s *PromptService) GetConfig() (PublicConfig, error) { return s.config.Public() }

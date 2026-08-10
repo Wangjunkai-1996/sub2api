@@ -2495,6 +2495,7 @@ func TestOpenAIStreamingPassthroughResponseDoneWithoutDoneMarkerStillSucceeds(t 
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.NotNil(t, result.usage)
+	require.Equal(t, "response.done", result.terminalEvent)
 	require.Equal(t, 2, result.usage.InputTokens)
 	require.Equal(t, 3, result.usage.OutputTokens)
 	require.Equal(t, 1, result.usage.CacheReadInputTokens)
@@ -2530,6 +2531,7 @@ func TestOpenAIStreamingPassthroughResponseIncompleteWithoutDoneMarkerStillSucce
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.NotNil(t, result.usage)
+	require.Equal(t, "response.incomplete", result.terminalEvent)
 	require.Equal(t, 2, result.usage.InputTokens)
 	require.Equal(t, 3, result.usage.OutputTokens)
 	require.Equal(t, 1, result.usage.CacheReadInputTokens)
@@ -3676,16 +3678,18 @@ func TestHandleCompatErrorResponseCyberPolicyEarlyReturn(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(cyberBody)),
 	}
 	var gotStatus int
-	var gotType, gotMsg string
-	writeError := func(_ *gin.Context, statusCode int, errType, message string) {
-		gotStatus, gotType, gotMsg = statusCode, errType, message
+	var gotType, gotCode, gotMsg string
+	writeError := func(_ *gin.Context, statusCode int, errType, code, message string) {
+		gotStatus, gotType, gotCode, gotMsg = statusCode, errType, code, message
 	}
 	// cyber 命中应早返回(写兼容错误 + 不冷却账号)，而非落到通用 "Upstream request failed"。
 	_, err := svc.handleCompatErrorResponse(resp, c, &Account{ID: 1, Platform: PlatformOpenAI, Name: "a"}, writeError)
 	require.Error(t, err)
 	require.Equal(t, http.StatusBadRequest, gotStatus)
 	require.Equal(t, "invalid_request_error", gotType)
-	require.Contains(t, gotMsg, "flagged for cyber policy")
+	require.Equal(t, "cyber_policy", gotCode)
+	require.Equal(t, "Request blocked by upstream cyber-security policy", gotMsg)
+	require.NotContains(t, gotMsg, "flagged for cyber policy")
 	require.NotContains(t, gotMsg, "Upstream request failed")
 	require.NotNil(t, GetOpsCyberPolicy(c))
 }

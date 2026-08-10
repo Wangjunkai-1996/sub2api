@@ -608,6 +608,12 @@ export interface SystemSettings {
   cyber_session_block_all_groups: boolean;
   cyber_session_block_group_ids: number[];
 
+  // OpenAI Cyber account cooldown
+  openai_cyber_account_cooldown_enabled: boolean;
+  openai_cyber_account_cooldown_window_seconds: number;
+  openai_cyber_account_cooldown_first_seconds: number;
+  openai_cyber_account_cooldown_escalated_seconds: number;
+
   payment_min_amount: number;
   payment_max_amount: number;
   payment_daily_limit: number;
@@ -912,6 +918,12 @@ export interface UpdateSettingsRequest {
   cyber_session_block_ttl_seconds?: number;
   cyber_session_block_all_groups?: boolean;
   cyber_session_block_group_ids?: number[];
+
+  // OpenAI Cyber account cooldown
+  openai_cyber_account_cooldown_enabled?: boolean;
+  openai_cyber_account_cooldown_window_seconds?: number;
+  openai_cyber_account_cooldown_first_seconds?: number;
+  openai_cyber_account_cooldown_escalated_seconds?: number;
 
   payment_min_amount?: number;
   payment_max_amount?: number;

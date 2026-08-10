@@ -178,6 +178,9 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	var usage *OpenAIUsage
 	var firstTokenMs *int
 	responseID := ""
+	terminalEvent := ""
+	var lineageOutput []byte
+	lineageComplete := false
 	if reqStream {
 		maxLineSize := defaultMaxLineSize
 		if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
@@ -194,6 +197,9 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		usage = streamResult.usage
 		firstTokenMs = streamResult.firstTokenMs
 		responseID = strings.TrimSpace(streamResult.responseID)
+		terminalEvent = streamResult.terminalEvent
+		lineageOutput = streamResult.lineageOutput
+		lineageComplete = streamResult.lineageComplete
 	} else {
 		nonStreamResult, err := s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
 		if err != nil {
@@ -201,25 +207,31 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		}
 		usage = nonStreamResult.usage
 		responseID = strings.TrimSpace(nonStreamResult.responseID)
+		terminalEvent = nonStreamResult.terminalEvent
+		lineageOutput = nonStreamResult.lineageOutput
+		lineageComplete = nonStreamResult.lineageComplete
 	}
 
 	if usage == nil {
 		usage = &OpenAIUsage{}
 	}
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(patchedBody, originalModel)
-	return &OpenAIForwardResult{
-		RequestID:       firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
-		ResponseID:      responseID,
-		Usage:           *usage,
-		Model:           originalModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		Stream:          reqStream,
-		OpenAIWSMode:    false,
-		ResponseHeaders: resp.Header.Clone(),
-		Duration:        time.Since(startTime),
-		FirstTokenMs:    firstTokenMs,
-	}, nil
+	result := &OpenAIForwardResult{
+		RequestID:             firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
+		ResponseID:            responseID,
+		Usage:                 *usage,
+		Model:                 originalModel,
+		UpstreamModel:         upstreamModel,
+		ReasoningEffort:       reasoningEffort,
+		Stream:                reqStream,
+		OpenAIWSMode:          false,
+		UpstreamTerminalEvent: terminalEvent,
+		ResponseHeaders:       resp.Header.Clone(),
+		Duration:              time.Since(startTime),
+		FirstTokenMs:          firstTokenMs,
+	}
+	result.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
+	return result, nil
 }
 
 func isGrokInvalidEncryptedContentResponse(statusCode int, body []byte) bool {

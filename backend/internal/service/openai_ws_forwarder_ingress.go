@@ -496,16 +496,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		var bridgeReplayInput []json.RawMessage
 		bridgeReplayInputExists := false
 		for turn := 1; ; turn++ {
-			if turn > 1 && hooks != nil && hooks.BeforeRequest != nil {
-				if err := hooks.BeforeRequest(turn, currentBridgePayload.payloadRaw, currentBridgePayload.originalModel); err != nil {
-					return err
-				}
-			}
-			if hooks != nil && hooks.BeforeTurn != nil {
-				if err := hooks.BeforeTurn(turn); err != nil {
-					return err
-				}
-			}
 			if turnState != "" && c != nil && c.Request != nil {
 				c.Request.Header.Set(openAIWSTurnStateHeader, turnState)
 			}
@@ -540,6 +530,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					currentBridgePayload.previousResponseID != "",
 					openAIWSRawPayloadHasToolCallOutput(currentBridgePayload.payloadRaw),
 				)
+			}
+			if turn > 1 && hooks != nil && hooks.BeforeRequest != nil {
+				if err := hooks.BeforeRequest(turn, bridgePayloadRaw, currentBridgePayload.originalModel); err != nil {
+					return err
+				}
+			}
+			if hooks != nil && hooks.BeforeTurn != nil {
+				if err := hooks.BeforeTurn(turn); err != nil {
+					return err
+				}
 			}
 			grokCacheIdentity := ""
 			if account.Platform == PlatformGrok {
@@ -822,6 +822,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		tokenEventCount := 0
 		terminalEventCount := 0
 		replayCollector := &openAIWSToolCallReplayCollector{}
+		var lineageOutput []byte
+		lineageComplete := false
+		lineageTerminalCount := 0
 		firstEventType := ""
 		lastEventType := ""
 		needModelReplace := false
@@ -847,6 +850,19 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					fmt.Errorf("read upstream websocket event: %w", readErr),
 					wroteDownstream,
 				)
+			}
+			rawEventType, rawEventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
+			if openAIResponsesLineageCaptureEnabled(c) && isOpenAIWSTerminalEvent(rawEventType) {
+				lineageTerminalCount++
+				if lineageTerminalCount == 1 {
+					expectedResponseID := responseID
+					if expectedResponseID == "" {
+						expectedResponseID = rawEventResponseID
+					}
+					lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(upstreamMessage, expectedResponseID)
+				} else {
+					lineageOutput, lineageComplete = nil, false
+				}
 			}
 			if normalized, changed := normalizeCompletedImageGenerationStatus(upstreamMessage); changed {
 				upstreamMessage = normalized
@@ -1029,6 +1045,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				imageCount := imageCounter.Count()
 				result := &OpenAIForwardResult{
 					RequestID:                     responseID,
+					ResponseID:                    responseID,
 					Usage:                         usage,
 					Model:                         originalModel,
 					UpstreamModel:                 mappedModel,
@@ -1043,6 +1060,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					Duration:                      time.Since(turnStart),
 					FirstTokenMs:                  firstTokenMs,
 				}
+				result.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
 				if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 					result.wsReplayInput = replayInput
 					result.wsReplayInputExists = true
@@ -1245,17 +1263,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return true
 	}
 	for {
-		if turn > 1 && !skipBeforeTurn && hooks != nil && hooks.BeforeRequest != nil {
-			if err := hooks.BeforeRequest(turn, currentPayload, currentOriginalModel); err != nil {
-				return err
-			}
-		}
-		if !skipBeforeTurn && hooks != nil && hooks.BeforeTurn != nil {
-			if err := hooks.BeforeTurn(turn); err != nil {
-				return err
-			}
-		}
-		skipBeforeTurn = false
 		currentPreviousResponseID := openAIWSPayloadStringFromRaw(currentPayload, "previous_response_id")
 		expectedPrev := strings.TrimSpace(lastTurnResponseID)
 		toolSignals := ToolContinuationSignals{
@@ -1408,6 +1415,21 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 		}
+		// BeforeRequest is the strict admission gate. It observes the exact
+		// payload for this attempt after deterministic lineage/replay rewrites.
+		// Retries are re-audited even when per-turn concurrency and billing hooks
+		// must not run twice.
+		if turn > 1 && hooks != nil && hooks.BeforeRequest != nil {
+			if err := hooks.BeforeRequest(turn, currentPayload, currentOriginalModel); err != nil {
+				return err
+			}
+		}
+		if !skipBeforeTurn && hooks != nil && hooks.BeforeTurn != nil {
+			if err := hooks.BeforeTurn(turn); err != nil {
+				return err
+			}
+		}
+		skipBeforeTurn = false
 		forcePreferredConn := isStrictAffinityTurn(currentPayload)
 		if sessionLease == nil {
 			acquiredLease, acquireErr := acquireTurnLease(turn, preferredConnID, forcePreferredConn)
@@ -1581,7 +1603,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if result == nil {
 			return errors.New("websocket turn result is nil")
 		}
-		responseID := strings.TrimSpace(result.RequestID)
+		responseID := strings.TrimSpace(result.ResponseID)
 		lastTurnResponseID = responseID
 		lastTurnPayload = cloneOpenAIWSPayloadBytes(currentPayload)
 		lastTurnReplayInput = cloneOpenAIWSRawMessages(currentTurnReplayInput)

@@ -470,7 +470,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 		}
 	}
-	if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 && gjson.GetBytes(body, "previous_response_id").Exists() {
+	if previousResponseID := gjson.GetBytes(body, "previous_response_id"); wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 && previousResponseID.Exists() && strings.TrimSpace(previousResponseID.String()) == "" {
 		markPatchDelete("previous_response_id")
 	}
 	if openAIRequestBodyMayContainEmptyBase64InputImage(body) {
@@ -938,6 +938,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		var usage *OpenAIUsage
 		var firstTokenMs *int
 		responseID := ""
+		terminalEvent := ""
+		var lineageOutput []byte
+		lineageComplete := false
 		imageCount := 0
 		var imageOutputSizes []string
 		if reqStream {
@@ -948,6 +951,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
 			responseID = strings.TrimSpace(streamResult.responseID)
+			terminalEvent = streamResult.terminalEvent
+			lineageOutput = streamResult.lineageOutput
+			lineageComplete = streamResult.lineageComplete
 			imageCount = streamResult.imageCount
 			imageOutputSizes = streamResult.imageOutputSizes
 		} else {
@@ -957,6 +963,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			usage = nonStreamResult.usage
 			responseID = strings.TrimSpace(nonStreamResult.responseID)
+			terminalEvent = nonStreamResult.terminalEvent
+			lineageOutput = nonStreamResult.lineageOutput
+			lineageComplete = nonStreamResult.lineageComplete
 			imageCount = nonStreamResult.imageCount
 			imageOutputSizes = nonStreamResult.imageOutputSizes
 		}
@@ -987,9 +996,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			ReasoningEffort:               reasoningEffort,
 			Stream:                        reqStream,
 			OpenAIWSMode:                  false,
+			UpstreamTerminalEvent:         terminalEvent,
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
 		}
+		forwardResult.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
 		if imageCount > 0 {
 			forwardResult.ImageCount = imageCount
 			forwardResult.ImageSize = imageSizeTier

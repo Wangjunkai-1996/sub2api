@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
+	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -143,6 +146,47 @@ func TestPromptGuardWebSocketCloseMappingGolden(t *testing.T) {
 	require.Equal(t, securityaudit.ErrorCodeInvalidResponse, securityAuditWSCloseReason(promptGuardDecision(securityaudit.DecisionInvalid)))
 }
 
+func TestStrictLegacyModerationWebSocketKeepsPolicyCode(t *testing.T) {
+	decision := &securityaudit.Decision{
+		Kind: securityaudit.DecisionBlock, HTTPStatus: http.StatusForbidden,
+		ErrorCode: securityaudit.ErrorCodePolicyBlocked, ClientMessage: "strict policy block",
+		Legacy: &securityaudit.LegacyDecision{
+			Blocked: true, Flagged: true, StatusCode: http.StatusForbidden,
+			ErrorCode: "content_policy_violation", Message: "legacy moderation block",
+		},
+	}
+
+	require.False(t, usesLegacySecurityAuditWSError(decision))
+	require.Equal(t, int64(4403), int64(securityAuditWSCloseStatus(decision)))
+	require.Equal(t, securityaudit.ErrorCodePolicyBlocked, securityAuditWSCloseReason(decision))
+
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow()
+		writeSecurityAuditWSError(r.Context(), conn, decision)
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	defer client.CloseNow()
+	messageType, payload, err := client.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, coderws.MessageText, messageType)
+	require.NoError(t, <-serverErr)
+	var event map[string]any
+	require.NoError(t, json.Unmarshal(payload, &event))
+	require.Equal(t, securityaudit.ErrorCodePolicyBlocked, requireObject(t, event["error"])["code"])
+}
+
 func TestLegacyModerationErrorKeepsExistingClientPriority(t *testing.T) {
 	legacy := &securityaudit.Decision{
 		Kind: securityaudit.DecisionBlock, HTTPStatus: http.StatusForbidden,
@@ -156,4 +200,7 @@ func TestLegacyModerationErrorKeepsExistingClientPriority(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "legacy exact message")
 	require.Contains(t, recorder.Body.String(), "content_policy_violation")
 	require.NotContains(t, recorder.Body.String(), securityaudit.ErrorCodeBlocked)
+	require.True(t, usesLegacySecurityAuditWSError(legacy))
+	require.Equal(t, int64(1008), int64(securityAuditWSCloseStatus(legacy)))
+	require.Equal(t, "legacy exact message", securityAuditWSCloseReason(legacy))
 }

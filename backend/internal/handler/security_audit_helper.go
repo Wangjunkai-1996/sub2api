@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -46,6 +47,50 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditStage(c *gin.Context, reqLog *z
 	return runSecurityAudit(c, reqLog, h.securityAuditCoordinator, h.contentModerationService, apiKey, subject, protocol, model, body, stage)
 }
 
+func cloneSecurityAuditSummary(decision *securityaudit.Decision) *securityaudit.AuditSummary {
+	if decision == nil || !decision.AllowNextStage || decision.Audit == nil {
+		return nil
+	}
+	cloned := decision.Audit.Clone()
+	return &cloned
+}
+
+func (h *OpenAIGatewayHandler) bindAllowedSecurityAuditResponse(ctx context.Context, reqLog *zap.Logger, summary *securityaudit.AuditSummary, result *service.OpenAIForwardResult) {
+	if h == nil || h.securityAuditCoordinator == nil || summary == nil || result == nil ||
+		!result.CompletedForLineage() || strings.TrimSpace(result.ResponseID) == "" {
+		return
+	}
+	output, complete := result.OpenAIResponsesLineageOutput()
+	if !complete {
+		return
+	}
+	augmented, err := securityaudit.AppendResponsesOutput(summary.Clone(), output)
+	if err != nil {
+		if reqLog != nil {
+			reqLog.Warn("security_audit.lineage_output_incomplete",
+				zap.Int64("api_key_id", summary.APIKeyID),
+				zap.Int64p("group_id", summary.GroupID),
+				zap.Int("response_id_len", len(strings.TrimSpace(result.ResponseID))),
+				zap.Error(err),
+			)
+		}
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+	if err := h.securityAuditCoordinator.BindAllowedResponse(ctx, augmented, result.ResponseID); err != nil && reqLog != nil {
+		reqLog.Warn("security_audit.lineage_bind_failed",
+			zap.Int64("api_key_id", summary.APIKeyID),
+			zap.Int64p("group_id", summary.GroupID),
+			zap.Int("response_id_len", len(strings.TrimSpace(result.ResponseID))),
+			zap.Error(err),
+		)
+	}
+}
+
 func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string) *securityaudit.Decision {
 	if c == nil || c.Request == nil {
 		return nil
@@ -57,23 +102,11 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 		}
 	}
 	if coordinator == nil {
-		legacyDecision := runContentModeration(c, reqLog, legacy, apiKey, subject, protocol, model, body)
-		if legacyDecision == nil {
-			return nil
+		return &securityaudit.Decision{
+			Kind: securityaudit.DecisionUnavailable, HTTPStatus: http.StatusServiceUnavailable,
+			ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
+			ClientMessage: "安全审计暂时不可用，请稍后重试",
 		}
-		decision := securityaudit.Decision{Kind: securityaudit.DecisionAllow, HTTPStatus: http.StatusOK, AllowNextStage: true}
-		decision.Legacy = &securityaudit.LegacyDecision{
-			Allowed: legacyDecision.Allowed, Blocked: legacyDecision.Blocked, Flagged: legacyDecision.Flagged,
-			Message: legacyDecision.Message, StatusCode: legacyDecision.StatusCode,
-			ErrorCode: "content_policy_violation", Action: legacyDecision.Action,
-		}
-		if legacyDecision.Blocked {
-			decision.Kind, decision.HTTPStatus, decision.ErrorCode, decision.ClientMessage, decision.AllowNextStage = securityaudit.DecisionBlock, contentModerationStatus(legacyDecision), "content_policy_violation", legacyDecision.Message, false
-		}
-		if decision.AllowNextStage && cacheCompletion {
-			c.Set(securityAuditCompletedContextKey, true)
-		}
-		return &decision
 	}
 	request := buildSecurityAuditRequest(c, apiKey, subject, protocol, model, body, stage)
 	if reqLog != nil {

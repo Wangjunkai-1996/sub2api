@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/httpclient"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
@@ -307,18 +308,21 @@ type ContentModerationModelFilter struct {
 }
 
 type ContentModerationCheckInput struct {
-	RequestID  string
-	UserID     int64
-	UserEmail  string
-	APIKeyID   int64
-	APIKeyName string
-	GroupID    *int64
-	GroupName  string
-	Endpoint   string
-	Provider   string
-	Model      string
-	Protocol   string
-	Body       []byte
+	RequestID    string
+	UserID       int64
+	UserEmail    string
+	APIKeyID     int64
+	APIKeyName   string
+	GroupID      *int64
+	GroupName    string
+	Endpoint     string
+	Provider     string
+	Model        string
+	Protocol     string
+	Body         []byte
+	Strict       bool
+	Document     *auditinput.Document
+	AuditContext string
 }
 
 type ContentModerationInput struct {
@@ -383,6 +387,7 @@ type ContentModerationDecision struct {
 	HighestScore    float64            `json:"highest_score"`
 	CategoryScores  map[string]float64 `json:"category_scores"`
 	Action          string             `json:"action"`
+	Unavailable     bool               `json:"unavailable,omitempty"`
 }
 
 type ContentModerationLog struct {
@@ -812,6 +817,9 @@ func (s *ContentModerationService) TestAPIKeys(ctx context.Context, input TestCo
 }
 
 func (s *ContentModerationService) Check(ctx context.Context, input ContentModerationCheckInput) (*ContentModerationDecision, error) {
+	if input.Strict {
+		return s.checkStrict(ctx, input)
+	}
 	allow := &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}
 	if s == nil || s.settingRepo == nil || s.repo == nil {
 		slog.Info("content_moderation.skip_unavailable",
@@ -1044,15 +1052,160 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 	return s.checkSync(ctx, input, cfg, content, hashText, nil, true), nil
 }
 
-func (s *ContentModerationService) checkSync(ctx context.Context, input ContentModerationCheckInput, cfg *ContentModerationConfig, content ContentModerationInput, hashText string, queueDelay *int, allowBlock bool) *ContentModerationDecision {
+func (s *ContentModerationService) checkStrict(ctx context.Context, input ContentModerationCheckInput) (*ContentModerationDecision, error) {
+	if s == nil || s.settingRepo == nil || s.repo == nil {
+		return nil, errors.New("strict content moderation service unavailable")
+	}
+	document := input.Document.Clone()
+	if document == nil {
+		document = ExtractContentModerationDocument(input.Protocol, input.Body)
+	}
+	if document == nil || !document.Complete {
+		return nil, errors.New("strict content moderation input is incomplete")
+	}
+	document, err := strictContentModerationDocument(document, input.AuditContext)
+	if err != nil {
+		return nil, err
+	}
+	runtimeSnapshot, err := s.loadRuntimeSnapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load strict content moderation config: %w", err)
+	}
+	cfg := runtimeSnapshot.config
+	if !runtimeSnapshot.riskControlEnabled || cfg == nil || !cfg.Enabled || cfg.Mode != ContentModerationModePreBlock ||
+		cfg.SampleRate != 100 || cfg.KeywordBlockingMode != ContentModerationKeywordModeKeywordAndAPI ||
+		!cfg.includesGroup(input.GroupID) || !cfg.includesModel(input.Model) {
+		return nil, errors.New("strict content moderation is not fully configured for request")
+	}
+	content := contentModerationInputFromDocument(document)
+	hashText := content.Hash()
+	if keyword, hit := strictBlockedKeyword(document, cfg.BlockedKeywords); hit {
+		s.recordPreBlockSyncMetric(0, ContentModerationActionKeywordBlock)
+		scores := map[string]float64{contentModerationKeywordCategory: 1}
+		// Strict-gate findings are admission evidence, not user violations. Keep
+		// the block action and scores, but do not let this log contribute to a
+		// later legacy AutoBan count.
+		log := s.buildLog(input, cfg, ContentModerationActionKeywordBlock, false, contentModerationKeywordCategory, 1, scores, content.ExcerptText(), nil, nil, "")
+		log.MatchedKeyword = keyword
+		s.enqueueRecord(input, cfg, log, hashText, false, false)
+		return &ContentModerationDecision{
+			Allowed: false, Blocked: true, Flagged: true, Message: cfg.BlockMessage, StatusCode: cfg.BlockStatus,
+			HighestCategory: contentModerationKeywordCategory, HighestScore: 1, CategoryScores: scores,
+			Action: ContentModerationActionKeywordBlock,
+		}, nil
+	}
+	if cfg.PreHashCheckEnabled {
+		if s.hashCache == nil {
+			return nil, errors.New("strict content moderation hash cache unavailable")
+		}
+		matched, err := s.hashCache.HasFlaggedInputHash(ctx, hashText)
+		if err != nil {
+			return nil, fmt.Errorf("strict content moderation hash lookup: %w", err)
+		}
+		if matched {
+			s.recordPreBlockSyncMetric(0, ContentModerationActionHashBlock)
+			scores := map[string]float64{"hash": 1}
+			log := s.buildLog(input, cfg, ContentModerationActionHashBlock, true, "hash", 1, scores, content.ExcerptText(), nil, nil, "")
+			s.enqueueRecord(input, cfg, log, hashText, false, false)
+			return &ContentModerationDecision{
+				Allowed: false, Blocked: true, Flagged: true, Message: cfg.BlockMessage, StatusCode: cfg.BlockStatus,
+				InputHash: hashText, HighestCategory: "hash", HighestScore: 1, CategoryScores: scores,
+				Action: ContentModerationActionHashBlock,
+			}, nil
+		}
+	}
+	if len(cfg.apiKeys()) == 0 {
+		return nil, errors.New("strict content moderation has no audit API key")
+	}
+	units := strictModerationUnits(document)
+	if len(units) == 0 {
+		return nil, errors.New("strict content moderation produced no auditable unit")
+	}
+	for _, unit := range units {
+		decision := s.checkSync(ctx, input, cfg, unit, hashText, nil, true, true)
+		if decision == nil || decision.Unavailable {
+			return nil, errors.New("strict content moderation audit API unavailable")
+		}
+		if decision.Blocked || decision.Flagged || !decision.Allowed {
+			return decision, nil
+		}
+	}
+	return &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}, nil
+}
+
+func strictContentModerationDocument(document *auditinput.Document, auditContext string) (*auditinput.Document, error) {
+	if document == nil || !document.Complete {
+		return nil, errors.New("strict content moderation input is incomplete")
+	}
+	auditContext = strings.TrimSpace(auditContext)
+	if auditContext == "" {
+		return document.Clone(), nil
+	}
+	if len([]rune(auditContext)) > auditinput.MaxTextRunes {
+		return nil, errors.New("strict content moderation context exceeds limit")
+	}
+	result := document.Clone()
+	result.NormalizedText = auditContext
+	result.FoldedText = auditinput.FoldForMatching(auditContext)
+	return result, nil
+}
+
+func strictBlockedKeyword(document *auditinput.Document, keywords []string) (string, bool) {
+	if document == nil || len(keywords) == 0 {
+		return "", false
+	}
+	normalizedText := strings.ToLower(document.NormalizedText)
+	foldedText := strings.ToLower(document.FoldedText)
+	for _, keyword := range keywords {
+		normalizedKeyword := strings.ToLower(auditinput.NormalizeText(keyword))
+		foldedKeyword := strings.ToLower(auditinput.FoldForMatching(keyword))
+		if normalizedKeyword != "" && strings.Contains(normalizedText, normalizedKeyword) {
+			return keyword, true
+		}
+		if foldedKeyword != "" && strings.Contains(foldedText, foldedKeyword) {
+			return keyword, true
+		}
+	}
+	return "", false
+}
+
+func strictModerationUnits(document *auditinput.Document) []ContentModerationInput {
+	if document == nil {
+		return nil
+	}
+	units := make([]ContentModerationInput, 0, (len([]rune(document.NormalizedText))/maxModerationInputRunes)+len(document.Media)+1)
+	textRunes := []rune(document.NormalizedText)
+	for start := 0; start < len(textRunes); start += maxModerationInputRunes {
+		end := start + maxModerationInputRunes
+		if end > len(textRunes) {
+			end = len(textRunes)
+		}
+		units = append(units, ContentModerationInput{Text: string(textRunes[start:end])})
+	}
+	for _, media := range document.Media {
+		if media.Kind == "image" && strings.TrimSpace(media.Value) != "" {
+			units = append(units, ContentModerationInput{Images: []string{media.Value}})
+		}
+	}
+	return units
+}
+
+func (s *ContentModerationService) checkSync(ctx context.Context, input ContentModerationCheckInput, cfg *ContentModerationConfig, content ContentModerationInput, hashText string, queueDelay *int, allowBlock bool, failClosed ...bool) *ContentModerationDecision {
 	allow := &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}
+	strictFailure := len(failClosed) > 0 && failClosed[0]
 	trackPreBlock := queueDelay == nil && allowBlock && cfg != nil && cfg.Mode == ContentModerationModePreBlock
 	if trackPreBlock {
 		s.preBlockActive.Add(1)
 		defer s.preBlockActive.Add(-1)
 	}
 	start := time.Now()
-	result, err := s.callModeration(ctx, cfg, content.ModerationInput(), trackPreBlock)
+	var result *moderationAPIResult
+	var err error
+	if strictFailure {
+		result, err = s.callModerationStrict(ctx, cfg, content.ModerationInput(), trackPreBlock)
+	} else {
+		result, err = s.callModeration(ctx, cfg, content.ModerationInput(), trackPreBlock)
+	}
 	latency := int(time.Since(start).Milliseconds())
 	if err != nil {
 		if trackPreBlock {
@@ -1076,10 +1229,14 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 			log := s.buildLog(input, cfg, ContentModerationActionError, false, "", 0, nil, content.ExcerptText(), &latency, queueDelay, err.Error())
 			_ = s.repo.CreateLog(ctx, log)
 		}
+		if strictFailure {
+			return &ContentModerationDecision{Allowed: false, Unavailable: true, Action: ContentModerationActionError}
+		}
 		return allow
 	}
 
-	flagged, highestCategory, highestScore := evaluateModerationScores(result.CategoryScores, cfg.Thresholds)
+	scoreFlagged, highestCategory, highestScore := evaluateModerationScores(result.CategoryScores, cfg.Thresholds)
+	flagged := result.Flagged || scoreFlagged
 	action := ContentModerationActionAllow
 	blocked := false
 	if allowBlock && flagged && cfg.Mode == ContentModerationModePreBlock {
@@ -1106,11 +1263,13 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 		"latency_ms", latency,
 		"queue_delay_ms", queueDelay)
 	if flagged || cfg.RecordNonHits {
-		log := s.buildLog(input, cfg, action, flagged, highestCategory, highestScore, result.CategoryScores, content.ExcerptText(), &latency, queueDelay, "")
+		logFlagged := flagged && !strictFailure
+		log := s.buildLog(input, cfg, action, logFlagged, highestCategory, highestScore, result.CategoryScores, content.ExcerptText(), &latency, queueDelay, "")
+		applySideEffects := flagged && !strictFailure
 		if queueDelay == nil && cfg.Mode == ContentModerationModePreBlock {
-			s.enqueueRecord(input, cfg, log, hashText, flagged, flagged)
+			s.enqueueRecord(input, cfg, log, hashText, flagged, applySideEffects)
 		} else {
-			s.persistContentModerationLog(ctx, cfg, log, hashText, flagged, flagged)
+			s.persistContentModerationLog(ctx, cfg, log, hashText, flagged, applySideEffects)
 		}
 	}
 	if blocked {
@@ -1733,6 +1892,50 @@ func (s *ContentModerationService) callModeration(ctx context.Context, cfg *Cont
 	return nil, lastErr
 }
 
+func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg *ContentModerationConfig, input any, trackKeyLoad ...bool) (*moderationAPIResult, error) {
+	attempts := cfg.RetryCount + 1
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if attempts > 2 {
+		attempts = 2
+	}
+	trackLoad := len(trackKeyLoad) > 0 && trackKeyLoad[0]
+	usedKeys := make(map[string]struct{}, attempts)
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		key, ok := s.nextUsableAPIKeyExcluding(cfg, usedKeys)
+		if !ok {
+			lastErr = errors.New("no distinct moderation api key available")
+			break
+		}
+		usedKeys[key] = struct{}{}
+		if trackLoad {
+			s.beginModerationAPIKeyCall(key)
+		}
+		start := time.Now()
+		httpStatus := 0
+		result, err := s.callModerationOnceWithInput(ctx, cfg, key, input, &httpStatus)
+		latency := int(time.Since(start).Milliseconds())
+		if err == nil {
+			if trackLoad {
+				s.finishModerationAPIKeyCall(key, latency, true)
+			}
+			s.markAPIKeySuccess(key, latency, httpStatus)
+			return result, nil
+		}
+		if trackLoad {
+			s.finishModerationAPIKeyCall(key, latency, false)
+		}
+		s.markAPIKeyError(key, err.Error(), latency, httpStatus)
+		lastErr = err
+		if httpStatus == http.StatusBadRequest || attempt == attempts-1 {
+			break
+		}
+	}
+	return nil, lastErr
+}
+
 func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Context, cfg *ContentModerationConfig, apiKey string, input any, httpStatus *int) (*moderationAPIResult, error) {
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	endpoint, err := url.JoinPath(base, "/v1/moderations")
@@ -2269,6 +2472,10 @@ func (cfg *ContentModerationConfig) apiKeys() []string {
 }
 
 func (s *ContentModerationService) nextUsableAPIKey(cfg *ContentModerationConfig) (string, bool) {
+	return s.nextUsableAPIKeyExcluding(cfg, nil)
+}
+
+func (s *ContentModerationService) nextUsableAPIKeyExcluding(cfg *ContentModerationConfig, excluded map[string]struct{}) (string, bool) {
 	keys := cfg.apiKeys()
 	if len(keys) == 0 {
 		return "", false
@@ -2277,6 +2484,9 @@ func (s *ContentModerationService) nextUsableAPIKey(cfg *ContentModerationConfig
 	for i := 0; i < len(keys); i++ {
 		idx := int(s.apiKeyCursor.Add(1)-1) % len(keys)
 		key := keys[idx]
+		if _, skip := excluded[key]; skip {
+			continue
+		}
 		if !s.isAPIKeyFrozen(key, now) {
 			return key, true
 		}
@@ -2645,7 +2855,8 @@ func buildContentModerationTestAuditResult(result *moderationAPIResult, threshol
 		scores[category] = score
 	}
 	thresholdSnapshot := mergeContentModerationThresholds(ContentModerationDefaultThresholds(), thresholds)
-	flagged, highestCategory, highestScore := evaluateModerationScores(scores, thresholdSnapshot)
+	scoreFlagged, highestCategory, highestScore := evaluateModerationScores(scores, thresholdSnapshot)
+	flagged := result.Flagged || scoreFlagged
 	compositeScore := highestScore
 	return &ContentModerationTestAuditResult{
 		Flagged:         flagged,

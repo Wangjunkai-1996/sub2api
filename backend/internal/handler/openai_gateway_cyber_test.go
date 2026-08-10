@@ -45,9 +45,11 @@ func (r *cyberHandlerSettingRepo) GetMultiple(_ context.Context, keys []string) 
 
 type cyberHandlerGatewayCache struct {
 	service.GatewayCache
-	blocked    map[string]bool
-	readCalls  int
-	writeCalls int
+	blocked             map[string]bool
+	readCalls           int
+	writeCalls          int
+	cooldownStrike      service.OpenAICyberAccountCooldownStrike
+	cooldownStrikeCalls int
 }
 
 func (c *cyberHandlerGatewayCache) SetCyberSessionBlocked(_ context.Context, key string, _ time.Duration) error {
@@ -62,6 +64,21 @@ func (c *cyberHandlerGatewayCache) SetCyberSessionBlocked(_ context.Context, key
 func (c *cyberHandlerGatewayCache) IsCyberSessionBlocked(_ context.Context, key string) (bool, error) {
 	c.readCalls++
 	return c.blocked[key], nil
+}
+
+func (c *cyberHandlerGatewayCache) RecordOpenAICyberAccountCooldownStrike(context.Context, int64, string, time.Duration, time.Time) (service.OpenAICyberAccountCooldownStrike, error) {
+	c.cooldownStrikeCalls++
+	return c.cooldownStrike, nil
+}
+
+type cyberHandlerAccountRepo struct {
+	service.AccountRepository
+	tempUnschedulableCalls int
+}
+
+func (r *cyberHandlerAccountRepo) SetTempUnschedulable(context.Context, int64, time.Time, string) error {
+	r.tempUnschedulableCalls++
+	return nil
 }
 
 func newCyberScopedHandler(groupIDs string) (*OpenAIGatewayHandler, *cyberHandlerGatewayCache) {
@@ -121,6 +138,40 @@ func TestRecordCyberPolicyIfMarked_WithMark(t *testing.T) {
 	// Flag should still be true (not toggled or cleared).
 	require.True(t, c.GetBool(cyberPolicyRecordedKey),
 		"cyberPolicyRecordedKey must remain true after second call (guard)")
+}
+
+func TestRecordCyberPolicyIfMarkedAppliesAccountCooldownOnlyForRealMark(t *testing.T) {
+	settingSvc := service.NewSettingService(&cyberHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAICyberAccountCooldownEnabled:          "true",
+		service.SettingKeyOpenAICyberAccountCooldownWindowSeconds:    "86400",
+		service.SettingKeyOpenAICyberAccountCooldownFirstSeconds:     "3600",
+		service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: "86400",
+	}}, nil)
+	cache := &cyberHandlerGatewayCache{cooldownStrike: service.OpenAICyberAccountCooldownStrike{Strikes: 1}}
+	repo := &cyberHandlerAccountRepo{}
+	gatewaySvc := service.NewOpenAIGatewayService(
+		repo, nil, nil, nil, nil, nil,
+		cache, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		settingSvc, nil,
+	)
+	h := &OpenAIGatewayHandler{gatewayService: gatewaySvc}
+	account := &service.Account{ID: 10616, Platform: service.PlatformOpenAI}
+
+	withoutMark := newTestGinContext()
+	h.recordCyberPolicyIfMarked(withoutMark, nil, account, nil, "gpt-5", false, "", service.ChannelUsageFields{}, "hash-a")
+	require.Zero(t, cache.cooldownStrikeCalls)
+	require.Zero(t, repo.tempUnschedulableCalls)
+
+	withMark := newTestGinContext()
+	service.MarkOpsCyberPolicy(withMark, service.CyberPolicyMark{Message: "blocked", UpstreamStatus: 400})
+	h.recordCyberPolicyIfMarked(withMark, nil, account, nil, "gpt-5", false, "", service.ChannelUsageFields{}, "hash-b")
+	require.Equal(t, 1, cache.cooldownStrikeCalls)
+	require.Equal(t, 1, repo.tempUnschedulableCalls)
+
+	// The request-level guard prevents duplicate event/cooldown writes.
+	h.recordCyberPolicyIfMarked(withMark, nil, account, nil, "gpt-5", false, "", service.ChannelUsageFields{}, "hash-b")
+	require.Equal(t, 1, cache.cooldownStrikeCalls)
+	require.Equal(t, 1, repo.tempUnschedulableCalls)
 }
 
 // TestRecordCyberPolicyIfMarked_ForwardSuccessSkipsUsageLog verifies the semantic:

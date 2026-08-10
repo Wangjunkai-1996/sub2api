@@ -1068,6 +1068,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			}
 		}
 	}
+	type lineageCapture struct {
+		output   []byte
+		complete bool
+	}
+	lineageCaptureEnabled := openAIResponsesLineageCaptureEnabled(c)
+	var lineageCaptureMu sync.Mutex
+	var lineageByResponseID map[string]lineageCapture
+	if lineageCaptureEnabled {
+		lineageByResponseID = make(map[string]lineageCapture)
+	}
 
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
 		Ctx:                ctx,
@@ -1095,7 +1105,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				turnNo := int(completedTurns.Add(1))
 				turnRequestModel, turnUpstreamModel := usageMeta.turnModels(turn.RequestModel)
 				turnResult := &OpenAIForwardResult{
-					RequestID: turn.RequestID,
+					RequestID:  turn.RequestID,
+					ResponseID: turn.RequestID,
 					Usage: OpenAIUsage{
 						InputTokens:              turn.Usage.InputTokens,
 						OutputTokens:             turn.Usage.OutputTokens,
@@ -1115,6 +1126,15 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
 					Duration:                      turn.Duration,
 					FirstTokenMs:                  turn.FirstTokenMs,
+				}
+				if lineageCaptureEnabled {
+					lineageCaptureMu.Lock()
+					capture, ok := lineageByResponseID[turn.RequestID]
+					delete(lineageByResponseID, turn.RequestID)
+					lineageCaptureMu.Unlock()
+					if ok {
+						turnResult.setOpenAIResponsesLineageOutput(capture.output, capture.complete)
+					}
 				}
 				logOpenAIWSV2Passthrough(
 					"relay_turn_completed account_id=%d turn=%d request_id=%s terminal_event=%s turn_requested_model=%s turn_upstream_model=%s duration_ms=%d first_token_ms=%d input_tokens=%d output_tokens=%d cache_read_tokens=%d",
@@ -1159,7 +1179,13 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				if msgType != coderws.MessageText {
 					return nil
 				}
-				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
+				eventType, responseID, _ := parseOpenAIWSEventEnvelope(payload)
+				if lineageCaptureEnabled && isOpenAIWSTerminalEvent(eventType) && responseID != "" {
+					output, complete := extractOpenAIResponsesLineageOutput(payload, responseID)
+					lineageCaptureMu.Lock()
+					lineageByResponseID[responseID] = lineageCapture{output: output, complete: complete}
+					lineageCaptureMu.Unlock()
+				}
 				if isOpenAIWSTerminalEvent(eventType) {
 					s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
 				}
@@ -1216,7 +1242,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 
 	resultRequestModel, resultUpstreamModel := usageMeta.turnModels(relayResult.RequestModel)
 	result := &OpenAIForwardResult{
-		RequestID: relayResult.RequestID,
+		RequestID:  relayResult.RequestID,
+		ResponseID: relayResult.RequestID,
 		Usage: OpenAIUsage{
 			InputTokens:              relayResult.Usage.InputTokens,
 			OutputTokens:             relayResult.Usage.OutputTokens,

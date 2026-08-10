@@ -68,7 +68,7 @@ func TestPromptServiceStartReportsDependencyFailureWithoutPanic(t *testing.T) {
 	require.NoError(t, service.Shutdown(ctx))
 }
 
-func TestPromptServiceBlockingLatestTurnOnlyUsesNarrowSnapshot(t *testing.T) {
+func TestPromptServiceBlockingAlwaysUsesCompleteSnapshot(t *testing.T) {
 	seen := make([]string, 0, 2)
 	evaluator := newGuardEvaluator(PromptScannerFunc(func(_ context.Context, _ ActiveEndpoint, chunk string, _ []string) (*NormalizedResult, error) {
 		seen = append(seen, chunk)
@@ -84,7 +84,21 @@ func TestPromptServiceBlockingLatestTurnOnlyUsesNarrowSnapshot(t *testing.T) {
 	decision, err := service.Evaluate(context.Background(), Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"system","content":"system instruction"},{"role":"user","content":"older user input"},{"role":"assistant","content":"previous output"},{"role":"user","content":"latest user input"}]}`)})
 	require.NoError(t, err)
 	require.Equal(t, DecisionAllow, decision.Kind)
-	require.Equal(t, []string{"latest user input", "previous output"}, seen)
+	require.Equal(t, []string{"latest user input", "system instruction\n\nolder user input\n\nprevious output"}, seen)
+}
+
+func TestPromptServiceBlockingScopeNeverExpandsWithoutTrustedConfig(t *testing.T) {
+	blocking := ModeBlocking
+	service := &PromptService{config: &fakeConfigStore{active: false, effectiveMode: &blocking}}
+	group12, group13 := int64(12), int64(13)
+	require.False(t, service.BlockingApplies(Request{GroupID: &group12}))
+	require.False(t, service.BlockingApplies(Request{GroupID: &group13}))
+
+	service.config = &fakeConfigStore{active: true, cfg: ActiveConfig{
+		RiskControlEnabled: true, Enabled: true, BlockingEnabled: true, GroupIDs: []int64{12},
+	}}
+	require.True(t, service.BlockingApplies(Request{GroupID: &group12}))
+	require.False(t, service.BlockingApplies(Request{GroupID: &group13}))
 }
 
 func TestPromptServiceRejectsInvalidDeleteConfirmationClaims(t *testing.T) {

@@ -85,3 +85,55 @@ func TestCyberSessionBlockSettings_PutRejectsEmptySelectedScope(t *testing.T) {
 	_, persisted := repo.values[service.SettingKeyCyberSessionBlockAllGroups]
 	require.False(t, persisted)
 }
+
+func TestOpenAICyberAccountCooldownSettingsGetPutRoundTrip(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	repo := &settingHandlerRepoStub{values: map[string]string{service.SettingKeyPromoCodeEnabled: "true"}}
+	svc := service.NewSettingService(repo, &config.Config{Default: config.DefaultConfig{UserConcurrency: 5}})
+	handler := NewSettingHandler(svc, nil, nil, nil, nil, nil, nil)
+
+	put := cyberSettingsRequest(t, handler, http.MethodPut, map[string]any{
+		"openai_cyber_account_cooldown_enabled":           true,
+		"openai_cyber_account_cooldown_window_seconds":    86400,
+		"openai_cyber_account_cooldown_first_seconds":     3600,
+		"openai_cyber_account_cooldown_escalated_seconds": 86400,
+	})
+	require.Equal(t, http.StatusOK, put.Code, put.Body.String())
+	require.Equal(t, "true", repo.values[service.SettingKeyOpenAICyberAccountCooldownEnabled])
+	require.Equal(t, "86400", repo.values[service.SettingKeyOpenAICyberAccountCooldownWindowSeconds])
+	require.Equal(t, "3600", repo.values[service.SettingKeyOpenAICyberAccountCooldownFirstSeconds])
+	require.Equal(t, "86400", repo.values[service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds])
+
+	get := cyberSettingsRequest(t, handler, http.MethodGet, nil)
+	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
+	var response struct {
+		Data struct {
+			Enabled   bool `json:"openai_cyber_account_cooldown_enabled"`
+			Window    int  `json:"openai_cyber_account_cooldown_window_seconds"`
+			First     int  `json:"openai_cyber_account_cooldown_first_seconds"`
+			Escalated int  `json:"openai_cyber_account_cooldown_escalated_seconds"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &response))
+	require.True(t, response.Data.Enabled)
+	require.Equal(t, 86400, response.Data.Window)
+	require.Equal(t, 3600, response.Data.First)
+	require.Equal(t, 86400, response.Data.Escalated)
+}
+
+func TestOpenAICyberAccountCooldownSettingsRejectInvalidRangeAndOrder(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, body := range []map[string]any{
+		{"openai_cyber_account_cooldown_window_seconds": 59},
+		{
+			"openai_cyber_account_cooldown_first_seconds":     3600,
+			"openai_cyber_account_cooldown_escalated_seconds": 600,
+		},
+	} {
+		repo := &settingHandlerRepoStub{values: map[string]string{service.SettingKeyPromoCodeEnabled: "true"}}
+		svc := service.NewSettingService(repo, &config.Config{Default: config.DefaultConfig{UserConcurrency: 5}})
+		handler := NewSettingHandler(svc, nil, nil, nil, nil, nil, nil)
+		response := cyberSettingsRequest(t, handler, http.MethodPut, body)
+		require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	}
+}

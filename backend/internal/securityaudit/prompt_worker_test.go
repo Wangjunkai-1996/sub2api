@@ -31,14 +31,18 @@ func (c *advancingClock) Now() time.Time {
 }
 
 type fakeConfigStore struct {
-	cfg    ActiveConfig
-	active bool
+	cfg           ActiveConfig
+	active        bool
+	effectiveMode *Mode
 }
 
 func (s *fakeConfigStore) Start(context.Context) error    { return nil }
 func (s *fakeConfigStore) Shutdown(context.Context) error { return nil }
 func (s *fakeConfigStore) Active() (ActiveConfig, bool)   { return cloneActiveConfig(s.cfg), s.active }
 func (s *fakeConfigStore) EffectiveMode() Mode {
+	if s.effectiveMode != nil {
+		return *s.effectiveMode
+	}
 	if s.BlockingActivationDegraded() {
 		return ModeBlocking
 	}
@@ -302,7 +306,7 @@ func TestEnqueuerSkipsOffOutOfScopeAndNoText(t *testing.T) {
 			cfg.GroupIDs = []int64{9}
 			return cfg
 		}(), req: asyncRequest()},
-		{name: "no user text", cfg: asyncConfig(), req: Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"function","content":"not audited"}]}`)}},
+		{name: "no user text", cfg: asyncConfig(), req: Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"user","content":"  "}]}`)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

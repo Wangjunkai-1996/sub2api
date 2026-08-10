@@ -340,6 +340,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	var firstTokenMs *int
 	responseID := ""
 	var finalResponse []byte
+	var lineageOutput []byte
+	lineageComplete := false
+	lineageTerminalCount := 0
 	wroteDownstream := false
 	needModelReplace := originalModel != mappedModel
 	var mappedModelBytes []byte
@@ -504,6 +507,19 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			}
 			setOpsUpstreamError(c, 0, sanitizeUpstreamErrorMessage(readErr.Error()), "")
 			return nil, fmt.Errorf("openai ws read event: %w", readErr)
+		}
+		rawEventType, rawEventResponseID, _ := parseOpenAIWSEventEnvelope(message)
+		if openAIResponsesLineageCaptureEnabled(c) && isOpenAIWSTerminalEvent(rawEventType) {
+			lineageTerminalCount++
+			if lineageTerminalCount == 1 {
+				expectedResponseID := responseID
+				if expectedResponseID == "" {
+					expectedResponseID = rawEventResponseID
+				}
+				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(message, expectedResponseID)
+			} else {
+				lineageOutput, lineageComplete = nil, false
+			}
 		}
 		if normalized, changed := normalizeCompletedImageGenerationStatus(message); changed {
 			message = normalized
@@ -683,6 +699,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			// Ignore any tail for the completed client turn, but never reuse the
 			// ambiguous upstream connection for another request.
 			cleanExit = len(pendingJSONDocuments) == 0
+			if !cleanExit {
+				lineageOutput, lineageComplete = nil, false
+			}
 			break
 		}
 	}
@@ -749,8 +768,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		clientDisconnected,
 	)
 
-	return &OpenAIForwardResult{
+	result := &OpenAIForwardResult{
 		RequestID:                     responseID,
+		ResponseID:                    responseID,
 		Usage:                         *usage,
 		Model:                         originalModel,
 		UpstreamModel:                 mappedModel,
@@ -766,7 +786,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		ResponseHeaders:               lease.HandshakeHeaders(),
 		Duration:                      time.Since(startTime),
 		FirstTokenMs:                  firstTokenMs,
-	}, nil
+	}
+	result.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
+	return result, nil
 }
 
 // ProxyResponsesWebSocketFromClient 处理客户端入站 WebSocket（OpenAI Responses WS Mode）并转发到上游。

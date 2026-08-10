@@ -203,10 +203,14 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		SettingKeyRiskControlEnabled: "false",
 
 		// cyber 会话屏蔽（默认关闭，TTL 默认 3600s，默认覆盖全部分组以兼容旧行为）
-		SettingKeyCyberSessionBlockEnabled:    "false",
-		SettingKeyCyberSessionBlockTTLSeconds: "3600",
-		SettingKeyCyberSessionBlockAllGroups:  "true",
-		SettingKeyCyberSessionBlockGroupIDs:   "[]",
+		SettingKeyCyberSessionBlockEnabled:                   "false",
+		SettingKeyCyberSessionBlockTTLSeconds:                "3600",
+		SettingKeyCyberSessionBlockAllGroups:                 "true",
+		SettingKeyCyberSessionBlockGroupIDs:                  "[]",
+		SettingKeyOpenAICyberAccountCooldownEnabled:          "false",
+		SettingKeyOpenAICyberAccountCooldownWindowSeconds:    strconv.Itoa(defaultOpenAICyberAccountCooldownWindowSeconds),
+		SettingKeyOpenAICyberAccountCooldownFirstSeconds:     strconv.Itoa(defaultOpenAICyberAccountCooldownFirstSeconds),
+		SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: strconv.Itoa(defaultOpenAICyberAccountCooldownEscalatedSeconds),
 
 		// Claude Code version check (default: empty = disabled)
 		SettingKeyMinClaudeCodeVersion: "",
@@ -850,6 +854,23 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 		} else {
 			result.CyberSessionBlockGroupIDs = groupIDs
 		}
+	}
+
+	result.OpenAICyberAccountCooldownEnabled = settings[SettingKeyOpenAICyberAccountCooldownEnabled] == "true"
+	result.OpenAICyberAccountCooldownWindowSeconds = parseOpenAICyberAccountCooldownSeconds(
+		settings[SettingKeyOpenAICyberAccountCooldownWindowSeconds],
+		defaultOpenAICyberAccountCooldownWindowSeconds,
+	)
+	result.OpenAICyberAccountCooldownFirstSeconds = parseOpenAICyberAccountCooldownSeconds(
+		settings[SettingKeyOpenAICyberAccountCooldownFirstSeconds],
+		defaultOpenAICyberAccountCooldownFirstSeconds,
+	)
+	result.OpenAICyberAccountCooldownEscalatedSeconds = parseOpenAICyberAccountCooldownSeconds(
+		settings[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds],
+		defaultOpenAICyberAccountCooldownEscalatedSeconds,
+	)
+	if result.OpenAICyberAccountCooldownEscalatedSeconds < result.OpenAICyberAccountCooldownFirstSeconds {
+		result.OpenAICyberAccountCooldownEscalatedSeconds = result.OpenAICyberAccountCooldownFirstSeconds
 	}
 
 	// Claude Code version check

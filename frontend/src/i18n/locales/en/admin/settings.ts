@@ -57,6 +57,13 @@ export default {
           cyberSessionBlockDisabledGroup: 'Disabled',
           cyberSessionBlockNoGroups: 'No matching groups',
           cyberSessionBlockGroupsRequired: 'Select at least one group for the Cyber local session block scope.',
+          cyberAccountCooldown: 'OpenAI Cyber account cooldown',
+          cyberAccountCooldownHint: 'Quarantines only the actual OpenAI account after an explicit upstream cyber_policy response. Redis failures use the escalated tier; local blocks and audit failures never trigger it.',
+          cyberAccountCooldownWindow: 'Quiet reset window (seconds)',
+          cyberAccountCooldownFirst: 'First quarantine (seconds)',
+          cyberAccountCooldownEscalated: 'Repeated quarantine (seconds)',
+          cyberAccountCooldownRange: 'Cyber account cooldown values must be whole seconds between 60 and 604800.',
+          cyberAccountCooldownOrder: 'Repeated quarantine cannot be shorter than the first quarantine.',
         },
         affiliate: {
           title: 'Affiliate (Invite Rebate)',

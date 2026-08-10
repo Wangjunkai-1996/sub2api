@@ -57,6 +57,13 @@ export default {
           cyberSessionBlockDisabledGroup: '已停用',
           cyberSessionBlockNoGroups: '没有匹配的分组',
           cyberSessionBlockGroupsRequired: 'Cyber 本地会话屏蔽选择指定分组时，至少需要选择一个分组。',
+          cyberAccountCooldown: 'OpenAI Cyber 账号阶梯冷却',
+          cyberAccountCooldownHint: '仅在 OpenAI 上游明确返回 cyber_policy 时隔离实际命中的账号。Redis 不可用时直接采用升级档，本地拦截和审计故障不会触发。',
+          cyberAccountCooldownWindow: '安静重置窗口（秒）',
+          cyberAccountCooldownFirst: '首次隔离（秒）',
+          cyberAccountCooldownEscalated: '再次隔离（秒）',
+          cyberAccountCooldownRange: 'Cyber 账号冷却时间必须是 60 到 604800 之间的整数秒。',
+          cyberAccountCooldownOrder: '再次隔离时长不能短于首次隔离时长。',
         },
         affiliate: {
           title: '邀请返利',

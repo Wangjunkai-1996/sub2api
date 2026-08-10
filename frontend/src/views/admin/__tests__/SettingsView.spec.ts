@@ -243,6 +243,10 @@ vi.mock("vue-i18n", async () => {
       "此范围只控制 cyber_policy 命中后的本地会话屏蔽。无论是否屏蔽，真实 Cyber 事件仍会保留审计记录。",
     "admin.settings.features.riskControl.cyberSessionBlockGroupsRequired":
       "Cyber 本地会话屏蔽选择指定分组时，至少需要选择一个分组。",
+    "admin.settings.features.riskControl.cyberAccountCooldownRange":
+      "Cyber 账号冷却时间必须是 60 到 604800 之间的整数秒。",
+    "admin.settings.features.riskControl.cyberAccountCooldownOrder":
+      "再次隔离时长不能短于首次隔离时长。",
   };
   return {
     ...actual,
@@ -474,6 +478,10 @@ const baseSettingsResponse = {
   cyber_session_block_ttl_seconds: 3600,
   cyber_session_block_all_groups: true,
   cyber_session_block_group_ids: [],
+  openai_cyber_account_cooldown_enabled: false,
+  openai_cyber_account_cooldown_window_seconds: 86400,
+  openai_cyber_account_cooldown_first_seconds: 3600,
+  openai_cyber_account_cooldown_escalated_seconds: 86400,
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -824,6 +832,45 @@ describe("admin SettingsView payment visible method controls", () => {
         cyber_session_block_group_ids: [],
       }),
     );
+  });
+
+  it("renders and persists the OpenAI Cyber account cooldown", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+
+    const section = wrapper.get('[data-testid="openai-cyber-account-cooldown"]');
+    await section.get('[data-testid="openai-cyber-account-cooldown-toggle"]').setValue(true);
+    await section.get('[data-testid="openai-cyber-account-cooldown-window"]').setValue(86400);
+    await section.get('[data-testid="openai-cyber-account-cooldown-first"]').setValue(3600);
+    await section.get('[data-testid="openai-cyber-account-cooldown-escalated"]').setValue(86400);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        openai_cyber_account_cooldown_enabled: true,
+        openai_cyber_account_cooldown_window_seconds: 86400,
+        openai_cyber_account_cooldown_first_seconds: 3600,
+        openai_cyber_account_cooldown_escalated_seconds: 86400,
+      }),
+    );
+  });
+
+  it("rejects an OpenAI Cyber cooldown escalation shorter than the first tier", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+
+    const section = wrapper.get('[data-testid="openai-cyber-account-cooldown"]');
+    await section.get('[data-testid="openai-cyber-account-cooldown-toggle"]').setValue(true);
+    await section.get('[data-testid="openai-cyber-account-cooldown-first"]').setValue(3600);
+    await section.get('[data-testid="openai-cyber-account-cooldown-escalated"]').setValue(600);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).not.toHaveBeenCalled();
+    expect(showError).toHaveBeenCalledWith("再次隔离时长不能短于首次隔离时长。");
   });
 
   it("renders panel rate limit card and saves settings", async () => {

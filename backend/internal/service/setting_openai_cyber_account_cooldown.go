@@ -1,0 +1,172 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	OpenAICyberAccountCooldownMinSeconds = 60
+	OpenAICyberAccountCooldownMaxSeconds = 604800
+
+	defaultOpenAICyberAccountCooldownWindowSeconds    = 86400
+	defaultOpenAICyberAccountCooldownFirstSeconds     = 3600
+	defaultOpenAICyberAccountCooldownEscalatedSeconds = 86400
+
+	openAICyberAccountCooldownRuntimeCacheTTL  = 60 * time.Second
+	openAICyberAccountCooldownRuntimeErrorTTL  = 5 * time.Second
+	openAICyberAccountCooldownRuntimeDBTimeout = 5 * time.Second
+	openAICyberAccountCooldownRuntimeSFKey     = "openai_cyber_account_cooldown_runtime"
+)
+
+type OpenAICyberAccountCooldownPolicy struct {
+	enabled   bool
+	window    time.Duration
+	first     time.Duration
+	escalated time.Duration
+}
+
+func newOpenAICyberAccountCooldownPolicy(enabled bool, windowSeconds, firstSeconds, escalatedSeconds int) OpenAICyberAccountCooldownPolicy {
+	if windowSeconds < OpenAICyberAccountCooldownMinSeconds || windowSeconds > OpenAICyberAccountCooldownMaxSeconds {
+		windowSeconds = defaultOpenAICyberAccountCooldownWindowSeconds
+	}
+	if firstSeconds < OpenAICyberAccountCooldownMinSeconds || firstSeconds > OpenAICyberAccountCooldownMaxSeconds {
+		firstSeconds = defaultOpenAICyberAccountCooldownFirstSeconds
+	}
+	if escalatedSeconds < OpenAICyberAccountCooldownMinSeconds || escalatedSeconds > OpenAICyberAccountCooldownMaxSeconds {
+		escalatedSeconds = defaultOpenAICyberAccountCooldownEscalatedSeconds
+	}
+	if escalatedSeconds < firstSeconds {
+		escalatedSeconds = firstSeconds
+	}
+	return OpenAICyberAccountCooldownPolicy{
+		enabled:   enabled,
+		window:    time.Duration(windowSeconds) * time.Second,
+		first:     time.Duration(firstSeconds) * time.Second,
+		escalated: time.Duration(escalatedSeconds) * time.Second,
+	}
+}
+
+func (p OpenAICyberAccountCooldownPolicy) Enabled() bool                    { return p.enabled }
+func (p OpenAICyberAccountCooldownPolicy) Window() time.Duration            { return p.window }
+func (p OpenAICyberAccountCooldownPolicy) FirstDuration() time.Duration     { return p.first }
+func (p OpenAICyberAccountCooldownPolicy) EscalatedDuration() time.Duration { return p.escalated }
+
+type cachedOpenAICyberAccountCooldownRuntime struct {
+	policy    OpenAICyberAccountCooldownPolicy
+	expiresAt int64
+}
+
+func parseOpenAICyberAccountCooldownSeconds(raw string, fallback int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || parsed < OpenAICyberAccountCooldownMinSeconds || parsed > OpenAICyberAccountCooldownMaxSeconds {
+		return fallback
+	}
+	return parsed
+}
+
+func ValidateOpenAICyberAccountCooldownDurations(windowSeconds, firstSeconds, escalatedSeconds int) error {
+	for _, field := range []struct {
+		key   string
+		value int
+	}{
+		{key: SettingKeyOpenAICyberAccountCooldownWindowSeconds, value: windowSeconds},
+		{key: SettingKeyOpenAICyberAccountCooldownFirstSeconds, value: firstSeconds},
+		{key: SettingKeyOpenAICyberAccountCooldownEscalatedSeconds, value: escalatedSeconds},
+	} {
+		if field.value < OpenAICyberAccountCooldownMinSeconds || field.value > OpenAICyberAccountCooldownMaxSeconds {
+			return fmt.Errorf("%s must be between %d and %d", field.key, OpenAICyberAccountCooldownMinSeconds, OpenAICyberAccountCooldownMaxSeconds)
+		}
+	}
+	if escalatedSeconds < firstSeconds {
+		return fmt.Errorf("%s must be greater than or equal to %s", SettingKeyOpenAICyberAccountCooldownEscalatedSeconds, SettingKeyOpenAICyberAccountCooldownFirstSeconds)
+	}
+	return nil
+}
+
+func normalizeOpenAICyberAccountCooldownSettings(settings *SystemSettings) error {
+	if settings.OpenAICyberAccountCooldownWindowSeconds == 0 {
+		settings.OpenAICyberAccountCooldownWindowSeconds = defaultOpenAICyberAccountCooldownWindowSeconds
+	}
+	if settings.OpenAICyberAccountCooldownFirstSeconds == 0 {
+		settings.OpenAICyberAccountCooldownFirstSeconds = defaultOpenAICyberAccountCooldownFirstSeconds
+	}
+	if settings.OpenAICyberAccountCooldownEscalatedSeconds == 0 {
+		settings.OpenAICyberAccountCooldownEscalatedSeconds = defaultOpenAICyberAccountCooldownEscalatedSeconds
+	}
+	return ValidateOpenAICyberAccountCooldownDurations(
+		settings.OpenAICyberAccountCooldownWindowSeconds,
+		settings.OpenAICyberAccountCooldownFirstSeconds,
+		settings.OpenAICyberAccountCooldownEscalatedSeconds,
+	)
+}
+
+func disabledOpenAICyberAccountCooldownPolicy() OpenAICyberAccountCooldownPolicy {
+	return newOpenAICyberAccountCooldownPolicy(
+		false,
+		defaultOpenAICyberAccountCooldownWindowSeconds,
+		defaultOpenAICyberAccountCooldownFirstSeconds,
+		defaultOpenAICyberAccountCooldownEscalatedSeconds,
+	)
+}
+
+func conservativeOpenAICyberAccountCooldownPolicy() OpenAICyberAccountCooldownPolicy {
+	return newOpenAICyberAccountCooldownPolicy(
+		true,
+		defaultOpenAICyberAccountCooldownWindowSeconds,
+		defaultOpenAICyberAccountCooldownEscalatedSeconds,
+		defaultOpenAICyberAccountCooldownEscalatedSeconds,
+	)
+}
+
+func (s *SettingService) GetOpenAICyberAccountCooldownRuntime(ctx context.Context) OpenAICyberAccountCooldownPolicy {
+	if s == nil || s.settingRepo == nil {
+		return conservativeOpenAICyberAccountCooldownPolicy()
+	}
+	if cached, ok := s.openAICyberAccountCooldownRuntimeCache.Load().(*cachedOpenAICyberAccountCooldownRuntime); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
+		return cached.policy
+	}
+
+	result, _, _ := s.openAICyberAccountCooldownRuntimeSF.Do(openAICyberAccountCooldownRuntimeSFKey, func() (any, error) {
+		if cached, ok := s.openAICyberAccountCooldownRuntimeCache.Load().(*cachedOpenAICyberAccountCooldownRuntime); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
+			return cached, nil
+		}
+		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAICyberAccountCooldownRuntimeDBTimeout)
+		defer cancel()
+		values, err := s.settingRepo.GetMultiple(dbCtx, []string{
+			SettingKeyOpenAICyberAccountCooldownEnabled,
+			SettingKeyOpenAICyberAccountCooldownWindowSeconds,
+			SettingKeyOpenAICyberAccountCooldownFirstSeconds,
+			SettingKeyOpenAICyberAccountCooldownEscalatedSeconds,
+		})
+		if err != nil {
+			policy := conservativeOpenAICyberAccountCooldownPolicy()
+			if stale, ok := s.openAICyberAccountCooldownRuntimeCache.Load().(*cachedOpenAICyberAccountCooldownRuntime); ok && stale != nil {
+				policy = stale.policy
+			}
+			slog.Warn("failed to get OpenAI Cyber account cooldown policy; retaining last policy", "error", err)
+			entry := &cachedOpenAICyberAccountCooldownRuntime{policy: policy, expiresAt: time.Now().Add(openAICyberAccountCooldownRuntimeErrorTTL).UnixNano()}
+			s.openAICyberAccountCooldownRuntimeCache.Store(entry)
+			return entry, nil
+		}
+
+		enabled := strings.TrimSpace(values[SettingKeyOpenAICyberAccountCooldownEnabled]) == "true"
+		window := parseOpenAICyberAccountCooldownSeconds(values[SettingKeyOpenAICyberAccountCooldownWindowSeconds], defaultOpenAICyberAccountCooldownWindowSeconds)
+		first := parseOpenAICyberAccountCooldownSeconds(values[SettingKeyOpenAICyberAccountCooldownFirstSeconds], defaultOpenAICyberAccountCooldownFirstSeconds)
+		escalated := parseOpenAICyberAccountCooldownSeconds(values[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds], defaultOpenAICyberAccountCooldownEscalatedSeconds)
+		entry := &cachedOpenAICyberAccountCooldownRuntime{
+			policy:    newOpenAICyberAccountCooldownPolicy(enabled, window, first, escalated),
+			expiresAt: time.Now().Add(openAICyberAccountCooldownRuntimeCacheTTL).UnixNano(),
+		}
+		s.openAICyberAccountCooldownRuntimeCache.Store(entry)
+		return entry, nil
+	})
+	if entry, ok := result.(*cachedOpenAICyberAccountCooldownRuntime); ok && entry != nil {
+		return entry.policy
+	}
+	return conservativeOpenAICyberAccountCooldownPolicy()
+}

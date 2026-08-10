@@ -315,10 +315,14 @@ type SystemSettings struct {
 	RiskControlEnabled bool `json:"risk_control_enabled"`
 
 	// cyber 会话屏蔽开关、TTL 与独立分组范围
-	CyberSessionBlockEnabled    bool    `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds int     `json:"cyber_session_block_ttl_seconds"`
-	CyberSessionBlockAllGroups  bool    `json:"cyber_session_block_all_groups"`
-	CyberSessionBlockGroupIDs   []int64 `json:"cyber_session_block_group_ids"`
+	CyberSessionBlockEnabled                   bool    `json:"cyber_session_block_enabled"`
+	CyberSessionBlockTTLSeconds                int     `json:"cyber_session_block_ttl_seconds"`
+	CyberSessionBlockAllGroups                 bool    `json:"cyber_session_block_all_groups"`
+	CyberSessionBlockGroupIDs                  []int64 `json:"cyber_session_block_group_ids"`
+	OpenAICyberAccountCooldownEnabled          bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
 
 	// Affiliate (邀请返利) feature switch
 	AffiliateEnabled bool `json:"affiliate_enabled"`

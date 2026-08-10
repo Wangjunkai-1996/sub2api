@@ -3,16 +3,19 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -26,9 +29,13 @@ type handlerPromptEngine struct {
 	evaluated int
 	enqueued  int
 	requests  []securityaudit.Request
+	strict    bool
 }
 
 func (e *handlerPromptEngine) EffectiveMode() securityaudit.Mode { return e.mode }
+func (e *handlerPromptEngine) BlockingApplies(securityaudit.Request) bool {
+	return e.strict
+}
 func (e *handlerPromptEngine) Enqueue(_ context.Context, req securityaudit.Request) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -205,4 +212,160 @@ func TestSecurityAuditBlockingFailuresLeaveAllDownstreamCountersAtZero(t *testin
 			require.Equal(t, promptDecision.HTTPStatus, recorder.Code)
 		})
 	}
+}
+
+type handlerLegacyEngine struct {
+	decision *securityaudit.LegacyDecision
+	err      error
+}
+
+func (e *handlerLegacyEngine) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
+	return e.decision, e.err
+}
+
+func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name       string
+		body       string
+		legacy     *handlerLegacyEngine
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "policy block", body: `{"model":"gpt-test","input":"blocked"}`,
+			legacy:     &handlerLegacyEngine{decision: &securityaudit.LegacyDecision{Blocked: true, Flagged: true}},
+			wantStatus: http.StatusForbidden, wantCode: securityaudit.ErrorCodePolicyBlocked,
+		},
+		{
+			name: "context incomplete", body: `{"model":"gpt-test","input":[{"type":"future_item"}]}`,
+			legacy:     &handlerLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}},
+			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
+		},
+		{
+			name: "audit unavailable", body: `{"model":"gpt-test","input":"safe"}`,
+			legacy:     &handlerLegacyEngine{err: errors.New("moderation 429")},
+			wantStatus: http.StatusServiceUnavailable, wantCode: securityaudit.ErrorCodeAuditUnavailable,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompt := &handlerPromptEngine{
+				mode: securityaudit.ModeBlocking, strict: true,
+				decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionAllow, AllowNextStage: true, ConfigVersion: 1},
+			}
+			h := &OpenAIGatewayHandler{
+				gatewayService:           &service.OpenAIGatewayService{},
+				billingCacheService:      &service.BillingCacheService{},
+				apiKeyService:            &service.APIKeyService{},
+				concurrencyHelper:        NewConcurrencyHelper(&service.ConcurrencyService{}, SSEPingFormatComment, time.Second),
+				securityAuditCoordinator: securityaudit.NewCoordinator(tt.legacy, prompt),
+			}
+
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				groupID := int64(12)
+				user := &service.User{ID: 7, Username: "strict-user", Email: "strict@example.test"}
+				c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+					ID: 9, UserID: user.ID, User: user, GroupID: &groupID,
+					Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+				})
+				c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: user.ID, Concurrency: 2})
+				c.Next()
+			})
+			router.POST("/v1/responses", h.Responses)
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tt.body))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			require.NotPanics(t, func() { router.ServeHTTP(recorder, request) },
+				"strict rejection must not touch the deliberately uninitialized scheduler, concurrency, billing, or upstream internals")
+			require.Equal(t, tt.wantStatus, recorder.Code)
+			require.Contains(t, recorder.Body.String(), tt.wantCode)
+		})
+	}
+}
+
+func TestOpenAIResponsesWebSocketStrictBlockHasZeroDownstreamSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cache := &concurrencyCacheMock{
+		acquireIngressLeaseFn: func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireUserSlotFn:     func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireAccountSlotFn:  func(context.Context, int64, int, string) (bool, error) { return true, nil },
+	}
+	prompt := &handlerPromptEngine{
+		mode: securityaudit.ModeBlocking, strict: true,
+		decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionBlock, AllowNextStage: false},
+	}
+	h := &OpenAIGatewayHandler{
+		gatewayService:           &service.OpenAIGatewayService{},
+		billingCacheService:      &service.BillingCacheService{},
+		apiKeyService:            &service.APIKeyService{},
+		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		securityAuditCoordinator: securityaudit.NewCoordinator(&handlerLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}}, prompt),
+		maxAccountSwitches:       1,
+	}
+
+	groupID := int64(12)
+	user := &service.User{ID: 7, Username: "strict-ws", Status: service.StatusActive}
+	apiKey := &service.APIKey{
+		ID: 9, UserID: user.ID, User: user, GroupID: &groupID,
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
+	}
+	handlerDone := make(chan struct{})
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), apiKey)
+		c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: user.ID, Concurrency: 2})
+		c.Next()
+	})
+	router.GET("/openai/v1/responses", func(c *gin.Context) {
+		h.ResponsesWebSocket(c)
+		close(handlerDone)
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	conn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http")+"/openai/v1/responses", nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = conn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-test","input":"blocked first turn"}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, payload, err := conn.Read(readCtx)
+	cancelRead()
+	require.NoError(t, err)
+	require.Contains(t, string(payload), securityaudit.ErrorCodePolicyBlocked)
+
+	readCtx, cancelRead = context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = conn.Read(readCtx)
+	cancelRead()
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusCode(4403), closeErr.Code)
+	require.Equal(t, securityaudit.ErrorCodePolicyBlocked, closeErr.Reason)
+	select {
+	case <-handlerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("strict websocket handler did not finish")
+	}
+
+	require.Zero(t, atomic.LoadInt32(&cache.acquireIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireUserCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireAccountCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.releaseIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.releaseUserCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.releaseAccountCalled))
+	evaluated, _, requests := prompt.snapshot()
+	require.Equal(t, 1, evaluated)
+	require.Len(t, requests, 1)
+	require.True(t, requests[0].Strict)
+	require.NotNil(t, requests[0].Document)
+	require.True(t, requests[0].Document.Complete)
 }

@@ -126,7 +126,7 @@ func writeSecurityAuditWSError(ctx context.Context, conn *coderws.Conn, decision
 	if conn == nil || decision == nil {
 		return
 	}
-	if decision.Legacy != nil && decision.Legacy.Blocked {
+	if usesLegacySecurityAuditWSError(decision) {
 		legacy := decision.Legacy
 		writeContentModerationWSError(ctx, conn, (legacyContentModerationDecision{legacy}).toService())
 		return
@@ -155,11 +155,23 @@ func (d legacyContentModerationDecision) toService() *service.ContentModerationD
 	return &service.ContentModerationDecision{Allowed: d.value.Allowed, Blocked: d.value.Blocked, Flagged: d.value.Flagged, Message: d.value.Message, StatusCode: d.value.StatusCode, Action: d.value.Action}
 }
 
+func usesLegacySecurityAuditWSError(decision *securityaudit.Decision) bool {
+	if decision == nil || decision.Legacy == nil || !decision.Legacy.Blocked {
+		return false
+	}
+	switch strings.TrimSpace(decision.ErrorCode) {
+	case securityaudit.ErrorCodePolicyBlocked, securityaudit.ErrorCodeContextIncomplete, securityaudit.ErrorCodeAuditUnavailable:
+		return false
+	default:
+		return true
+	}
+}
+
 func securityAuditWSCloseStatus(decision *securityaudit.Decision) coderws.StatusCode {
 	if decision == nil {
 		return coderws.StatusInternalError
 	}
-	if decision.Legacy != nil && decision.Legacy.Blocked {
+	if usesLegacySecurityAuditWSError(decision) {
 		return coderws.StatusPolicyViolation
 	}
 	if decision.Kind == securityaudit.DecisionBlock {
@@ -172,7 +184,7 @@ func securityAuditWSCloseReason(decision *securityaudit.Decision) string {
 	if decision == nil {
 		return securityaudit.ErrorCodeUnavailable
 	}
-	if decision.Legacy != nil && decision.Legacy.Blocked {
+	if usesLegacySecurityAuditWSError(decision) {
 		message := strings.TrimSpace(decision.Legacy.Message)
 		if message != "" {
 			return message

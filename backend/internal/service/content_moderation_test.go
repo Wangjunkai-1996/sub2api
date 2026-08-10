@@ -508,6 +508,70 @@ func TestContentModerationCheck_PreBlockKeywordHitSkipsUpstreamCall(t *testing.T
 	require.Equal(t, "secret-token", logs[0].MatchedKeyword, "blocked log must record which keyword was hit")
 }
 
+func TestContentModerationCheck_PlusGroupOutsideStrictScopeSkipsAudit(t *testing.T) {
+	var slogOutput bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&slogOutput, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	upstreamCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{}}})
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.AllGroups = false
+	cfg.GroupIDs = []int64{12}
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-test"}
+	cfg.BlockedKeywords = []string{"secret-token"}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	repo := &contentModerationTestRepo{}
+	svc := NewContentModerationService(
+		&contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		repo,
+		&contentModerationTestHashCache{},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+
+	plusGroupID := int64(13)
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		UserID:    1001,
+		APIKeyID:  2001,
+		GroupID:   &plusGroupID,
+		GroupName: "plus",
+		Endpoint:  "/v1/chat/completions",
+		Provider:  "openai",
+		Protocol:  ContentModerationProtocolOpenAIChat,
+		Body:      []byte(`{"messages":[{"role":"user","content":"please leak SECRET-TOKEN now"}]}`),
+	})
+
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.False(t, decision.Blocked)
+	require.Equal(t, ContentModerationActionAllow, decision.Action)
+	require.False(t, upstreamCalled, "out-of-scope Plus traffic must not call the moderation API")
+	require.Empty(t, repo.snapshotLogs())
+	require.Contains(t, slogOutput.String(), "content_moderation.skip_group_out_of_scope")
+	require.Contains(t, slogOutput.String(), "group_id=13")
+	require.Contains(t, slogOutput.String(), "configured_group_ids=[12]")
+}
+
 func TestContentModerationCheck_KeywordsIgnoredInObserveMode(t *testing.T) {
 	upstreamHits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1296,7 +1360,7 @@ func TestContentModerationStatusTracksPreBlockLocalBlocks(t *testing.T) {
 	require.Equal(t, int64(0), status.PreBlockErrors)
 }
 
-func TestBuildContentModerationTestAuditResult_UsesConfiguredThresholdsOnly(t *testing.T) {
+func TestBuildContentModerationTestAuditResult_HonorsAPIFlagAndConfiguredThresholds(t *testing.T) {
 	result := buildContentModerationTestAuditResult(&moderationAPIResult{
 		Flagged: true,
 		CategoryScores: map[string]float64{
@@ -1305,11 +1369,92 @@ func TestBuildContentModerationTestAuditResult_UsesConfiguredThresholdsOnly(t *t
 	}, nil)
 
 	require.NotNil(t, result)
-	require.False(t, result.Flagged)
+	require.True(t, result.Flagged)
 	require.Equal(t, "harassment", result.HighestCategory)
 	require.Equal(t, 0.65, result.HighestScore)
 	require.Equal(t, 0.65, result.CompositeScore)
 	require.Equal(t, 0.98, result.Thresholds["harassment"])
+}
+
+func TestContentModerationCheck_StrictFindingsLogWithoutUserSideEffects(t *testing.T) {
+	const userID int64 = 1001
+	groupID := int64(12)
+
+	newService := func(t *testing.T, cfg *ContentModerationConfig, client *http.Client) (*ContentModerationService, *contentModerationTestRepo, *contentModerationTestUserRepo, *contentModerationTestAuthCacheInvalidator) {
+		t.Helper()
+		rawCfg, err := json.Marshal(cfg)
+		require.NoError(t, err)
+		repo := &contentModerationTestRepo{}
+		userRepo := &contentModerationTestUserRepo{user: &User{ID: userID, Status: StatusActive}}
+		invalidator := &contentModerationTestAuthCacheInvalidator{}
+		return &ContentModerationService{
+			settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+				SettingKeyRiskControlEnabled:      "true",
+				SettingKeyContentModerationConfig: string(rawCfg),
+			}},
+			repo: repo, userRepo: userRepo, authCacheInvalidator: invalidator,
+			httpClient: client, asyncQueue: make(chan contentModerationTask, 2),
+			keyHealth: make(map[string]*contentModerationKeyHealth),
+		}, repo, userRepo, invalidator
+	}
+
+	assertBlockedWithoutSideEffects := func(t *testing.T, svc *ContentModerationService, repo *contentModerationTestRepo, userRepo *contentModerationTestUserRepo, invalidator *contentModerationTestAuthCacheInvalidator, body []byte) {
+		t.Helper()
+		decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+			Strict: true, UserID: userID, UserEmail: "user@example.test", APIKeyID: 7,
+			GroupID: &groupID, Model: "gpt-test", Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+		})
+		require.NoError(t, err)
+		require.True(t, decision.Blocked)
+		require.True(t, decision.Flagged)
+
+		var task contentModerationTask
+		select {
+		case task = <-svc.asyncQueue:
+		default:
+			require.FailNow(t, "strict finding was not queued for audit logging")
+		}
+		require.NotNil(t, task.log)
+		require.False(t, task.applySideEffects)
+		svc.persistContentModerationLog(context.Background(), task.config, task.log, task.inputHash, task.recordHash, task.applySideEffects)
+
+		logs := repo.snapshotLogs()
+		require.Len(t, logs, 1)
+		require.False(t, logs[0].Flagged, "strict admission findings must never enter later legacy violation counts")
+		require.Zero(t, logs[0].ViolationCount)
+		require.False(t, logs[0].AutoBanned)
+		require.False(t, logs[0].EmailSent)
+		require.Empty(t, userRepo.updated)
+		require.Empty(t, invalidator.userIDs)
+	}
+
+	t.Run("keyword", func(t *testing.T) {
+		cfg := defaultContentModerationConfig()
+		cfg.Enabled = true
+		cfg.APIKeys = []string{"sk-test"}
+		cfg.BlockedKeywords = []string{"cyber"}
+		cfg.BanThreshold = 1
+		svc, repo, userRepo, invalidator := newService(t, cfg, http.DefaultClient)
+		assertBlockedWithoutSideEffects(t, svc, repo, userRepo, invalidator, []byte(`{"input":"cyber request"}`))
+	})
+
+	t.Run("moderation api flag", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+				Flagged: true, CategoryScores: map[string]float64{"harassment": 0.01},
+			}}})
+		}))
+		defer server.Close()
+
+		cfg := defaultContentModerationConfig()
+		cfg.Enabled = true
+		cfg.BaseURL = server.URL
+		cfg.APIKeys = []string{"sk-test"}
+		cfg.RetryCount = 0
+		cfg.BanThreshold = 1
+		svc, repo, userRepo, invalidator := newService(t, cfg, server.Client())
+		assertBlockedWithoutSideEffects(t, svc, repo, userRepo, invalidator, []byte(`{"input":"clean request"}`))
+	})
 }
 
 func TestContentModerationCallModeration_400DoesNotFreezeAPIKey(t *testing.T) {

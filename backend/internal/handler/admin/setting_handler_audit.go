@@ -601,6 +601,18 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if !slices.Equal(before.CyberSessionBlockGroupIDs, after.CyberSessionBlockGroupIDs) {
 		changed = append(changed, "cyber_session_block_group_ids")
 	}
+	if before.OpenAICyberAccountCooldownEnabled != after.OpenAICyberAccountCooldownEnabled {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownEnabled)
+	}
+	if before.OpenAICyberAccountCooldownWindowSeconds != after.OpenAICyberAccountCooldownWindowSeconds {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownWindowSeconds)
+	}
+	if before.OpenAICyberAccountCooldownFirstSeconds != after.OpenAICyberAccountCooldownFirstSeconds {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownFirstSeconds)
+	}
+	if before.OpenAICyberAccountCooldownEscalatedSeconds != after.OpenAICyberAccountCooldownEscalatedSeconds {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds)
+	}
 	// Default platform quotas（JSON map，整体比较）
 	if !equalPlatformQuotaSettings(before.DefaultPlatformQuotas, after.DefaultPlatformQuotas) {
 		changed = append(changed, service.SettingKeyDefaultPlatformQuotas)

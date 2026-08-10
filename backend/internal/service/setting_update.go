@@ -103,6 +103,9 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 		return nil, err
 	}
 	settings.CyberSessionBlockGroupIDs = normalizeInt64IDs(settings.CyberSessionBlockGroupIDs)
+	if err := normalizeOpenAICyberAccountCooldownSettings(settings); err != nil {
+		return nil, infraerrors.BadRequest("INVALID_OPENAI_CYBER_ACCOUNT_COOLDOWN", err.Error())
+	}
 	normalizedWhitelist, err := NormalizeRegistrationEmailSuffixWhitelist(settings.RegistrationEmailSuffixWhitelist)
 	if err != nil {
 		return nil, infraerrors.BadRequest("INVALID_REGISTRATION_EMAIL_SUFFIX_WHITELIST", err.Error())
@@ -441,6 +444,10 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 		return nil, fmt.Errorf("marshal cyber session block group IDs: %w", err)
 	}
 	updates[SettingKeyCyberSessionBlockGroupIDs] = string(groupIDsJSON)
+	updates[SettingKeyOpenAICyberAccountCooldownEnabled] = strconv.FormatBool(settings.OpenAICyberAccountCooldownEnabled)
+	updates[SettingKeyOpenAICyberAccountCooldownWindowSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownWindowSeconds)
+	updates[SettingKeyOpenAICyberAccountCooldownFirstSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownFirstSeconds)
+	updates[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownEscalatedSeconds)
 
 	// Claude Code version check
 	updates[SettingKeyMinClaudeCodeVersion] = settings.MinClaudeCodeVersion
@@ -616,6 +623,16 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 			settings.CyberSessionBlockGroupIDs,
 		),
 		expiresAt: time.Now().Add(cyberSessionBlockRuntimeCacheTTL).UnixNano(),
+	})
+	s.openAICyberAccountCooldownRuntimeSF.Forget(openAICyberAccountCooldownRuntimeSFKey)
+	s.openAICyberAccountCooldownRuntimeCache.Store(&cachedOpenAICyberAccountCooldownRuntime{
+		policy: newOpenAICyberAccountCooldownPolicy(
+			settings.OpenAICyberAccountCooldownEnabled,
+			settings.OpenAICyberAccountCooldownWindowSeconds,
+			settings.OpenAICyberAccountCooldownFirstSeconds,
+			settings.OpenAICyberAccountCooldownEscalatedSeconds,
+		),
+		expiresAt: time.Now().Add(openAICyberAccountCooldownRuntimeCacheTTL).UnixNano(),
 	})
 	backendModeSF.Forget("backend_mode")
 	backendModeCache.Store(&cachedBackendMode{

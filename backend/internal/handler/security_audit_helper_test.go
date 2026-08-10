@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -18,6 +20,23 @@ func TestCachesSecurityAuditCompletionSkipsWebSocketStages(t *testing.T) {
 	require.True(t, cachesSecurityAuditCompletion(""))
 	require.False(t, cachesSecurityAuditCompletion("first_turn"))
 	require.False(t, cachesSecurityAuditCompletion("subsequent_turn"))
+}
+
+func TestRunSecurityAuditMissingCoordinatorFailsClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	decision := runSecurityAudit(
+		c, nil, nil, nil, nil, middleware2.AuthSubject{UserID: 7},
+		service.ContentModerationProtocolOpenAIResponses, "gpt-test", []byte(`{"input":"safe"}`), "http",
+	)
+
+	require.NotNil(t, decision)
+	require.False(t, decision.AllowNextStage)
+	require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, decision.ErrorCode)
 }
 
 func TestRunSecurityAuditDoesNotSkipSubsequentWebSocketTurns(t *testing.T) {
@@ -46,6 +65,86 @@ func TestRunSecurityAuditDoesNotSkipSubsequentWebSocketTurns(t *testing.T) {
 		[]byte(`{"type":"response.create","response":{"input":"malicious follow-up"}}`), "subsequent_turn")
 	require.NotNil(t, second)
 	require.Equal(t, int64(2), engine.enqueues.Load(), "subsequent WebSocket turns must be audited again")
+}
+
+type captureLineageStore struct {
+	calls      int
+	responseID string
+	summary    securityaudit.AuditSummary
+}
+
+func (s *captureLineageStore) Load(context.Context, securityaudit.LineageLookup) (*securityaudit.AuditSummary, error) {
+	return nil, securityaudit.ErrLineageNotFound
+}
+
+func (s *captureLineageStore) BindAllowedResponse(_ context.Context, summary securityaudit.AuditSummary, responseID string) error {
+	s.calls++
+	s.responseID = responseID
+	s.summary = summary.Clone()
+	return nil
+}
+
+func TestBindAllowedSecurityAuditResponseRequiresSuccessfulTerminalResponse(t *testing.T) {
+	groupID := int64(12)
+	store := &captureLineageStore{}
+	h := &OpenAIGatewayHandler{
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, nil).SetLineageStore(store),
+	}
+	summary := &securityaudit.AuditSummary{
+		ParserVersion: "auditinput/v1", ConfigVersion: 3, APIKeyID: 9, GroupID: &groupID,
+		PromptHash: "prompt-hash", DocumentHash: "request-document-hash", RedactedContext: "audited context",
+		ContextComplete: true, Verdict: securityaudit.AuditVerdictAllow,
+	}
+	completeResult := func(responseID, event, status, output string) *service.OpenAIForwardResult {
+		result := &service.OpenAIForwardResult{ResponseID: responseID, OpenAIWSMode: true, UpstreamTerminalEvent: event}
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		service.EnableOpenAIStrictLineageCapture(c)
+		result.CaptureOpenAIResponsesLineageOutput(c, []byte(fmt.Sprintf(
+			`{"type":%q,"response":{"id":%q,"status":%q,"output":%s}}`, event, responseID, status, output,
+		)))
+		return result
+	}
+
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, completeResult(
+		"resp_completed", "response.completed", "completed",
+		`[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"audited command\"}"}]`,
+	))
+	require.Equal(t, 1, store.calls)
+	require.Equal(t, "resp_completed", store.responseID)
+	require.Contains(t, store.summary.RedactedContext, "audited command")
+	require.NotEqual(t, summary.PromptHash, store.summary.PromptHash)
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, completeResult(
+		"resp_http_completed", "response.done", "done",
+		`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant answer"}]}]`,
+	))
+	require.Equal(t, 2, store.calls)
+	require.Equal(t, "resp_http_completed", store.responseID)
+	require.Contains(t, store.summary.RedactedContext, "assistant answer")
+
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, &service.OpenAIForwardResult{
+		ResponseID: "resp_failed", OpenAIWSMode: true, UpstreamTerminalEvent: "response.failed",
+	})
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, &service.OpenAIForwardResult{
+		ResponseID: "resp_http_incomplete", UpstreamTerminalEvent: "response.incomplete",
+	})
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, &service.OpenAIForwardResult{
+		ResponseID: "resp_http_cancelled", UpstreamTerminalEvent: "response.cancelled",
+	})
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, &service.OpenAIForwardResult{
+		ResponseID: "resp_http_unknown",
+	})
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, &service.OpenAIForwardResult{
+		ResponseID: "resp_completed_without_output", UpstreamTerminalEvent: "response.completed",
+	})
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, completeResult(
+		"resp_unknown_output", "response.completed", "completed", `[{"type":"future_item","payload":"hidden"}]`,
+	))
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, &service.OpenAIForwardResult{
+		OpenAIWSMode: true, UpstreamTerminalEvent: "response.completed",
+	})
+	h.bindAllowedSecurityAuditResponse(context.Background(), nil, nil, &service.OpenAIForwardResult{ResponseID: "resp_no_audit"})
+	require.Equal(t, 2, store.calls)
 }
 
 type turnCountingEngine struct {

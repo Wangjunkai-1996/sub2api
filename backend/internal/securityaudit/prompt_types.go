@@ -3,6 +3,8 @@ package securityaudit
 import (
 	"context"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 )
 
 const (
@@ -19,6 +21,10 @@ const (
 	ErrorCodeConfigUnavailable     = "prompt_audit_config_unavailable"
 	ErrorCodeEncryptionKeyRequired = "prompt_audit_encryption_key_required"
 	ErrorCodeRequiresEnabled       = "prompt_guard_requires_audit_enabled"
+
+	ErrorCodePolicyBlocked     = "request_policy_blocked"
+	ErrorCodeContextIncomplete = "policy_context_incomplete"
+	ErrorCodeAuditUnavailable  = "policy_audit_unavailable"
 
 	DefaultGuardModel = "sileader/qwen3guard:0.6b"
 )
@@ -81,10 +87,21 @@ type Request struct {
 	Model      string
 	Body       []byte
 	Stage      string
+	Strict     bool
+	Document   *auditinput.Document
+	PriorAudit *AuditSummary
+	// AuditContext is the bounded, chronological context consumed by strict
+	// auditors. It is never written back to Body or forwarded upstream.
+	AuditContext string
 }
 
 func (r Request) Clone() Request {
 	r.Body = append([]byte(nil), r.Body...)
+	r.Document = r.Document.Clone()
+	if r.PriorAudit != nil {
+		prior := r.PriorAudit.Clone()
+		r.PriorAudit = &prior
+	}
 	if r.GroupID != nil {
 		id := *r.GroupID
 		r.GroupID = &id
@@ -142,18 +159,20 @@ type NormalizedResult struct {
 type PromptDecision struct {
 	Kind           DecisionKind      `json:"kind"`
 	ErrorCode      string            `json:"error_code,omitempty"`
+	ConfigVersion  int64             `json:"config_version,omitempty"`
 	Result         *NormalizedResult `json:"result,omitempty"`
 	AllowNextStage bool              `json:"allow_next_stage"`
 }
 
 type LegacyDecision struct {
-	Allowed    bool   `json:"allowed"`
-	Blocked    bool   `json:"blocked"`
-	Flagged    bool   `json:"flagged"`
-	Message    string `json:"message"`
-	StatusCode int    `json:"status_code"`
-	ErrorCode  string `json:"error_code"`
-	Action     string `json:"action"`
+	Allowed     bool   `json:"allowed"`
+	Blocked     bool   `json:"blocked"`
+	Flagged     bool   `json:"flagged"`
+	Message     string `json:"message"`
+	StatusCode  int    `json:"status_code"`
+	ErrorCode   string `json:"error_code"`
+	Action      string `json:"action"`
+	Unavailable bool   `json:"unavailable,omitempty"`
 }
 
 type Decision struct {
@@ -163,7 +182,35 @@ type Decision struct {
 	ClientMessage  string          `json:"client_message,omitempty"`
 	Legacy         *LegacyDecision `json:"legacy,omitempty"`
 	Prompt         *PromptDecision `json:"prompt,omitempty"`
+	Audit          *AuditSummary   `json:"audit,omitempty"`
 	AllowNextStage bool            `json:"allow_next_stage"`
+}
+
+const AuditVerdictAllow = "allow"
+
+type AuditSummary struct {
+	ParserVersion      string   `json:"parser_version"`
+	ConfigVersion      int64    `json:"config_version"`
+	APIKeyID           int64    `json:"api_key_id"`
+	GroupID            *int64   `json:"group_id,omitempty"`
+	PreviousResponseID string   `json:"previous_response_id,omitempty"`
+	PromptHash         string   `json:"prompt_hash"`
+	ParentPromptHash   string   `json:"parent_prompt_hash,omitempty"`
+	DocumentHash       string   `json:"document_hash"`
+	NormalizedContext  string   `json:"-"`
+	RedactedContext    string   `json:"redacted_context"`
+	MediaDigests       []string `json:"media_digests,omitempty"`
+	ContextComplete    bool     `json:"context_complete"`
+	Verdict            string   `json:"verdict"`
+}
+
+func (s AuditSummary) Clone() AuditSummary {
+	if s.GroupID != nil {
+		id := *s.GroupID
+		s.GroupID = &id
+	}
+	s.MediaDigests = append([]string(nil), s.MediaDigests...)
+	return s
 }
 
 type IssueSummary struct {

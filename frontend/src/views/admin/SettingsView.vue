@@ -7071,6 +7071,71 @@
                 </div>
               </div>
             </div>
+
+            <div
+              data-testid="openai-cyber-account-cooldown"
+              class="space-y-4 border-t border-gray-100 pt-5 dark:border-dark-700"
+            >
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldown') }}
+                  </label>
+                  <p class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownHint') }}
+                  </p>
+                </div>
+                <Toggle
+                  v-model="form.openai_cyber_account_cooldown_enabled"
+                  data-testid="openai-cyber-account-cooldown-toggle"
+                />
+              </div>
+
+              <div
+                v-if="form.openai_cyber_account_cooldown_enabled"
+                class="grid grid-cols-1 gap-4 md:grid-cols-3"
+              >
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownWindow') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_window_seconds"
+                    data-testid="openai-cyber-account-cooldown-window"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownFirst') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_first_seconds"
+                    data-testid="openai-cyber-account-cooldown-first"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownEscalated') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_escalated_seconds"
+                    data-testid="openai-cyber-account-cooldown-escalated"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    class="input"
+                  />
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -9355,6 +9420,10 @@ const form = reactive<SettingsForm>({
   cyber_session_block_ttl_seconds: 3600,
   cyber_session_block_all_groups: true,
   cyber_session_block_group_ids: [],
+  openai_cyber_account_cooldown_enabled: false,
+  openai_cyber_account_cooldown_window_seconds: 86400,
+  openai_cyber_account_cooldown_first_seconds: 3600,
+  openai_cyber_account_cooldown_escalated_seconds: 86400,
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -10888,6 +10957,28 @@ async function saveSettings() {
       return;
     }
 
+    const cyberAccountCooldownValues = [
+      Number(form.openai_cyber_account_cooldown_window_seconds),
+      Number(form.openai_cyber_account_cooldown_first_seconds),
+      Number(form.openai_cyber_account_cooldown_escalated_seconds),
+    ];
+    if (
+      cyberAccountCooldownValues.some(
+        (value) => !Number.isInteger(value) || value < 60 || value > 604800,
+      )
+    ) {
+      appStore.showError(
+        t("admin.settings.features.riskControl.cyberAccountCooldownRange"),
+      );
+      return;
+    }
+    if (cyberAccountCooldownValues[2] < cyberAccountCooldownValues[1]) {
+      appStore.showError(
+        t("admin.settings.features.riskControl.cyberAccountCooldownOrder"),
+      );
+      return;
+    }
+
     const normalizedDefaultSubscriptions = normalizeDefaultSubscriptionSettings(
       form.default_subscriptions,
     );
@@ -11179,6 +11270,14 @@ async function saveSettings() {
         Number(form.cyber_session_block_ttl_seconds) || 3600,
       cyber_session_block_all_groups: form.cyber_session_block_all_groups,
       cyber_session_block_group_ids: form.cyber_session_block_group_ids,
+      openai_cyber_account_cooldown_enabled:
+        form.openai_cyber_account_cooldown_enabled,
+      openai_cyber_account_cooldown_window_seconds:
+        Number(form.openai_cyber_account_cooldown_window_seconds),
+      openai_cyber_account_cooldown_first_seconds:
+        Number(form.openai_cyber_account_cooldown_first_seconds),
+      openai_cyber_account_cooldown_escalated_seconds:
+        Number(form.openai_cyber_account_cooldown_escalated_seconds),
       payment_min_amount: Number(form.payment_min_amount) || 0,
       payment_max_amount: Number(form.payment_max_amount) || 0,
       payment_daily_limit: Number(form.payment_daily_limit) || 0,

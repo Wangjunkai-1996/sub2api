@@ -26,6 +26,9 @@ type openaiStreamingResult struct {
 	usage            *OpenAIUsage
 	firstTokenMs     *int
 	responseID       string
+	terminalEvent    string
+	lineageOutput    []byte
+	lineageComplete  bool
 	imageCount       int
 	imageOutputSizes []string
 }
@@ -34,6 +37,9 @@ type openaiNonStreamingResult struct {
 	*OpenAIUsage
 	usage            *OpenAIUsage
 	responseID       string
+	terminalEvent    string
+	lineageOutput    []byte
+	lineageComplete  bool
 	imageCount       int
 	imageOutputSizes []string
 }
@@ -140,6 +146,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	usage := &OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
 	responseID := ""
+	terminalEvent := ""
+	var lineageOutput []byte
+	lineageComplete := false
+	lineageTerminalCount := 0
 	var firstOutputScanGuard atomic.Bool
 	firstOutputScanGuard.Store(guardFirstOutput)
 	scanner := bufio.NewScanner(resp.Body)
@@ -297,6 +307,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			usage:            usage,
 			firstTokenMs:     firstTokenMs,
 			responseID:       responseID,
+			terminalEvent:    terminalEvent,
+			lineageOutput:    append([]byte(nil), lineageOutput...),
+			lineageComplete:  lineageComplete,
 			imageCount:       imageCounter.Count(),
 			imageOutputSizes: imageCounter.Sizes(),
 		}
@@ -414,9 +427,21 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// 初始上游 data 的 type 只解析一次：原始值保持终止事件的精确匹配，规范化值供后续分支复用。
 			if openAIStreamEventIsTerminalWithType(data, eventTypeRaw) {
 				sawTerminalEvent = true
+				if openAIResponsesLineageCaptureEnabled(c) {
+					lineageTerminalCount++
+					if lineageTerminalCount > 1 {
+						lineageOutput, lineageComplete = nil, false
+					}
+				}
+				if eventType != "" {
+					terminalEvent = eventType
+				}
 			}
 			if responseID == "" {
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
+			}
+			if openAIResponsesLineageCaptureEnabled(c) && (eventType == "response.completed" || eventType == "response.done") && lineageTerminalCount == 1 {
+				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(dataBytes, responseID)
 			}
 			forceFlushFailedEvent := false
 			if eventType == "response.failed" {
@@ -1021,6 +1046,41 @@ func extractOpenAIResponseIDFromJSONBytes(body []byte) string {
 	return strings.TrimSpace(gjson.GetBytes(body, "response.id").String())
 }
 
+func extractOpenAIResponseTerminalEventFromJSONBytes(body []byte) string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ""
+	}
+	if eventType := strings.TrimSpace(gjson.GetBytes(body, "type").String()); openAIStreamEventTypeIsTerminal(eventType) {
+		return eventType
+	}
+	status := strings.TrimSpace(gjson.GetBytes(body, "status").String())
+	if status == "" {
+		status = strings.TrimSpace(gjson.GetBytes(body, "response.status").String())
+	}
+	switch status {
+	case "completed":
+		return "response.completed"
+	case "done":
+		return "response.done"
+	case "failed":
+		return "response.failed"
+	case "incomplete":
+		return "response.incomplete"
+	case "cancelled", "canceled":
+		return "response." + status
+	default:
+		return ""
+	}
+}
+
+func extractOpenAISSETerminalEventType(body string) string {
+	eventType, _, ok := extractOpenAISSETerminalEvent(body)
+	if !ok {
+		return ""
+	}
+	return eventType
+}
+
 func (s *OpenAIGatewayService) bindHTTPResponseAccount(ctx context.Context, c *gin.Context, account *Account, responseID string) {
 	if s == nil || account == nil || account.ID <= 0 {
 		return
@@ -1115,6 +1175,10 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	if err != nil {
 		return nil, err
 	}
+	lineageOutput, lineageComplete := []byte(nil), false
+	if openAIResponsesLineageCaptureEnabled(c) && !bodyHasSSEFraming(body) {
+		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, extractOpenAIResponseIDFromJSONBytes(body))
+	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -1192,6 +1256,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		OpenAIUsage:      usage,
 		usage:            usage,
 		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
+		terminalEvent:    extractOpenAIResponseTerminalEventFromJSONBytes(body),
+		lineageOutput:    lineageOutput,
+		lineageComplete:  lineageComplete,
 		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
 		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 	}, nil
@@ -1282,10 +1349,18 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		c.Data(resp.StatusCode, contentType, body)
 	}
 
+	lineageOutput, lineageComplete := []byte(nil), false
+	if openAIResponsesLineageCaptureEnabled(c) {
+		expectedResponseID := firstNonEmpty(extractFirstOpenAIResponseIDFromSSEBody(bodyText), extractOpenAIResponseIDFromJSONBytes(body))
+		lineageOutput, lineageComplete = extractSingleOpenAIResponsesSuccessTerminal(bodyText, expectedResponseID)
+	}
 	return &openaiNonStreamingResult{
 		OpenAIUsage:      usage,
 		usage:            usage,
 		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
+		terminalEvent:    firstNonEmpty(extractOpenAIResponseTerminalEventFromJSONBytes(body), extractOpenAISSETerminalEventType(bodyText)),
+		lineageOutput:    lineageOutput,
+		lineageComplete:  lineageComplete,
 		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
 		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
 	}, nil
@@ -1309,6 +1384,17 @@ func extractOpenAISSETerminalEvent(body string) (string, []byte, bool) {
 		return terminalType, terminalPayload, true
 	}
 	return "", nil, false
+}
+
+func extractFirstOpenAIResponseIDFromSSEBody(body string) string {
+	responseID := ""
+	forEachOpenAISSEDataPayload(body, func(data []byte) {
+		if responseID != "" {
+			return
+		}
+		responseID = extractOpenAIResponseIDFromJSONBytes(data)
+	})
+	return responseID
 }
 
 func extractOpenAISSEErrorMessage(payload []byte) string {

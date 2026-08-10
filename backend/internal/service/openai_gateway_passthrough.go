@@ -242,6 +242,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	var usage *OpenAIUsage
 	var firstTokenMs *int
 	responseID := ""
+	terminalEvent := ""
+	var lineageOutput []byte
+	lineageComplete := false
 	imageCount := 0
 	var imageOutputSizes []string
 	if reqStream {
@@ -252,6 +255,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		usage = result.usage
 		firstTokenMs = result.firstTokenMs
 		responseID = strings.TrimSpace(result.responseID)
+		terminalEvent = result.terminalEvent
+		lineageOutput = result.lineageOutput
+		lineageComplete = result.lineageComplete
 		imageCount = result.imageCount
 		imageOutputSizes = result.imageOutputSizes
 	} else {
@@ -261,6 +267,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		usage = result.usage
 		responseID = strings.TrimSpace(result.responseID)
+		terminalEvent = result.terminalEvent
+		lineageOutput = result.lineageOutput
+		lineageComplete = result.lineageComplete
 		imageCount = result.imageCount
 		imageOutputSizes = result.imageOutputSizes
 	}
@@ -289,9 +298,11 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		ReasoningEffort:               reasoningEffort,
 		Stream:                        reqStream,
 		OpenAIWSMode:                  false,
+		UpstreamTerminalEvent:         terminalEvent,
 		Duration:                      time.Since(startTime),
 		FirstTokenMs:                  firstTokenMs,
 	}
+	forwardResult.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
 	if imageCount > 0 {
 		forwardResult.ImageCount = imageCount
 		forwardResult.ImageSize = imageSizeTier
@@ -720,6 +731,9 @@ type openaiStreamingResultPassthrough struct {
 	usage            *OpenAIUsage
 	firstTokenMs     *int
 	responseID       string
+	terminalEvent    string
+	lineageOutput    []byte
+	lineageComplete  bool
 	imageCount       int
 	imageOutputSizes []string
 }
@@ -728,6 +742,9 @@ type openaiNonStreamingResultPassthrough struct {
 	*OpenAIUsage
 	usage            *OpenAIUsage
 	responseID       string
+	terminalEvent    string
+	lineageOutput    []byte
+	lineageComplete  bool
 	imageCount       int
 	imageOutputSizes []string
 }
@@ -1122,6 +1139,10 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	responseID := ""
+	terminalEvent := ""
+	var lineageOutput []byte
+	lineageComplete := false
+	lineageTerminalCount := 0
 	clientDisconnected := false
 	sawDone := false
 	sawTerminalEvent := false
@@ -1169,6 +1190,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			usage:            usage,
 			firstTokenMs:     firstTokenMs,
 			responseID:       responseID,
+			terminalEvent:    terminalEvent,
+			lineageOutput:    append([]byte(nil), lineageOutput...),
+			lineageComplete:  lineageComplete,
 			imageCount:       imageCounter.Count(),
 			imageOutputSizes: imageCounter.Sizes(),
 		}
@@ -1182,7 +1206,19 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			dataBytes := []byte(data)
 			trimmedData := strings.TrimSpace(data)
 			rawEventType := strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
+			rawResponseID := extractOpenAIResponseIDFromJSONBytes(dataBytes)
+			if responseID == "" && rawResponseID != "" {
+				responseID = rawResponseID
+			}
 			observer.ObserveOpenAI(dataBytes, rawEventType)
+			if openAIResponsesLineageCaptureEnabled(c) && isOpenAIWSTerminalEvent(rawEventType) {
+				lineageTerminalCount++
+				if lineageTerminalCount == 1 && (rawEventType == "response.completed" || rawEventType == "response.done") {
+					lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(dataBytes, responseID)
+				} else if lineageTerminalCount > 1 {
+					lineageOutput, lineageComplete = nil, false
+				}
+			}
 			if needModelReplace && strings.Contains(data, mappedModel) {
 				line = s.replaceModelInSSELine(line, mappedModel, originalModel)
 				if replacedData, replaced := extractOpenAISSEDataLine(line); replaced {
@@ -1256,9 +1292,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			}
 			if openAIStreamEventIsTerminal(trimmedData) {
 				sawTerminalEvent = true
-			}
-			if responseID == "" {
-				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
+				if rawEventType != "" {
+					terminalEvent = rawEventType
+				}
 			}
 			imageCounter.AddSSEData(dataBytes)
 			if sanitizedData, sanitized := sanitizeOpenAIResponseFailedEventForClient(
@@ -1369,6 +1405,10 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if err != nil {
 		return nil, err
 	}
+	lineageOutput, lineageComplete := []byte(nil), false
+	if openAIResponsesLineageCaptureEnabled(c) && !bodyHasSSEFraming(body) {
+		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, extractOpenAIResponseIDFromJSONBytes(body))
+	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -1420,6 +1460,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 		OpenAIUsage:      usage,
 		usage:            usage,
 		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
+		terminalEvent:    extractOpenAIResponseTerminalEventFromJSONBytes(body),
+		lineageOutput:    lineageOutput,
+		lineageComplete:  lineageComplete,
 		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
 		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 	}, nil
@@ -1488,10 +1531,18 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		c.Data(resp.StatusCode, contentType, body)
 	}
 
+	lineageOutput, lineageComplete := []byte(nil), false
+	if openAIResponsesLineageCaptureEnabled(c) {
+		expectedResponseID := firstNonEmpty(extractFirstOpenAIResponseIDFromSSEBody(bodyText), extractOpenAIResponseIDFromJSONBytes(body))
+		lineageOutput, lineageComplete = extractSingleOpenAIResponsesSuccessTerminal(bodyText, expectedResponseID)
+	}
 	return &openaiNonStreamingResultPassthrough{
 		OpenAIUsage:      usage,
 		usage:            usage,
 		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
+		terminalEvent:    firstNonEmpty(extractOpenAIResponseTerminalEventFromJSONBytes(body), extractOpenAISSETerminalEventType(bodyText)),
+		lineageOutput:    lineageOutput,
+		lineageComplete:  lineageComplete,
 		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
 		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
 	}, nil
