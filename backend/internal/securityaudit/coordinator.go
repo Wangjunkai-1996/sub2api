@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -208,6 +209,12 @@ func (c *Coordinator) checkBlocking(ctx context.Context, req Request) Decision {
 func (c *Coordinator) checkStrict(ctx context.Context, req Request, promptRequired bool) Decision {
 	legacy, err := c.checkLegacy(ctx, req.Clone())
 	if err != nil || legacy == nil || legacy.Unavailable || (!legacy.Allowed && !legacy.Blocked && !legacy.Flagged) {
+		slog.Warn("security_audit.strict_legacy_unavailable",
+			"request_id", req.RequestID,
+			"api_key_id", req.APIKeyID,
+			"group_id", pointerLogID(req.GroupID),
+			"protocol", req.Protocol,
+			"error", err)
 		return auditUnavailableDecision(legacy, nil)
 	}
 	if legacy.Blocked || legacy.Flagged {
