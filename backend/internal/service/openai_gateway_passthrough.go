@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -1142,6 +1143,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	terminalEvent := ""
 	var lineageOutput []byte
 	lineageComplete := false
+	lineageTerminalValid := false
 	lineageTerminalCount := 0
 	clientDisconnected := false
 	sawDone := false
@@ -1185,6 +1187,10 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	documentScanner := newOpenAISSEJSONDocumentScanner(scanner)
 
 	needModelReplace := strings.TrimSpace(originalModel) != "" && strings.TrimSpace(mappedModel) != "" && strings.TrimSpace(originalModel) != strings.TrimSpace(mappedModel)
+	streamOutputAccumulator := apicompat.NewBufferedResponseAccumulator()
+	streamOutputCollector := newResponsesStreamOutputCollector()
+	streamImageOutputs := make([]json.RawMessage, 0, 1)
+	streamSeenImages := make(map[string]struct{})
 	resultWithUsage := func() *openaiStreamingResultPassthrough {
 		return &openaiStreamingResultPassthrough{
 			usage:            usage,
@@ -1213,11 +1219,13 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			observer.ObserveOpenAI(dataBytes, rawEventType)
 			if openAIResponsesLineageCaptureEnabled(c) && isOpenAIWSTerminalEvent(rawEventType) {
 				lineageTerminalCount++
-				if lineageTerminalCount == 1 && (rawEventType == "response.completed" || rawEventType == "response.done") {
-					lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(dataBytes, responseID)
-				} else if lineageTerminalCount > 1 {
+				if lineageTerminalCount > 1 {
 					lineageOutput, lineageComplete = nil, false
+					lineageTerminalValid = false
 				}
+			}
+			if openAIResponsesLineageCaptureEnabled(c) && (rawEventType == "response.completed" || rawEventType == "response.done") && lineageTerminalCount == 1 {
+				_, lineageTerminalValid = extractOpenAIResponsesLineageOutput(dataBytes, responseID)
 			}
 			if needModelReplace && strings.Contains(data, mappedModel) {
 				line = s.replaceModelInSSELine(line, mappedModel, originalModel)
@@ -1236,6 +1244,21 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				trimmedData = strings.TrimSpace(string(normalizedData))
 				line = "data: " + string(normalizedData)
 			}
+			lineageDataBytes := dataBytes
+			lineageStreamComplete := true
+			streamOutputCollector.Observe(dataBytes)
+			if imageOutput, ok := extractImageGenerationOutputFromSSEData(dataBytes, streamSeenImages); ok {
+				streamImageOutputs = append(streamImageOutputs, imageOutput)
+			}
+			if responsesStreamEventMayContributeToOutput(rawEventType) {
+				var streamEvent apicompat.ResponsesStreamEvent
+				if err := json.Unmarshal(dataBytes, &streamEvent); err == nil {
+					streamOutputAccumulator.ProcessEvent(&streamEvent)
+				}
+			}
+			if openAIResponsesLineageCaptureEnabled(c) {
+				lineageDataBytes, lineageStreamComplete = normalizeResponsesStreamingLineageTerminalOutput(dataBytes, streamOutputAccumulator, streamImageOutputs, streamOutputCollector)
+			}
 			if trimmedData != "[DONE]" {
 				restoredData, restoreErr := restoreOpenAIResponsesNamespacePayload(c, dataBytes)
 				if restoreErr != nil {
@@ -1245,6 +1268,15 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					dataBytes = restoredData
 					trimmedData = strings.TrimSpace(string(restoredData))
 					line = "data: " + string(restoredData)
+				}
+				if openAIResponsesLineageCaptureEnabled(c) && (rawEventType == "response.completed" || rawEventType == "response.done") {
+					restoredLineageData, restoreErr := restoreOpenAIResponsesNamespacePayload(c, lineageDataBytes)
+					if restoreErr != nil {
+						return resultWithUsage(), fmt.Errorf("restore OpenAI passthrough lineage namespace response: %w", restoreErr)
+					}
+					lineageDataBytes = restoredLineageData
+				} else {
+					lineageDataBytes = dataBytes
 				}
 			}
 			eventType := strings.TrimSpace(gjson.Get(trimmedData, "type").String())
@@ -1305,6 +1337,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				dataBytes = sanitizedData
 				trimmedData = strings.TrimSpace(string(sanitizedData))
 				line = "data: " + string(sanitizedData)
+			}
+			if openAIResponsesLineageCaptureEnabled(c) && lineageTerminalValid && lineageStreamComplete && streamOutputCollector.Complete() && (rawEventType == "response.completed" || rawEventType == "response.done") && lineageTerminalCount == 1 {
+				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(lineageDataBytes, responseID)
 			}
 			lineStartsClientOutput = forceFlushFailedEvent || openAIStreamDataStartsClientOutput(trimmedData, eventType)
 			if firstTokenMs == nil && lineStartsClientOutput && trimmedData != "[DONE]" {
@@ -1406,8 +1441,11 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 		return nil, err
 	}
 	lineageOutput, lineageComplete := []byte(nil), false
+	lineageResponseID := ""
+	lineageSourceValid := false
 	if openAIResponsesLineageCaptureEnabled(c) && !bodyHasSSEFraming(body) {
-		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, extractOpenAIResponseIDFromJSONBytes(body))
+		lineageResponseID = extractOpenAIResponseIDFromJSONBytes(body)
+		_, lineageSourceValid = extractOpenAIResponsesLineageOutput(body, lineageResponseID)
 	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
@@ -1453,6 +1491,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if err != nil {
 		return nil, fmt.Errorf("restore OpenAI passthrough namespace response: %w", err)
 	}
+	if lineageSourceValid {
+		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, lineageResponseID)
+	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
@@ -1475,6 +1516,8 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, body []byte, originalModel string, mappedModel string) (*openaiNonStreamingResultPassthrough, error) {
 	bodyText := string(body)
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
+	lineageReconstructionComplete := true
+	var lineageReconstructedOutput []byte
 
 	usage := &OpenAIUsage{}
 	if ok {
@@ -1484,6 +1527,13 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		// When the terminal event has an empty output array, reconstruct
 		// output from accumulated delta events so the client gets full content.
 		if len(gjson.GetBytes(finalResponse, "output").Array()) == 0 {
+			if strictOutput, reconstructed, complete := reconstructResponseLineageOutputFromSSE(bodyText); complete {
+				if reconstructed {
+					lineageReconstructedOutput = strictOutput
+				}
+			} else {
+				lineageReconstructionComplete = false
+			}
 			if outputJSON, reconstructed := reconstructResponseOutputFromSSE(bodyText); reconstructed {
 				if patched, err := sjson.SetRawBytes(finalResponse, "output", outputJSON); err == nil {
 					finalResponse = patched
@@ -1535,6 +1585,22 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	if openAIResponsesLineageCaptureEnabled(c) {
 		expectedResponseID := firstNonEmpty(extractFirstOpenAIResponseIDFromSSEBody(bodyText), extractOpenAIResponseIDFromJSONBytes(body))
 		lineageOutput, lineageComplete = extractSingleOpenAIResponsesSuccessTerminal(bodyText, expectedResponseID)
+		if lineageComplete && ok && lineageReconstructionComplete {
+			lineageBody := body
+			if len(lineageReconstructedOutput) > 0 {
+				patched, patchErr := sjson.SetRawBytes(lineageBody, "output", lineageReconstructedOutput)
+				if patchErr != nil {
+					lineageReconstructionComplete = false
+				} else {
+					lineageBody = patched
+				}
+			}
+			if lineageReconstructionComplete {
+				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(lineageBody, expectedResponseID)
+			}
+		} else if !lineageReconstructionComplete {
+			lineageOutput, lineageComplete = nil, false
+		}
 	}
 	return &openaiNonStreamingResultPassthrough{
 		OpenAIUsage:      usage,

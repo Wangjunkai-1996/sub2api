@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -149,6 +150,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	terminalEvent := ""
 	var lineageOutput []byte
 	lineageComplete := false
+	lineageTerminalValid := false
 	lineageTerminalCount := 0
 	var firstOutputScanGuard atomic.Bool
 	firstOutputScanGuard.Store(guardFirstOutput)
@@ -300,6 +302,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 
 	needModelReplace := originalModel != mappedModel
 	streamOutputAccumulator := apicompat.NewBufferedResponseAccumulator()
+	streamOutputCollector := newResponsesStreamOutputCollector()
 	streamImageOutputs := make([]json.RawMessage, 0, 1)
 	streamSeenImages := make(map[string]struct{})
 	resultWithUsage := func() *openaiStreamingResult {
@@ -431,6 +434,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					lineageTerminalCount++
 					if lineageTerminalCount > 1 {
 						lineageOutput, lineageComplete = nil, false
+						lineageTerminalValid = false
 					}
 				}
 				if eventType != "" {
@@ -441,7 +445,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
 			}
 			if openAIResponsesLineageCaptureEnabled(c) && (eventType == "response.completed" || eventType == "response.done") && lineageTerminalCount == 1 {
-				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(dataBytes, responseID)
+				_, lineageTerminalValid = extractOpenAIResponsesLineageOutput(dataBytes, responseID)
 			}
 			forceFlushFailedEvent := false
 			if eventType == "response.failed" {
@@ -500,6 +504,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				line = "data: " + data
 				eventType = strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
 			}
+			streamOutputCollector.Observe(dataBytes)
+			lineageDataBytes := dataBytes
+			lineageStreamComplete := true
 			if imageOutput, ok := extractImageGenerationOutputFromSSEData(dataBytes, streamSeenImages); ok {
 				streamImageOutputs = append(streamImageOutputs, imageOutput)
 			}
@@ -508,6 +515,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				if err := json.Unmarshal(dataBytes, &streamEvent); err == nil {
 					streamOutputAccumulator.ProcessEvent(&streamEvent)
 				}
+			}
+			if openAIResponsesLineageCaptureEnabled(c) {
+				lineageDataBytes, lineageStreamComplete = normalizeResponsesStreamingLineageTerminalOutput(dataBytes, streamOutputAccumulator, streamImageOutputs, streamOutputCollector)
 			}
 			if normalizedData, normalized := normalizeResponsesStreamingTerminalOutput(dataBytes, streamOutputAccumulator, streamImageOutputs); normalized {
 				dataBytes = normalizedData
@@ -530,6 +540,19 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				data = string(restoredData)
 				line = "data: " + data
 				eventType = strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
+			}
+			if openAIResponsesLineageCaptureEnabled(c) && lineageTerminalValid && lineageStreamComplete && streamOutputCollector.Complete() && (eventType == "response.completed" || eventType == "response.done") && lineageTerminalCount == 1 {
+				restoredLineageData, restoreLineageErr := restoreGrokResponsesClientToolPayload(c, lineageDataBytes)
+				if restoreLineageErr != nil {
+					streamEarlyErr = fmt.Errorf("restore Grok Responses lineage tool response: %w", restoreLineageErr)
+					return
+				}
+				restoredLineageData, restoreLineageErr = restoreOpenAIResponsesNamespacePayload(c, restoredLineageData)
+				if restoreLineageErr != nil {
+					streamEarlyErr = fmt.Errorf("restore OpenAI lineage namespace response: %w", restoreLineageErr)
+					return
+				}
+				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(restoredLineageData, responseID)
 			}
 			if sanitizedData, sanitized := sanitizeOpenAIResponseFailedEventForClient(
 				dataBytes,
@@ -1176,8 +1199,11 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		return nil, err
 	}
 	lineageOutput, lineageComplete := []byte(nil), false
+	lineageResponseID := ""
+	lineageSourceValid := false
 	if openAIResponsesLineageCaptureEnabled(c) && !bodyHasSSEFraming(body) {
-		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, extractOpenAIResponseIDFromJSONBytes(body))
+		lineageResponseID = extractOpenAIResponseIDFromJSONBytes(body)
+		_, lineageSourceValid = extractOpenAIResponsesLineageOutput(body, lineageResponseID)
 	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
@@ -1239,6 +1265,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	if err != nil {
 		return nil, fmt.Errorf("restore OpenAI namespace response: %w", err)
 	}
+	if lineageSourceValid {
+		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, lineageResponseID)
+	}
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 
 	contentType := "application/json"
@@ -1288,6 +1317,8 @@ func bodyHasSSEFraming(body []byte) bool {
 func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, body []byte, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
 	bodyText := string(body)
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
+	lineageReconstructionComplete := true
+	var lineageReconstructedOutput []byte
 
 	usage := &OpenAIUsage{}
 	if ok {
@@ -1298,6 +1329,13 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		// output from accumulated delta events so the client gets full content.
 		// gjson Array() returns empty slice for null, missing, or empty arrays.
 		if len(gjson.GetBytes(finalResponse, "output").Array()) == 0 {
+			if strictOutput, reconstructed, complete := reconstructResponseLineageOutputFromSSE(bodyText); complete {
+				if reconstructed {
+					lineageReconstructedOutput = strictOutput
+				}
+			} else {
+				lineageReconstructionComplete = false
+			}
 			if outputJSON, reconstructed := reconstructResponseOutputFromSSE(bodyText); reconstructed {
 				if patched, err := sjson.SetRawBytes(finalResponse, "output", outputJSON); err == nil {
 					finalResponse = patched
@@ -1353,6 +1391,22 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	if openAIResponsesLineageCaptureEnabled(c) {
 		expectedResponseID := firstNonEmpty(extractFirstOpenAIResponseIDFromSSEBody(bodyText), extractOpenAIResponseIDFromJSONBytes(body))
 		lineageOutput, lineageComplete = extractSingleOpenAIResponsesSuccessTerminal(bodyText, expectedResponseID)
+		if lineageComplete && ok && lineageReconstructionComplete {
+			lineageBody := body
+			if len(lineageReconstructedOutput) > 0 {
+				patched, patchErr := sjson.SetRawBytes(lineageBody, "output", lineageReconstructedOutput)
+				if patchErr != nil {
+					lineageReconstructionComplete = false
+				} else {
+					lineageBody = patched
+				}
+			}
+			if lineageReconstructionComplete {
+				lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(lineageBody, expectedResponseID)
+			}
+		} else if !lineageReconstructionComplete {
+			lineageOutput, lineageComplete = nil, false
+		}
 	}
 	return &openaiNonStreamingResult{
 		OpenAIUsage:      usage,
@@ -1570,6 +1624,148 @@ func normalizeCompletedImageGenerationStatus(data []byte) ([]byte, bool) {
 	}
 }
 
+type responsesStreamOutputCollector struct {
+	rawDoneItems          []json.RawMessage
+	rawDoneIndexes        map[int64]struct{}
+	rawDoneKeys           map[string]struct{}
+	contributorIndexes    map[int64]struct{}
+	requiresDoneIndexes   map[int64]struct{}
+	contributorUnindexed  bool
+	requiresDoneUnindexed bool
+	fallbackUnsupported   bool
+	complete              bool
+}
+
+func newResponsesStreamOutputCollector() *responsesStreamOutputCollector {
+	return &responsesStreamOutputCollector{
+		rawDoneIndexes:      make(map[int64]struct{}),
+		rawDoneKeys:         make(map[string]struct{}),
+		contributorIndexes:  make(map[int64]struct{}),
+		requiresDoneIndexes: make(map[int64]struct{}),
+		complete:            true,
+	}
+}
+
+func (c *responsesStreamOutputCollector) Observe(data []byte) {
+	if c == nil || !c.complete || len(data) == 0 {
+		return
+	}
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("[DONE]")) {
+		return
+	}
+	if !gjson.ValidBytes(trimmed) {
+		c.complete = false
+		return
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+	if !strings.HasPrefix(eventType, "response.") {
+		return
+	}
+	if auditinput.HasDuplicateJSONFields(data) {
+		c.complete = false
+		return
+	}
+	recordIndex := func(target map[int64]struct{}, unindexed *bool) {
+		index := gjson.GetBytes(data, "output_index")
+		if !index.Exists() || index.Type != gjson.Number || index.Int() < 0 {
+			*unindexed = true
+			return
+		}
+		target[index.Int()] = struct{}{}
+	}
+	switch eventType {
+	case "response.output_item.done":
+		item := gjson.GetBytes(data, "item")
+		if !item.Exists() || !item.IsObject() {
+			c.complete = false
+			return
+		}
+		key := ""
+		index := gjson.GetBytes(data, "output_index")
+		if index.Exists() && index.Type == gjson.Number && index.Int() >= 0 {
+			key = "index:" + strconv.FormatInt(index.Int(), 10)
+			c.rawDoneIndexes[index.Int()] = struct{}{}
+		} else if id := strings.TrimSpace(item.Get("id").String()); id != "" {
+			key = "id:" + id
+		} else if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+			key = "call:" + callID
+		}
+		if key == "" {
+			c.complete = false
+			return
+		}
+		if _, duplicate := c.rawDoneKeys[key]; duplicate {
+			c.complete = false
+			return
+		}
+		c.rawDoneKeys[key] = struct{}{}
+		c.rawDoneItems = append(c.rawDoneItems, append(json.RawMessage(nil), item.Raw...))
+	case "response.output_item.added":
+		recordIndex(c.contributorIndexes, &c.contributorUnindexed)
+		itemType := strings.TrimSpace(gjson.GetBytes(data, "item.type").String())
+		switch itemType {
+		case "message", "reasoning", "function_call", "custom_tool_call":
+		default:
+			c.fallbackUnsupported = true
+		}
+	case "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		recordIndex(c.contributorIndexes, &c.contributorUnindexed)
+	default:
+		if strings.HasSuffix(eventType, ".delta") || (strings.HasSuffix(eventType, ".done") && eventType != "response.done") {
+			recordIndex(c.requiresDoneIndexes, &c.requiresDoneUnindexed)
+		}
+	}
+}
+
+func (c *responsesStreamOutputCollector) Complete() bool {
+	return c != nil && c.complete
+}
+
+func (c *responsesStreamOutputCollector) HasRawDoneItems() bool {
+	return c != nil && len(c.rawDoneItems) > 0
+}
+
+func (c *responsesStreamOutputCollector) buildOutput(acc *apicompat.BufferedResponseAccumulator, imageOutputs []json.RawMessage) ([]byte, bool, bool) {
+	if c == nil || !c.complete {
+		return nil, false, false
+	}
+	if len(c.rawDoneItems) > 0 {
+		if c.contributorUnindexed || c.requiresDoneUnindexed {
+			c.complete = false
+			return nil, false, false
+		}
+		for index := range c.contributorIndexes {
+			if _, ok := c.rawDoneIndexes[index]; !ok {
+				c.complete = false
+				return nil, false, false
+			}
+		}
+		for index := range c.requiresDoneIndexes {
+			if _, ok := c.rawDoneIndexes[index]; !ok {
+				c.complete = false
+				return nil, false, false
+			}
+		}
+		output, err := json.Marshal(c.rawDoneItems)
+		if err != nil {
+			c.complete = false
+			return nil, false, false
+		}
+		return output, true, true
+	}
+	if c.fallbackUnsupported || len(c.requiresDoneIndexes) > 0 || c.requiresDoneUnindexed {
+		c.complete = false
+		return nil, false, false
+	}
+	output, ok := buildResponsesOutputJSON(acc, imageOutputs)
+	if !ok && (len(c.contributorIndexes) > 0 || c.contributorUnindexed) {
+		c.complete = false
+		return nil, false, false
+	}
+	return output, ok, true
+}
+
 func normalizeResponsesStreamingTerminalOutput(data []byte, acc *apicompat.BufferedResponseAccumulator, imageOutputs []json.RawMessage) ([]byte, bool) {
 	eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
 	switch eventType {
@@ -1597,12 +1793,37 @@ func normalizeResponsesStreamingTerminalOutput(data []byte, acc *apicompat.Buffe
 	return updated, true
 }
 
+func normalizeResponsesStreamingLineageTerminalOutput(data []byte, acc *apicompat.BufferedResponseAccumulator, imageOutputs []json.RawMessage, collector *responsesStreamOutputCollector) ([]byte, bool) {
+	eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+	if eventType != "response.completed" && eventType != "response.done" {
+		return data, true
+	}
+	output := gjson.GetBytes(data, "response.output")
+	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		return data, collector.Complete()
+	}
+	outputJSON, reconstructed, complete := collector.buildOutput(acc, imageOutputs)
+	if !complete {
+		return data, false
+	}
+	if !reconstructed {
+		return data, true
+	}
+	updated, err := sjson.SetRawBytes(data, "response.output", outputJSON)
+	if err != nil {
+		return data, false
+	}
+	return updated, true
+}
+
 func responsesStreamEventMayContributeToOutput(eventType string) bool {
 	switch eventType {
 	case "response.output_text.delta",
 		"response.output_item.added",
 		"response.function_call_arguments.delta",
-		"response.reasoning_summary_text.delta":
+		"response.custom_tool_call_input.delta",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_text.delta":
 		return true
 	default:
 		return false
@@ -1755,6 +1976,30 @@ func findRawCompactionItemFromSSE(bodyText string) (json.RawMessage, bool) {
 // item types such as compaction — Codex remote compact v2 then fails with
 // "expected exactly one compaction output item, got 0" (#3887).
 // Returns (nil, false) if nothing could be reconstructed.
+func reconstructResponseLineageOutputFromSSE(bodyText string) ([]byte, bool, bool) {
+	acc := apicompat.NewBufferedResponseAccumulator()
+	collector := newResponsesStreamOutputCollector()
+	imageOutputs := make([]json.RawMessage, 0, 1)
+	seenImages := make(map[string]struct{})
+	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
+		if normalized, changed := normalizeCompletedImageGenerationStatus(data); changed {
+			data = normalized
+		}
+		collector.Observe(data)
+		if imageOutput, ok := extractImageGenerationOutputFromSSEData(data, seenImages); ok {
+			imageOutputs = append(imageOutputs, imageOutput)
+		}
+		eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+		if responsesStreamEventMayContributeToOutput(eventType) {
+			var event apicompat.ResponsesStreamEvent
+			if err := json.Unmarshal(data, &event); err == nil {
+				acc.ProcessEvent(&event)
+			}
+		}
+	})
+	return collector.buildOutput(acc, imageOutputs)
+}
+
 func reconstructResponseOutputFromSSE(bodyText string) ([]byte, bool) {
 	if outputJSON, ok := collectRawResponsesOutputItemsFromSSE(bodyText); ok {
 		return outputJSON, true
