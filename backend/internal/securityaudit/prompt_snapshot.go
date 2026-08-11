@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 var (
@@ -24,6 +25,10 @@ var (
 
 const promptAuditPrioritySeparator = "\x00SUB2API_PROMPT_AUDIT_PRIORITY_END\x00"
 
+// StrictPromptGuardMaxRunes is the absolute amount of current-user text that a
+// strict Prompt Guard request may send to a remote scanner.
+const StrictPromptGuardMaxRunes = 12000
+
 type promptSegment struct {
 	text string
 	user bool
@@ -31,17 +36,16 @@ type promptSegment struct {
 }
 
 func ExtractPromptSnapshot(req Request) (PromptSnapshot, error) {
-	return extractPromptSnapshot(req, false)
+	return extractPromptSnapshot(req, false, false)
 }
 
-// ExtractBlockingPromptSnapshot builds the narrow, low-latency blocking input
-// when configured. Asynchronous auditing always uses ExtractPromptSnapshot so
-// the complete client-controlled transcript is retained for review.
+// ExtractBlockingPromptSnapshot builds the narrow current-user input used by
+// strict blocking and strict asynchronous auditing.
 func ExtractBlockingPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
-	return extractPromptSnapshot(req, latestTurnOnly)
+	return extractPromptSnapshot(req, true, latestTurnOnly)
 }
 
-func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
+func extractPromptSnapshot(req Request, blocking, latestTurnOnly bool) (PromptSnapshot, error) {
 	document := req.Document.Clone()
 	if document == nil {
 		if req.Strict {
@@ -57,7 +61,15 @@ func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, er
 		return PromptSnapshot{}, errors.New("prompt audit input is incomplete")
 	}
 	var segments []string
-	if req.Strict && strings.TrimSpace(req.AuditContext) != "" {
+	if blocking && req.Strict {
+		// Complete parsing and lineage validation happen before this point. The
+		// remote synchronous guard only needs the latest user-authored text from
+		// the current request; history, instructions, tools, outputs, and images
+		// must not amplify one request into a large remote scan.
+		if text := service.ExtractStrictCurrentUserText(req.Protocol, req.Body); text != "" {
+			segments = []string{hardLimitRunes(text, StrictPromptGuardMaxRunes)}
+		}
+	} else if req.Strict && strings.TrimSpace(req.AuditContext) != "" {
 		// Strict lineage must be scanned in chronological order as a single
 		// cumulative context. Reordering the current user turn ahead of its parent
 		// would hide cross-turn combinations from semantic guards.
@@ -93,6 +105,31 @@ func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, er
 		PromptLength: utf8.RuneCountInString(metadataText), MessageCount: len(segments), Stage: stage,
 		ScanText: scanText,
 	}, nil
+}
+
+func hardLimitRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
+}
+
+func limitPromptSnapshot(snapshot PromptSnapshot, limit int) PromptSnapshot {
+	limited := hardLimitRunes(strings.ReplaceAll(snapshot.ScanText, promptAuditPrioritySeparator, "\n\n"), limit)
+	if limited == snapshot.ScanText {
+		return snapshot
+	}
+	digest := sha256.Sum256([]byte(limited))
+	snapshot.ScanText = limited
+	snapshot.PromptHash = hex.EncodeToString(digest[:])
+	snapshot.RedactedPreview = BuildPromptPreview(limited, DefaultPromptPreviewMaxRunes)
+	snapshot.FullPrompt = BuildFullPrompt(limited, DefaultFullPromptMaxRunes)
+	snapshot.PromptLength = utf8.RuneCountInString(limited)
+	return snapshot
 }
 
 // DefaultPromptPreviewMaxRunes caps how much sanitized prompt text may be

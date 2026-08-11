@@ -681,6 +681,53 @@ func TestContentModerationStrictPreBlockAppliesUsesEffectiveGroupScope(t *testin
 	}
 }
 
+func TestStrictContentModerationRequestSupportedNarrowsToOpenAIGPTText(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		model    string
+		want     bool
+	}{
+		{name: "responses GPT", protocol: ContentModerationProtocolOpenAIResponses, model: "gpt-5.5", want: true},
+		{name: "chat GPT with surrounding whitespace", protocol: "  OPENAI_CHAT_COMPLETIONS  ", model: " GPT-5.4 ", want: true},
+		{name: "responses image model", protocol: ContentModerationProtocolOpenAIResponses, model: "gpt-image-1"},
+		{name: "chat image model", protocol: ContentModerationProtocolOpenAIChat, model: "gpt-image-1.5"},
+		{name: "responses non GPT model", protocol: ContentModerationProtocolOpenAIResponses, model: "gemini-3-pro"},
+		{name: "anthropic protocol with GPT model", protocol: ContentModerationProtocolAnthropicMessages, model: "gpt-5.5"},
+		{name: "gemini protocol with GPT model", protocol: ContentModerationProtocolGemini, model: "gpt-5.5"},
+		{name: "OpenAI images protocol", protocol: ContentModerationProtocolOpenAIImages, model: "gpt-5.5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, StrictContentModerationRequestSupported(tt.protocol, tt.model))
+		})
+	}
+}
+
+func TestContentModerationStrictRequestPreBlockAppliesRejectsUnsupportedBeforeConfigLoad(t *testing.T) {
+	var svc *ContentModerationService
+	requests := []struct {
+		protocol string
+		model    string
+	}{
+		{protocol: ContentModerationProtocolOpenAIResponses, model: "gpt-image-1"},
+		{protocol: ContentModerationProtocolOpenAIResponses, model: "gemini-3-pro"},
+		{protocol: ContentModerationProtocolAnthropicMessages, model: "gpt-5.5"},
+		{protocol: ContentModerationProtocolGemini, model: "gpt-5.5"},
+		{protocol: ContentModerationProtocolOpenAIImages, model: "gpt-5.5"},
+	}
+
+	for _, request := range requests {
+		applies, err := svc.StrictRequestPreBlockApplies(context.Background(), nil, request.protocol, request.model)
+		require.NoError(t, err)
+		require.False(t, applies)
+	}
+
+	_, err := svc.StrictRequestPreBlockApplies(context.Background(), nil, ContentModerationProtocolOpenAIResponses, "gpt-5.5")
+	require.ErrorContains(t, err, "service unavailable")
+}
+
 func TestContentModerationCheck_KeywordsIgnoredInObserveMode(t *testing.T) {
 	upstreamHits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1153,9 +1200,9 @@ func TestContentModerationInput_NormalizeKeepsImagesAndModerationInputSamplesOne
 	require.Contains(t, images, parts[1].ImageURL.URL)
 }
 
-func TestStrictModerationBatchesAuditTextAndExclude59ToolScreenshots(t *testing.T) {
+func TestStrictModerationBatchesUsesOneTextInputAndIgnoresImages(t *testing.T) {
 	document := &auditinput.Document{
-		NormalizedText: strings.Repeat("a", maxModerationInputRunes+1),
+		NormalizedText: "current user text",
 		HasImages:      true,
 	}
 
@@ -1163,22 +1210,27 @@ func TestStrictModerationBatchesAuditTextAndExclude59ToolScreenshots(t *testing.
 
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
-	textBatch, ok := batches[0].input.([]string)
+	textInput, ok := batches[0].input.(string)
 	require.True(t, ok)
-	require.Len(t, textBatch, 2)
-	require.Equal(t, 2, batches[0].expectedResults)
+	require.Equal(t, "current user text", textInput)
+	require.Equal(t, 1, batches[0].expectedResults)
 }
 
-func TestStrictModerationBatchesRejectsTextBeyondAPICallLimit(t *testing.T) {
+func TestStrictModerationBatchesTruncatesUnnormalizedTextToRuneLimit(t *testing.T) {
+	want := strings.Repeat("界", maxStrictModerationTextRunes)
 	document := &auditinput.Document{
-		NormalizedText: strings.Repeat("a", maxStrictModerationTextRunes+1),
+		NormalizedText: want + "尾",
 	}
 
 	batches, err := strictModerationBatches(document)
 
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "requires 9 API calls, limit is 8")
-	require.Nil(t, batches)
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+	textInput, ok := batches[0].input.(string)
+	require.True(t, ok)
+	require.Equal(t, want, textInput)
+	require.Equal(t, maxStrictModerationTextRunes, len([]rune(textInput)))
+	require.Equal(t, 1, batches[0].expectedResults)
 }
 
 func TestBuildModerationTestInputRejectsMultipleImages(t *testing.T) {
@@ -1209,6 +1261,145 @@ func TestExtractContentModerationInput_OpenAIResponsesCodexPayloadUsesLastUserMe
 	require.Empty(t, input.Images)
 	require.NotContains(t, input.Text, "developer permissions")
 	require.NotContains(t, input.Text, "first user prompt")
+}
+
+func TestExtractStrictCurrentUserText(t *testing.T) {
+	longText := strings.Repeat("界", maxStrictModerationTextRunes) + strings.Repeat("尾", 17)
+	longBody, err := json.Marshal(map[string]any{
+		"input": []any{map[string]any{
+			"type": "message", "role": "user",
+			"content": []any{map[string]any{"type": "input_text", "text": longText}},
+		}},
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		protocol  string
+		body      []byte
+		want      string
+		forbidden string
+	}{
+		{
+			name:     "chat scans backward for the latest user role",
+			protocol: ContentModerationProtocolOpenAIChat,
+			body: []byte(`{"messages":[
+				{"role":"user","content":"historical user"},
+				{"role":"assistant","content":"assistant output"},
+				{"role":"user","content":"latest user"},
+				{"role":"assistant","content":"later assistant output"},
+				{"role":"tool","content":"later tool output"}
+			]}`),
+			want:      "latest user",
+			forbidden: "later tool output",
+		},
+		{
+			name:     "responses ignores assistant and tool output after latest user",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"historical user"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"latest user"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
+				{"type":"function_call_output","call_id":"call_1","output":"tool output"}
+			]}`),
+			want:      "latest user",
+			forbidden: "tool output",
+		},
+		{
+			name:     "latest image-only user does not fall back to history",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"historical user must not be reused"}]},
+				{"type":"message","role":"user","content":[{"type":"input_image","image_url":"opaque-image-secret"}]},
+				{"type":"function_call_output","call_id":"call_1","output":"tool output"}
+			]}`),
+			forbidden: "historical user must not be reused",
+		},
+		{
+			name:     "flat text and image items are one current user input",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"input_text","text":"flat user text"},
+				{"type":"input_image","image_url":"opaque-image-secret"}
+			]}`),
+			want:      "flat user text",
+			forbidden: "opaque-image-secret",
+		},
+		{
+			name:     "image values never enter text result",
+			protocol: ContentModerationProtocolOpenAIChat,
+			body: []byte(`{"messages":[{"role":"user","content":[
+				{"type":"text","text":"inspect this"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,IMAGE_SECRET"}}
+			]}]}`),
+			want:      "inspect this",
+			forbidden: "IMAGE_SECRET",
+		},
+		{
+			name:     "multiple text parts are joined and normalized",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[{"type":"message","role":"user","content":[
+				{"type":"input_text","text":" first\npart "},
+				{"type":"input_image","image_url":"opaque-image"},
+				{"type":"input_text","text":" second   part "}
+			]}]}`),
+			want:      "first part second part",
+			forbidden: "opaque-image",
+		},
+		{
+			name:      "text is truncated at 12000 runes",
+			protocol:  ContentModerationProtocolOpenAIResponses,
+			body:      longBody,
+			want:      strings.Repeat("界", maxStrictModerationTextRunes),
+			forbidden: "尾",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractStrictCurrentUserText(tt.protocol, tt.body)
+			require.Equal(t, tt.want, got)
+			if tt.forbidden != "" {
+				require.NotContains(t, got, tt.forbidden)
+			}
+		})
+	}
+}
+
+func TestExtractStrictCurrentUserText_ExplicitResponsesTopLevelPayloadWithHistoricalImage(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{
+			name: "message top-level text",
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":[{"type":"input_image","image_url":"opaque-history"}]},
+				{"type":"message","role":"user","text":"latest top-level text"}
+			]}`),
+			want: "latest top-level text",
+		},
+		{
+			name: "empty type top-level refusal",
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":[{"type":"input_image","image_url":"opaque-history"}]},
+				{"role":"user","refusal":"latest top-level refusal"}
+			]}`),
+			want: "latest top-level refusal",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			document := auditinput.ParseForTextAudit(ContentModerationProtocolOpenAIResponses, tt.body)
+			require.True(t, document.Complete, "%+v", document.Issues)
+			require.True(t, document.HasImages)
+			require.Empty(t, document.Media)
+			require.Contains(t, document.NormalizedText, tt.want)
+			require.Equal(t, tt.want, ExtractStrictCurrentUserText(ContentModerationProtocolOpenAIResponses, tt.body))
+		})
+	}
 }
 
 func TestContentModerationCheck_OpenAIResponsesRecordsNonHitForCodexPayload(t *testing.T) {
@@ -1342,6 +1533,175 @@ func TestContentModerationCheck_PreBlockBlocksCodexResponsesLatestUserInput(t *t
 	require.Equal(t, ContentModerationModePreBlock, logs[0].Mode)
 	require.Equal(t, "latest blocked prompt", logs[0].InputExcerpt)
 	require.Equal(t, "latest blocked prompt", moderationRequest.Input)
+}
+
+func TestContentModerationCheck_StrictSendsOnlyCurrentUserText(t *testing.T) {
+	groupID := int64(12)
+	tests := []struct {
+		name     string
+		protocol string
+		body     []byte
+		want     string
+	}{
+		{
+			name:     "chat completions",
+			protocol: ContentModerationProtocolOpenAIChat,
+			body: []byte(`{
+				"model":"gpt-5.5",
+				"messages":[
+					{"role":"system","content":"system secret"},
+					{"role":"developer","content":"developer secret"},
+					{"role":"user","content":"historical user text"},
+					{"role":"assistant","content":"assistant output"},
+					{"role":"tool","content":"tool output"},
+					{"role":"user","content":[
+						{"type":"text","text":"  current   chat user text  "},
+						{"type":"image_url","image_url":{"url":"opaque-image-payload"}}
+					]}
+				],
+				"tools":[{"type":"function","function":{"name":"secret_tool","description":"tool schema secret"}}]
+			}`),
+			want: "current chat user text",
+		},
+		{
+			name:     "responses",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{
+				"model":"gpt-5.5",
+				"instructions":"system instructions secret",
+				"tools":[{"type":"function","name":"secret_tool","description":"tool schema secret"}],
+				"input":[
+					{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer secret"}]},
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"historical user text"}]},
+					{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
+					{"type":"function_call_output","call_id":"call_1","output":"tool output"},
+					{"type":"message","role":"user","content":[
+						{"type":"input_text","text":"current responses user text"},
+						{"type":"input_image","image_url":"opaque-image-payload"}
+					]}
+				]
+			}`),
+			want: "current responses user text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			requestCount := 0
+			var gotInput any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request moderationAPIRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				mu.Lock()
+				requestCount++
+				gotInput = request.Input
+				mu.Unlock()
+				require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+					Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+				}}}))
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.Mode = ContentModerationModePreBlock
+			cfg.AllGroups = false
+			cfg.GroupIDs = []int64{groupID}
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = []string{"sk-test"}
+			cfg.RetryCount = 5
+			rawCfg, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			svc := &ContentModerationService{
+				settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+					SettingKeyRiskControlEnabled:      "true",
+					SettingKeyContentModerationConfig: string(rawCfg),
+				}},
+				repo:       &contentModerationTestRepo{},
+				httpClient: server.Client(),
+				asyncQueue: make(chan contentModerationTask, 1),
+				keyHealth:  make(map[string]*contentModerationKeyHealth),
+			}
+
+			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+				Strict:       true,
+				APIKeyID:     7,
+				GroupID:      &groupID,
+				Model:        "gpt-5.5",
+				Protocol:     tt.protocol,
+				Body:         tt.body,
+				AuditContext: "system context secret\ndeveloper context secret\nhistorical replay\nassistant replay\ntool output replay",
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, decision)
+			require.True(t, decision.Allowed)
+			mu.Lock()
+			defer mu.Unlock()
+			require.Equal(t, 1, requestCount)
+			require.Equal(t, tt.want, gotInput)
+		})
+	}
+}
+
+func TestContentModerationCheck_StrictTruncatesCurrentUserTextToRuneLimit(t *testing.T) {
+	groupID := int64(12)
+	want := strings.Repeat("界", maxStrictModerationTextRunes)
+	body, err := json.Marshal(map[string]any{
+		"input": []any{map[string]any{
+			"type": "message", "role": "user",
+			"content": []any{map[string]any{
+				"type": "input_text", "text": want + strings.Repeat("尾", 17),
+			}},
+		}},
+	})
+	require.NoError(t, err)
+
+	requestCount := 0
+	var gotInput any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		var request moderationAPIRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		gotInput = request.Input
+		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+		}}}))
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.AllGroups = false
+	cfg.GroupIDs = []int64{groupID}
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-test"}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	svc := &ContentModerationService{
+		settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		repo:       &contentModerationTestRepo{},
+		httpClient: server.Client(),
+		asyncQueue: make(chan contentModerationTask, 1),
+		keyHealth:  make(map[string]*contentModerationKeyHealth),
+	}
+
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, decision)
+	require.True(t, decision.Allowed)
+	require.Equal(t, 1, requestCount)
+	require.Equal(t, want, gotInput)
+	require.Equal(t, maxStrictModerationTextRunes, len([]rune(gotInput.(string))))
 }
 
 func TestContentModerationStatusTracksPreBlockSyncMetrics(t *testing.T) {
@@ -1692,24 +2052,20 @@ func TestContentModerationCheck_StrictValidatesCompleteModerationVerdict(t *test
 	}
 }
 
-func TestContentModerationCheck_StrictBlocksWhenLaterBatchResultIsFlagged(t *testing.T) {
+func TestContentModerationCheck_StrictBlocksFlaggedSingleResult(t *testing.T) {
 	groupID := int64(12)
-	body, err := json.Marshal(map[string]string{
-		"input": strings.Repeat("a", maxModerationInputRunes+1),
-	})
-	require.NoError(t, err)
+	body := []byte(`{"input":"current flagged text"}`)
+	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := moderationRequestExpectedResultCount(t, r)
-		results := make([]moderationAPIResult, count)
-		for index := range results {
-			results[index] = moderationAPIResult{
-				Flagged:        false,
-				CategoryScores: completeModerationCategoryScores(0.01),
-			}
-		}
-		results[len(results)-1].Flagged = true
-		results[len(results)-1].CategoryScores["violence"] = 0.99
-		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: results}))
+		requestCount++
+		var request moderationAPIRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, "current flagged text", request.Input)
+		scores := completeModerationCategoryScores(0.01)
+		scores["violence"] = 0.99
+		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+			Flagged: true, CategoryScores: scores,
+		}}}))
 	}))
 	defer server.Close()
 
@@ -1744,6 +2100,7 @@ func TestContentModerationCheck_StrictBlocksWhenLaterBatchResultIsFlagged(t *tes
 	require.True(t, decision.Flagged)
 	require.Equal(t, "violence", decision.HighestCategory)
 	require.Equal(t, 0.99, decision.HighestScore)
+	require.Equal(t, 1, requestCount)
 }
 
 func TestContentModerationCheck_StrictImageOnlyRequestIsAllowedWithoutModerationCall(t *testing.T) {
@@ -1853,23 +2210,21 @@ func TestContentModerationCheck_StrictControlOnlyRequestStillFailsClosed(t *test
 	})
 
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no auditable text batch")
+	require.Contains(t, err.Error(), "no auditable user text")
 	require.Nil(t, decision)
 	require.Zero(t, requestCount)
 }
 
 func TestContentModerationCheck_StrictResultCountMismatchFailsClosed(t *testing.T) {
 	groupID := int64(12)
-	body, err := json.Marshal(map[string]string{
-		"input": strings.Repeat("a", maxModerationInputRunes+1),
-	})
-	require.NoError(t, err)
+	body := []byte(`{"input":"current user text"}`)
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requestCount++
-		_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
-			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
-		}}})
+		_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{
+			{Flagged: false, CategoryScores: completeModerationCategoryScores(0.01)},
+			{Flagged: false, CategoryScores: completeModerationCategoryScores(0.01)},
+		}})
 	}))
 	defer server.Close()
 
@@ -1903,132 +2258,91 @@ func TestContentModerationCheck_StrictResultCountMismatchFailsClosed(t *testing.
 	require.Equal(t, 1, requestCount)
 }
 
-func TestContentModerationCheck_StrictAuditUsesAtMostTwoKeysPerRequest(t *testing.T) {
+func TestContentModerationCheck_StrictUsesOneCallAndNeverFailsOver(t *testing.T) {
 	groupID := int64(12)
-	body, err := json.Marshal(map[string]string{
-		"input": strings.Repeat("a", maxModerationInputRunes*(maxStrictModerationTextBatchItems+1)),
-	})
-	require.NoError(t, err)
-
-	newService := func(t *testing.T, server *httptest.Server) *ContentModerationService {
-		t.Helper()
-		cfg := defaultContentModerationConfig()
-		cfg.Enabled = true
-		cfg.AllGroups = false
-		cfg.GroupIDs = []int64{groupID}
-		cfg.BaseURL = server.URL
-		cfg.APIKeys = []string{"sk-primary", "sk-backup", "sk-third"}
-		cfg.RetryCount = 2
-		rawCfg, marshalErr := json.Marshal(cfg)
-		require.NoError(t, marshalErr)
-		return &ContentModerationService{
-			settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
-				SettingKeyRiskControlEnabled:      "true",
-				SettingKeyContentModerationConfig: string(rawCfg),
-			}},
-			repo:       &contentModerationTestRepo{},
-			httpClient: server.Client(),
-			asyncQueue: make(chan contentModerationTask, 4),
-			keyHealth:  make(map[string]*contentModerationKeyHealth),
-		}
+	tests := []struct {
+		name      string
+		respond   func(*testing.T, http.ResponseWriter, *http.Request)
+		wantError bool
+	}{
+		{
+			name: "success",
+			respond: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+				writeCompleteModerationResponse(t, w, r)
+			},
+		},
+		{
+			name: "429 does not select backup key",
+			respond: func(_ *testing.T, w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+			},
+			wantError: true,
+		},
+		{
+			name: "malformed verdict does not select backup key",
+			respond: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
+				scores := completeModerationCategoryScores(0.01)
+				delete(scores, "sexual/minors")
+				require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+					Flagged: false, CategoryScores: scores,
+				}}}))
+			},
+			wantError: true,
+		},
 	}
-	check := func(svc *ContentModerationService) (*ContentModerationDecision, error) {
-		return svc.Check(context.Background(), ContentModerationCheckInput{
-			Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
-			Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var authorizations []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				authorizations = append(authorizations, r.Header.Get("Authorization"))
+				mu.Unlock()
+				tt.respond(t, w, r)
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.Mode = ContentModerationModePreBlock
+			cfg.AllGroups = false
+			cfg.GroupIDs = []int64{groupID}
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = []string{"sk-primary", "sk-backup", "sk-third"}
+			cfg.RetryCount = 10
+			rawCfg, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			svc := &ContentModerationService{
+				settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+					SettingKeyRiskControlEnabled:      "true",
+					SettingKeyContentModerationConfig: string(rawCfg),
+				}},
+				repo:       &contentModerationTestRepo{},
+				httpClient: server.Client(),
+				asyncQueue: make(chan contentModerationTask, 1),
+				keyHealth:  make(map[string]*contentModerationKeyHealth),
+			}
+
+			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+				Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
+				Protocol: ContentModerationProtocolOpenAIResponses, Body: []byte(`{"input":"current user text"}`),
+			})
+
+			if tt.wantError {
+				require.Error(t, err)
+				require.Nil(t, decision)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, decision)
+				require.True(t, decision.Allowed)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			require.Equal(t, []string{"Bearer sk-primary"}, authorizations)
 		})
 	}
-
-	t.Run("successful key is reused for every batch", func(t *testing.T) {
-		var mu sync.Mutex
-		var authorizations []string
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			authorizations = append(authorizations, r.Header.Get("Authorization"))
-			mu.Unlock()
-			writeCompleteModerationResponse(t, w, r)
-		}))
-		defer server.Close()
-
-		decision, err := check(newService(t, server))
-		require.NoError(t, err)
-		require.True(t, decision.Allowed)
-		mu.Lock()
-		defer mu.Unlock()
-		require.Equal(t, []string{"Bearer sk-primary", "Bearer sk-primary"}, authorizations)
-	})
-
-	t.Run("failed keys are never retried and a third key is never selected", func(t *testing.T) {
-		var mu sync.Mutex
-		var authorizations []string
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			authorizations = append(authorizations, r.Header.Get("Authorization"))
-			call := len(authorizations)
-			mu.Unlock()
-			switch call {
-			case 1:
-				writeCompleteModerationResponse(t, w, r)
-			case 2:
-				w.WriteHeader(http.StatusTooManyRequests)
-				_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
-			case 3:
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error":{"message":"unavailable"}}`))
-			}
-		}))
-		defer server.Close()
-
-		decision, err := check(newService(t, server))
-		require.Error(t, err)
-		require.Nil(t, decision)
-		mu.Lock()
-		defer mu.Unlock()
-		require.Equal(t, []string{
-			"Bearer sk-primary",
-			"Bearer sk-primary",
-			"Bearer sk-backup",
-		}, authorizations)
-		require.NotContains(t, authorizations, "Bearer sk-third")
-	})
-
-	t.Run("malformed verdict in any batch result fails over to one backup key", func(t *testing.T) {
-		var mu sync.Mutex
-		var authorizations []string
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			authorizations = append(authorizations, r.Header.Get("Authorization"))
-			call := len(authorizations)
-			mu.Unlock()
-			if call == 1 {
-				count := moderationRequestExpectedResultCount(t, r)
-				results := make([]map[string]any, count)
-				for index := range results {
-					results[index] = map[string]any{
-						"flagged":         false,
-						"category_scores": completeModerationCategoryScores(0.01),
-					}
-				}
-				delete(results[len(results)-1]["category_scores"].(map[string]float64), "sexual/minors")
-				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
-				return
-			}
-			writeCompleteModerationResponse(t, w, r)
-		}))
-		defer server.Close()
-
-		decision, err := check(newService(t, server))
-		require.NoError(t, err)
-		require.True(t, decision.Allowed)
-		mu.Lock()
-		defer mu.Unlock()
-		require.Equal(t, []string{
-			"Bearer sk-primary",
-			"Bearer sk-backup",
-			"Bearer sk-backup",
-		}, authorizations)
-		require.NotContains(t, authorizations, "Bearer sk-third")
-	})
 }
 
 func TestContentModerationStrictAPICallLimitStopsRequestStorm(t *testing.T) {
@@ -2049,7 +2363,7 @@ func TestContentModerationStrictAPICallLimitStopsRequestStorm(t *testing.T) {
 	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
 	batches := make([]strictModerationBatch, maxStrictModerationAPICalls+1)
 	for index := range batches {
-		batches[index] = strictModerationBatch{input: []string{"safe"}, expectedResults: 1}
+		batches[index] = strictModerationBatch{input: "safe", expectedResults: 1}
 	}
 
 	_, err := svc.callModerationStrictBatches(context.Background(), cfg, batches, newStrictModerationKeyState(cfg))
@@ -2061,20 +2375,15 @@ func TestContentModerationStrictAPICallLimitStopsRequestStorm(t *testing.T) {
 	require.Equal(t, maxStrictModerationAPICalls, requestCount)
 }
 
-func TestContentModerationStrictAPICallLimitCountsKeyFailover(t *testing.T) {
+func TestContentModerationStrict429NeverFailsOverToAnotherKey(t *testing.T) {
 	var mu sync.Mutex
 	var authorizations []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		authorizations = append(authorizations, r.Header.Get("Authorization"))
-		call := len(authorizations)
 		mu.Unlock()
-		if call == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
-			return
-		}
-		writeCompleteModerationResponse(t, w, r)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
 	}))
 	defer server.Close()
 
@@ -2084,24 +2393,15 @@ func TestContentModerationStrictAPICallLimitCountsKeyFailover(t *testing.T) {
 	cfg.RetryCount = 1
 	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
 	state := newStrictModerationKeyState(cfg)
-	state.maxCalls = 3
-	batches := []strictModerationBatch{
-		{input: []string{"batch-1"}, expectedResults: 1},
-		{input: []string{"batch-2"}, expectedResults: 1},
-		{input: []string{"batch-3"}, expectedResults: 1},
-	}
+	batches := []strictModerationBatch{{input: "current user text", expectedResults: 1}}
 
 	_, err := svc.callModerationStrictBatches(context.Background(), cfg, batches, state)
 
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "API call limit")
+	require.Contains(t, err.Error(), "moderation api status 429")
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, []string{
-		"Bearer sk-primary",
-		"Bearer sk-backup",
-		"Bearer sk-backup",
-	}, authorizations)
+	require.Equal(t, []string{"Bearer sk-primary"}, authorizations)
 }
 
 func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcurrency(t *testing.T) {
@@ -2111,7 +2411,7 @@ func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcu
 
 	var mu sync.Mutex
 	requestCount := 0
-	textInputs := 0
+	textRequests := 0
 	imageInputs := 0
 	var handlerErr error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2125,32 +2425,27 @@ func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcu
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		inputs, ok := request.Input.([]any)
-		resultCount := 1
-		batchTextInputs := 0
+		text, isText := request.Input.(string)
 		batchImageInputs := 0
-		if ok && len(inputs) > 0 {
-			if _, isTextBatch := inputs[0].(string); isTextBatch {
-				resultCount = len(inputs)
-				batchTextInputs = len(inputs)
-			} else {
-				batchImageInputs = len(inputs)
-			}
+		if inputs, isArray := request.Input.([]any); isArray {
+			batchImageInputs = len(inputs)
 		}
 		mu.Lock()
 		requestCount++
-		textInputs += batchTextInputs
+		if isText {
+			textRequests++
+			if got := len([]rune(text)); got != maxStrictModerationTextRunes && handlerErr == nil {
+				handlerErr = fmt.Errorf("moderation text rune count = %d, want %d", got, maxStrictModerationTextRunes)
+			}
+		} else if handlerErr == nil {
+			handlerErr = fmt.Errorf("moderation input type = %T, want string", request.Input)
+		}
 		imageInputs += batchImageInputs
 		mu.Unlock()
 
-		results := make([]moderationAPIResult, resultCount)
-		for index := range results {
-			results[index] = moderationAPIResult{
-				Flagged:        false,
-				CategoryScores: completeModerationCategoryScores(0.01),
-			}
-		}
-		_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: results})
+		_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+		}}})
 	}))
 	defer server.Close()
 
@@ -2189,7 +2484,7 @@ func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcu
 				return
 			}
 			if decision == nil || !decision.Allowed || decision.Unavailable {
-				errCh <- errors.New("strict moderation did not allow safe batched request")
+				errCh <- errors.New("strict moderation did not allow safe request")
 			}
 		}()
 	}
@@ -2203,11 +2498,11 @@ func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcu
 	defer mu.Unlock()
 	require.NoError(t, handlerErr)
 	require.Equal(t, workers, requestCount)
-	require.Equal(t, workers*2, textInputs)
+	require.Equal(t, workers, textRequests)
 	require.Zero(t, imageInputs)
 }
 
-func TestContentModerationCheck_Strict429ConcurrencyFailsClosedWithinTwoKeys(t *testing.T) {
+func TestContentModerationCheck_Strict429ConcurrencyFailsClosedWithinOneCallPerRequest(t *testing.T) {
 	const workers = 32
 	groupID := int64(12)
 	body := strictResponsesBodyWithImages(t, 59)
@@ -2278,7 +2573,7 @@ func TestContentModerationCheck_Strict429ConcurrencyFailsClosedWithinTwoKeys(t *
 	mu.Lock()
 	defer mu.Unlock()
 	require.Greater(t, requestCount, 0)
-	require.LessOrEqual(t, requestCount, workers*2)
+	require.LessOrEqual(t, requestCount, workers)
 }
 
 func TestContentModerationCallModeration_400DoesNotFreezeAPIKey(t *testing.T) {
@@ -2305,6 +2600,120 @@ func TestContentModerationCallModeration_400DoesNotFreezeAPIKey(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, status.LastHTTPStatus)
 	require.Zero(t, status.FailureCount)
 	require.Nil(t, status.FrozenUntil)
+}
+
+func TestSafeModerationHeaderSanitizesControlCharactersAndTruncates(t *testing.T) {
+	require.Equal(t, "req    id", safeModerationHeader(" \r\nreq\r\n\t\x00id\t "))
+
+	got := safeModerationHeader(strings.Repeat("界", 129))
+	require.Equal(t, strings.Repeat("界", 128), got)
+	require.Equal(t, 128, len([]rune(got)))
+}
+
+func TestSafeModerationIdentifierAllowsOnlyDiagnosticCharacters(t *testing.T) {
+	require.Equal(t, "Rate_Limit.Error:code/429-", safeModerationIdentifier(" Rate_Limit.Error:code/429-\r\n<>中文 "))
+	require.Equal(t, strings.Repeat("a", 64), safeModerationIdentifier(strings.Repeat("a", 65)))
+}
+
+func TestParseModerationRetryAfter(t *testing.T) {
+	now := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "seconds", value: "120", want: 2 * time.Minute},
+		{name: "HTTP date", value: now.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second},
+		{name: "negative seconds", value: "-1"},
+		{name: "integer overflow", value: "999999999999999999999999999999"},
+		{name: "seconds clamp to 24 hours", value: "999999999", want: 24 * time.Hour},
+		{name: "HTTP date clamp to 24 hours", value: now.Add(7 * 24 * time.Hour).Format(http.TimeFormat), want: 24 * time.Hour},
+		{name: "past HTTP date", value: now.Add(-time.Minute).Format(http.TimeFormat)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, parseModerationRetryAfter(tt.value, now))
+		})
+	}
+}
+
+func TestContentModerationCallModeration_429PreservesDiagnosticsWithoutLeakingBody(t *testing.T) {
+	const upstreamMessage = "customer prompt must never appear in diagnostics"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.Header().Set("x-request-id", "req_moderation_123")
+		w.Header().Set("x-ratelimit-limit-requests", "100")
+		w.Header().Set("x-ratelimit-remaining-requests", "0")
+		w.Header().Set("x-ratelimit-reset-requests", "2m")
+		w.Header().Set("x-ratelimit-limit-tokens", "10000")
+		w.Header().Set("x-ratelimit-remaining-tokens", "0")
+		w.Header().Set("x-ratelimit-reset-tokens", "2m")
+		w.Header().Set("x-ratelimit-limit-project-tokens", "50000")
+		w.Header().Set("x-ratelimit-remaining-project-tokens", "123")
+		w.Header().Set("x-ratelimit-reset-project-tokens", "30s")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprintf(w, `{"error":{"message":%q,"type":"rate_limit_error","code":"rate_limit_exceeded"}}`, upstreamMessage)
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-diagnostic-test"}
+	cfg.RetryCount = 0
+	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+
+	_, err := svc.callModeration(context.Background(), cfg, "current user text")
+
+	require.Error(t, err)
+	var apiErr *moderationAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
+	require.Equal(t, "rate_limit_error", apiErr.ErrorType)
+	require.Equal(t, "rate_limit_exceeded", apiErr.ErrorCode)
+	require.Equal(t, moderationAPIKeyHash("sk-diagnostic-test"), apiErr.KeyHash)
+	require.Equal(t, "120", apiErr.RetryAfter)
+	require.Equal(t, 2*time.Minute, apiErr.retryAfterDuration)
+	require.Equal(t, "req_moderation_123", apiErr.RequestID)
+	require.Equal(t, "100", apiErr.LimitRequests)
+	require.Equal(t, "0", apiErr.RemainingRequests)
+	require.Equal(t, "2m", apiErr.ResetRequests)
+	require.Equal(t, "10000", apiErr.LimitTokens)
+	require.Equal(t, "0", apiErr.RemainingTokens)
+	require.Equal(t, "2m", apiErr.ResetTokens)
+	require.Equal(t, "50000", apiErr.LimitProjectTokens)
+	require.Equal(t, "123", apiErr.RemainingProjectTokens)
+	require.Equal(t, "30s", apiErr.ResetProjectTokens)
+	require.NotContains(t, err.Error(), upstreamMessage)
+
+	fields := moderationAPIErrorLogFields(err)
+	require.Zero(t, len(fields)%2)
+	diagnostics := make(map[string]any, len(fields)/2)
+	for index := 0; index < len(fields); index += 2 {
+		key, ok := fields[index].(string)
+		require.True(t, ok)
+		diagnostics[key] = fields[index+1]
+	}
+	require.Equal(t, http.StatusTooManyRequests, diagnostics["moderation_http_status"])
+	require.Equal(t, "rate_limit_error", diagnostics["moderation_error_type"])
+	require.Equal(t, "rate_limit_exceeded", diagnostics["moderation_error_code"])
+	require.Equal(t, "req_moderation_123", diagnostics["openai_request_id"])
+	require.Equal(t, "100", diagnostics["ratelimit_limit_requests"])
+	require.Equal(t, "0", diagnostics["ratelimit_remaining_requests"])
+	require.Equal(t, "10000", diagnostics["ratelimit_limit_tokens"])
+	require.Equal(t, "0", diagnostics["ratelimit_remaining_tokens"])
+	require.Equal(t, "50000", diagnostics["ratelimit_limit_project_tokens"])
+	require.Equal(t, "123", diagnostics["ratelimit_remaining_project_tokens"])
+	require.Equal(t, "30s", diagnostics["ratelimit_reset_project_tokens"])
+	require.NotContains(t, fmt.Sprint(fields), upstreamMessage)
+
+	status := svc.apiKeyStatusForHash(0, moderationAPIKeyHash("sk-diagnostic-test"), maskSecretTail("sk-diagnostic-test"), true)
+	require.Equal(t, "frozen", status.Status)
+	require.NotContains(t, status.LastError, upstreamMessage)
+	require.NotNil(t, status.FrozenUntil)
+	remaining := time.Until(*status.FrozenUntil)
+	require.GreaterOrEqual(t, remaining, 115*time.Second)
+	require.LessOrEqual(t, remaining, 121*time.Second)
 }
 
 func TestContentModerationCallModeration_FreezesByHTTPStatus(t *testing.T) {

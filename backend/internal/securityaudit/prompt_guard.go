@@ -175,6 +175,28 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 	return decision, nil
 }
 
+// EvaluateStrict performs one bounded synchronous scan against only the first
+// enabled endpoint. A strict business request must never fan out into multiple
+// chunks or failover attempts.
+func (g *GuardEvaluator) EvaluateStrict(ctx context.Context, cfg ActiveConfig, snapshot PromptSnapshot) (*PromptDecision, error) {
+	endpoints := cfg.EnabledEndpoints()
+	if len(endpoints) == 0 {
+		return g.Evaluate(ctx, cfg, snapshot)
+	}
+	primary := endpoints[0]
+	inputLimit := primary.InputLimit
+	if inputLimit <= 0 {
+		inputLimit = DefaultInputLimit
+	}
+	if inputLimit > StrictPromptGuardMaxRunes {
+		inputLimit = StrictPromptGuardMaxRunes
+	}
+	snapshot = limitPromptSnapshot(snapshot, inputLimit)
+	strictConfig := cloneActiveConfig(cfg)
+	strictConfig.Endpoints = []ActiveEndpoint{primary}
+	return g.Evaluate(ctx, strictConfig, snapshot)
+}
+
 func logGuardFailure(snapshot PromptSnapshot, cfg ActiveConfig, kind DecisionKind, code, guardEndpointID string, latency time.Duration) {
 	fields := snapshotLogFields(snapshot)
 	fields["config_version"] = cfg.ConfigVersion

@@ -5,6 +5,13 @@ import (
 	"errors"
 )
 
+const (
+	standardAsyncMaxAttempts = 3
+	// The enqueuer is the sole async job producer. Until an explicit scan
+	// profile is persisted, max_attempts=1 is reserved for strict async jobs.
+	strictAsyncMaxAttempts = 1
+)
+
 type Enqueuer struct {
 	config  ConfigStore
 	repo    JobRepository
@@ -40,7 +47,12 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req Request) error {
 		LogWarn(EventEnqueueDropped, mergeLogFields(baseFields, map[string]any{"status": "dropped", "error_code": "no_enabled_endpoint"}))
 		return nil
 	}
+	maxAttempts := standardAsyncMaxAttempts
 	snapshot, err := ExtractPromptSnapshot(req)
+	if req.Strict {
+		maxAttempts = strictAsyncMaxAttempts
+		snapshot, err = ExtractBlockingPromptSnapshot(req, false)
+	}
 	if errors.Is(err, ErrNoPromptText) {
 		LogInfo(EventEnqueueSkipped, mergeLogFields(baseFields, map[string]any{"status": "skipped", "error_code": "no_user_text"}))
 		return nil
@@ -50,7 +62,7 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req Request) error {
 		LogWarn(EventEnqueueDropped, mergeLogFields(baseFields, map[string]any{"status": "dropped", "error_code": "snapshot_invalid"}))
 		return nil
 	}
-	job, err := e.repo.CreateStagingWithCapacity(ctx, snapshot.Redacted(), cfg.ConfigVersion, 3, cfg.QueueCapacity)
+	job, err := e.repo.CreateStagingWithCapacity(ctx, snapshot.Redacted(), cfg.ConfigVersion, maxAttempts, cfg.QueueCapacity)
 	if err != nil {
 		code := "database_unavailable"
 		if errors.Is(err, ErrQueueFull) {

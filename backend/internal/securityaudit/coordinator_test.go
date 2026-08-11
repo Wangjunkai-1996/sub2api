@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,6 +59,59 @@ func (f *fakePromptEngine) Enqueue(context.Context, Request) error {
 	return f.err
 }
 
+type proScopedLegacySpy struct {
+	strictGroup     bool
+	decision        *LegacyDecision
+	err             error
+	scopeCalls      atomic.Int64
+	moderationCalls atomic.Int64
+	strictSeen      atomic.Bool
+}
+
+func (s *proScopedLegacySpy) BlockingApplies(_ context.Context, req Request) (bool, error) {
+	s.scopeCalls.Add(1)
+	return s.strictGroup && service.StrictContentModerationRequestSupported(req.Protocol, req.Model), nil
+}
+
+func (s *proScopedLegacySpy) Check(_ context.Context, req Request) (*LegacyDecision, error) {
+	if s.strictGroup && !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
+		return &LegacyDecision{Allowed: true}, nil
+	}
+	s.moderationCalls.Add(1)
+	s.strictSeen.Store(req.Strict)
+	return s.decision, s.err
+}
+
+type proScopedPromptSpy struct {
+	mode      Mode
+	decision  *PromptDecision
+	err       error
+	enqueues  atomic.Int64
+	evaluates atomic.Int64
+}
+
+func (s *proScopedPromptSpy) EffectiveMode() Mode { return s.mode }
+
+func (s *proScopedPromptSpy) BlockingApplies(req Request) bool {
+	return s.mode == ModeBlocking && service.StrictContentModerationRequestSupported(req.Protocol, req.Model)
+}
+
+func (s *proScopedPromptSpy) Enqueue(_ context.Context, req Request) error {
+	if !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
+		return nil
+	}
+	s.enqueues.Add(1)
+	return s.err
+}
+
+func (s *proScopedPromptSpy) Evaluate(_ context.Context, req Request) (*PromptDecision, error) {
+	if !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
+		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+	}
+	s.evaluates.Add(1)
+	return s.decision, s.err
+}
+
 func TestCoordinatorNilReceiverFailsClosed(t *testing.T) {
 	var coordinator *Coordinator
 	decision := coordinator.Check(context.Background(), Request{Protocol: "openai_responses", Body: []byte(`{"input":"safe"}`)})
@@ -93,7 +147,7 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 		require.Zero(t, prompt.evaluates.Load())
 	})
 
-	t.Run("image only input bypasses text auditors without a 422", func(t *testing.T) {
+	t.Run("image only input remains structurally complete without a 422", func(t *testing.T) {
 		images := make([]string, 59)
 		for index := range images {
 			if index == 0 {
@@ -201,6 +255,113 @@ func TestCoordinatorContentModerationOutOfScopeRemainsNonStrict(t *testing.T) {
 	}
 }
 
+func TestCoordinatorProScopeSkipsNonGPTAndImageAuditors(t *testing.T) {
+	groupID := int64(12)
+	tests := []struct {
+		name     string
+		protocol string
+		model    string
+		body     string
+	}{
+		{
+			name: "Responses non-GPT model", protocol: service.ContentModerationProtocolOpenAIResponses, model: "gemini-3-pro",
+			body: `{"previous_response_id":"must_not_load","input":"safe"}`,
+		},
+		{
+			name: "Chat non-GPT model", protocol: service.ContentModerationProtocolOpenAIChat, model: "claude-sonnet-4-5",
+			body: `{"messages":[{"role":"user","content":"safe"}]}`,
+		},
+		{
+			name: "Responses image model", protocol: service.ContentModerationProtocolOpenAIResponses, model: "gpt-image-2",
+			body: `{"previous_response_id":"must_not_load","input":"draw"}`,
+		},
+		{
+			name: "Chat image model", protocol: service.ContentModerationProtocolOpenAIChat, model: "gpt-image-1.5",
+			body: `{"messages":[{"role":"user","content":"draw"}]}`,
+		},
+		{
+			name: "Anthropic protocol", protocol: service.ContentModerationProtocolAnthropicMessages, model: "gpt-5.4",
+			body: `{"messages":[{"role":"user","content":"safe"}]}`,
+		},
+		{
+			name: "Gemini protocol", protocol: service.ContentModerationProtocolGemini, model: "gpt-5.4",
+			body: `{"contents":[{"role":"user","parts":[{"text":"safe"}]}]}`,
+		},
+		{
+			name: "OpenAI images protocol", protocol: service.ContentModerationProtocolOpenAIImages, model: "gpt-5.4",
+			body: `{"prompt":"draw"}`,
+		},
+	}
+
+	for _, mode := range []Mode{ModeBlocking, ModeAsync} {
+		for _, tt := range tests {
+			t.Run(string(mode)+"/"+tt.name, func(t *testing.T) {
+				legacy := &proScopedLegacySpy{strictGroup: true}
+				prompt := &proScopedPromptSpy{mode: mode}
+				lineage := &fakeLineageStore{loadErr: errors.New("lineage must not be loaded")}
+				decision := NewCoordinator(legacy, prompt).SetLineageStore(lineage).Check(context.Background(), Request{
+					APIKeyID: 7, GroupID: &groupID, Protocol: tt.protocol, Model: tt.model, Body: []byte(tt.body),
+				})
+
+				require.True(t, decision.AllowNextStage)
+				require.Equal(t, DecisionAllow, decision.Kind)
+				require.Nil(t, decision.Audit)
+				require.Equal(t, int64(1), legacy.scopeCalls.Load())
+				require.Zero(t, legacy.moderationCalls.Load())
+				require.Zero(t, prompt.enqueues.Load())
+				require.Zero(t, prompt.evaluates.Load())
+				require.Zero(t, lineage.loads.Load())
+			})
+		}
+	}
+}
+
+func TestCoordinatorProScopeKeepsGPTTextFailClosed(t *testing.T) {
+	groupID := int64(12)
+	tests := []struct {
+		name     string
+		protocol string
+		body     string
+	}{
+		{name: "Responses", protocol: service.ContentModerationProtocolOpenAIResponses, body: `{"input":"safe"}`},
+		{name: "Chat", protocol: service.ContentModerationProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"safe"}]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+" moderation unavailable", func(t *testing.T) {
+			legacy := &proScopedLegacySpy{strictGroup: true, err: errors.New("moderation unavailable")}
+			prompt := &proScopedPromptSpy{mode: ModeBlocking, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}}
+			decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+				APIKeyID: 7, GroupID: &groupID, Protocol: tt.protocol, Model: "gpt-5.4", Body: []byte(tt.body),
+			})
+
+			require.False(t, decision.AllowNextStage)
+			require.Equal(t, DecisionUnavailable, decision.Kind)
+			require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+			require.Equal(t, ErrorCodeAuditUnavailable, decision.ErrorCode)
+			require.Equal(t, int64(1), legacy.moderationCalls.Load())
+			require.True(t, legacy.strictSeen.Load())
+			require.Zero(t, prompt.evaluates.Load())
+		})
+
+		t.Run(tt.name+" prompt unavailable", func(t *testing.T) {
+			legacy := &proScopedLegacySpy{strictGroup: true, decision: &LegacyDecision{Allowed: true}}
+			prompt := &proScopedPromptSpy{mode: ModeBlocking, err: errors.New("prompt unavailable")}
+			decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+				APIKeyID: 7, GroupID: &groupID, Protocol: tt.protocol, Model: "gpt-5.4", Body: []byte(tt.body),
+			})
+
+			require.False(t, decision.AllowNextStage)
+			require.Equal(t, DecisionUnavailable, decision.Kind)
+			require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+			require.Equal(t, ErrorCodeAuditUnavailable, decision.ErrorCode)
+			require.Equal(t, int64(1), legacy.moderationCalls.Load())
+			require.True(t, legacy.strictSeen.Load())
+			require.Equal(t, int64(1), prompt.evaluates.Load())
+		})
+	}
+}
+
 func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 	groupID := int64(12)
 	strict := true
@@ -295,7 +456,7 @@ func TestCoordinatorStrictAllowExposesStableAuditSummaryOnlyForProtectedGroup(t 
 	require.Nil(t, outOfScope.Audit)
 }
 
-func TestCoordinatorStoreFalseAuditsLargeFullHistoryWithoutResponseLineage(t *testing.T) {
+func TestCoordinatorStoreFalseBuildsLargeLocalContextWithoutResponseLineage(t *testing.T) {
 	groupID := int64(12)
 	largeInput := strings.Repeat("x", 1024*1024)
 	store := &fakeLineageStore{}
@@ -367,9 +528,11 @@ type fakeLineageStore struct {
 	lookup     LineageLookup
 	bound      *AuditSummary
 	responseID string
+	loads      atomic.Int64
 }
 
 func (s *fakeLineageStore) Load(_ context.Context, lookup LineageLookup) (*AuditSummary, error) {
+	s.loads.Add(1)
 	s.lookup = lookup
 	return s.loaded, s.loadErr
 }
@@ -433,7 +596,7 @@ func TestCoordinatorStrictLineageAllowsMediaOnlyParent(t *testing.T) {
 	require.Equal(t, []string{mediaDigest}, decision.Audit.MediaDigests)
 }
 
-func TestCoordinatorStrictLineageFeedsCumulativeContextToEveryRequiredAuditor(t *testing.T) {
+func TestCoordinatorStrictLineageMaintainsCumulativeLocalContext(t *testing.T) {
 	groupID := int64(12)
 	strict := true
 
@@ -461,7 +624,7 @@ func TestCoordinatorStrictLineageFeedsCumulativeContextToEveryRequiredAuditor(t 
 		require.Zero(t, prompt.evaluates.Load(), "local keyword blocks must not consume Prompt Guard capacity")
 	})
 
-	t.Run("semantic guard receives chronological parent and current context", func(t *testing.T) {
+	t.Run("prompt stage retains local lineage context while body remains current turn", func(t *testing.T) {
 		store := &fakeLineageStore{loaded: &AuditSummary{
 			Verdict: AuditVerdictAllow, ContextComplete: true, APIKeyID: 7, GroupID: &groupID,
 			RedactedContext: "harmful", PromptHash: "parent-hash",
@@ -469,6 +632,7 @@ func TestCoordinatorStrictLineageFeedsCumulativeContextToEveryRequiredAuditor(t 
 		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
 		prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, evaluate: func(_ context.Context, req Request) (*PromptDecision, error) {
 			require.Equal(t, "harmful\nrequest", req.AuditContext)
+			require.JSONEq(t, `{"previous_response_id":"resp_parent","input":"request"}`, string(req.Body))
 			return &PromptDecision{Kind: DecisionBlock}, nil
 		}}
 		decision := NewCoordinator(legacy, prompt).SetLineageStore(store).Check(context.Background(), Request{

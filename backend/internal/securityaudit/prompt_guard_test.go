@@ -208,6 +208,37 @@ func TestGuardEvaluatorScansLatestUserPromptAsIndependentFirstChunk(t *testing.T
 	require.Equal(t, history, strings.Join(seen[1:], ""))
 }
 
+func TestGuardEvaluatorStrictAlwaysUsesOneChunkAndOneEndpoint(t *testing.T) {
+	type scanCall struct {
+		endpoint string
+		text     string
+	}
+	calls := make([]scanCall, 0, 1)
+	evaluator := newGuardEvaluator(PromptScannerFunc(func(_ context.Context, endpoint ActiveEndpoint, text string, _ []string) (*NormalizedResult, error) {
+		calls = append(calls, scanCall{endpoint: endpoint.ID, text: text})
+		return &NormalizedResult{
+			Decision: EventPass, RiskLevel: RiskLow, Action: ActionAllow,
+			ScannerScores: map[string]float64{}, ScannerEvidence: map[string]string{}, GuardEndpointID: endpoint.ID,
+		}, nil
+	}), nil, NewAtomicMetrics(), 2, 2)
+	snapshot := PromptSnapshot{
+		ScanText: strings.Repeat("a", 80) + promptAuditPrioritySeparator + strings.Repeat("b", 80),
+	}
+
+	decision, err := evaluator.EvaluateStrict(context.Background(), guardConfig(
+		ActiveEndpoint{ID: "primary", Enabled: true, TimeoutMS: 1000, InputLimit: 100},
+		ActiveEndpoint{ID: "backup", Enabled: true, TimeoutMS: 1000, InputLimit: 100},
+	), snapshot)
+
+	require.NoError(t, err)
+	require.Equal(t, DecisionAllow, decision.Kind)
+	require.Len(t, calls, 1)
+	require.Equal(t, "primary", calls[0].endpoint)
+	require.Equal(t, 100, len([]rune(calls[0].text)))
+	require.NotContains(t, calls[0].text, promptAuditPrioritySeparator)
+	require.Equal(t, 1, decision.Result.ChunkTotal)
+}
+
 func TestGuardEvaluatorBlockStopsRemainingChunksButReportsPlannedTotal(t *testing.T) {
 	calls := 0
 	scanner := PromptScannerFunc(func(context.Context, ActiveEndpoint, string, []string) (*NormalizedResult, error) {

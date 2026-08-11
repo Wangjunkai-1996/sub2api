@@ -369,16 +369,47 @@ func TestResponsesOutputTextIncludedInFullAndLatestTurnSnapshots(t *testing.T) {
 	require.NotContains(t, latestTurn.ScanText, "earlier user input")
 }
 
-func TestStrictPromptSnapshotUsesChronologicalCumulativeLineageContext(t *testing.T) {
+func TestStrictBlockingPromptSnapshotUsesOnlyLatestCurrentUserText(t *testing.T) {
 	req := Request{
-		Protocol: "openai_responses", Body: []byte(`{"input":"current turn"}`),
-		Strict: true, AuditContext: "redacted parent\ncurrent turn",
+		Protocol: "openai_responses",
+		Body: []byte(`{
+			"instructions":"system instruction",
+			"input":[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"older user"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
+				{"type":"function_call_output","call_id":"call_1","output":"tool output"},
+				{"type":"message","role":"user","content":[
+					{"type":"input_text","text":"current part one"},
+					{"type":"input_image","image_url":"opaque"},
+					{"type":"input_text","text":"current part two"}
+				]}
+			]
+		}`),
+		Strict: true, AuditContext: "redacted parent\nfull historical context",
 	}
 	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
 	require.NoError(t, err)
-	require.Equal(t, "redacted parent\ncurrent turn", snapshot.ScanText)
+	require.Equal(t, "current part one current part two", snapshot.ScanText)
 	require.Equal(t, 1, snapshot.MessageCount)
 	require.NotContains(t, snapshot.ScanText, promptAuditPrioritySeparator)
+	for _, omitted := range []string{"redacted parent", "system instruction", "older user", "assistant output", "tool output", "opaque"} {
+		require.NotContains(t, snapshot.ScanText, omitted)
+	}
+}
+
+func TestStrictBlockingPromptSnapshotCapsCurrentUserTextAtTwelveThousandRunes(t *testing.T) {
+	latest := "latest:" + strings.Repeat("界", StrictPromptGuardMaxRunes+100)
+	req := Request{
+		Protocol: "openai_chat_completions", Strict: true,
+		Body:         []byte(`{"messages":[{"role":"system","content":"ignore"},{"role":"user","content":` + string(mustJSON(t, latest)) + `}]}`),
+		AuditContext: strings.Repeat("historical context", 1000),
+	}
+
+	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
+	require.NoError(t, err)
+	require.Equal(t, StrictPromptGuardMaxRunes, utf8.RuneCountInString(snapshot.ScanText))
+	require.Equal(t, hardLimitRunes(latest, StrictPromptGuardMaxRunes), snapshot.ScanText)
+	require.Equal(t, StrictPromptGuardMaxRunes, snapshot.PromptLength)
 }
 
 func TestBlockingPromptSnapshotPreservesFullScopeByDefaultAndWithoutUserInput(t *testing.T) {

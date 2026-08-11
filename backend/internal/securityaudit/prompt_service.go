@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 type PromptService struct {
@@ -108,7 +111,7 @@ func (s *PromptService) EffectiveMode() Mode {
 }
 
 func (s *PromptService) BlockingApplies(req Request) bool {
-	if s == nil || s.config == nil || s.EffectiveMode() != ModeBlocking {
+	if !promptGuardRequestSupported(req) || s == nil || s.config == nil || s.EffectiveMode() != ModeBlocking {
 		return false
 	}
 	cfg, ok := s.config.Active()
@@ -122,7 +125,13 @@ func (s *PromptService) BlockingApplies(req Request) bool {
 }
 
 func (s *PromptService) Enqueue(_ context.Context, req Request) error {
-	if s == nil || s.enqueuer == nil || s.EffectiveMode() != ModeAsync {
+	if !promptGuardRequestSupported(req) {
+		return nil
+	}
+	if req.Strict && strictImageOnlyRequest(req) {
+		return nil
+	}
+	if s == nil || s.config == nil || s.enqueuer == nil || s.EffectiveMode() != ModeAsync {
 		return nil
 	}
 	select {
@@ -154,6 +163,12 @@ func (s *PromptService) Enqueue(_ context.Context, req Request) error {
 }
 
 func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecision, error) {
+	if !promptGuardRequestSupported(req) {
+		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+	}
+	if req.Strict && strictImageOnlyRequest(req) {
+		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+	}
 	if s == nil || s.config == nil || s.evaluator == nil {
 		return nil, &GuardError{Code: ErrorCodeUnavailable}
 	}
@@ -170,11 +185,11 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	if cfg.EffectiveMode() != ModeBlocking || !cfg.IncludesGroup(req.GroupID) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	// Strict blocking always scans the complete model-visible document. The
-	// historical latest-turn setting remains relevant only to old config views.
+	// Strict blocking scans only bounded current-user text. Complete parsing and
+	// lineage remain admission checks and are not forwarded to Prompt Guard.
 	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
 	if errors.Is(err, ErrNoPromptText) {
-		if req.Document != nil && req.Document.Complete && req.Document.HasImages {
+		if strictImageOnlyRequest(req) {
 			return &PromptDecision{Kind: DecisionAllow, ConfigVersion: cfg.ConfigVersion, AllowNextStage: true}, nil
 		}
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
@@ -182,11 +197,35 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	if err != nil {
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
 	}
-	decision, err := s.evaluator.Evaluate(ctx, cfg, snapshot)
+	var decision *PromptDecision
+	if req.Strict {
+		decision, err = s.evaluator.EvaluateStrict(ctx, cfg, snapshot)
+	} else {
+		decision, err = s.evaluator.Evaluate(ctx, cfg, snapshot)
+	}
 	if decision != nil {
 		decision.ConfigVersion = cfg.ConfigVersion
 	}
 	return decision, err
+}
+
+func promptGuardRequestSupported(req Request) bool {
+	return service.StrictContentModerationRequestSupported(req.Protocol, req.Model)
+}
+
+func strictImageOnlyDocument(document *auditinput.Document) bool {
+	return document != nil && document.Complete && document.HasImages
+}
+
+func strictImageOnlyRequest(req Request) bool {
+	if service.ExtractStrictCurrentUserText(req.Protocol, req.Body) != "" {
+		return false
+	}
+	document := req.Document
+	if document == nil {
+		document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
+	}
+	return strictImageOnlyDocument(document)
 }
 
 func (s *PromptService) GetConfig() (PublicConfig, error) { return s.config.Public() }
