@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -55,14 +56,27 @@ func cloneSecurityAuditSummary(decision *securityaudit.Decision) *securityaudit.
 	return &cloned
 }
 
-func (h *OpenAIGatewayHandler) bindAllowedSecurityAuditResponse(ctx context.Context, reqLog *zap.Logger, summary *securityaudit.AuditSummary, result *service.OpenAIForwardResult) {
-	if h == nil || h.securityAuditCoordinator == nil || summary == nil || result == nil ||
-		!result.CompletedForLineage() || strings.TrimSpace(result.ResponseID) == "" {
-		return
+func (h *OpenAIGatewayHandler) bindAllowedSecurityAuditResponse(ctx context.Context, reqLog *zap.Logger, summary *securityaudit.AuditSummary, result *service.OpenAIForwardResult) error {
+	if h == nil || h.securityAuditCoordinator == nil || summary == nil {
+		return fmt.Errorf("strict audit lineage coordinator is unavailable")
+	}
+	if result == nil || !result.CompletedForLineage() || strings.TrimSpace(result.ResponseID) == "" {
+		if reqLog != nil {
+			responseIDLen := 0
+			if result != nil {
+				responseIDLen = len(strings.TrimSpace(result.ResponseID))
+			}
+			reqLog.Warn("security_audit.lineage_output_incomplete",
+				zap.Int64("api_key_id", summary.APIKeyID),
+				zap.Int64p("group_id", summary.GroupID),
+				zap.Int("response_id_len", responseIDLen),
+			)
+		}
+		return fmt.Errorf("%w: successful response output is incomplete", securityaudit.ErrLineageInvalid)
 	}
 	output, complete := result.OpenAIResponsesLineageOutput()
 	if !complete {
-		return
+		return fmt.Errorf("%w: successful response output is incomplete", securityaudit.ErrLineageInvalid)
 	}
 	augmented, err := securityaudit.AppendResponsesOutput(summary.Clone(), output)
 	if err != nil {
@@ -74,21 +88,25 @@ func (h *OpenAIGatewayHandler) bindAllowedSecurityAuditResponse(ctx context.Cont
 				zap.Error(err),
 			)
 		}
-		return
+		return err
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	} else {
 		ctx = context.WithoutCancel(ctx)
 	}
-	if err := h.securityAuditCoordinator.BindAllowedResponse(ctx, augmented, result.ResponseID); err != nil && reqLog != nil {
-		reqLog.Warn("security_audit.lineage_bind_failed",
-			zap.Int64("api_key_id", summary.APIKeyID),
-			zap.Int64p("group_id", summary.GroupID),
-			zap.Int("response_id_len", len(strings.TrimSpace(result.ResponseID))),
-			zap.Error(err),
-		)
+	if err := h.securityAuditCoordinator.BindAllowedResponse(ctx, augmented, result.ResponseID); err != nil {
+		if reqLog != nil {
+			reqLog.Warn("security_audit.lineage_bind_failed",
+				zap.Int64("api_key_id", summary.APIKeyID),
+				zap.Int64p("group_id", summary.GroupID),
+				zap.Int("response_id_len", len(strings.TrimSpace(result.ResponseID))),
+				zap.Error(err),
+			)
+		}
+		return err
 	}
+	return nil
 }
 
 func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string) *securityaudit.Decision {

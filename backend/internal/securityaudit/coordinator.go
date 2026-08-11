@@ -60,7 +60,11 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 			return *rejected
 		}
 		req = prepared
-		promptRequired := mode == ModeBlocking && c.promptBlockingApplies(req)
+		// A blocking mode may be the fail-closed effective state while the active
+		// snapshot is unavailable or stale. Always enter Evaluate in that mode: the
+		// prompt service returns allow for a trusted out-of-scope group and
+		// unavailable for a degraded blocking configuration.
+		promptRequired := mode == ModeBlocking
 		decision := c.checkStrict(ctx, req, promptRequired)
 		if decision.AllowNextStage && mode == ModeAsync && c.prompt != nil {
 			_ = c.prompt.Enqueue(ctx, req.Clone())
@@ -73,7 +77,11 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 		legacy, _ := c.checkLegacy(ctx, req)
 		return prioritize(legacy, nil, false, nil)
 	case ModeBlocking:
-		return c.checkBlocking(ctx, req)
+		if c.promptBlockingApplies(req) {
+			return c.checkBlocking(ctx, req)
+		}
+		legacy, _ := c.checkLegacy(ctx, req)
+		return prioritize(legacy, nil, false, nil)
 	default:
 		legacy, _ := c.checkLegacy(ctx, req)
 		return prioritize(legacy, nil, false, nil)

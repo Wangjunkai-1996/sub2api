@@ -815,6 +815,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 
 	agentTaskRecoveryTried := false
+	strictContinuation := openAIWSStrictAuditContinuation(hooks, 1, firstClientMessage)
 	var upstreamConn openAIWSClientConn
 	statusCode := 0
 	var handshakeHeaders http.Header
@@ -835,7 +836,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			responseBody = handshakeErr.Body
 		}
 		dialErr := &openAIWSDialError{StatusCode: statusCode, ResponseHeaders: cloneHeader(handshakeHeaders), ResponseBody: responseBody, Err: err}
-		if s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidWSDialError(dialErr) && !agentTaskRecoveryTried {
+		if !strictContinuation && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidWSDialError(dialErr) && !agentTaskRecoveryTried {
 			agentTaskRecoveryTried = true
 			if recoveryErr := s.recoverAgentIdentityTask(ctx, account, account.GetCredential("task_id")); recoveryErr != nil {
 				return fmt.Errorf("agent identity task recovery failed: %w", recoveryErr)
@@ -1075,8 +1076,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	lineageCaptureEnabled := openAIResponsesLineageCaptureEnabled(c)
 	var lineageCaptureMu sync.Mutex
 	var lineageByResponseID map[string]lineageCapture
+	var lineageAccumulator *openAIResponsesLineageAccumulator
 	if lineageCaptureEnabled {
 		lineageByResponseID = make(map[string]lineageCapture)
+		lineageAccumulator = newOpenAIResponsesLineageAccumulator()
 	}
 
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
@@ -1180,11 +1183,37 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					return nil
 				}
 				eventType, responseID, _ := parseOpenAIWSEventEnvelope(payload)
-				if lineageCaptureEnabled && isOpenAIWSTerminalEvent(eventType) && responseID != "" {
-					output, complete := extractOpenAIResponsesLineageOutput(payload, responseID)
+				if eventType == "response.failed" {
+					if hit, code, message := detectOpenAICyberPolicy(payload); hit {
+						cyberUsage := OpenAIUsage{}
+						parseOpenAIWSResponseUsageFromCompletedEvent(payload, &cyberUsage)
+						MarkOpsCyberPolicy(c, CyberPolicyMark{
+							Code:           code,
+							Message:        message,
+							Body:           truncateString(string(payload), 4096),
+							UpstreamStatus: http.StatusOK,
+							UpstreamInTok:  cyberUsage.InputTokens,
+							UpstreamOutTok: cyberUsage.OutputTokens,
+						})
+					}
+				}
+				if lineageAccumulator != nil {
+					lineageAccumulator.Observe(payload)
+				}
+				if lineageCaptureEnabled && isOpenAIWSTerminalEvent(eventType) {
+					output, complete := lineageAccumulator.SuccessTerminalOutput(payload, responseID)
 					lineageCaptureMu.Lock()
-					lineageByResponseID[responseID] = lineageCapture{output: output, complete: complete}
+					if responseID != "" {
+						lineageByResponseID[responseID] = lineageCapture{output: output, complete: complete}
+					}
 					lineageCaptureMu.Unlock()
+					turnNo := int(completedTurns.Load()) + 1
+					if eventType == "response.completed" || eventType == "response.done" {
+						if err := commitOpenAIStrictLineageFields(c, turnNo, responseID, normalizeOpenAIWSTerminalEvent(eventType), output, complete); err != nil {
+							return err
+						}
+					}
+					lineageAccumulator = newOpenAIResponsesLineageAccumulator()
 				}
 				if isOpenAIWSTerminalEvent(eventType) {
 					s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)

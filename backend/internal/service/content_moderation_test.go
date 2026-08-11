@@ -149,6 +149,14 @@ func requireRecordedHashCount(t *testing.T, cache *contentModerationTestHashCach
 	return hashes
 }
 
+func completeModerationCategoryScores(score float64) map[string]float64 {
+	scores := make(map[string]float64, len(contentModerationCategoryOrder))
+	for _, category := range contentModerationCategoryOrder {
+		scores[category] = score
+	}
+	return scores
+}
+
 type contentModerationTestHashCache struct {
 	mu            sync.Mutex
 	hashes        map[string]struct{}
@@ -1488,7 +1496,7 @@ func TestContentModerationCheck_StrictFindingsLogWithoutUserSideEffects(t *testi
 	t.Run("moderation api flag", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
-				Flagged: true, CategoryScores: map[string]float64{"harassment": 0.01},
+				Flagged: true, CategoryScores: completeModerationCategoryScores(0.01),
 			}}})
 		}))
 		defer server.Close()
@@ -1502,6 +1510,104 @@ func TestContentModerationCheck_StrictFindingsLogWithoutUserSideEffects(t *testi
 		svc, repo, userRepo, invalidator := newService(t, cfg, server.Client())
 		assertBlockedWithoutSideEffects(t, svc, repo, userRepo, invalidator, []byte(`{"input":"clean request"}`))
 	})
+}
+
+func TestContentModerationCheck_StrictValidatesCompleteModerationVerdict(t *testing.T) {
+	groupID := int64(12)
+	tests := []struct {
+		name    string
+		mutate  func(map[string]any)
+		wantErr bool
+	}{
+		{
+			name: "missing flagged",
+			mutate: func(result map[string]any) {
+				delete(result, "flagged")
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing category scores",
+			mutate: func(result map[string]any) {
+				delete(result, "category_scores")
+			},
+			wantErr: true,
+		},
+		{
+			name: "incomplete category scores",
+			mutate: func(result map[string]any) {
+				delete(result["category_scores"].(map[string]float64), "sexual/minors")
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative category score",
+			mutate: func(result map[string]any) {
+				result["category_scores"].(map[string]float64)["violence"] = -0.01
+			},
+			wantErr: true,
+		},
+		{
+			name: "category score above one",
+			mutate: func(result map[string]any) {
+				result["category_scores"].(map[string]float64)["violence"] = 1.01
+			},
+			wantErr: true,
+		},
+		{name: "complete verdict"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := map[string]any{
+				"flagged":         false,
+				"category_scores": completeModerationCategoryScores(0.01),
+			}
+			if tt.mutate != nil {
+				tt.mutate(result)
+			}
+			requestCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requestCount++
+				_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{result}})
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.AllGroups = false
+			cfg.GroupIDs = []int64{groupID}
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = []string{"sk-test"}
+			cfg.RetryCount = 0
+			rawCfg, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			svc := &ContentModerationService{
+				settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+					SettingKeyRiskControlEnabled:      "true",
+					SettingKeyContentModerationConfig: string(rawCfg),
+				}},
+				repo:       &contentModerationTestRepo{},
+				httpClient: server.Client(),
+				asyncQueue: make(chan contentModerationTask, 1),
+				keyHealth:  make(map[string]*contentModerationKeyHealth),
+			}
+
+			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+				Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
+				Protocol: ContentModerationProtocolOpenAIResponses, Body: []byte(`{"input":"clean request"}`),
+			})
+			require.Equal(t, 1, requestCount)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Nil(t, decision)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, decision)
+			require.True(t, decision.Allowed)
+		})
+	}
 }
 
 func TestContentModerationCheck_StrictAuditUsesAtMostTwoKeysPerRequest(t *testing.T) {
@@ -1547,7 +1653,9 @@ func TestContentModerationCheck_StrictAuditUsesAtMostTwoKeysPerRequest(t *testin
 			mu.Lock()
 			authorizations = append(authorizations, r.Header.Get("Authorization"))
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{}}})
+			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+				CategoryScores: completeModerationCategoryScores(0.01),
+			}}})
 		}))
 		defer server.Close()
 
@@ -1575,7 +1683,9 @@ func TestContentModerationCheck_StrictAuditUsesAtMostTwoKeysPerRequest(t *testin
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"error":{"message":"unavailable"}}`))
 			default:
-				_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{}}})
+				_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+					CategoryScores: completeModerationCategoryScores(0.01),
+				}}})
 			}
 		}))
 		defer server.Close()
@@ -1588,6 +1698,40 @@ func TestContentModerationCheck_StrictAuditUsesAtMostTwoKeysPerRequest(t *testin
 		require.Equal(t, []string{
 			"Bearer sk-primary",
 			"Bearer sk-primary",
+			"Bearer sk-backup",
+			"Bearer sk-backup",
+		}, authorizations)
+		require.NotContains(t, authorizations, "Bearer sk-third")
+	})
+
+	t.Run("malformed verdict fails over to one backup key", func(t *testing.T) {
+		var mu sync.Mutex
+		var authorizations []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			authorizations = append(authorizations, r.Header.Get("Authorization"))
+			call := len(authorizations)
+			mu.Unlock()
+			if call == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{
+					"flagged": false, "category_scores": map[string]float64{"sexual": 0.01},
+				}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+				CategoryScores: completeModerationCategoryScores(0.01),
+			}}})
+		}))
+		defer server.Close()
+
+		decision, err := check(newService(t, server))
+		require.NoError(t, err)
+		require.True(t, decision.Allowed)
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, []string{
+			"Bearer sk-primary",
+			"Bearer sk-backup",
 			"Bearer sk-backup",
 			"Bearer sk-backup",
 		}, authorizations)

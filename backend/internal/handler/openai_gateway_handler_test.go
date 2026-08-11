@@ -1255,7 +1255,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 
 	moderationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/moderations", r.URL.Path)
-		_, _ = w.Write([]byte(`{"results":[{"category_scores":{"sexual":0.9}}]}`))
+		_, _ = w.Write([]byte(`{"results":[{"flagged":true,"category_scores":{"harassment":0.01,"harassment/threatening":0.01,"hate":0.01,"hate/threatening":0.01,"illicit":0.01,"illicit/violent":0.01,"self-harm":0.01,"self-harm/intent":0.01,"self-harm/instructions":0.01,"sexual":0.9,"sexual/minors":0.01,"violence":0.01,"violence/graphic":0.01}}]}`))
 	}))
 	defer moderationServer.Close()
 
@@ -1598,6 +1598,15 @@ func TestShouldReportOpenAIWSProxyAccountFailure(t *testing.T) {
 		require.ErrorAs(t, err, &closeErr)
 		require.Equal(t, coderws.StatusPolicyViolation, closeErr.StatusCode())
 		require.Equal(t, "model switch requires reconnect", closeErr.Reason())
+	})
+
+	t.Run("strict passthrough policy rejection does not penalize account", func(t *testing.T) {
+		err := service.NewOpenAIWSClientCloseError(
+			coderws.StatusTryAgainLater,
+			"strict security audit is unavailable for websocket passthrough mode",
+			service.ErrOpenAIWSStrictAuditPassthroughUnsupported,
+		)
+		require.False(t, shouldReportOpenAIWSProxyAccountFailure(fmt.Errorf("wrapped local rejection: %w", err)))
 	})
 
 	t.Run("upstream policy violation still penalizes account", func(t *testing.T) {

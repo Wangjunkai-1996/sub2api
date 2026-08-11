@@ -4,11 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+type openAIWSStrictStateCache struct {
+	GatewayCache
+	mu        sync.Mutex
+	accountID int64
+	setErr    error
+	getErr    error
+	getCalls  int
+}
+
+func (c *openAIWSStrictStateCache) SetSessionAccountID(context.Context, int64, string, int64, time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.setErr
+}
+
+func (c *openAIWSStrictStateCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.getCalls++
+	return c.accountID, c.getErr
+}
 
 func TestOpenAIWSStateStore_BindGetDeleteResponseAccount(t *testing.T) {
 	cache := &stubGatewayCache{}
@@ -26,6 +49,41 @@ func TestOpenAIWSStateStore_BindGetDeleteResponseAccount(t *testing.T) {
 	accountID, err = store.GetResponseAccount(ctx, groupID, "resp_abc")
 	require.NoError(t, err)
 	require.Zero(t, accountID)
+}
+
+func TestOpenAIWSStateStore_StrictResponseAccountIsRedisAuthoritative(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(12)
+	responseID := "resp_strict_authority"
+	cache := &openAIWSStrictStateCache{accountID: 22}
+	raw := NewOpenAIWSStateStore(cache)
+	strict, ok := raw.(openAIWSStrictResponseAccountStore)
+	require.True(t, ok)
+
+	cache.setErr = errors.New("redis set unavailable")
+	err := strict.BindResponseAccountStrict(ctx, groupID, responseID, 11, time.Hour)
+	require.ErrorIs(t, err, ErrOpenAIResponseAccountStoreUnavailable)
+	cache.getErr = ErrStickySessionNotFound
+	accountID, getErr := raw.GetResponseAccount(ctx, groupID, responseID)
+	require.NoError(t, getErr)
+	require.Zero(t, accountID, "failed strict SET must not leave a local-only binding")
+
+	cache.setErr = nil
+	cache.getErr = nil
+	require.NoError(t, raw.BindResponseAccount(ctx, groupID, responseID, 11, time.Hour))
+	accountID, getErr = raw.GetResponseAccount(ctx, groupID, responseID)
+	require.NoError(t, getErr)
+	require.Equal(t, int64(11), accountID, "ordinary reads retain the local-cache contract")
+
+	accountID, getErr = strict.GetResponseAccountStrict(ctx, groupID, responseID)
+	require.NoError(t, getErr)
+	require.Equal(t, int64(22), accountID, "strict reads must ignore poisoned local state")
+	require.Positive(t, cache.getCalls)
+
+	cache.getErr = errors.New("redis get unavailable")
+	accountID, getErr = strict.GetResponseAccountStrict(ctx, groupID, responseID)
+	require.Zero(t, accountID)
+	require.ErrorIs(t, getErr, ErrOpenAIResponseAccountStoreUnavailable)
 }
 
 func TestOpenAIWSStateStore_ResponseConnTTL(t *testing.T) {

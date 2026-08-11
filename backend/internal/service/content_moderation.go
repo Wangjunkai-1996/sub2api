@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1988,6 +1989,9 @@ func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg
 		start := time.Now()
 		httpStatus := 0
 		result, err := s.callModerationOnceWithInput(ctx, cfg, key, input, &httpStatus)
+		if err == nil {
+			err = validateStrictModerationAPIResult(result)
+		}
 		latency := int(time.Since(start).Milliseconds())
 		if err == nil {
 			if trackLoad {
@@ -2959,6 +2963,48 @@ type moderationAPIResponse struct {
 type moderationAPIResult struct {
 	Flagged        bool               `json:"flagged"`
 	CategoryScores map[string]float64 `json:"category_scores"`
+	flaggedPresent bool
+}
+
+func (r *moderationAPIResult) UnmarshalJSON(data []byte) error {
+	type wireResult struct {
+		Flagged        *bool              `json:"flagged"`
+		CategoryScores map[string]float64 `json:"category_scores"`
+	}
+	var decoded wireResult
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	r.Flagged = false
+	r.flaggedPresent = decoded.Flagged != nil
+	if decoded.Flagged != nil {
+		r.Flagged = *decoded.Flagged
+	}
+	r.CategoryScores = decoded.CategoryScores
+	return nil
+}
+
+func validateStrictModerationAPIResult(result *moderationAPIResult) error {
+	if result == nil {
+		return errors.New("moderation api returned nil result")
+	}
+	if !result.flaggedPresent {
+		return errors.New("moderation api result is missing flagged verdict")
+	}
+	if result.CategoryScores == nil {
+		return errors.New("moderation api result is missing category_scores")
+	}
+	for _, category := range contentModerationCategoryOrder {
+		if _, ok := result.CategoryScores[category]; !ok {
+			return fmt.Errorf("moderation api result is missing category score %q", category)
+		}
+	}
+	for category, score := range result.CategoryScores {
+		if math.IsNaN(score) || math.IsInf(score, 0) || score < 0 || score > 1 {
+			return fmt.Errorf("moderation api result has invalid category score %q", category)
+		}
+	}
+	return nil
 }
 
 func evaluateModerationScores(scores map[string]float64, thresholds map[string]float64) (bool, string, float64) {

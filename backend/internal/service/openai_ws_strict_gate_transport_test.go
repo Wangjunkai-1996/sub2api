@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,15 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+type strictPassthroughCountingDialer struct {
+	calls atomic.Int32
+}
+
+func (d *strictPassthroughCountingDialer) Dial(context.Context, string, http.Header, string) (openAIWSClientConn, int, http.Header, error) {
+	d.calls.Add(1)
+	return nil, 0, nil, errors.New("strict passthrough must not dial upstream")
+}
 
 func strictGateReplaySignals(payload []byte) (assistantText, functionArguments bool) {
 	for _, item := range gjson.GetBytes(payload, "input").Array() {
@@ -108,6 +118,72 @@ func runStrictGateTwoTurnSession(
 	}
 }
 
+func TestOpenAIWSPassthroughRejectsStrictAuditBeforeDial(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := passthroughLifecycleConfig()
+	dialer := &strictPassthroughCountingDialer{}
+	svc := &OpenAIGatewayService{
+		cfg:                       cfg,
+		httpUpstream:              &httpUpstreamRecorder{},
+		cache:                     &stubGatewayCache{},
+		openaiWSResolver:          NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:             NewCodexToolCorrector(),
+		openaiWSPassthroughDialer: dialer,
+	}
+	account := passthroughLifecycleAccount()
+	serverErrCh := make(chan error, 1)
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		readCtx, cancelRead := context.WithTimeout(r.Context(), 3*time.Second)
+		_, firstMessage, err := conn.Read(readCtx)
+		cancelRead()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Request = r.Clone(r.Context())
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(
+			r.Context(),
+			ginCtx,
+			conn,
+			account,
+			"sk-test",
+			firstMessage,
+			&OpenAIWSIngressHooks{StrictAudit: true},
+		)
+	}))
+	defer wsServer.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.4","input":"safe"}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	select {
+	case proxyErr := <-serverErrCh:
+		require.ErrorIs(t, proxyErr, ErrOpenAIWSStrictAuditPassthroughUnsupported)
+		var closeErr *OpenAIWSClientCloseError
+		require.ErrorAs(t, proxyErr, &closeErr)
+		require.Equal(t, coderws.StatusTryAgainLater, closeErr.StatusCode())
+	case <-time.After(3 * time.Second):
+		t.Fatal("strict passthrough rejection did not return")
+	}
+	require.Zero(t, dialer.calls.Load(), "strict passthrough must fail before any upstream dial")
+}
+
 func TestOpenAIWSHTTPBridgeStrictGateBlocksReplayBeforeTurnAndSecondUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	auditBlockErr := errors.New("strict bridge audit blocked")
@@ -155,6 +231,7 @@ func TestOpenAIWSHTTPBridgeStrictGateBlocksReplayBeforeTurnAndSecondUpstream(t *
 	sawAssistant := false
 	sawFunctionArguments := false
 	hooks := &OpenAIWSIngressHooks{
+		StrictAudit: true,
 		BeforeRequest: func(turn int, payload []byte, _ string) error {
 			if turn != 2 {
 				return nil
@@ -277,6 +354,7 @@ func TestOpenAIWSIngressStrictGateBlocksSecondTurnBeforeTurnAndUpstreamWrite(t *
 	sawAssistant := false
 	sawFunctionArguments := false
 	hooks := &OpenAIWSIngressHooks{
+		StrictAudit: true,
 		BeforeRequest: func(turn int, payload []byte, _ string) error {
 			if turn != 2 {
 				return nil
@@ -398,6 +476,7 @@ func TestOpenAIWSHTTPBridgeRejectsMixedResponseCreateBeforeTurnAndDispatch(t *te
 	beforeTurn2Calls := 0
 	sawIncomplete := false
 	hooks := &OpenAIWSIngressHooks{
+		StrictAudit: true,
 		BeforeRequest: func(turn int, payload []byte, _ string) error {
 			if turn != 2 {
 				return nil
@@ -476,6 +555,7 @@ func TestOpenAIWSIngressRejectsMixedResponseCreateBeforeTurnAndUpstreamWrite(t *
 	beforeTurn2Calls := 0
 	sawIncomplete := false
 	hooks := &OpenAIWSIngressHooks{
+		StrictAudit: true,
 		BeforeRequest: func(turn int, payload []byte, _ string) error {
 			if turn != 2 {
 				return nil

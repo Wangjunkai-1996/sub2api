@@ -3,20 +3,100 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
 const (
 	openAIResponsesLineageCaptureContextKey = "sub2api.openai.strict_lineage_capture"
+	openAIResponsesLineageCommitContextKey  = "sub2api.openai.strict_lineage_commit"
 	// Response media is not accepted into lineage, so 2 MiB safely covers the
 	// 65,536-rune text limit plus JSON escaping and item metadata while bounding
 	// per-turn copies under Pro concurrency.
 	openAIResponsesLineageOutputMaxBytes = 2 * 1024 * 1024
 )
+
+// OpenAIStrictLineageCommitter persists one successful strict-audit turn before
+// its success terminal is exposed to the client. turn is 1 for HTTP requests.
+type OpenAIStrictLineageCommitter func(turn int, result *OpenAIForwardResult) error
+
+// OpenAIStrictLineageCommitError is a local fail-closed error. Callers must not
+// retry the upstream request because the upstream already completed it.
+type OpenAIStrictLineageCommitError struct {
+	cause error
+}
+
+func (e *OpenAIStrictLineageCommitError) Error() string {
+	if e == nil || e.cause == nil {
+		return "strict audit lineage commit failed"
+	}
+	return fmt.Sprintf("strict audit lineage commit failed: %v", e.cause)
+}
+
+func (e *OpenAIStrictLineageCommitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// SetOpenAIStrictLineageCommitter installs the request/turn-scoped persistence
+// gate. Capture-only unit tests intentionally remain possible without a gate.
+func SetOpenAIStrictLineageCommitter(c *gin.Context, committer OpenAIStrictLineageCommitter) {
+	if c != nil && committer != nil {
+		c.Set(openAIResponsesLineageCommitContextKey, committer)
+	}
+}
+
+func openAIStrictLineageCommitRequired(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, exists := c.Get(openAIResponsesLineageCommitContextKey)
+	if !exists {
+		return false
+	}
+	_, ok := value.(OpenAIStrictLineageCommitter)
+	return ok
+}
+
+func commitOpenAIStrictLineageBeforeSuccess(c *gin.Context, turn int, result *OpenAIForwardResult) error {
+	if c == nil {
+		return nil
+	}
+	value, exists := c.Get(openAIResponsesLineageCommitContextKey)
+	if !exists {
+		return nil
+	}
+	committer, ok := value.(OpenAIStrictLineageCommitter)
+	if !ok || committer == nil {
+		return &OpenAIStrictLineageCommitError{cause: fmt.Errorf("lineage committer is unavailable")}
+	}
+	if turn <= 0 {
+		turn = 1
+	}
+	if err := committer(turn, result); err != nil {
+		return &OpenAIStrictLineageCommitError{cause: err}
+	}
+	return nil
+}
+
+func commitOpenAIStrictLineageFields(c *gin.Context, turn int, responseID, terminalEvent string, output []byte, complete bool) error {
+	if !openAIStrictLineageCommitRequired(c) {
+		return nil
+	}
+	result := &OpenAIForwardResult{
+		ResponseID:            strings.TrimSpace(responseID),
+		UpstreamTerminalEvent: strings.TrimSpace(terminalEvent),
+	}
+	result.setOpenAIResponsesLineageOutput(output, complete)
+	return commitOpenAIStrictLineageBeforeSuccess(c, turn, result)
+}
 
 // EnableOpenAIStrictLineageCapture enables response output capture only after
 // strict request admission produced an AuditSummary.
@@ -107,6 +187,59 @@ func extractSingleOpenAIResponsesSuccessTerminal(body string, expectedResponseID
 	}
 	output, complete := extractOpenAIResponsesLineageOutput(terminal, expectedResponseID)
 	return output, complete
+}
+
+// openAIResponsesLineageAccumulator rebuilds the complete model-visible output
+// for transports whose success terminal legitimately contains output: [].
+type openAIResponsesLineageAccumulator struct {
+	output      *apicompat.BufferedResponseAccumulator
+	collector   *responsesStreamOutputCollector
+	imageOutput []json.RawMessage
+	seenImages  map[string]struct{}
+}
+
+func newOpenAIResponsesLineageAccumulator() *openAIResponsesLineageAccumulator {
+	return &openAIResponsesLineageAccumulator{
+		output:     apicompat.NewBufferedResponseAccumulator(),
+		collector:  newResponsesStreamOutputCollector(),
+		seenImages: make(map[string]struct{}),
+	}
+}
+
+func (a *openAIResponsesLineageAccumulator) Observe(payload []byte) {
+	if a == nil || len(payload) == 0 {
+		return
+	}
+	a.collector.Observe(payload)
+	if imageOutput, ok := extractImageGenerationOutputFromSSEData(payload, a.seenImages); ok {
+		a.imageOutput = append(a.imageOutput, imageOutput)
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	if !responsesStreamEventMayContributeToOutput(eventType) {
+		return
+	}
+	var event apicompat.ResponsesStreamEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		a.collector.complete = false
+		return
+	}
+	a.output.ProcessEvent(&event)
+}
+
+func (a *openAIResponsesLineageAccumulator) SuccessTerminalOutput(payload []byte, expectedResponseID string) ([]byte, bool) {
+	if a == nil {
+		return extractOpenAIResponsesLineageOutput(payload, expectedResponseID)
+	}
+	lineagePayload, complete := normalizeResponsesStreamingLineageTerminalOutput(
+		payload,
+		a.output,
+		a.imageOutput,
+		a.collector,
+	)
+	if !complete || !a.collector.Complete() {
+		return nil, false
+	}
+	return extractOpenAIResponsesLineageOutput(lineagePayload, expectedResponseID)
 }
 
 // CaptureOpenAIResponsesLineageOutput is exported for protocol adapters and

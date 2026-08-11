@@ -137,6 +137,16 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	}
 	responsesResp := apicompat.ChatCompletionsResponseToResponses(ccResp, originalModel, customTools, toolSearch, namespaceTools)
 	terminalEvent := openAIResponsesTerminalEventForStatus(responsesResp.Status)
+	if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+		if err := commitOpenAIStrictLineageFields(c, 1, responsesResp.ID, terminalEvent, nil, false); err != nil {
+			return &OpenAIForwardResult{
+				RequestID: requestID, ResponseID: responsesResp.ID, Usage: usage,
+				Model: originalModel, BillingModel: billingModel, UpstreamModel: upstreamModel,
+				ReasoningEffort: reasoningEffort, ServiceTier: serviceTier, Stream: false,
+				UpstreamTerminalEvent: terminalEvent, Duration: time.Since(startTime),
+			}, err
+		}
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -227,13 +237,23 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
-	writeEvents(finalEvents)
 	terminalEvent := ""
 	for _, event := range finalEvents {
 		if event.Response != nil {
 			terminalEvent = openAIResponsesTerminalEventForStatus(event.Response.Status)
 		}
 	}
+	if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+		if err := commitOpenAIStrictLineageFields(c, 1, state.ResponseID, terminalEvent, nil, false); err != nil {
+			return &OpenAIForwardResult{
+				RequestID: requestID, ResponseID: state.ResponseID, Usage: scan.Usage,
+				Model: originalModel, BillingModel: billingModel, UpstreamModel: upstreamModel,
+				ReasoningEffort: reasoningEffort, ServiceTier: serviceTier, Stream: true,
+				UpstreamTerminalEvent: terminalEvent, Duration: time.Since(startTime), FirstTokenMs: scan.FirstTokenMs,
+			}, err
+		}
+	}
+	writeEvents(finalEvents)
 	if !clientDisconnected {
 		writeStreamHeaders()
 		if _, err := fmt.Fprint(c.Writer, "data: [DONE]\n\n"); err != nil {

@@ -31,6 +31,21 @@ func (h *OpenAIGatewayHandler) openAISecurityAuditError(c *gin.Context, decision
 	}})
 }
 
+func (h *OpenAIGatewayHandler) openAIStrictLineageCommitError(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	const message = "安全审计暂时不可用，请稍后重试"
+	if c.Writer.Written() {
+		service.MarkOpsStreamError(c, securityaudit.ErrorCodeAuditUnavailable, message, http.StatusServiceUnavailable)
+		_ = writeResponsesFailedSSE(c, securityaudit.ErrorCodeAuditUnavailable, message)
+		return
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
+		"type": "api_error", "code": securityaudit.ErrorCodeAuditUnavailable, "message": message,
+	}})
+}
+
 func (h *GatewayHandler) openAISecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
 	if decision == nil {
 		return

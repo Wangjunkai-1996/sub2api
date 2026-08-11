@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,18 +32,62 @@ func (r *openAICyberCooldownSettingRepo) GetMultiple(ctx context.Context, keys [
 
 type openAICyberCooldownCache struct {
 	GatewayCache
-	strike   OpenAICyberAccountCooldownStrike
-	err      error
-	calls    int
-	onRecord func(context.Context)
+	mu            sync.Mutex
+	strike        OpenAICyberAccountCooldownStrike
+	err           error
+	deadline      time.Time
+	deadlineErr   error
+	calls         int
+	deadlineCalls int
+	onRecord      func(context.Context)
 }
 
-func (c *openAICyberCooldownCache) RecordOpenAICyberAccountCooldownStrike(ctx context.Context, _ int64, _ string, _ time.Duration, _ time.Time) (OpenAICyberAccountCooldownStrike, error) {
+func (c *openAICyberCooldownCache) RecordOpenAICyberAccountCooldownStrike(
+	ctx context.Context,
+	_ int64,
+	_ string,
+	_ time.Duration,
+	firstDuration time.Duration,
+	escalatedDuration time.Duration,
+	now time.Time,
+) (OpenAICyberAccountCooldownStrike, error) {
+	c.mu.Lock()
 	c.calls++
+	strike := c.strike
+	err := c.err
+	c.mu.Unlock()
 	if c.onRecord != nil {
 		c.onRecord(ctx)
 	}
-	return c.strike, c.err
+	if err != nil {
+		return OpenAICyberAccountCooldownStrike{}, err
+	}
+	if strike.EventRecordedAt.IsZero() {
+		strike.EventRecordedAt = now.UTC()
+	}
+	duration := escalatedDuration
+	if strike.Strikes == 1 {
+		duration = firstDuration
+	}
+	if strike.EventCooldownUntil.IsZero() {
+		strike.EventCooldownUntil = strike.EventRecordedAt.Add(duration)
+	}
+	if strike.AccountCooldownUntil.IsZero() {
+		strike.AccountCooldownUntil = strike.EventCooldownUntil
+	}
+	c.mu.Lock()
+	if strike.AccountCooldownUntil.After(c.deadline) {
+		c.deadline = strike.AccountCooldownUntil
+	}
+	c.mu.Unlock()
+	return strike, nil
+}
+
+func (c *openAICyberCooldownCache) GetOpenAICyberAccountCooldownDeadline(context.Context, int64) (time.Time, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadlineCalls++
+	return c.deadline, c.deadlineErr
 }
 
 type openAICyberCooldownAccountRepo struct {
@@ -129,28 +174,54 @@ func TestOpenAICyberAccountEventDigestIsStableAndAccountScoped(t *testing.T) {
 	require.NotEqual(t, fallbackA, fallbackB, "observation time separates otherwise unidentifiable events")
 }
 
-func TestOpenAICyberAccountCooldownDuplicateReinstallsAndPersistsCooldown(t *testing.T) {
-	cache := &openAICyberCooldownCache{strike: OpenAICyberAccountCooldownStrike{Strikes: 1, Duplicate: true}}
+func TestOpenAICyberAccountCooldownDuplicateReusesOriginalDeadline(t *testing.T) {
+	eventRecordedAt := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	cache := &openAICyberCooldownCache{strike: OpenAICyberAccountCooldownStrike{
+		Strikes: 1, Duplicate: true, EventRecordedAt: eventRecordedAt,
+	}}
 	repo := &openAICyberCooldownAccountRepo{}
 	svc := newOpenAICyberCooldownService(true, cache, repo)
 	account := &Account{ID: 10616, Platform: PlatformOpenAI}
 
-	result := svc.ApplyCyberPolicyAccountCooldown(context.Background(), account, OpenAICyberAccountCooldownEvent{RequestID: "req-duplicate"})
+	first := svc.ApplyCyberPolicyAccountCooldown(context.Background(), account, OpenAICyberAccountCooldownEvent{RequestID: "req-duplicate"})
+	firstUntil := repo.until
+	second := svc.ApplyCyberPolicyAccountCooldown(context.Background(), account, OpenAICyberAccountCooldownEvent{RequestID: "req-duplicate"})
 
-	require.True(t, result.Applied)
-	require.True(t, result.Duplicate)
-	require.Equal(t, 1, result.Strikes)
-	require.Equal(t, 1, cache.calls)
-	require.Equal(t, 1, repo.calls)
+	require.True(t, first.Applied)
+	require.True(t, first.Duplicate)
+	require.Equal(t, 1, first.Strikes)
+	require.True(t, second.Applied)
+	require.True(t, second.Duplicate)
+	require.Equal(t, eventRecordedAt.Add(time.Hour), firstUntil)
+	require.Equal(t, firstUntil, repo.until, "reprocessing one event must not move its deadline")
+	require.Equal(t, 2, cache.calls)
+	require.Equal(t, 2, repo.calls)
 	require.Contains(t, repo.reason, "strikes=1")
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAICyberAccountCooldownExpiredDuplicateDoesNotRestartWindow(t *testing.T) {
+	cache := &openAICyberCooldownCache{strike: OpenAICyberAccountCooldownStrike{
+		Strikes: 1, Duplicate: true, EventRecordedAt: time.Now().UTC().Add(-2 * time.Hour),
+	}}
+	repo := &openAICyberCooldownAccountRepo{}
+	svc := newOpenAICyberCooldownService(true, cache, repo)
+	account := &Account{ID: 10616, Platform: PlatformOpenAI}
+
+	result := svc.ApplyCyberPolicyAccountCooldown(context.Background(), account, OpenAICyberAccountCooldownEvent{RequestID: "req-expired-duplicate"})
+
+	require.False(t, result.Applied)
+	require.True(t, result.Duplicate)
+	require.Equal(t, 1, result.Strikes)
+	require.Zero(t, repo.calls)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
 func TestOpenAICyberAccountCooldownPendingGateBlocksSchedulingDuringDedup(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	cache := &openAICyberCooldownCache{
-		strike: OpenAICyberAccountCooldownStrike{Strikes: 1, Duplicate: true},
+		strike: OpenAICyberAccountCooldownStrike{Strikes: 1, Duplicate: true, EventRecordedAt: time.Now().UTC()},
 		onRecord: func(ctx context.Context) {
 			close(entered)
 			select {
@@ -295,4 +366,29 @@ func TestOpenAICyberAccountCooldownPersistenceFailureKeepsRuntimeBlock(t *testin
 
 	require.Error(t, result.PersistenceError)
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAICyberAccountCooldownPersistenceFailureBlocksAnotherServiceInstance(t *testing.T) {
+	cache := &openAICyberCooldownCache{strike: OpenAICyberAccountCooldownStrike{Strikes: 1}}
+	writer := newOpenAICyberCooldownService(true, cache, &openAICyberCooldownAccountRepo{err: errors.New("db unavailable")})
+	reader := newOpenAICyberCooldownService(true, cache, &openAICyberCooldownAccountRepo{})
+	account := &Account{ID: 10616, Platform: PlatformOpenAI}
+
+	result := writer.ApplyCyberPolicyAccountCooldown(context.Background(), account, OpenAICyberAccountCooldownEvent{RequestID: "req-cross-instance"})
+
+	require.Error(t, result.PersistenceError)
+	require.ErrorIs(t, reader.RecheckOpenAICyberAccountCooldown(context.Background(), account), ErrOpenAICyberAccountCooldownBlocked)
+	require.True(t, reader.isOpenAIAccountRuntimeBlocked(account), "Redis deadline must install a runtime block in the other instance")
+	require.Equal(t, 1, cache.deadlineCalls)
+}
+
+func TestOpenAICyberAccountCooldownRecheckFailsClosedWhenRedisReadFails(t *testing.T) {
+	cache := &openAICyberCooldownCache{deadlineErr: errors.New("redis unavailable")}
+	svc := newOpenAICyberCooldownService(true, cache, &openAICyberCooldownAccountRepo{})
+	account := &Account{ID: 10616, Platform: PlatformOpenAI}
+
+	err := svc.RecheckOpenAICyberAccountCooldown(context.Background(), account)
+
+	require.ErrorIs(t, err, ErrOpenAICyberAccountCooldownStateUnavailable)
+	require.Equal(t, 1, cache.deadlineCalls)
 }

@@ -18,11 +18,20 @@ const (
 	openAICyberAccountCooldownRedisTimeout = 500 * time.Millisecond
 )
 
+var (
+	ErrOpenAICyberAccountCooldownBlocked          = errors.New("OpenAI account is blocked by Cyber cooldown")
+	ErrOpenAICyberAccountCooldownStateUnavailable = errors.New("OpenAI Cyber cooldown state unavailable")
+)
+
 // OpenAICyberAccountCooldownStrike is the atomic Redis result for one real
-// upstream Cyber event. Duplicate events preserve the current strike count.
+// upstream Cyber event. Duplicate events preserve their original tier and
+// deadline even when later events have escalated the account-wide deadline.
 type OpenAICyberAccountCooldownStrike struct {
-	Strikes   int
-	Duplicate bool
+	Strikes              int
+	Duplicate            bool
+	EventRecordedAt      time.Time
+	EventCooldownUntil   time.Time
+	AccountCooldownUntil time.Time
 }
 
 // OpenAICyberAccountCooldownStore is implemented by the Redis gateway cache.
@@ -34,8 +43,11 @@ type OpenAICyberAccountCooldownStore interface {
 		accountID int64,
 		eventDigest string,
 		window time.Duration,
+		firstDuration time.Duration,
+		escalatedDuration time.Duration,
 		now time.Time,
 	) (OpenAICyberAccountCooldownStrike, error)
+	GetOpenAICyberAccountCooldownDeadline(ctx context.Context, accountID int64) (time.Time, error)
 }
 
 // OpenAICyberAccountCooldownEvent contains only request/upstream evidence from
@@ -127,7 +139,6 @@ func (s *OpenAIGatewayService) ApplyCyberPolicyAccountCooldown(
 	}
 
 	now := time.Now().UTC()
-	duration := policy.EscalatedDuration()
 	strike := OpenAICyberAccountCooldownStrike{}
 	store := s.openAICyberAccountCooldownStore()
 	if store == nil {
@@ -141,25 +152,34 @@ func (s *OpenAIGatewayService) ApplyCyberPolicyAccountCooldown(
 			account.ID,
 			openAICyberAccountEventDigest(account.ID, event),
 			policy.Window(),
+			policy.FirstDuration(),
+			policy.EscalatedDuration(),
 			now,
 		)
 		cancel()
-		if err != nil || strike.Strikes <= 0 {
+		if err != nil || strike.Strikes <= 0 || strike.EventRecordedAt.IsZero() || strike.EventCooldownUntil.IsZero() ||
+			strike.AccountCooldownUntil.IsZero() || strike.AccountCooldownUntil.Before(strike.EventCooldownUntil) {
 			result.RedisFallback = true
 			if err == nil {
-				err = errors.New("invalid zero strike count")
+				err = errors.New("invalid Cyber cooldown strike state")
 			}
 			slog.Warn("openai cyber account cooldown strike failed; using escalated tier", "account_id", account.ID, "error", err)
 		} else {
 			result.Strikes = strike.Strikes
 			result.Duplicate = strike.Duplicate
-			if strike.Strikes == 1 {
-				duration = policy.FirstDuration()
-			}
 		}
 	}
 
-	until := now.Add(duration)
+	until := strike.AccountCooldownUntil.UTC()
+	if result.RedisFallback {
+		until = now.Add(policy.EscalatedDuration())
+	}
+	if until.IsZero() || !until.After(now) {
+		result.CooldownUntil = until
+		clearPending()
+		pending = false
+		return result
+	}
 	reason := fmt.Sprintf("%s:strikes=%d", openAICyberAccountCooldownReason, result.Strikes)
 	if result.RedisFallback {
 		reason = openAICyberAccountCooldownReason + ":redis_fallback"
@@ -187,4 +207,39 @@ func (s *OpenAIGatewayService) ApplyCyberPolicyAccountCooldown(
 		slog.Error("openai cyber account cooldown persistence failed", "account_id", account.ID, "error", result.PersistenceError)
 	}
 	return result
+}
+
+// RecheckOpenAICyberAccountCooldown is the final scheduling/admission gate.
+// An enabled policy requires a readable Redis deadline; failures are closed so
+// a DB persistence failure cannot become a cross-instance scheduling bypass.
+func (s *OpenAIGatewayService) RecheckOpenAICyberAccountCooldown(ctx context.Context, account *Account) error {
+	if s == nil || account == nil || account.ID <= 0 || account.Platform != PlatformOpenAI {
+		return nil
+	}
+	if s.isOpenAIAccountRuntimeBlocked(account) {
+		return ErrOpenAICyberAccountCooldownBlocked
+	}
+	// Tests and deliberately minimal service instances have no runtime setting
+	// service. Production constructors always provide one.
+	if s.settingService == nil {
+		return nil
+	}
+	if !s.settingService.GetOpenAICyberAccountCooldownRuntime(ctx).Enabled() {
+		return nil
+	}
+	store := s.openAICyberAccountCooldownStore()
+	if store == nil {
+		return ErrOpenAICyberAccountCooldownStateUnavailable
+	}
+	stateCtx, cancel := openAICyberAccountCooldownRedisContext(ctx)
+	deadline, err := store.GetOpenAICyberAccountCooldownDeadline(stateCtx, account.ID)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrOpenAICyberAccountCooldownStateUnavailable, err)
+	}
+	if !deadline.After(time.Now().UTC()) {
+		return nil
+	}
+	s.BlockAccountScheduling(account, deadline, openAICyberAccountCooldownReason+":redis_deadline")
+	return ErrOpenAICyberAccountCooldownBlocked
 }

@@ -193,6 +193,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 
 	agentTaskRecoveryTried := false
+	allowInternalReplay := !openAIStrictHTTPContinuationRequired(ctx)
 	var resp *http.Response
 	for {
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
@@ -219,7 +220,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		probeBody := s.readUpstreamErrorBody(resp)
 		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(probeBody))
-		if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, probeBody) {
+		if allowInternalReplay && !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, probeBody) {
 			agentTaskRecoveryTried = true
 			expectedTaskID := account.GetCredential("task_id")
 			if recoveryErr := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); recoveryErr != nil {
@@ -246,12 +247,17 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	terminalEvent := ""
 	var lineageOutput []byte
 	lineageComplete := false
+	var responseErr error
 	imageCount := 0
 	var imageOutputSizes []string
 	if reqStream {
 		result, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
 		if err != nil {
-			return nil, err
+			var lineageCommitErr *OpenAIStrictLineageCommitError
+			if !errors.As(err, &lineageCommitErr) || result == nil {
+				return nil, err
+			}
+			responseErr = err
 		}
 		usage = result.usage
 		firstTokenMs = result.firstTokenMs
@@ -264,7 +270,11 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	} else {
 		result, err := s.handleNonStreamingResponsePassthrough(ctx, resp, c, reqModel, upstreamPassthroughModel)
 		if err != nil {
-			return nil, err
+			var lineageCommitErr *OpenAIStrictLineageCommitError
+			if !errors.As(err, &lineageCommitErr) || result == nil {
+				return nil, err
+			}
+			responseErr = err
 		}
 		usage = result.usage
 		responseID = strings.TrimSpace(result.responseID)
@@ -311,7 +321,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		forwardResult.ImageOutputSizes = imageOutputSizes
 		forwardResult.BillingModel = imageBillingModel
 	}
-	return forwardResult, nil
+	return forwardResult, responseErr
 }
 
 func logOpenAIPassthroughInstructionsRejected(
@@ -1152,6 +1162,8 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	failedMessage := ""
 	clientOutputStarted := false
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
+	strictTerminalPending := false
+	strictTerminalLine := ""
 	// pendingLines 在首个可见输出前保留前导事件，确保无输出失败仍可安全 failover。
 	pendingLines := make([]string, 0, 8)
 	// flushPending 表示已写入但未到 SSE 空行边界的脏状态；defer 兜底函数退出前的残留，断连后不再 Flush。
@@ -1203,9 +1215,63 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			imageOutputSizes: imageCounter.Sizes(),
 		}
 	}
+	commitStrictTerminal := func(doneLine string) error {
+		if !strictTerminalPending {
+			return &OpenAIStrictLineageCommitError{cause: fmt.Errorf("strict passthrough SSE success terminal is unavailable")}
+		}
+		if err := commitOpenAIStrictLineageFields(c, 1, responseID, terminalEvent, lineageOutput, lineageComplete); err != nil {
+			return err
+		}
+		if !clientDisconnected {
+			if !clientOutputStarted && !writePendingLines() {
+				strictTerminalPending = false
+				strictTerminalLine = ""
+				return nil
+			}
+			lines := []string{strictTerminalLine, ""}
+			if doneLine != "" {
+				lines = append(lines, doneLine, "")
+			}
+			for _, terminalLine := range lines {
+				if _, err := fmt.Fprintln(w, terminalLine); err != nil {
+					clientDisconnected = true
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] Client disconnected while writing committed strict terminal: account=%d", account.ID)
+					break
+				}
+			}
+			if !clientDisconnected {
+				flusher.Flush()
+				clientOutputStarted = true
+				flushPending = false
+			}
+		}
+		strictTerminalPending = false
+		strictTerminalLine = ""
+		return nil
+	}
+	failStrictTerminal := func(cause error) error {
+		lineageOutput, lineageComplete = nil, false
+		if err := commitOpenAIStrictLineageFields(c, 1, responseID, terminalEvent, nil, false); err != nil {
+			return err
+		}
+		return &OpenAIStrictLineageCommitError{cause: cause}
+	}
 
 	for documentScanner.Scan() {
 		line := documentScanner.Text()
+		if strictTerminalPending {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			if data, ok := extractOpenAISSEDataLine(line); ok && strings.TrimSpace(data) == "[DONE]" {
+				sawDone = true
+				if err := commitStrictTerminal(line); err != nil {
+					return resultWithUsage(), err
+				}
+				break
+			}
+			return resultWithUsage(), failStrictTerminal(fmt.Errorf("strict passthrough SSE stream contains data after success terminal"))
+		}
 		lineStartsClientOutput := false
 		forceFlushFailedEvent := false
 		if data, ok := extractOpenAISSEDataLine(line); ok {
@@ -1347,6 +1413,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				firstTokenMs = &ms
 			}
 			s.parseSSEUsageBytes(dataBytes, usage)
+			if openAIStrictLineageCommitRequired(c) && (rawEventType == "response.completed" || rawEventType == "response.done") {
+				strictTerminalPending = true
+				strictTerminalLine = line
+				continue
+			}
 		}
 
 		if !clientDisconnected {
@@ -1372,6 +1443,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 	}
 	if err := documentScanner.Err(); err != nil {
+		if strictTerminalPending {
+			return resultWithUsage(), failStrictTerminal(fmt.Errorf("strict passthrough SSE stream failed after success terminal: %w", err))
+		}
 		if (sawDone || sawTerminalEvent) && !sawFailedEvent {
 			s.clearOpenAIProxyStreamDisconnect(account)
 			return resultWithUsage(), nil
@@ -1405,6 +1479,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			err,
 		)
 		return resultWithUsage(), fmt.Errorf("stream read error: %w", err)
+	}
+	if strictTerminalPending {
+		if err := commitStrictTerminal(""); err != nil {
+			return resultWithUsage(), err
+		}
 	}
 	if sawFailedEvent {
 		return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
@@ -1494,14 +1573,24 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if lineageSourceValid {
 		lineageOutput, lineageComplete = extractOpenAIResponsesLineageOutput(body, lineageResponseID)
 	}
+	responseID := extractOpenAIResponseIDFromJSONBytes(body)
+	terminalEvent := extractOpenAIResponseTerminalEventFromJSONBytes(body)
+	if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+		if err := commitOpenAIStrictLineageFields(c, 1, responseID, terminalEvent, lineageOutput, lineageComplete); err != nil {
+			return &openaiNonStreamingResultPassthrough{
+				OpenAIUsage: usage, usage: usage, responseID: responseID, terminalEvent: terminalEvent,
+				lineageOutput: lineageOutput, lineageComplete: lineageComplete,
+			}, err
+		}
+	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
 	return &openaiNonStreamingResultPassthrough{
 		OpenAIUsage:      usage,
 		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		terminalEvent:    extractOpenAIResponseTerminalEventFromJSONBytes(body),
+		responseID:       responseID,
+		terminalEvent:    terminalEvent,
 		lineageOutput:    lineageOutput,
 		lineageComplete:  lineageComplete,
 		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
@@ -1568,19 +1657,6 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		body = []byte(bodyText)
 	}
 
-	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
-
-	contentType := "application/json; charset=utf-8"
-	if !ok {
-		contentType = resp.Header.Get("Content-Type")
-		if contentType == "" {
-			contentType = "text/event-stream"
-		}
-	}
-	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
-		c.Data(resp.StatusCode, contentType, body)
-	}
-
 	lineageOutput, lineageComplete := []byte(nil), false
 	if openAIResponsesLineageCaptureEnabled(c) {
 		expectedResponseID := firstNonEmpty(extractFirstOpenAIResponseIDFromSSEBody(bodyText), extractOpenAIResponseIDFromJSONBytes(body))
@@ -1602,11 +1678,35 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 			lineageOutput, lineageComplete = nil, false
 		}
 	}
+	responseID := extractOpenAIResponseIDFromJSONBytes(body)
+	terminalEvent := firstNonEmpty(extractOpenAIResponseTerminalEventFromJSONBytes(body), extractOpenAISSETerminalEventType(bodyText))
+	if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+		if err := commitOpenAIStrictLineageFields(c, 1, responseID, terminalEvent, lineageOutput, lineageComplete); err != nil {
+			return &openaiNonStreamingResultPassthrough{
+				OpenAIUsage: usage, usage: usage, responseID: responseID, terminalEvent: terminalEvent,
+				lineageOutput: lineageOutput, lineageComplete: lineageComplete,
+			}, err
+		}
+	}
+
+	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+
+	contentType := "application/json; charset=utf-8"
+	if !ok {
+		contentType = resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "text/event-stream"
+		}
+	}
+	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
+		c.Data(resp.StatusCode, contentType, body)
+	}
+
 	return &openaiNonStreamingResultPassthrough{
 		OpenAIUsage:      usage,
 		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		terminalEvent:    firstNonEmpty(extractOpenAIResponseTerminalEventFromJSONBytes(body), extractOpenAISSETerminalEventType(bodyText)),
+		responseID:       responseID,
+		terminalEvent:    terminalEvent,
 		lineageOutput:    lineageOutput,
 		lineageComplete:  lineageComplete,
 		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),

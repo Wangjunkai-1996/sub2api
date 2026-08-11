@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,7 +73,7 @@ func securityAuditMediaTestMiddleware(c *gin.Context) {
 }
 
 func blockingHandlerPromptEngine() *handlerPromptEngine {
-	return &handlerPromptEngine{mode: securityaudit.ModeBlocking, decision: &securityaudit.PromptDecision{
+	return &handlerPromptEngine{mode: securityaudit.ModeBlocking, strict: true, decision: &securityaudit.PromptDecision{
 		Kind: securityaudit.DecisionBlock, ErrorCode: securityaudit.ErrorCodeBlocked, AllowNextStage: false,
 	}}
 }
@@ -109,7 +110,7 @@ func TestAsyncImageSuccessfulPrecheckIsNotRepeatedByDetachedExecution(t *testing
 	gin.SetMode(gin.TestMode)
 	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
 	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
-	engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionAllow, AllowNextStage: true}}
+	engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, strict: true, decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionAllow, AllowNextStage: true}}
 	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
 	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
 	var executionMu sync.Mutex
@@ -184,7 +185,7 @@ func TestSecurityAuditBlockingFailuresLeaveAllDownstreamCountersAtZero(t *testin
 	for _, kind := range []securityaudit.DecisionKind{securityaudit.DecisionBlock, securityaudit.DecisionUnavailable, securityaudit.DecisionInvalid} {
 		t.Run(string(kind), func(t *testing.T) {
 			promptDecision := promptGuardDecision(kind)
-			engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, decision: &securityaudit.PromptDecision{
+			engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, strict: true, decision: &securityaudit.PromptDecision{
 				Kind: kind, ErrorCode: promptDecision.ErrorCode, AllowNextStage: false,
 			}}
 			coordinator := securityaudit.NewCoordinator(nil, engine)
@@ -291,6 +292,240 @@ type strictContinuationBillingCacheSpy struct {
 func (s *strictContinuationBillingCacheSpy) GetUserBalance(context.Context, int64) (float64, error) {
 	s.balanceCalls.Add(1)
 	return 0, errors.New("unexpected billing check")
+}
+
+type cyberBlockedAuditSpy struct {
+	blockingCalls atomic.Int32
+	checkCalls    atomic.Int32
+}
+
+func (s *cyberBlockedAuditSpy) BlockingApplies(context.Context, securityaudit.Request) (bool, error) {
+	s.blockingCalls.Add(1)
+	return true, nil
+}
+
+func (s *cyberBlockedAuditSpy) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
+	s.checkCalls.Add(1)
+	return &securityaudit.LegacyDecision{Allowed: true}, nil
+}
+
+type cyberBlockedHandlerFixture struct {
+	handler          *OpenAIGatewayHandler
+	cache            *cyberHandlerGatewayCache
+	legacyAudit      *cyberBlockedAuditSpy
+	promptAudit      *handlerPromptEngine
+	lineage          *handlerAllowLineageStore
+	accountRepo      *strictContinuationAccountRepoSpy
+	concurrencyCache *concurrencyCacheMock
+	billingCache     *strictContinuationBillingCacheSpy
+	upstream         *openAIHTTPPassthroughFailoverUpstream
+}
+
+func newCyberBlockedHandlerFixture(t *testing.T, groupID int64) *cyberBlockedHandlerFixture {
+	t.Helper()
+	settingSvc := service.NewSettingService(&cyberHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyCyberSessionBlockEnabled:    "true",
+		service.SettingKeyCyberSessionBlockTTLSeconds: "60",
+		service.SettingKeyCyberSessionBlockAllGroups:  "false",
+		service.SettingKeyCyberSessionBlockGroupIDs:   fmt.Sprintf("[%d]", groupID),
+	}}, nil)
+	cache := &cyberHandlerGatewayCache{blocked: make(map[string]bool)}
+	accountRepo := &strictContinuationAccountRepoSpy{}
+	concurrencyCache := &concurrencyCacheMock{
+		acquireIngressLeaseFn: func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireUserSlotFn:     func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireAccountSlotFn:  func(context.Context, int64, int, string) (bool, error) { return true, nil },
+	}
+	concurrency := service.NewConcurrencyService(concurrencyCache)
+	cfg := &config.Config{}
+	billingCache := &strictContinuationBillingCacheSpy{}
+	billing := service.NewBillingCacheService(billingCache, nil, nil, nil, nil, nil, cfg, nil)
+	t.Cleanup(billing.Stop)
+	upstream := &openAIHTTPPassthroughFailoverUpstream{}
+	gateway := service.NewOpenAIGatewayService(
+		accountRepo, nil, nil, nil, nil, nil, cache, cfg, nil, concurrency, nil, nil,
+		billing, upstream, nil, nil, nil, nil, nil, nil, settingSvc, nil,
+	)
+	legacyAudit := &cyberBlockedAuditSpy{}
+	promptAudit := &handlerPromptEngine{
+		mode: securityaudit.ModeBlocking, strict: true, err: errors.New("auditor must not run for an already-blocked session"),
+	}
+	lineage := &handlerAllowLineageStore{summary: securityaudit.AuditSummary{
+		Verdict: securityaudit.AuditVerdictAllow, ContextComplete: true,
+		APIKeyID: 9, GroupID: &groupID, PromptHash: "parent-hash", RedactedContext: "parent context",
+	}}
+	h := &OpenAIGatewayHandler{
+		gatewayService:      gateway,
+		billingCacheService: billing,
+		apiKeyService:       &service.APIKeyService{},
+		concurrencyHelper:   NewConcurrencyHelper(concurrency, SSEPingFormatComment, time.Second),
+		securityAuditCoordinator: securityaudit.NewCoordinator(legacyAudit, promptAudit).
+			SetLineageStore(lineage),
+		cfg: cfg, maxAccountSwitches: 1,
+	}
+	return &cyberBlockedHandlerFixture{
+		handler: h, cache: cache, legacyAudit: legacyAudit, promptAudit: promptAudit,
+		lineage: lineage, accountRepo: accountRepo, concurrencyCache: concurrencyCache,
+		billingCache: billingCache, upstream: upstream,
+	}
+}
+
+func (f *cyberBlockedHandlerFixture) assertNoDownstreamSideEffects(t *testing.T) {
+	t.Helper()
+	require.Zero(t, f.legacyAudit.blockingCalls.Load())
+	require.Zero(t, f.legacyAudit.checkCalls.Load())
+	evaluated, enqueued, requests := f.promptAudit.snapshot()
+	require.Zero(t, evaluated)
+	require.Zero(t, enqueued)
+	require.Empty(t, requests)
+	require.Zero(t, f.lineage.loads.Load())
+	require.Zero(t, f.cache.stickyReadCalls)
+	require.Zero(t, f.accountRepo.calls.Load())
+	require.Zero(t, atomic.LoadInt32(&f.concurrencyCache.acquireIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&f.concurrencyCache.acquireUserCalled))
+	require.Zero(t, atomic.LoadInt32(&f.concurrencyCache.acquireAccountCalled))
+	require.Zero(t, atomic.LoadInt32(&f.concurrencyCache.releaseIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&f.concurrencyCache.releaseUserCalled))
+	require.Zero(t, atomic.LoadInt32(&f.concurrencyCache.releaseAccountCalled))
+	require.Zero(t, f.billingCache.balanceCalls.Load())
+	require.Empty(t, f.upstream.calls())
+}
+
+func blockCyberSessionForRequest(t *testing.T, fixture *cyberBlockedHandlerFixture, apiKeyID int64, method, path, sessionID string, body []byte) {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(method, path, nil)
+	c.Request.Header.Set("session_id", sessionID)
+	key := service.CyberSessionBlockKey(apiKeyID, c, body)
+	require.NotEmpty(t, key)
+	fixture.cache.blocked[key] = true
+}
+
+func TestCyberSessionBlockPrecedesStrictAuditAndDownstreamHTTP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(12)
+	tests := []struct {
+		name    string
+		path    string
+		body    string
+		handler func(*OpenAIGatewayHandler, *gin.Context)
+	}{
+		{
+			name: "responses continuation", path: "/v1/responses",
+			body:    `{"model":"gpt-5.4","previous_response_id":"resp_parent","input":"safe"}`,
+			handler: func(h *OpenAIGatewayHandler, c *gin.Context) { h.Responses(c) },
+		},
+		{
+			name: "chat completions", path: "/v1/chat/completions",
+			body:    `{"model":"gpt-5.4","messages":[{"role":"user","content":"safe"}]}`,
+			handler: func(h *OpenAIGatewayHandler, c *gin.Context) { h.ChatCompletions(c) },
+		},
+		{
+			name: "messages", path: "/v1/messages",
+			body:    `{"model":"gpt-5.4","messages":[{"role":"user","content":"safe"}]}`,
+			handler: func(h *OpenAIGatewayHandler, c *gin.Context) { h.Messages(c) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newCyberBlockedHandlerFixture(t, groupID)
+			sessionID := "blocked-" + strings.ReplaceAll(tt.name, " ", "-")
+			blockCyberSessionForRequest(t, fixture, 9, http.MethodPost, tt.path, sessionID, []byte(tt.body))
+
+			user := &service.User{ID: 7, Username: "strict-user", Status: service.StatusActive}
+			apiKey := &service.APIKey{
+				ID: 9, UserID: user.ID, User: user, GroupID: &groupID,
+				Group: &service.Group{
+					ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive,
+					AllowMessagesDispatch: true,
+				},
+			}
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set(string(middleware2.ContextKeyAPIKey), apiKey)
+				c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: user.ID, Concurrency: 2})
+				c.Next()
+			})
+			router.POST(tt.path, func(c *gin.Context) { tt.handler(fixture.handler, c) })
+
+			request := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("session_id", sessionID)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+
+			require.Equal(t, http.StatusForbidden, recorder.Code)
+			require.Equal(t, 1, fixture.cache.readCalls)
+			fixture.assertNoDownstreamSideEffects(t)
+		})
+	}
+}
+
+func TestCyberSessionBlockPrecedesStrictAuditAndDownstreamWebSocket(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(12)
+	fixture := newCyberBlockedHandlerFixture(t, groupID)
+	sessionID := "blocked-ws-first-turn"
+	firstMessage := []byte(`{"type":"response.create","model":"gpt-5.4","previous_response_id":"resp_parent","input":"safe"}`)
+	blockCyberSessionForRequest(t, fixture, 9, http.MethodGet, "/openai/v1/responses", sessionID, firstMessage)
+
+	user := &service.User{ID: 7, Username: "strict-ws", Status: service.StatusActive}
+	apiKey := &service.APIKey{
+		ID: 9, UserID: user.ID, User: user, GroupID: &groupID,
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
+	}
+	handlerDone := make(chan struct{})
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), apiKey)
+		c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: user.ID, Concurrency: 2})
+		c.Next()
+	})
+	router.GET("/openai/v1/responses", func(c *gin.Context) {
+		fixture.handler.ResponsesWebSocket(c)
+		close(handlerDone)
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Set("session_id", sessionID)
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	conn, _, err := coderws.Dial(
+		dialCtx,
+		"ws"+strings.TrimPrefix(server.URL, "http")+"/openai/v1/responses",
+		&coderws.DialOptions{HTTPHeader: headers},
+	)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = conn.Write(writeCtx, coderws.MessageText, firstMessage)
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, payload, err := conn.Read(readCtx)
+	cancelRead()
+	require.NoError(t, err)
+	require.Contains(t, string(payload), "session_blocked_by_cyber_policy")
+
+	readCtx, cancelRead = context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = conn.Read(readCtx)
+	cancelRead()
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusPolicyViolation, closeErr.Code)
+	select {
+	case <-handlerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cyber-blocked websocket handler did not finish")
+	}
+
+	require.Equal(t, 1, fixture.cache.readCalls)
+	fixture.assertNoDownstreamSideEffects(t)
 }
 
 func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testing.T) {

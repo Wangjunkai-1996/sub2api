@@ -89,22 +89,28 @@ type OpenAIAccountScheduleRequest struct {
 	ExcludedIDs                    map[int64]struct{}
 }
 
-type openAIStrictHTTPContinuationContextKey struct{}
+type openAIStrictContinuationContextKey struct{}
+
+// WithOpenAIStrictContinuation marks an audited continuation whose
+// response/account binding must never fall back to another account.
+func WithOpenAIStrictContinuation(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIStrictContinuationContextKey{}, true)
+}
 
 // WithOpenAIStrictHTTPContinuation marks an audited HTTP continuation whose
 // response/account binding must never fall back to another account.
 func WithOpenAIStrictHTTPContinuation(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, openAIStrictHTTPContinuationContextKey{}, true)
+	return WithOpenAIStrictContinuation(ctx)
 }
 
 func openAIStrictHTTPContinuationRequired(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	required, _ := ctx.Value(openAIStrictHTTPContinuationContextKey{}).(bool)
+	required, _ := ctx.Value(openAIStrictContinuationContextKey{}).(bool)
 	return required
 }
 
@@ -2060,6 +2066,9 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
 	if err == nil && selection != nil && selection.Account != nil {
 		return selection, decision, nil
 	}
+	if errors.Is(err, ErrOpenAICyberAccountCooldownStateUnavailable) {
+		return nil, decision, err
+	}
 	// 如果要求 native 能力（如指定了模型）但没有可用的 APIKey 账号，回退到 basic（OAuth 账号）
 	if requiredCapability == OpenAIImagesCapabilityNative {
 		return s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", OpenAIImagesCapabilityBasic, false, PlatformOpenAI, false, false)
@@ -2067,13 +2076,9 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
 	return selection, decision, err
 }
 
-// selectAccountWithScheduler wraps selectAccountWithSchedulerOnce with a
-// fail-open second pass for the proxy stream circuit (#5056): when the only
-// reason no account is available is that every candidate sits behind a
-// quarantined proxy, the quarantine must degrade to a preference instead of
-// zeroing out capacity. The retry re-runs the exact same selection with the
-// quarantine checks bypassed, so healthy proxies always win the first pass
-// and quarantined ones only serve when nothing else can.
+// selectAccountWithScheduler performs the final cross-instance Cyber cooldown
+// admission after either scheduler returns. A blocked account is released and
+// excluded before retrying; Redis state failures stop selection.
 func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	ctx context.Context,
 	groupID *int64,
@@ -2089,6 +2094,71 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	previousResponseCanMove bool,
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
+	for {
+		selection, decision, err := s.selectAccountWithSchedulerBeforeCyberCooldown(
+			ctx,
+			groupID,
+			previousResponseID,
+			sessionHash,
+			requestedModel,
+			effectiveExcludedIDs,
+			requiredTransport,
+			requiredCapability,
+			requiredImageCapability,
+			requireCompact,
+			platform,
+			previousResponseCanMove,
+			useUpstreamTokenCost,
+		)
+		if err != nil || selection == nil || selection.Account == nil {
+			return selection, decision, err
+		}
+
+		cooldownErr := s.RecheckOpenAICyberAccountCooldown(ctx, selection.Account)
+		if cooldownErr == nil {
+			return selection, decision, nil
+		}
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		if errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownStateUnavailable) {
+			return nil, decision, cooldownErr
+		}
+		if !errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownBlocked) {
+			return nil, decision, cooldownErr
+		}
+		if openAIStrictHTTPContinuationRequired(ctx) {
+			return nil, decision, ErrOpenAIPreviousResponseAccountUnavailable
+		}
+		if effectiveExcludedIDs == nil {
+			effectiveExcludedIDs = make(map[int64]struct{})
+		}
+		accountID := selection.Account.ID
+		if _, exists := effectiveExcludedIDs[accountID]; exists {
+			return nil, decision, ErrNoAvailableAccounts
+		}
+		effectiveExcludedIDs[accountID] = struct{}{}
+	}
+}
+
+func (s *OpenAIGatewayService) selectAccountWithSchedulerBeforeCyberCooldown(
+	ctx context.Context,
+	groupID *int64,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requiredImageCapability OpenAIImagesCapability,
+	requireCompact bool,
+	platform string,
+	previousResponseCanMove bool,
+	useUpstreamTokenCost bool,
+) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	// Preserve the proxy stream circuit's fail-open second pass: quarantined
+	// proxies are used only when no healthy candidate remains.
 	selection, decision, err := s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
 	if err == nil || openAIProxyStreamQuarantineBypassed(ctx) {
 		return selection, decision, err
@@ -2170,7 +2240,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
 			effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 			for {
-				selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, sessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost)
+				selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, sessionHash, requestedModel, effectiveExcludedIDs, requiredTransport, requireCompact, requiredCapability, useUpstreamTokenCost)
 				if err != nil {
 					return nil, decision, err
 				}
@@ -2195,7 +2265,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 
 		effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 		for {
-			selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, sessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost)
+			selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, sessionHash, requestedModel, effectiveExcludedIDs, requiredTransport, requireCompact, requiredCapability, useUpstreamTokenCost)
 			if err != nil {
 				return nil, decision, err
 			}
@@ -2295,14 +2365,24 @@ func (s *OpenAIGatewayService) isOpenAIAccountTransportCompatible(account *Accou
 	if s == nil || account == nil {
 		return false
 	}
-	if requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Ingress {
+	if requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Ingress ||
+		requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Audited ||
+		requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress {
 		if s.cfg == nil || !s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled {
 			return s.getOpenAIWSProtocolResolver().Resolve(account).Transport == OpenAIUpstreamTransportResponsesWebsocketV2
 		}
 		mode := account.ResolveOpenAIResponsesWebSocketV2Mode(s.cfg.Gateway.OpenAIWS.IngressModeDefault)
 		switch mode {
-		case OpenAIWSIngressModeCtxPool, OpenAIWSIngressModePassthrough, OpenAIWSIngressModeHTTPBridge, OpenAIWSIngressModeShared, OpenAIWSIngressModeDedicated:
-			return true
+		case OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeShared, OpenAIWSIngressModeDedicated:
+			if requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Ingress {
+				return true
+			}
+			return s.getOpenAIWSProtocolResolver().Resolve(account).Transport == OpenAIUpstreamTransportResponsesWebsocketV2
+		case OpenAIWSIngressModeHTTPBridge:
+			return requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Ingress ||
+				requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress
+		case OpenAIWSIngressModePassthrough:
+			return requiredTransport == OpenAIUpstreamTransportResponsesWebsocketV2Ingress
 		default:
 			return false
 		}

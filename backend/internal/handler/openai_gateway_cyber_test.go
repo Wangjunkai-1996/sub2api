@@ -48,8 +48,11 @@ type cyberHandlerGatewayCache struct {
 	blocked             map[string]bool
 	readCalls           int
 	writeCalls          int
+	stickyReadCalls     int
 	cooldownStrike      service.OpenAICyberAccountCooldownStrike
 	cooldownStrikeCalls int
+	cooldownDeadline    time.Time
+	cooldownReadCalls   int
 }
 
 func (c *cyberHandlerGatewayCache) SetCyberSessionBlocked(_ context.Context, key string, _ time.Duration) error {
@@ -66,9 +69,42 @@ func (c *cyberHandlerGatewayCache) IsCyberSessionBlocked(_ context.Context, key 
 	return c.blocked[key], nil
 }
 
-func (c *cyberHandlerGatewayCache) RecordOpenAICyberAccountCooldownStrike(context.Context, int64, string, time.Duration, time.Time) (service.OpenAICyberAccountCooldownStrike, error) {
+func (c *cyberHandlerGatewayCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	c.stickyReadCalls++
+	return 0, service.ErrStickySessionNotFound
+}
+
+func (c *cyberHandlerGatewayCache) RecordOpenAICyberAccountCooldownStrike(
+	_ context.Context,
+	_ int64,
+	_ string,
+	_ time.Duration,
+	firstDuration time.Duration,
+	escalatedDuration time.Duration,
+	now time.Time,
+) (service.OpenAICyberAccountCooldownStrike, error) {
 	c.cooldownStrikeCalls++
-	return c.cooldownStrike, nil
+	strike := c.cooldownStrike
+	if strike.EventRecordedAt.IsZero() {
+		strike.EventRecordedAt = now.UTC()
+	}
+	duration := escalatedDuration
+	if strike.Strikes == 1 {
+		duration = firstDuration
+	}
+	if strike.EventCooldownUntil.IsZero() {
+		strike.EventCooldownUntil = strike.EventRecordedAt.Add(duration)
+	}
+	if strike.AccountCooldownUntil.IsZero() {
+		strike.AccountCooldownUntil = strike.EventCooldownUntil
+	}
+	c.cooldownDeadline = strike.AccountCooldownUntil
+	return strike, nil
+}
+
+func (c *cyberHandlerGatewayCache) GetOpenAICyberAccountCooldownDeadline(context.Context, int64) (time.Time, error) {
+	c.cooldownReadCalls++
+	return c.cooldownDeadline, nil
 }
 
 type cyberHandlerAccountRepo struct {

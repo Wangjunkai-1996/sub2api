@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -144,6 +145,46 @@ func TestPromptGuardWebSocketCloseMappingGolden(t *testing.T) {
 	require.Equal(t, securityaudit.ErrorCodeUnavailable, securityAuditWSCloseReason(promptGuardDecision(securityaudit.DecisionUnavailable)))
 	require.Equal(t, int64(1013), int64(securityAuditWSCloseStatus(promptGuardDecision(securityaudit.DecisionInvalid))))
 	require.Equal(t, securityaudit.ErrorCodeInvalidResponse, securityAuditWSCloseReason(promptGuardDecision(securityaudit.DecisionInvalid)))
+}
+
+func TestOpenAIStrictContinuationErrorDecisionDistinguishesStoreOutageFromMissingContext(t *testing.T) {
+	unavailable := openAIStrictContinuationErrorDecision(service.ErrOpenAIResponseAccountStoreUnavailable)
+	require.Equal(t, securityaudit.DecisionUnavailable, unavailable.Kind)
+	require.Equal(t, http.StatusServiceUnavailable, unavailable.HTTPStatus)
+	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, unavailable.ErrorCode)
+	require.Equal(t, coderws.StatusTryAgainLater, securityAuditWSCloseStatus(unavailable))
+
+	missing := openAIStrictContinuationErrorDecision(service.ErrOpenAIPreviousResponseAccountUnavailable)
+	require.Equal(t, securityaudit.DecisionInvalid, missing.Kind)
+	require.Equal(t, http.StatusUnprocessableEntity, missing.HTTPStatus)
+	require.Equal(t, securityaudit.ErrorCodeContextIncomplete, missing.ErrorCode)
+	require.Equal(t, coderws.StatusTryAgainLater, securityAuditWSCloseStatus(missing))
+}
+
+func TestOpenAIStrictLineageCommitErrorReturnsStructuredHTTP503(t *testing.T) {
+	c, recorder := securityAuditErrorTestContext(t)
+
+	(&OpenAIGatewayHandler{}).openAIStrictLineageCommitError(c)
+
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &payload))
+	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, requireObject(t, payload["error"])["code"])
+}
+
+func TestOpenAIStrictLineageCommitErrorReplacesStreamingSuccessWithFailedEvent(t *testing.T) {
+	c, recorder := securityAuditErrorTestContext(t)
+	c.Header("Content-Type", "text/event-stream")
+	_, err := c.Writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"safe\"}\n\n"))
+	require.NoError(t, err)
+
+	(&OpenAIGatewayHandler{}).openAIStrictLineageCommitError(c)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"type":"response.output_text.delta"`)
+	require.Contains(t, recorder.Body.String(), `"type":"response.failed"`)
+	require.Contains(t, recorder.Body.String(), securityaudit.ErrorCodeAuditUnavailable)
+	require.NotContains(t, recorder.Body.String(), `"type":"response.completed"`)
 }
 
 func TestStrictLegacyModerationWebSocketKeepsPolicyCode(t *testing.T) {

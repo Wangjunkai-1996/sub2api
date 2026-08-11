@@ -48,7 +48,10 @@ type fakePromptEngine struct {
 
 func (f *fakePromptEngine) EffectiveMode() Mode { return f.mode }
 func (f *fakePromptEngine) BlockingApplies(Request) bool {
-	return f.strict != nil && *f.strict
+	if f.strict != nil {
+		return *f.strict
+	}
+	return f.mode == ModeBlocking
 }
 func (f *fakePromptEngine) Enqueue(context.Context, Request) error {
 	f.enqueues.Add(1)
@@ -135,21 +138,33 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 
 func TestCoordinatorContentModerationOutOfScopeRemainsNonStrict(t *testing.T) {
 	plusGroupID := int64(13)
-	legacy := &fakeLegacyEngine{check: func(_ context.Context, req Request) (*LegacyDecision, error) {
-		require.False(t, req.Strict)
-		require.Nil(t, req.Document)
-		return &LegacyDecision{Allowed: true}, nil
-	}}
-	prompt := &fakePromptEngine{mode: ModeOff}
-	decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
-		GroupID: &plusGroupID, Protocol: "openai_responses",
-		Body: []byte(`{"input":[{"type":"future_item","payload":"opaque"}]}`),
-	})
+	for _, test := range []struct {
+		name   string
+		prompt *fakePromptEngine
+	}{
+		{name: "prompt audit off", prompt: &fakePromptEngine{mode: ModeOff}},
+		{name: "degraded blocking prompt remains out of scope", prompt: func() *fakePromptEngine {
+			outOfScope := false
+			return &fakePromptEngine{mode: ModeBlocking, strict: &outOfScope, err: errors.New("degraded prompt audit")}
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			legacy := &fakeLegacyEngine{check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+				require.False(t, req.Strict)
+				require.Nil(t, req.Document)
+				return &LegacyDecision{Allowed: true}, nil
+			}}
+			decision := NewCoordinator(legacy, test.prompt).Check(context.Background(), Request{
+				GroupID: &plusGroupID, Protocol: "openai_responses",
+				Body: []byte(`{"input":[{"type":"future_item","payload":"opaque"}]}`),
+			})
 
-	require.True(t, decision.AllowNextStage)
-	require.Nil(t, decision.Audit)
-	require.Equal(t, int64(1), legacy.calls.Load())
-	require.Zero(t, prompt.evaluates.Load())
+			require.True(t, decision.AllowNextStage)
+			require.Nil(t, decision.Audit)
+			require.Equal(t, int64(1), legacy.calls.Load())
+			require.Zero(t, test.prompt.evaluates.Load())
+		})
+	}
 }
 
 func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {

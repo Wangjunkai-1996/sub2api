@@ -349,7 +349,7 @@ func TestConfigManagerStartupLoadFailureFailsClosedWithoutTrustedSnapshot(t *tes
 	require.ErrorAs(t, evalErr, &guardErr)
 	require.Equal(t, ErrorCodeUnavailable, guardErr.Code)
 
-	coordinator := NewCoordinator(&fakeLegacyEngine{decision: &LegacyDecision{Allowed: true}}, service)
+	coordinator := NewCoordinator(&fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}, service)
 	strictGroupID := int64(12)
 	admission := coordinator.Check(context.Background(), Request{
 		Protocol: "openai_chat_completions",
@@ -358,7 +358,7 @@ func TestConfigManagerStartupLoadFailureFailsClosedWithoutTrustedSnapshot(t *tes
 	})
 	require.False(t, admission.AllowNextStage)
 	require.Equal(t, DecisionUnavailable, admission.Kind)
-	require.Equal(t, ErrorCodeUnavailable, admission.ErrorCode)
+	require.Equal(t, ErrorCodeAuditUnavailable, admission.ErrorCode)
 	require.NoError(t, manager.Shutdown(context.Background()))
 }
 
