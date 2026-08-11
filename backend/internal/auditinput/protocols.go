@@ -81,6 +81,15 @@ func (b *builder) parseResponsesInput(value any, path string) {
 }
 
 func (b *builder) parseResponsesItem(item map[string]any, path string) {
+	if b.ignoreImages {
+		if typeName, ok := item["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(typeName)) {
+			case "input_image", "image_url", "image", "computer_screenshot", "computer_call_output":
+				b.addImage("", "", path)
+				return
+			}
+		}
+	}
 	typeName, typeValid := b.optionalStringField(item, "type", path)
 	role, roleValid := b.optionalStringField(item, "role", path)
 	name, nameValid := b.optionalStringField(item, "name", path)
@@ -887,6 +896,15 @@ func (b *builder) parseContentParts(value any, role, path string, flavor content
 }
 
 func (b *builder) parseContentPart(part map[string]any, role, path string, flavor contentFlavor) {
+	if b.ignoreImages {
+		if typeName, ok := part["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(typeName)) {
+			case "image", "input_image", "image_url", "computer_screenshot":
+				b.addImage("", "", path)
+				return
+			}
+		}
+	}
 	typeName, typeValid := b.optionalStringField(part, "type", path)
 	if !typeValid {
 		return

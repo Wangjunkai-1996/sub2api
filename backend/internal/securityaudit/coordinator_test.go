@@ -96,6 +96,10 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 	t.Run("image only input bypasses text auditors without a 422", func(t *testing.T) {
 		images := make([]string, 59)
 		for index := range images {
+			if index == 0 {
+				images[index] = `{"type":"input_image","id":42,"image_url":{"malformed":true},"future_image_field":"ignored"}`
+				continue
+			}
 			images[index] = fmt.Sprintf(`{"type":"input_image","image_url":"opaque-image-%02d"}`, index)
 		}
 		body := []byte(`{"store":false,"input":[{"type":"message","role":"user","content":[` + strings.Join(images, ",") + `]}]}`)

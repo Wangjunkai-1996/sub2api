@@ -1750,10 +1750,16 @@ func TestContentModerationCheck_StrictImageOnlyRequestIsAllowedWithoutModeration
 	groupID := int64(12)
 	content := make([]any, 0, 59)
 	for index := 0; index < 59; index++ {
-		content = append(content, map[string]any{
+		image := map[string]any{
 			"type":      "input_image",
 			"image_url": fmt.Sprintf("opaque-image-payload-%02d", index),
-		})
+		}
+		if index == 0 {
+			image["id"] = 42
+			image["image_url"] = map[string]any{"malformed": true}
+			image["future_image_field"] = "ignored"
+		}
+		content = append(content, image)
 	}
 	body, err := json.Marshal(map[string]any{
 		"input": []any{map[string]any{
