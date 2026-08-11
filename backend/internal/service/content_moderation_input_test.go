@@ -179,16 +179,11 @@ func TestExtractContentModerationInput_ResponsesLastIsAssistantSkipped(t *testin
 	require.Empty(t, input.Images)
 }
 
-func TestStrictContentModerationDocumentScansSplitLineageKeywordWithoutMutatingCurrentDocument(t *testing.T) {
-	document := auditinput.Parse(ContentModerationProtocolOpenAIResponses, []byte(`{"input":"ber"}`))
+func TestStrictBlockedKeywordUsesOnlyCurrentUserDocument(t *testing.T) {
+	document := auditinput.ParseForTextAudit(ContentModerationProtocolOpenAIResponses, []byte(`{"input":"safe current text"}`))
 	require.True(t, document.Complete)
 
-	auditDocument, err := strictContentModerationDocument(document, "cy\nber")
-	require.NoError(t, err)
-	require.Equal(t, "cy\nber", auditDocument.NormalizedText)
-	require.Equal(t, "cyber", auditDocument.FoldedText)
-	keyword, blocked := strictBlockedKeyword(auditDocument, []string{"cyber"})
-	require.True(t, blocked)
-	require.Equal(t, "cyber", keyword)
-	require.Equal(t, "ber", document.NormalizedText, "the canonical current-turn document must remain immutable")
+	keyword, blocked := strictBlockedKeyword(document, []string{"historical blocked keyword"})
+	require.False(t, blocked)
+	require.Empty(t, keyword)
 }

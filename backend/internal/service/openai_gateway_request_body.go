@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
@@ -1408,19 +1409,7 @@ func shouldDropEmptyBase64InputImagePart(part any) bool {
 }
 
 func isEmptyBase64DataURI(raw string) bool {
-	if !strings.HasPrefix(raw, "data:") {
-		return false
-	}
-	rest := strings.TrimPrefix(raw, "data:")
-	semicolonIdx := strings.Index(rest, ";")
-	if semicolonIdx < 0 {
-		return false
-	}
-	rest = rest[semicolonIdx+1:]
-	if !strings.HasPrefix(rest, "base64,") {
-		return false
-	}
-	return strings.TrimSpace(strings.TrimPrefix(rest, "base64,")) == ""
+	return auditinput.IsEmptyBase64DataURI(raw)
 }
 
 func getOpenAIRequestBodyMap(_ *gin.Context, body []byte) (map[string]any, error) {

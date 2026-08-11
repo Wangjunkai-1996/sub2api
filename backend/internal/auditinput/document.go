@@ -137,10 +137,31 @@ func Parse(protocol string, body []byte) *Document {
 }
 
 // ParseForTextAudit extracts auditable text while treating image payloads as
-// opaque request data. It records only that an image is present and never
-// decodes, hashes, counts, size-checks, or retains image content.
+// opaque request data. For OpenAI Chat and Responses requests it scopes
+// extraction to the current user turn; historical, assistant, tool, and unknown
+// non-text items remain outside the audit document. Images are never decoded,
+// hashed, counted, size-checked, or retained.
 func ParseForTextAudit(protocol string, body []byte) *Document {
 	return parse(protocol, body, true)
+}
+
+// IsEmptyBase64DataURI matches the empty data URL shape removed by the OpenAI
+// forwarding sanitizer. Text-audit boundary selection uses the same predicate
+// so an item that will disappear before forwarding cannot hide user text.
+func IsEmptyBase64DataURI(raw string) bool {
+	if !strings.HasPrefix(raw, "data:") {
+		return false
+	}
+	rest := strings.TrimPrefix(raw, "data:")
+	semicolonIndex := strings.Index(rest, ";")
+	if semicolonIndex < 0 {
+		return false
+	}
+	rest = rest[semicolonIndex+1:]
+	if !strings.HasPrefix(rest, "base64,") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(rest, "base64,")) == ""
 }
 
 func parse(protocol string, body []byte, ignoreImages bool) *Document {
@@ -163,7 +184,11 @@ func parse(protocol string, body []byte, ignoreImages bool) *Document {
 		b.issue(IssueInvalidJSON, "$")
 		return b.finish()
 	}
-	if duplicatePath, duplicate := duplicateJSONFieldPath(trimmed); duplicate {
+	duplicatePath, duplicate := duplicateJSONFieldPath(trimmed)
+	if ignoreImages && (protocol == ProtocolOpenAIResponses || protocol == ProtocolOpenAIChat) {
+		duplicatePath, duplicate = textAuditDuplicateJSONFieldPath(trimmed, protocol, value)
+	}
+	if duplicate {
 		b.issue(IssueDuplicateField, duplicatePath)
 		return b.finish()
 	}
@@ -291,6 +316,242 @@ func scanJSONValueForDuplicateFields(decoder *json.Decoder, path string) (string
 		return "", false, err
 	default:
 		return "", false, errors.New("unexpected json delimiter")
+	}
+}
+
+func textAuditDuplicateJSONFieldPath(raw []byte, protocol string, value any) (string, bool) {
+	checkedPaths := map[string]struct{}{"$": {}}
+	selectionFields := make(map[string]map[string]struct{})
+	root, ok := value.(map[string]any)
+	if ok {
+		switch protocol {
+		case ProtocolOpenAIResponses:
+			addResponsesTextAuditDuplicatePaths(checkedPaths, selectionFields, root["input"], "$.input")
+		case ProtocolOpenAIChat:
+			addChatTextAuditDuplicatePaths(checkedPaths, selectionFields, root["messages"], "$.messages")
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	path, duplicate, err := scanJSONValueForDuplicateFieldsAtPaths(decoder, "$", checkedPaths, selectionFields)
+	return path, duplicate && err == nil
+}
+
+func scanJSONValueForDuplicateFieldsAtPaths(decoder *json.Decoder, path string, checkedPaths map[string]struct{}, selectionFields map[string]map[string]struct{}) (string, bool, error) {
+	duplicatePath, duplicate, _, err := scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder, path, checkedPaths, selectionFields)
+	return duplicatePath, duplicate, err
+}
+
+type duplicateSelectionValue struct {
+	normalizedString string
+	isString         bool
+}
+
+func scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder *json.Decoder, path string, checkedPaths map[string]struct{}, selectionFields map[string]map[string]struct{}) (string, bool, duplicateSelectionValue, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", false, duplicateSelectionValue{}, err
+	}
+	delim, structured := token.(json.Delim)
+	if !structured {
+		if value, ok := token.(string); ok {
+			return "", false, duplicateSelectionValue{
+				normalizedString: strings.ToLower(strings.TrimSpace(value)),
+				isString:         true,
+			}, nil
+		}
+		return "", false, duplicateSelectionValue{}, nil
+	}
+	switch delim {
+	case '{':
+		_, checkAllDuplicates := checkedPaths[path]
+		criticalFields := selectionFields[path]
+		var seen map[string]struct{}
+		var selectedValues map[string]duplicateSelectionValue
+		if checkAllDuplicates || len(criticalFields) > 0 {
+			seen = make(map[string]struct{})
+			selectedValues = make(map[string]duplicateSelectionValue)
+		}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return "", false, duplicateSelectionValue{}, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return "", false, duplicateSelectionValue{}, errors.New("json object key is not a string")
+			}
+			fieldPath := childPath(path, key)
+			_, alreadySeen := seen[key]
+			_, critical := criticalFields[key]
+			if seen != nil {
+				if alreadySeen && checkAllDuplicates {
+					return fieldPath, true, duplicateSelectionValue{}, nil
+				}
+			}
+			duplicatePath, duplicate, fieldValue, err := scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder, fieldPath, checkedPaths, selectionFields)
+			if err != nil || duplicate {
+				return duplicatePath, duplicate, duplicateSelectionValue{}, err
+			}
+			if alreadySeen && critical {
+				previousValue := selectedValues[key]
+				if !previousValue.isString || !fieldValue.isString || previousValue.normalizedString != fieldValue.normalizedString {
+					return fieldPath, true, duplicateSelectionValue{}, nil
+				}
+			}
+			if seen != nil {
+				seen[key] = struct{}{}
+				if critical && !alreadySeen {
+					selectedValues[key] = fieldValue
+				}
+			}
+		}
+		_, err = decoder.Token()
+		return "", false, duplicateSelectionValue{}, err
+	case '[':
+		index := 0
+		for decoder.More() {
+			itemPath := indexPath(path, index)
+			if duplicatePath, duplicate, _, err := scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder, itemPath, checkedPaths, selectionFields); err != nil || duplicate {
+				return duplicatePath, duplicate, duplicateSelectionValue{}, err
+			}
+			index++
+		}
+		_, err = decoder.Token()
+		return "", false, duplicateSelectionValue{}, err
+	default:
+		return "", false, duplicateSelectionValue{}, errors.New("unexpected json delimiter")
+	}
+}
+
+func addResponsesTextAuditDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, input any, path string) {
+	switch typed := input.(type) {
+	case map[string]any:
+		addTextAuditSelectionFields(selectionFields, path, "role", "type")
+		switch responsesCurrentUserItemClassification(typed) {
+		case responsesCurrentUserExplicit, responsesCurrentUserImplicit, responsesCurrentUserMalformedText:
+			addResponsesCurrentUserDuplicatePaths(paths, selectionFields, typed, path)
+		}
+	case []any:
+		lastBusinessIndex := -1
+		for index := len(typed) - 1; index >= 0; index-- {
+			if _, transparent := responsesTransparentControl(typed[index]); transparent {
+				if _, ok := typed[index].(map[string]any); ok {
+					addTextAuditSelectionFields(selectionFields, indexPath(path, index), "role", "type")
+				}
+				continue
+			}
+			lastBusinessIndex = index
+			break
+		}
+		if lastBusinessIndex < 0 {
+			return
+		}
+		if _, ok := typed[lastBusinessIndex].(map[string]any); ok {
+			addTextAuditSelectionFields(selectionFields, indexPath(path, lastBusinessIndex), "role", "type")
+		}
+		switch responsesCurrentUserItemClassification(typed[lastBusinessIndex]) {
+		case responsesCurrentUserExplicit, responsesCurrentUserMalformedText:
+			if item, ok := typed[lastBusinessIndex].(map[string]any); ok {
+				addResponsesCurrentUserDuplicatePaths(paths, selectionFields, item, indexPath(path, lastBusinessIndex))
+			}
+		case responsesCurrentUserImplicit:
+			for index := lastBusinessIndex; index >= 0; index-- {
+				if _, transparent := responsesTransparentControl(typed[index]); transparent {
+					if _, ok := typed[index].(map[string]any); ok {
+						addTextAuditSelectionFields(selectionFields, indexPath(path, index), "role", "type")
+					}
+					continue
+				}
+				if responsesCurrentUserItemClassification(typed[index]) != responsesCurrentUserImplicit {
+					break
+				}
+				if item, ok := typed[index].(map[string]any); ok {
+					addTextAuditSelectionFields(selectionFields, indexPath(path, index), "role", "type")
+					addResponsesCurrentUserDuplicatePaths(paths, selectionFields, item, indexPath(path, index))
+				}
+			}
+		}
+	}
+}
+
+func addResponsesCurrentUserDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, item map[string]any, path string) {
+	typeName, _ := item["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "", "message":
+		paths[path] = struct{}{}
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["content"], childPath(path, "content"))
+	case "input_text", "text":
+		paths[path] = struct{}{}
+	}
+}
+
+func addChatTextAuditDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, messages any, path string) {
+	items, ok := messages.([]any)
+	if !ok || len(items) == 0 {
+		return
+	}
+	lastIndex := len(items) - 1
+	message, ok := items[lastIndex].(map[string]any)
+	if !ok {
+		return
+	}
+	messagePath := indexPath(path, lastIndex)
+	addTextAuditSelectionFields(selectionFields, messagePath, "role")
+	role, ok := message["role"].(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(role), "user") {
+		return
+	}
+	paths[messagePath] = struct{}{}
+	addOpenAITextContentDuplicatePaths(paths, selectionFields, message["content"], childPath(messagePath, "content"))
+}
+
+func addTextAuditSelectionFields(selectionFields map[string]map[string]struct{}, path string, fields ...string) {
+	if len(fields) == 0 {
+		return
+	}
+	selected := selectionFields[path]
+	if selected == nil {
+		selected = make(map[string]struct{}, len(fields))
+		selectionFields[path] = selected
+	}
+	for _, field := range fields {
+		selected[field] = struct{}{}
+	}
+}
+
+func addOpenAITextContentDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, value any, path string) {
+	switch typed := value.(type) {
+	case []any:
+		for index, item := range typed {
+			addOpenAITextContentDuplicatePaths(paths, selectionFields, item, indexPath(path, index))
+		}
+	case map[string]any:
+		if selectionFields != nil {
+			addTextAuditSelectionFields(selectionFields, path, "type")
+		}
+		typeName, hasStringType := typed["type"].(string)
+		typeName = strings.ToLower(strings.TrimSpace(typeName))
+		if hasStringType {
+			switch typeName {
+			case "image", "input_image", "image_url", "computer_screenshot":
+				return
+			case "", "text", "input_text", "output_text", "refusal", "summary_text", "reasoning_text":
+				paths[path] = struct{}{}
+			default:
+				return
+			}
+		} else {
+			if _, hasText := typed["text"]; !hasText {
+				if _, hasContent := typed["content"]; !hasContent {
+					return
+				}
+			}
+			paths[path] = struct{}{}
+		}
+		if typeName == "" {
+			addOpenAITextContentDuplicatePaths(paths, selectionFields, typed["content"], childPath(path, "content"))
+		}
 	}
 }
 

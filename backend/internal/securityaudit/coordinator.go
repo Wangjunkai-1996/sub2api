@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 type LegacyEngine interface {
@@ -61,6 +62,15 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 			return *rejected
 		}
 		req = prepared
+		if strings.TrimSpace(req.Document.NormalizedText) == "" &&
+			strings.TrimSpace(service.ExtractStrictCurrentUserText(req.Protocol, req.Body)) == "" {
+			decision := allowDecision(nil, nil)
+			decision.Audit = buildAuditSummary(req, nil)
+			if decision.Audit == nil {
+				return auditUnavailableDecision(nil, nil)
+			}
+			return decision
+		}
 		// A blocking mode may be the fail-closed effective state while the active
 		// snapshot is unavailable or stale. Always enter Evaluate in that mode: the
 		// prompt service returns allow for a trusted out-of-scope group and

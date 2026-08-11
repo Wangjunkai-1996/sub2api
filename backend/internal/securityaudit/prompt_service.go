@@ -128,7 +128,7 @@ func (s *PromptService) Enqueue(_ context.Context, req Request) error {
 	if !promptGuardRequestSupported(req) {
 		return nil
 	}
-	if req.Strict && strictImageOnlyRequest(req) {
+	if req.Strict && strictNoCurrentUserTextRequest(req) {
 		return nil
 	}
 	if s == nil || s.config == nil || s.enqueuer == nil || s.EffectiveMode() != ModeAsync {
@@ -166,7 +166,7 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	if !promptGuardRequestSupported(req) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	if req.Strict && strictImageOnlyRequest(req) {
+	if req.Strict && strictNoCurrentUserTextRequest(req) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
 	if s == nil || s.config == nil || s.evaluator == nil {
@@ -189,7 +189,7 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	// lineage remain admission checks and are not forwarded to Prompt Guard.
 	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
 	if errors.Is(err, ErrNoPromptText) {
-		if strictImageOnlyRequest(req) {
+		if strictNoCurrentUserTextRequest(req) {
 			return &PromptDecision{Kind: DecisionAllow, ConfigVersion: cfg.ConfigVersion, AllowNextStage: true}, nil
 		}
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
@@ -214,10 +214,14 @@ func promptGuardRequestSupported(req Request) bool {
 }
 
 func strictImageOnlyDocument(document *auditinput.Document) bool {
-	return document != nil && document.Complete && document.HasImages
+	return strictNoCurrentUserTextDocument(document) && document.HasImages
 }
 
-func strictImageOnlyRequest(req Request) bool {
+func strictNoCurrentUserTextDocument(document *auditinput.Document) bool {
+	return document != nil && document.Complete && strings.TrimSpace(document.NormalizedText) == ""
+}
+
+func strictNoCurrentUserTextRequest(req Request) bool {
 	if service.ExtractStrictCurrentUserText(req.Protocol, req.Body) != "" {
 		return false
 	}
@@ -225,7 +229,7 @@ func strictImageOnlyRequest(req Request) bool {
 	if document == nil {
 		document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
 	}
-	return strictImageOnlyDocument(document)
+	return strictNoCurrentUserTextDocument(document)
 }
 
 func (s *PromptService) GetConfig() (PublicConfig, error) { return s.config.Public() }

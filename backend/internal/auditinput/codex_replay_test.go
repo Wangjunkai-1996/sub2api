@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseForTextAuditReplaysRedactedCodexFullHistory(t *testing.T) {
+func TestParseForTextAuditIgnoresRedactedCodexFullHistory(t *testing.T) {
 	items := []any{
 		map[string]any{
 			"type":              "reasoning",
@@ -110,22 +110,18 @@ func TestParseForTextAuditReplaysRedactedCodexFullHistory(t *testing.T) {
 	document := ParseForTextAudit(ProtocolOpenAIResponses, body)
 
 	require.True(t, document.Complete, "%+v", document.Issues)
-	require.True(t, document.HasImages)
+	require.False(t, document.HasImages)
 	require.Empty(t, document.Media)
-	require.Len(t, document.ControlItems, len(items))
-	require.Len(t, document.OpaqueStates, 2)
-	for _, visible := range []string{
-		"view_page", "redacted tool output", "exec_command", "redacted command output",
-		"redacted user request", "redacted agent reply",
-	} {
-		require.Contains(t, document.NormalizedText, visible)
-	}
+	require.Len(t, document.ControlItems, 1)
+	require.Empty(t, document.OpaqueStates)
+	require.Empty(t, document.NormalizedText)
 	serialized, err := json.Marshal(document)
 	require.NoError(t, err)
 	for _, secret := range []string{
 		"redacted-reasoning-ciphertext", "redacted-agent-ciphertext",
 		"/root/redacted_worker", "00000000-0000-4000-8000-000000000001", "opaque-screenshot-payload-01",
-		strings.Repeat("x", 256),
+		strings.Repeat("x", 256), "view_page", "redacted tool output", "exec_command",
+		"redacted command output", "redacted user request", "redacted agent reply",
 	} {
 		require.NotContains(t, string(serialized), secret)
 	}

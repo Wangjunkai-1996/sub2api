@@ -126,6 +126,21 @@ type openAIResponsesStrictLineageStore struct {
 	binds atomic.Int32
 }
 
+type openAIHandlerStrictLegacySpy struct {
+	blockingCalls atomic.Int32
+	checkCalls    atomic.Int32
+}
+
+func (s *openAIHandlerStrictLegacySpy) BlockingApplies(context.Context, securityaudit.Request) (bool, error) {
+	s.blockingCalls.Add(1)
+	return true, nil
+}
+
+func (s *openAIHandlerStrictLegacySpy) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
+	s.checkCalls.Add(1)
+	return &securityaudit.LegacyDecision{Blocked: true, Flagged: true}, nil
+}
+
 func (s *openAIResponsesStrictLineageStore) Load(context.Context, securityaudit.LineageLookup) (*securityaudit.AuditSummary, error) {
 	return nil, securityaudit.ErrLineageNotFound
 }
@@ -438,10 +453,20 @@ func TestOpenAIGatewayHandlerResponses_StrictContinuationNeverRetriesOrSwitchesA
 	}))
 	defer wsServer.Close()
 	upstream := &openAIResponsesFailoverCancelUpstream{}
-	handler := newOpenAIResponsesStrictFailoverTestHandlerWithState(t, upstream, groupID, nil, nil, wsServer.URL)
+	lineage := &handlerAllowLineageStore{summary: securityaudit.AuditSummary{
+		Verdict: securityaudit.AuditVerdictAllow, ContextComplete: true,
+		APIKeyID: 99, GroupID: &groupID, PromptHash: "parent-hash", RedactedContext: "parent context",
+	}}
+	legacy := &openAIHandlerStrictLegacySpy{}
+	prompt := &handlerPromptEngine{
+		mode: securityaudit.ModeBlocking, strict: true,
+		decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionBlock, AllowNextStage: false},
+	}
+	handler := newOpenAIResponsesStrictFailoverTestHandlerWithState(t, upstream, groupID, nil, lineage, wsServer.URL)
+	handler.securityAuditCoordinator = securityaudit.NewCoordinator(legacy, prompt).SetLineageStore(lineage)
 	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader([]byte(
-		`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_parent","input":"hello"}`,
+		`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_parent","input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`,
 	)))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -452,11 +477,121 @@ func TestOpenAIGatewayHandlerResponses_StrictContinuationNeverRetriesOrSwitchesA
 	select {
 	case payload := <-received:
 		require.Equal(t, "resp_parent", gjson.GetBytes(payload, "previous_response_id").String())
+		require.Equal(t, "function_call_output", gjson.GetBytes(payload, "input.0.type").String())
 	case <-time.After(3 * time.Second):
 		t.Fatal("strict continuation websocket payload was not received")
 	}
+	require.Equal(t, int32(1), legacy.blockingCalls.Load(), "handler must enter the strict audit path")
+	require.Zero(t, legacy.checkCalls.Load(), "tool continuation must not call Legacy Moderation")
+	evaluated, enqueued, requests := prompt.snapshot()
+	require.Zero(t, evaluated, "tool continuation must not call Prompt Guard")
+	require.Zero(t, enqueued)
+	require.Empty(t, requests)
+	require.Equal(t, int32(1), lineage.loads.Load(), "strict continuation must still validate lineage")
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+}
+
+func TestOpenAIHandlersStrictNoCurrentUserTextSkipsAuditorsAndReachesUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name      string
+		path      string
+		body      string
+		responses bool
+	}{
+		{
+			name: "responses image only", path: "/v1/responses", responses: true,
+			body: `{"model":"gpt-5.1","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`,
+		},
+		{
+			name: "responses empty input", path: "/v1/responses", responses: true,
+			body: `{"model":"gpt-5.1","stream":false,"input":[]}`,
+		},
+		{
+			name: "chat trailing tool", path: "/v1/chat/completions",
+			body: `{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"historical user text"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"done"}]}`,
+		},
+		{
+			name: "chat trailing assistant", path: "/v1/chat/completions",
+			body: `{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"historical user text"},{"role":"assistant","content":"historical assistant output"}]}`,
+		},
+		{
+			name: "chat image only", path: "/v1/chat/completions",
+			body: `{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
+		},
+		{
+			name: "chat empty messages", path: "/v1/chat/completions",
+			body: `{"model":"gpt-5.1","stream":false,"messages":[]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := &openAIResponsesFailoverCancelUpstream{}
+			var handler *OpenAIGatewayHandler
+			if tt.responses {
+				handler = newOpenAIResponsesStrictFailoverTestHandler(t, upstream, 3131)
+			} else {
+				handler = newOpenAIResponsesFailoverTestHandler(t, upstream)
+			}
+			legacy := &openAIHandlerStrictLegacySpy{}
+			prompt := &handlerPromptEngine{
+				mode: securityaudit.ModeBlocking, strict: true,
+				decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionBlock, AllowNextStage: false},
+			}
+			handler.securityAuditCoordinator = securityaudit.NewCoordinator(legacy, prompt)
+			c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+			c.Request = httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			if tt.responses {
+				handler.Responses(c)
+			} else {
+				handler.ChatCompletions(c)
+			}
+
+			require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
+			require.NotEmpty(t, upstream.calls(), "request must continue beyond the audit gate")
+			require.Equal(t, int32(1), legacy.blockingCalls.Load(), "handler must enter the strict audit path")
+			require.Zero(t, legacy.checkCalls.Load(), "request without current user text must not call Legacy Moderation")
+			evaluated, enqueued, requests := prompt.snapshot()
+			require.Zero(t, evaluated, "request without current user text must not call Prompt Guard")
+			require.Zero(t, enqueued)
+			require.Empty(t, requests)
+			require.NotContains(t, rec.Body.String(), securityaudit.ErrorCodeContextIncomplete)
+			require.NotContains(t, rec.Body.String(), securityaudit.ErrorCodeAuditUnavailable)
+		})
+	}
+}
+
+func TestOpenAIResponsesStrictForwardSanitizedImageCannotHideCurrentUserText(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &openAIResponsesFailoverCancelUpstream{}
+	handler := newOpenAIResponsesStrictFailoverTestHandler(t, upstream, 3131)
+	legacy := &openAIHandlerStrictLegacySpy{}
+	handler.securityAuditCoordinator = securityaudit.NewCoordinator(
+		legacy,
+		&handlerPromptEngine{mode: securityaudit.ModeOff},
+	)
+	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.1",
+		"stream":false,
+		"input":[
+			{"type":"message","role":"user","content":"current user text"},
+			{"type":"input_image","image_url":"data:image/png;base64,"}
+		]
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Responses(c)
+
+	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+	require.Empty(t, upstream.calls(), "blocked current text must not reach upstream")
+	require.Equal(t, int32(1), legacy.blockingCalls.Load())
+	require.Equal(t, int32(1), legacy.checkCalls.Load(), "sanitized image tail must not skip Legacy Moderation")
+	require.Equal(t, securityaudit.ErrorCodePolicyBlocked, gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
 }
 
 func TestOpenAIGatewayHandlerResponses_StrictContinuationSecondStickyReadFailureIsAuditUnavailable(t *testing.T) {

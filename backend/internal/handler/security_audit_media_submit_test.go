@@ -554,7 +554,7 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 			wantStatus: http.StatusForbidden, wantCode: securityaudit.ErrorCodePolicyBlocked,
 		},
 		{
-			name: "context incomplete", body: `{"model":"gpt-test","input":[{"type":"future_item"}]}`,
+			name: "context incomplete", body: `{"model":"gpt-test","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"current","future_field":true}]}]}`,
 			legacy:     &handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
 			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
 		},

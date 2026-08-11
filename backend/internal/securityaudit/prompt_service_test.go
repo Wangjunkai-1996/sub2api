@@ -158,7 +158,7 @@ func TestPromptServiceStrictImageTurnDoesNotFallBackToHistoricalUserText(t *test
 			document := auditinput.ParseForTextAudit(test.protocol, body)
 			require.True(t, document.Complete, "%+v", document.Issues)
 			require.True(t, document.HasImages)
-			require.Contains(t, document.NormalizedText, "historical user text")
+			require.Empty(t, document.NormalizedText)
 
 			decision, err := promptService.Evaluate(context.Background(), Request{
 				Strict: true, Protocol: test.protocol, Model: "gpt-5.6-terra", Body: body, Document: document,
@@ -324,10 +324,10 @@ func TestPromptServiceStrictControlAndImageIsAllowedWithoutScanning(t *testing.T
 	require.False(t, scannerCalled)
 }
 
-func TestPromptServiceStrictControlOnlyFailsClosedWithoutScanning(t *testing.T) {
-	scannerCalled := false
+func TestPromptServiceStrictCompleteNonUserTurnsAllowWithoutScanning(t *testing.T) {
+	scannerCalls := 0
 	evaluator := newGuardEvaluator(PromptScannerFunc(func(context.Context, ActiveEndpoint, string, []string) (*NormalizedResult, error) {
-		scannerCalled = true
+		scannerCalls++
 		return nil, nil
 	}), nil, NewAtomicMetrics(), 2, 2)
 	promptService := &PromptService{
@@ -337,22 +337,39 @@ func TestPromptServiceStrictControlOnlyFailsClosedWithoutScanning(t *testing.T) 
 		}},
 		evaluator: evaluator,
 	}
-	body := []byte(`{"input":[{"type":"compaction_trigger"}]}`)
-	document := auditinput.ParseForTextAudit(auditinput.ProtocolOpenAIResponses, body)
-	require.True(t, document.Complete, "%+v", document.Issues)
-	require.False(t, document.HasImages)
-	require.NotEmpty(t, document.ControlItems)
+	tests := []struct {
+		name     string
+		protocol string
+		body     string
+	}{
+		{name: "control only", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"compaction_trigger"}]}`},
+		{name: "responses tool output", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical user"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`},
+		{name: "responses missing input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-5.6-terra"}`},
+		{name: "chat tool output", protocol: auditinput.ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"historical user"},{"role":"tool","content":"ok"}]}`},
+		{name: "chat missing messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-5.6-terra"}`},
+		{name: "chat empty messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-5.6-terra","messages":[]}`},
+		{name: "empty websocket turn", protocol: auditinput.ProtocolOpenAIResponses, body: `{"type":"response.create","model":"gpt-5.6-terra","input":[]}`},
+		{name: "empty continuation", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-5.6-terra","previous_response_id":"resp_parent","input":null}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(test.body)
+			document := auditinput.ParseForTextAudit(test.protocol, body)
+			require.True(t, document.Complete, "%+v", document.Issues)
+			require.Empty(t, document.NormalizedText)
+			require.NotEmpty(t, document.ControlItems)
 
-	decision, err := promptService.Evaluate(context.Background(), Request{
-		Strict: true, Protocol: auditinput.ProtocolOpenAIResponses, Model: "gpt-5.6-terra", Body: body, Document: document,
-	})
+			decision, err := promptService.Evaluate(context.Background(), Request{
+				Strict: true, Protocol: test.protocol, Model: "gpt-5.6-terra", Body: body, Document: document,
+			})
 
-	require.Error(t, err)
-	require.Nil(t, decision)
-	var guardErr *GuardError
-	require.ErrorAs(t, err, &guardErr)
-	require.Equal(t, ErrorCodeInvalidResponse, guardErr.Code)
-	require.False(t, scannerCalled)
+			require.NoError(t, err)
+			require.NotNil(t, decision)
+			require.Equal(t, DecisionAllow, decision.Kind)
+			require.True(t, decision.AllowNextStage)
+			require.Equal(t, 0, scannerCalls)
+		})
+	}
 }
 
 func TestPromptServiceBlockingScopeNeverExpandsWithoutTrustedConfig(t *testing.T) {

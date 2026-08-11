@@ -157,15 +157,7 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 			images[index] = fmt.Sprintf(`{"type":"input_image","image_url":"opaque-image-%02d"}`, index)
 		}
 		body := []byte(`{"store":false,"input":[{"type":"message","role":"user","content":[` + strings.Join(images, ",") + `]}]}`)
-		legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
-			require.True(t, req.Strict)
-			require.NotNil(t, req.Document)
-			require.True(t, req.Document.Complete, "%+v", req.Document.Issues)
-			require.True(t, req.Document.HasImages)
-			require.Empty(t, req.Document.Media)
-			require.Empty(t, req.Document.NormalizedText)
-			return &LegacyDecision{Allowed: true}, nil
-		}}
+		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Blocked: true}}
 		prompt := &fakePromptEngine{mode: ModeOff}
 
 		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
@@ -177,16 +169,16 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 		require.Equal(t, http.StatusOK, decision.HTTPStatus)
 		require.NotNil(t, decision.Audit)
 		require.Empty(t, decision.Audit.MediaDigests)
-		require.Equal(t, int64(1), legacy.calls.Load())
+		require.Zero(t, legacy.calls.Load())
 		require.Zero(t, prompt.evaluates.Load())
 	})
 
-	t.Run("incomplete input stops before every auditor", func(t *testing.T) {
+	t.Run("invalid input stops before every auditor", func(t *testing.T) {
 		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
 		prompt := &fakePromptEngine{mode: ModeOff}
 		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
 			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
-			Body: []byte(`{"input":[{"type":"future_item","payload":"opaque"}]}`),
+			Body: []byte(`{"input":[{"type":"input_text","role":null,"text":"blocked current text"}]}`),
 		})
 
 		require.Equal(t, DecisionInvalid, decision.Kind)
@@ -377,22 +369,9 @@ func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 		promptCall int64
 	}{
 		{
-			name: "unknown item rejected before engines", body: `{"input":[{"type":"future_item","payload":"opaque"}]}`,
+			name: "malformed current text rejected before engines", body: `{"input":[{"type":"input_text","role":null,"text":"blocked current text"}]}`,
 			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
 			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
-		},
-		{
-			name: "nonempty empty context rejected before engines", body: `{"model":"gpt-test"}`,
-			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
-			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
-		},
-		{
-			name: "inspectable tool output without lineage reaches engines", body: `{"store":false,"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`,
-			legacy: &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
-				require.Contains(t, req.AuditContext, "done")
-				return &LegacyDecision{Allowed: true}, nil
-			}}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionBlock}},
-			wantKind: DecisionBlock, wantStatus: http.StatusForbidden, wantCode: ErrorCodePolicyBlocked, legacyCall: 1, promptCall: 1,
 		},
 		{
 			name: "legacy error is unavailable", body: `{"input":"hello"}`,
@@ -422,6 +401,44 @@ func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 			require.Nil(t, decision.Audit)
 			require.Equal(t, tt.legacyCall, tt.legacy.calls.Load())
 			require.Equal(t, tt.promptCall, tt.prompt.evaluates.Load())
+		})
+	}
+}
+
+func TestCoordinatorStrictCompleteNoCurrentUserTextSkipsAllEngines(t *testing.T) {
+	groupID := int64(12)
+	strict := true
+	tests := []struct {
+		name     string
+		protocol string
+		body     string
+	}{
+		{name: "responses missing input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-test"}`},
+		{name: "responses null input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-test","input":null}`},
+		{name: "responses empty websocket input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"type":"response.create","model":"gpt-test","input":[]}`},
+		{name: "responses null tail", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical"},null]}`},
+		{name: "responses numeric tail", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical"},42]}`},
+		{name: "responses tool output", protocol: auditinput.ProtocolOpenAIResponses, body: `{"store":false,"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`},
+		{name: "chat missing messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-test"}`},
+		{name: "chat empty messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-test","messages":[]}`},
+		{name: "chat trailing tool", protocol: auditinput.ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"historical"},{"role":"tool","content":"done"}]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Blocked: true}}
+			prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionBlock}}
+			decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+				APIKeyID: 7, GroupID: &groupID, Protocol: test.protocol, Body: []byte(test.body),
+			})
+
+			require.True(t, decision.AllowNextStage)
+			require.Equal(t, DecisionAllow, decision.Kind)
+			require.Equal(t, http.StatusOK, decision.HTTPStatus)
+			require.NotNil(t, decision.Audit)
+			require.True(t, decision.Audit.ContextComplete)
+			require.Zero(t, legacy.calls.Load())
+			require.Zero(t, prompt.evaluates.Load())
 		})
 	}
 }
@@ -574,6 +591,45 @@ func TestCoordinatorLineageIsResolvedBeforeEnginesAndBoundOnlyFromAllowSummary(t
 	require.Equal(t, http.StatusUnprocessableEntity, missingDecision.HTTPStatus)
 }
 
+func TestCoordinatorEmptyContinuationStillRequiresValidLineageBeforeSkippingEngines(t *testing.T) {
+	groupID := int64(12)
+	strict := true
+	prior := &AuditSummary{
+		ParserVersion: auditinput.ParserVersion, Verdict: AuditVerdictAllow, ContextComplete: true,
+		APIKeyID: 7, GroupID: &groupID, RedactedContext: "verified parent context", PromptHash: "parent-hash",
+	}
+	store := &fakeLineageStore{loaded: prior}
+	legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Blocked: true}}
+	prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionBlock}}
+	decision := NewCoordinator(legacy, prompt).SetLineageStore(store).Check(context.Background(), Request{
+		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses,
+		Body: []byte(`{"model":"gpt-test","previous_response_id":"resp_parent","input":[]}`),
+	})
+
+	require.True(t, decision.AllowNextStage)
+	require.Equal(t, DecisionAllow, decision.Kind)
+	require.Equal(t, int64(1), store.loads.Load())
+	require.Equal(t, "resp_parent", store.lookup.PreviousResponseID)
+	require.NotNil(t, decision.Audit)
+	require.Equal(t, "verified parent context", decision.Audit.NormalizedContext)
+	require.Zero(t, legacy.calls.Load())
+	require.Zero(t, prompt.evaluates.Load())
+
+	missingLegacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
+	missingPrompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}}
+	missing := NewCoordinator(missingLegacy, missingPrompt).SetLineageStore(&fakeLineageStore{loadErr: ErrLineageNotFound}).Check(context.Background(), Request{
+		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses,
+		Body: []byte(`{"model":"gpt-test","previous_response_id":"missing","input":null}`),
+	})
+
+	require.False(t, missing.AllowNextStage)
+	require.Equal(t, DecisionInvalid, missing.Kind)
+	require.Equal(t, http.StatusUnprocessableEntity, missing.HTTPStatus)
+	require.Equal(t, ErrorCodeContextIncomplete, missing.ErrorCode)
+	require.Zero(t, missingLegacy.calls.Load())
+	require.Zero(t, missingPrompt.evaluates.Load())
+}
+
 func TestCoordinatorStrictLineageAllowsMediaOnlyParent(t *testing.T) {
 	groupID := int64(12)
 	strict := true
@@ -600,7 +656,7 @@ func TestCoordinatorStrictLineageMaintainsCumulativeLocalContext(t *testing.T) {
 	groupID := int64(12)
 	strict := true
 
-	t.Run("split keyword blocks before prompt guard", func(t *testing.T) {
+	t.Run("split keyword is retained locally but does not block current turn", func(t *testing.T) {
 		store := &fakeLineageStore{loaded: &AuditSummary{
 			Verdict: AuditVerdictAllow, ContextComplete: true, APIKeyID: 7, GroupID: &groupID,
 			RedactedContext: "cy", PromptHash: "parent-hash",
@@ -608,7 +664,9 @@ func TestCoordinatorStrictLineageMaintainsCumulativeLocalContext(t *testing.T) {
 		legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
 			require.Equal(t, "cy\nber", req.AuditContext)
 			require.Contains(t, string(req.Body), `"input":"ber"`)
-			if strings.Contains(strings.ToLower(auditinput.FoldForMatching(req.AuditContext)), "cyber") {
+			require.NotNil(t, req.Document)
+			require.Equal(t, "ber", req.Document.NormalizedText)
+			if strings.Contains(strings.ToLower(auditinput.FoldForMatching(req.Document.NormalizedText)), "cyber") {
 				return &LegacyDecision{Blocked: true, Flagged: true}, nil
 			}
 			return &LegacyDecision{Allowed: true}, nil
@@ -618,13 +676,15 @@ func TestCoordinatorStrictLineageMaintainsCumulativeLocalContext(t *testing.T) {
 			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
 			Body: []byte(`{"previous_response_id":"resp_parent","input":"ber"}`),
 		})
-		require.Equal(t, DecisionBlock, decision.Kind)
-		require.Equal(t, ErrorCodePolicyBlocked, decision.ErrorCode)
+		require.Equal(t, DecisionAllow, decision.Kind)
+		require.True(t, decision.AllowNextStage)
+		require.NotNil(t, decision.Audit)
+		require.Equal(t, "cy\nber", decision.Audit.NormalizedContext)
 		require.Equal(t, int64(1), legacy.calls.Load())
-		require.Zero(t, prompt.evaluates.Load(), "local keyword blocks must not consume Prompt Guard capacity")
+		require.Equal(t, int64(1), prompt.evaluates.Load())
 	})
 
-	t.Run("prompt stage retains local lineage context while body remains current turn", func(t *testing.T) {
+	t.Run("prompt stage receives lineage summary but evaluates current turn", func(t *testing.T) {
 		store := &fakeLineageStore{loaded: &AuditSummary{
 			Verdict: AuditVerdictAllow, ContextComplete: true, APIKeyID: 7, GroupID: &groupID,
 			RedactedContext: "harmful", PromptHash: "parent-hash",
@@ -633,14 +693,21 @@ func TestCoordinatorStrictLineageMaintainsCumulativeLocalContext(t *testing.T) {
 		prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, evaluate: func(_ context.Context, req Request) (*PromptDecision, error) {
 			require.Equal(t, "harmful\nrequest", req.AuditContext)
 			require.JSONEq(t, `{"previous_response_id":"resp_parent","input":"request"}`, string(req.Body))
-			return &PromptDecision{Kind: DecisionBlock}, nil
+			require.NotNil(t, req.Document)
+			require.Equal(t, "request", req.Document.NormalizedText)
+			if strings.Contains(strings.ToLower(auditinput.FoldForMatching(req.Document.NormalizedText)), "harmful") {
+				return &PromptDecision{Kind: DecisionBlock}, nil
+			}
+			return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 		}}
 		decision := NewCoordinator(legacy, prompt).SetLineageStore(store).Check(context.Background(), Request{
 			APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
 			Body: []byte(`{"previous_response_id":"resp_parent","input":"request"}`),
 		})
-		require.Equal(t, DecisionBlock, decision.Kind)
-		require.Equal(t, ErrorCodePolicyBlocked, decision.ErrorCode)
+		require.Equal(t, DecisionAllow, decision.Kind)
+		require.True(t, decision.AllowNextStage)
+		require.NotNil(t, decision.Audit)
+		require.Equal(t, "harmful\nrequest", decision.Audit.NormalizedContext)
 		require.Equal(t, int64(1), legacy.calls.Load())
 		require.Equal(t, int64(1), prompt.evaluates.Load())
 	})

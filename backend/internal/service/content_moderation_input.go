@@ -73,13 +73,14 @@ func strictLastChatUserText(messages gjson.Result) string {
 		return ""
 	}
 	items := messages.Array()
-	for index := len(items) - 1; index >= 0; index-- {
-		message := items[index]
-		if strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "user") {
-			return strings.Join(strictTextContent(message.Get("content")), "\n")
-		}
+	if len(items) == 0 {
+		return ""
 	}
-	return ""
+	message := items[len(items)-1]
+	if !message.IsObject() || !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "user") {
+		return ""
+	}
+	return strings.Join(strictTextContent(message.Get("content")), "\n")
 }
 
 func strictLastResponsesUserText(input gjson.Result) string {
@@ -96,28 +97,85 @@ func strictLastResponsesUserText(input gjson.Result) string {
 	}
 
 	items := input.Array()
-	implicitParts := make([]string, 0, 2)
-	foundImplicit := false
+	lastBusinessIndex := -1
 	for index := len(items) - 1; index >= 0; index-- {
-		text, kind := strictResponsesUserItem(items[index])
-		switch kind {
-		case strictResponsesUserExplicit:
-			if foundImplicit {
-				return strictJoinReversedText(implicitParts)
+		if strictResponsesTransparentControl(items[index]) {
+			continue
+		}
+		lastBusinessIndex = index
+		break
+	}
+	if lastBusinessIndex < 0 {
+		return ""
+	}
+
+	text, kind := strictResponsesUserItem(items[lastBusinessIndex])
+	switch kind {
+	case strictResponsesUserExplicit:
+		return text
+	case strictResponsesUserImplicit:
+		implicitParts := make([]string, 0, 2)
+		for index := lastBusinessIndex; index >= 0; index-- {
+			if strictResponsesTransparentControl(items[index]) {
+				continue
 			}
-			return text
-		case strictResponsesUserImplicit:
-			foundImplicit = true
-			if text != "" {
-				implicitParts = append(implicitParts, text)
+			itemText, itemKind := strictResponsesUserItem(items[index])
+			if itemKind != strictResponsesUserImplicit {
+				break
 			}
-		default:
-			if foundImplicit {
-				return strictJoinReversedText(implicitParts)
+			if itemText != "" {
+				implicitParts = append(implicitParts, itemText)
 			}
 		}
+		return strictJoinReversedText(implicitParts)
+	default:
+		return ""
 	}
-	return strictJoinReversedText(implicitParts)
+}
+
+func strictResponsesTransparentControl(item gjson.Result) bool {
+	if strictResponsesForwardSanitizerDropsInputItem(item) {
+		return true
+	}
+	if !item.IsObject() || !strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "compaction_trigger") {
+		return false
+	}
+	role := item.Get("role")
+	roleExists := role.Exists() || role.Raw != ""
+	return !roleExists || (role.Type == gjson.String && strings.TrimSpace(role.String()) == "")
+}
+
+func strictResponsesForwardSanitizerDropsInputItem(item gjson.Result) bool {
+	if !item.IsObject() {
+		return false
+	}
+	if strictResponsesForwardSanitizerDropsImagePart(item) {
+		return true
+	}
+	content := item.Get("content")
+	if !content.IsArray() {
+		return false
+	}
+	dropped, remaining := false, 0
+	content.ForEach(func(_, part gjson.Result) bool {
+		if strictResponsesForwardSanitizerDropsImagePart(part) {
+			dropped = true
+		} else {
+			remaining++
+		}
+		return true
+	})
+	return dropped && remaining == 0
+}
+
+func strictResponsesForwardSanitizerDropsImagePart(part gjson.Result) bool {
+	if !part.IsObject() {
+		return false
+	}
+	typeName := part.Get("type")
+	imageURL := part.Get("image_url")
+	return typeName.Type == gjson.String && imageURL.Type == gjson.String &&
+		strings.TrimSpace(typeName.String()) == "input_image" && auditinput.IsEmptyBase64DataURI(imageURL.String())
 }
 
 func strictJoinReversedText(parts []string) string {
@@ -142,7 +200,11 @@ func strictResponsesUserItem(item gjson.Result) (string, strictResponsesUserKind
 	if !item.IsObject() {
 		return "", strictResponsesUserNone
 	}
-	role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+	roleResult := item.Get("role")
+	if (roleResult.Exists() || roleResult.Raw != "") && roleResult.Type != gjson.String {
+		return "", strictResponsesUserNone
+	}
+	role := strings.ToLower(strings.TrimSpace(roleResult.String()))
 	typeName := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
 	if role != "" && role != "user" {
 		return "", strictResponsesUserNone
@@ -191,7 +253,7 @@ func strictCollectTextContent(value gjson.Result, parts *[]string) {
 	case !value.Exists():
 		return
 	case value.Type == gjson.String:
-		addModerationText(parts, value.String())
+		addStrictModerationText(parts, value.String())
 	case value.IsArray():
 		value.ForEach(func(_, item gjson.Result) bool {
 			strictCollectTextContent(item, parts)
@@ -201,14 +263,21 @@ func strictCollectTextContent(value gjson.Result, parts *[]string) {
 		typeName := strings.ToLower(strings.TrimSpace(value.Get("type").String()))
 		switch typeName {
 		case "text", "input_text", "output_text", "refusal", "summary_text", "reasoning_text":
-			addModerationText(parts, value.Get("text").String())
+			addStrictModerationText(parts, value.Get("text").String())
 		case "":
 			if value.Get("text").Exists() {
-				addModerationText(parts, value.Get("text").String())
+				addStrictModerationText(parts, value.Get("text").String())
 			} else {
 				strictCollectTextContent(value.Get("content"), parts)
 			}
 		}
+	}
+}
+
+func addStrictModerationText(parts *[]string, text string) {
+	text = strings.TrimSpace(text)
+	if text != "" {
+		*parts = append(*parts, text)
 	}
 }
 

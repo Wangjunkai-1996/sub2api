@@ -47,17 +47,35 @@ func (b *builder) parseResponses(root map[string]any, path string) {
 			b.doc.Store = &store
 		}
 	}
-	b.parseInstruction(root["instructions"], "system", childPath(path, "instructions"))
-	b.parseToolDefinitions(root["tools"], childPath(path, "tools"))
-	b.addJSON(root["text"], "system", "text_config", childPath(path, "text"))
+	if !b.ignoreImages {
+		b.parseInstruction(root["instructions"], "system", childPath(path, "instructions"))
+		b.parseToolDefinitions(root["tools"], childPath(path, "tools"))
+		b.addJSON(root["text"], "system", "text_config", childPath(path, "text"))
+	}
 	input, exists := root["input"]
+	if b.ignoreImages && responsesEmptyInput(input, exists) {
+		b.addControlItem("responses_empty_turn", childPath(path, "input"))
+		return
+	}
 	if !exists || input == nil {
 		return
 	}
 	b.parseResponsesInput(input, childPath(path, "input"))
 }
 
+func responsesEmptyInput(input any, exists bool) bool {
+	if !exists || input == nil {
+		return true
+	}
+	items, ok := input.([]any)
+	return ok && len(items) == 0
+}
+
 func (b *builder) parseResponsesInput(value any, path string) {
+	if b.ignoreImages {
+		b.parseResponsesCurrentUserInput(value, path)
+		return
+	}
 	switch typed := value.(type) {
 	case string:
 		b.addText(typed, "user", "input_text", path)
@@ -77,6 +95,260 @@ func (b *builder) parseResponsesInput(value any, path string) {
 		b.parseResponsesItem(typed, path)
 	default:
 		b.issue(IssueInvalidShape, path)
+	}
+}
+
+type responsesCurrentUserItemKind int
+
+const (
+	responsesCurrentUserNone responsesCurrentUserItemKind = iota
+	responsesCurrentUserExplicit
+	responsesCurrentUserImplicit
+	responsesCurrentUserMalformedText
+)
+
+// parseResponsesCurrentUserInput mirrors the Responses current-turn boundary
+// used by strict Moderations and Prompt Guard. Historical user messages,
+// assistant state, tool traffic, and unknown non-text items are outside the
+// text-audit scope and must not make an otherwise auditable request incomplete.
+func (b *builder) parseResponsesCurrentUserInput(value any, path string) {
+	defer func() {
+		if len(b.doc.Segments) == 0 && !b.doc.HasImages && len(b.doc.ControlItems) == 0 {
+			b.addControlItem("responses_empty_user_text", path)
+		}
+	}()
+
+	switch typed := value.(type) {
+	case string:
+		b.addText(typed, "user", "input_text", path)
+	case map[string]any:
+		if controlKind, transparent := responsesTransparentControl(typed); transparent {
+			b.addControlItem(controlKind, path)
+		} else if responsesCurrentUserItemClassification(typed) != responsesCurrentUserNone {
+			b.parseResponsesCurrentUserItem(typed, path)
+		} else {
+			b.addControlItem("responses_non_text", path)
+		}
+	case []any:
+		lastBusinessIndex := -1
+		for index := len(typed) - 1; index >= 0; index-- {
+			if controlKind, transparent := responsesTransparentControl(typed[index]); transparent {
+				b.addControlItem(controlKind, indexPath(path, index))
+				continue
+			}
+			lastBusinessIndex = index
+			break
+		}
+		if lastBusinessIndex < 0 {
+			return
+		}
+
+		switch responsesCurrentUserItemClassification(typed[lastBusinessIndex]) {
+		case responsesCurrentUserExplicit, responsesCurrentUserMalformedText:
+			b.parseResponsesCurrentUserItem(typed[lastBusinessIndex].(map[string]any), indexPath(path, lastBusinessIndex))
+		case responsesCurrentUserImplicit:
+			selected := make([]int, 0, 2)
+			for index := lastBusinessIndex; index >= 0; index-- {
+				if controlKind, transparent := responsesTransparentControl(typed[index]); transparent {
+					b.addControlItem(controlKind, indexPath(path, index))
+					continue
+				}
+				if responsesCurrentUserItemClassification(typed[index]) != responsesCurrentUserImplicit {
+					break
+				}
+				selected = append(selected, index)
+			}
+			for index := len(selected) - 1; index >= 0; index-- {
+				itemIndex := selected[index]
+				itemPath := indexPath(path, itemIndex)
+				switch item := typed[itemIndex].(type) {
+				case string:
+					b.addText(item, "user", "input_text", itemPath)
+				case map[string]any:
+					b.parseResponsesCurrentUserItem(item, itemPath)
+				}
+			}
+		default:
+			itemPath := indexPath(path, lastBusinessIndex)
+			b.addControlItem("responses_non_text", itemPath)
+		}
+	default:
+		b.issue(IssueInvalidShape, path)
+	}
+}
+
+func responsesTransparentControl(value any) (string, bool) {
+	if responsesForwardSanitizerDropsInputItem(value) {
+		return "sanitized_empty_input_image", true
+	}
+	item, ok := value.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	typeName, ok := item["type"].(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(typeName), "compaction_trigger") {
+		return "", false
+	}
+	if rawRole, exists := item["role"]; exists {
+		role, ok := rawRole.(string)
+		if !ok || strings.TrimSpace(role) != "" {
+			return "", false
+		}
+	}
+	return "compaction_trigger", true
+}
+
+func responsesForwardSanitizerDropsInputItem(value any) bool {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	if responsesForwardSanitizerDropsImagePart(item) {
+		return true
+	}
+	content, ok := item["content"].([]any)
+	if !ok {
+		return false
+	}
+	dropped, remaining := false, 0
+	for _, part := range content {
+		partMap, ok := part.(map[string]any)
+		if ok && responsesForwardSanitizerDropsImagePart(partMap) {
+			dropped = true
+			continue
+		}
+		remaining++
+	}
+	return dropped && remaining == 0
+}
+
+func responsesForwardSanitizerDropsImagePart(part map[string]any) bool {
+	typeName, typeValid := part["type"].(string)
+	imageURL, imageURLValid := part["image_url"].(string)
+	return typeValid && imageURLValid && strings.TrimSpace(typeName) == "input_image" && IsEmptyBase64DataURI(imageURL)
+}
+
+func responsesCurrentUserItemClassification(value any) responsesCurrentUserItemKind {
+	if _, ok := value.(string); ok {
+		return responsesCurrentUserImplicit
+	}
+	item, ok := value.(map[string]any)
+	if !ok {
+		return responsesCurrentUserNone
+	}
+	rawType, typeExists := item["type"]
+	typeName, typeValid := rawType.(string)
+	if typeExists && !typeValid {
+		if responsesItemHasKnownTextSurface(item, "") {
+			return responsesCurrentUserMalformedText
+		}
+		return responsesCurrentUserNone
+	}
+	typeName = strings.ToLower(strings.TrimSpace(typeName))
+	knownNonUserType := responsesKnownNonUserTextAuditType(typeName)
+	if knownNonUserType {
+		return responsesCurrentUserNone
+	}
+	if rawRole, exists := item["role"]; exists {
+		role, valid := rawRole.(string)
+		if !valid {
+			if responsesKnownCurrentUserTextAuditType(typeName) ||
+				(!responsesKnownImageTextAuditType(typeName) && responsesItemHasKnownTextSurface(item, typeName)) {
+				return responsesCurrentUserMalformedText
+			}
+			return responsesCurrentUserNone
+		}
+		role = strings.ToLower(strings.TrimSpace(role))
+		if strings.EqualFold(role, "user") {
+			return responsesCurrentUserExplicit
+		}
+		if role != "" {
+			if !knownResponsesRole(role) && responsesItemHasKnownTextSurface(item, typeName) {
+				return responsesCurrentUserMalformedText
+			}
+			return responsesCurrentUserNone
+		}
+	}
+	switch typeName {
+	case "input_text", "text", "input_image", "image_url", "image":
+		return responsesCurrentUserImplicit
+	case "", "message":
+		if responsesItemHasKnownTextSurface(item, typeName) {
+			return responsesCurrentUserMalformedText
+		}
+	default:
+		if responsesItemHasKnownTextSurface(item, typeName) {
+			return responsesCurrentUserMalformedText
+		}
+	}
+	return responsesCurrentUserNone
+}
+
+func responsesKnownCurrentUserTextAuditType(typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "", "message", "input_text", "text":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesKnownImageTextAuditType(typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "input_image", "image_url", "image":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesKnownNonUserTextAuditType(typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "agent_message", "output_text", "refusal", "input_file", "file",
+		"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+		"local_shell_call_output", "apply_patch_call_output", "tool_search_output",
+		"tool_call", "mcp_tool_call", "tool_call_output", "mcp_tool_call_output", "computer_call_output",
+		"reasoning", "compaction", "compaction_summary", "compaction_trigger", "additional_tools", "item_reference",
+		"computer_call", "web_search_call", "file_search_call", "image_generation_call", "code_interpreter_call",
+		"local_shell_call", "apply_patch_call", "mcp_call", "mcp_list_tools", "mcp_approval_request",
+		"mcp_approval_response", "tool_search_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesItemHasKnownTextSurface(item map[string]any, typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "message", "input_text", "text":
+		return true
+	}
+	for _, field := range []string{"content", "text", "refusal"} {
+		if value, exists := item[field]; exists && value != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *builder) parseResponsesCurrentUserItem(item map[string]any, path string) {
+	typeName, valid := b.optionalStringField(item, "type", path)
+	if !valid {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "", "message", "input_text", "text":
+		b.parseResponsesItem(item, path)
+	case "input_image", "image_url", "image":
+		b.addImage("", "", path)
+	default:
+		if responsesItemHasKnownTextSurface(item, typeName) {
+			b.issue(IssueUnknownType, childPath(path, "type"))
+		} else {
+			// A role=user item with no recognized text surface is intentionally
+			// opaque to text auditing. Upstream remains responsible for its schema.
+			b.addControlItem("responses_non_text", path)
+		}
 	}
 }
 
@@ -124,7 +396,9 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 			b.issue(IssueUnknownRole, childPath(path, "role"))
 			return
 		}
-		b.addText(name, role, "name", childPath(path, "name"))
+		if !b.ignoreImages {
+			b.addText(name, role, "name", childPath(path, "name"))
+		}
 		payloadCount := 0
 		if content, exists := item["content"]; exists {
 			payloadCount++
@@ -160,8 +434,10 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 			return
 		}
 		b.addText(text, role, typeName, childPath(path, "text"))
-		b.addJSON(item["annotations"], role, "annotations", childPath(path, "annotations"))
-		b.addJSON(item["logprobs"], role, "logprobs", childPath(path, "logprobs"))
+		if !b.ignoreImages {
+			b.addJSON(item["annotations"], role, "annotations", childPath(path, "annotations"))
+			b.addJSON(item["logprobs"], role, "logprobs", childPath(path, "logprobs"))
+		}
 	case "input_image", "image_url", "image":
 		b.rejectUnknownResponsesItemFields(item, path, "image_url", "url", "source", "data", "base64", "mime_type", "media_type", "mimeType", "detail", "file_id", "fileId")
 		b.parseImageObject(item, childPath(path, "image_url"))
@@ -406,6 +682,10 @@ func (b *builder) parseResponsesFunctionNamespace(item map[string]any, role, pat
 
 func (b *builder) parseChat(root map[string]any, path string) {
 	b.rejectUnknownFields(root, path, chatRootFields...)
+	if b.ignoreImages {
+		b.parseChatCurrentUser(root, path)
+		return
+	}
 	b.parseToolDefinitions(root["tools"], childPath(path, "tools"))
 	b.parseToolDefinitions(root["functions"], childPath(path, "functions"))
 	b.addJSON(root["prediction"], "system", "prediction", childPath(path, "prediction"))
@@ -461,6 +741,72 @@ func (b *builder) parseChat(root map[string]any, path string) {
 				}
 			}
 		}
+	}
+}
+
+func (b *builder) parseChatCurrentUser(root map[string]any, path string) {
+	rawMessages, exists := root["messages"]
+	if !exists || rawMessages == nil {
+		b.addControlItem("chat_empty_turn", childPath(path, "messages"))
+		return
+	}
+	messages, ok := rawMessages.([]any)
+	if !ok {
+		b.issue(IssueInvalidShape, childPath(path, "messages"))
+		return
+	}
+	if len(messages) == 0 {
+		b.addControlItem("chat_empty_turn", childPath(path, "messages"))
+		return
+	}
+	lastIndex := len(messages) - 1
+	messagePath := indexPath(childPath(path, "messages"), lastIndex)
+	message, ok := messages[lastIndex].(map[string]any)
+	if !ok {
+		b.issue(IssueInvalidShape, messagePath)
+		return
+	}
+	rawRole, roleExists := message["role"]
+	if !roleExists {
+		b.issue(IssueInvalidShape, childPath(messagePath, "role"))
+		return
+	}
+	role, ok := rawRole.(string)
+	if !ok {
+		b.issue(IssueInvalidShape, childPath(messagePath, "role"))
+		return
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+	if !knownOpenAIChatRole(role) {
+		b.issue(IssueUnknownRole, childPath(messagePath, "role"))
+		return
+	}
+	if role != "user" {
+		b.addControlItem("chat_non_text", messagePath)
+		return
+	}
+	b.parseChatCurrentUserMessage(message, messagePath)
+}
+
+func (b *builder) parseChatCurrentUserMessage(message map[string]any, path string) {
+	b.rejectUnknownFields(message, path, "role", "content", "name", "audio", "refusal", "tool_calls", "function_call", "tool_call_id")
+	role, roleValid := b.optionalStringField(message, "role", path)
+	_, nameValid := b.optionalStringField(message, "name", path)
+	if !roleValid || !nameValid {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(role), "user") {
+		b.issue(IssueUnknownRole, childPath(path, "role"))
+		return
+	}
+	segmentCount := len(b.doc.Segments)
+	hadImages := b.doc.HasImages
+	controlCount := len(b.doc.ControlItems)
+	if content, exists := message["content"]; exists && content != nil {
+		b.parseContentParts(content, "user", childPath(path, "content"), contentFlavorChat)
+	}
+	if len(b.doc.Segments) == segmentCount && b.doc.HasImages == hadImages && len(b.doc.ControlItems) == controlCount {
+		b.addControlItem("chat_non_text", path)
 	}
 }
 
@@ -898,9 +1244,29 @@ func (b *builder) parseContentParts(value any, role, path string, flavor content
 func (b *builder) parseContentPart(part map[string]any, role, path string, flavor contentFlavor) {
 	if b.ignoreImages {
 		if typeName, ok := part["type"].(string); ok {
-			switch strings.ToLower(strings.TrimSpace(typeName)) {
+			typeName = strings.ToLower(strings.TrimSpace(typeName))
+			switch typeName {
 			case "image", "input_image", "image_url", "computer_screenshot":
 				b.addImage("", "", path)
+				return
+			case "", "text", "input_text", "output_text", "refusal", "summary_text", "reasoning_text":
+				// Known text shapes are validated below.
+			default:
+				if flavor == contentFlavorResponses || flavor == contentFlavorChat {
+					if responsesItemHasKnownTextSurface(part, typeName) {
+						b.issue(IssueUnknownType, childPath(path, "type"))
+					} else {
+						b.addControlItem("openai_non_text", path)
+					}
+					return
+				}
+			}
+		} else if _, typeExists := part["type"]; !typeExists && (flavor == contentFlavorResponses || flavor == contentFlavorChat) {
+			_, hasText := part["text"]
+			_, hasContent := part["content"]
+			_, hasRefusal := part["refusal"]
+			if !hasText && !hasContent && !hasRefusal {
+				b.addControlItem("openai_non_text", path)
 				return
 			}
 		}
@@ -941,8 +1307,10 @@ func (b *builder) parseContentPart(part map[string]any, role, path string, flavo
 			}
 			b.addText(text, role, typeName, childPath(path, "text"))
 		}
-		b.addJSON(part["annotations"], role, "annotations", childPath(path, "annotations"))
-		b.addJSON(part["logprobs"], role, "logprobs", childPath(path, "logprobs"))
+		if !b.ignoreImages {
+			b.addJSON(part["annotations"], role, "annotations", childPath(path, "annotations"))
+			b.addJSON(part["logprobs"], role, "logprobs", childPath(path, "logprobs"))
+		}
 	case "image", "input_image", "image_url", "computer_screenshot":
 		b.rejectUnknownContentPartFields(part, path, "image_url", "url", "source", "data", "base64", "mime_type", "media_type", "mimeType", "detail", "file_id", "fileId")
 		b.parseImageObject(part, path)

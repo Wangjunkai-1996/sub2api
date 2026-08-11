@@ -1281,7 +1281,7 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 		forbidden string
 	}{
 		{
-			name:     "chat scans backward for the latest user role",
+			name:     "chat does not rewind past final tool message",
 			protocol: ContentModerationProtocolOpenAIChat,
 			body: []byte(`{"messages":[
 				{"role":"user","content":"historical user"},
@@ -1290,11 +1290,10 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 				{"role":"assistant","content":"later assistant output"},
 				{"role":"tool","content":"later tool output"}
 			]}`),
-			want:      "latest user",
 			forbidden: "later tool output",
 		},
 		{
-			name:     "responses ignores assistant and tool output after latest user",
+			name:     "responses does not rewind past final tool output",
 			protocol: ContentModerationProtocolOpenAIResponses,
 			body: []byte(`{"input":[
 				{"type":"message","role":"user","content":[{"type":"input_text","text":"historical user"}]},
@@ -1302,7 +1301,6 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
 				{"type":"function_call_output","call_id":"call_1","output":"tool output"}
 			]}`),
-			want:      "latest user",
 			forbidden: "tool output",
 		},
 		{
@@ -1353,6 +1351,59 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 			want:      strings.Repeat("界", maxStrictModerationTextRunes),
 			forbidden: "尾",
 		},
+		{
+			name:     "trailing compaction remains transparent to current user",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":"current user text"},
+				{"type":"compaction_trigger"}
+			]}`),
+			want: "current user text",
+		},
+		{
+			name:     "trailing compaction does not cross tool output",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":"historical user text"},
+				{"type":"function_call_output","call_id":"call_1","output":"tool output"},
+				{"type":"compaction_trigger"}
+			]}`),
+			forbidden: "historical user text",
+		},
+		{
+			name:     "forward-sanitized empty image cannot hide current user text",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":"current user text"},
+				{"type":"input_image","image_url":"data:image/png;base64,   "}
+			]}`),
+			want: "current user text",
+		},
+		{
+			name:     "forward-sanitized empty image does not cross tool output",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[
+				{"type":"message","role":"user","content":"historical user text"},
+				{"type":"function_call_output","call_id":"call_1","output":"done"},
+				{"type":"input_image","image_url":"data:image/png;base64,"}
+			]}`),
+			forbidden: "historical user text",
+		},
+		{
+			name:     "strict text keeps system-reminder literals",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body: []byte(`{"input":[{"type":"message","role":"user","content":[
+				{"type":"input_text","text":"safe prefix"},
+				{"type":"input_text","text":"<system-reminder> blocked current text"}
+			]}]}`),
+			want: "safe prefix <system-reminder> blocked current text",
+		},
+		{
+			name:      "responses null role does not become flat user text",
+			protocol:  ContentModerationProtocolOpenAIResponses,
+			body:      []byte(`{"input":[{"type":"input_text","role":null,"text":"must not be audited"}]}`),
+			forbidden: "must not be audited",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1394,7 +1445,7 @@ func TestExtractStrictCurrentUserText_ExplicitResponsesTopLevelPayloadWithHistor
 		t.Run(tt.name, func(t *testing.T) {
 			document := auditinput.ParseForTextAudit(ContentModerationProtocolOpenAIResponses, tt.body)
 			require.True(t, document.Complete, "%+v", document.Issues)
-			require.True(t, document.HasImages)
+			require.False(t, document.HasImages, "historical images are outside the current-user text audit")
 			require.Empty(t, document.Media)
 			require.Contains(t, document.NormalizedText, tt.want)
 			require.Equal(t, tt.want, ExtractStrictCurrentUserText(ContentModerationProtocolOpenAIResponses, tt.body))
@@ -1554,8 +1605,8 @@ func TestContentModerationCheck_StrictSendsOnlyCurrentUserText(t *testing.T) {
 					{"role":"user","content":"historical user text"},
 					{"role":"assistant","content":"assistant output"},
 					{"role":"tool","content":"tool output"},
-					{"role":"user","content":[
-						{"type":"text","text":"  current   chat user text  "},
+						{"role":"user","content":[
+							{"type":"text","text":"  current   chat user text  ","annotations":[{"label":"annotation must not be audited"}],"logprobs":[{"token":"logprob must not be audited"}]},
 						{"type":"image_url","image_url":{"url":"opaque-image-payload"}}
 					]}
 				],
@@ -1575,8 +1626,8 @@ func TestContentModerationCheck_StrictSendsOnlyCurrentUserText(t *testing.T) {
 					{"type":"message","role":"user","content":[{"type":"input_text","text":"historical user text"}]},
 					{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
 					{"type":"function_call_output","call_id":"call_1","output":"tool output"},
-					{"type":"message","role":"user","content":[
-						{"type":"input_text","text":"current responses user text"},
+					{"type":"message","role":"user","name":"metadata must not be audited","content":[
+						{"type":"input_text","text":"current responses user text","annotations":[{"label":"annotation must not be audited"}],"logprobs":[{"token":"logprob must not be audited"}]},
 						{"type":"input_image","image_url":"opaque-image-payload"}
 					]}
 				]
@@ -1587,6 +1638,11 @@ func TestContentModerationCheck_StrictSendsOnlyCurrentUserText(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			document := auditinput.ParseForTextAudit(tt.protocol, tt.body)
+			require.True(t, document.Complete, "%+v", document.Issues)
+			require.Equal(t, tt.want, document.NormalizedText)
+			require.Equal(t, tt.want, ExtractStrictCurrentUserText(tt.protocol, tt.body))
+
 			var mu sync.Mutex
 			requestCount := 0
 			var gotInput any
@@ -1645,6 +1701,158 @@ func TestContentModerationCheck_StrictSendsOnlyCurrentUserText(t *testing.T) {
 	}
 }
 
+func TestContentModerationCheck_StrictCompleteNoCurrentUserTextAllowsWithoutRemoteCall(t *testing.T) {
+	groupID := int64(12)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.AllGroups = false
+	cfg.GroupIDs = []int64{groupID}
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-test"}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	svc := &ContentModerationService{
+		settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		repo:       &contentModerationTestRepo{},
+		httpClient: server.Client(),
+		asyncQueue: make(chan contentModerationTask, 1),
+		keyHealth:  make(map[string]*contentModerationKeyHealth),
+	}
+
+	tests := []struct {
+		name     string
+		protocol string
+		body     string
+	}{
+		{name: "responses missing input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"model":"gpt-5.5"}`},
+		{name: "responses null input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"model":"gpt-5.5","input":null}`},
+		{name: "responses empty websocket input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"type":"response.create","model":"gpt-5.5","input":[]}`},
+		{name: "responses tool output", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical user"},{"type":"function_call_output","call_id":"call_1","output":"done"}]}`},
+		{name: "responses empty continuation", protocol: ContentModerationProtocolOpenAIResponses, body: `{"previous_response_id":"resp_parent","input":[]}`},
+		{name: "responses empty string input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":""}`},
+		{name: "responses empty input text", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"input_text","text":""}]}`},
+		{name: "responses empty message content", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":""}]}`},
+		{name: "responses name metadata only", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","name":"metadata only","content":""}]}`},
+		{name: "responses content metadata only", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"","annotations":[{"label":"metadata only"}],"logprobs":[{"token":"metadata only"}]}]}]}`},
+		{name: "responses top-level text metadata only", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"input_text","text":"","annotations":[{"label":"metadata only"}],"logprobs":[{"token":"metadata only"}]}]}`},
+		{name: "chat missing messages", protocol: ContentModerationProtocolOpenAIChat, body: `{"model":"gpt-5.5"}`},
+		{name: "chat null messages", protocol: ContentModerationProtocolOpenAIChat, body: `{"model":"gpt-5.5","messages":null}`},
+		{name: "chat empty messages", protocol: ContentModerationProtocolOpenAIChat, body: `{"model":"gpt-5.5","messages":[]}`},
+		{name: "chat tool output", protocol: ContentModerationProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"historical user"},{"role":"tool","content":"done"}]}`},
+		{name: "chat content metadata only", protocol: ContentModerationProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":[{"type":"text","text":"","annotations":[{"label":"metadata only"}],"logprobs":[{"token":"metadata only"}]}]}]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			document := auditinput.ParseForTextAudit(test.protocol, []byte(test.body))
+			require.True(t, document.Complete, "%+v", document.Issues)
+			require.Equal(t, ExtractStrictCurrentUserText(test.protocol, []byte(test.body)), document.NormalizedText)
+			require.NotEmpty(t, document.ControlItems)
+
+			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+				Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+				Protocol: test.protocol, Body: []byte(test.body),
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, decision)
+			require.True(t, decision.Allowed)
+			require.Equal(t, ContentModerationActionAllow, decision.Action)
+			require.Equal(t, 0, requestCount)
+		})
+	}
+}
+
+func TestContentModerationCheck_StrictPenaltySignalsUseOnlyCurrentUserText(t *testing.T) {
+	groupID := int64(12)
+	requestCount := 0
+	var gotInput any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		var request moderationAPIRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		gotInput = request.Input
+		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+		}}}))
+	}))
+	defer server.Close()
+
+	historical := ContentModerationInput{Text: "historical blocked keyword"}
+	historical.Normalize()
+	currentHashBlocked := ContentModerationInput{Text: "current hash blocked"}
+	currentHashBlocked.Normalize()
+	hashCache := &contentModerationTestHashCache{hashes: map[string]struct{}{
+		historical.Hash():         {},
+		currentHashBlocked.Hash(): {},
+	}}
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.AllGroups = false
+	cfg.GroupIDs = []int64{groupID}
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-test"}
+	cfg.BlockedKeywords = []string{"historical blocked keyword"}
+	cfg.PreHashCheckEnabled = true
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	svc := &ContentModerationService{
+		settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		repo:       &contentModerationTestRepo{},
+		hashCache:  hashCache,
+		httpClient: server.Client(),
+		asyncQueue: make(chan contentModerationTask, 4),
+		keyHealth:  make(map[string]*contentModerationKeyHealth),
+	}
+
+	safeCurrent := ContentModerationInput{Text: "safe current text"}
+	safeCurrent.Normalize()
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: []byte(`{"input":"safe current text"}`),
+		AuditContext: "historical blocked keyword",
+	})
+
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.Equal(t, 1, requestCount)
+	require.Equal(t, "safe current text", gotInput)
+	require.Equal(t, []string{safeCurrent.Hash()}, hashCache.snapshotChecked())
+
+	keywordDecision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: []byte(`{"input":"historical blocked keyword"}`),
+	})
+	require.NoError(t, err)
+	require.True(t, keywordDecision.Blocked)
+	require.Equal(t, ContentModerationActionKeywordBlock, keywordDecision.Action)
+	require.Equal(t, 1, requestCount)
+
+	hashDecision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: []byte(`{"input":"current hash blocked"}`),
+	})
+	require.NoError(t, err)
+	require.True(t, hashDecision.Blocked)
+	require.Equal(t, ContentModerationActionHashBlock, hashDecision.Action)
+	require.Equal(t, 1, requestCount)
+}
+
 func TestContentModerationCheck_StrictTruncatesCurrentUserTextToRuneLimit(t *testing.T) {
 	groupID := int64(12)
 	want := strings.Repeat("界", maxStrictModerationTextRunes)
@@ -1678,6 +1886,7 @@ func TestContentModerationCheck_StrictTruncatesCurrentUserTextToRuneLimit(t *tes
 	cfg.GroupIDs = []int64{groupID}
 	cfg.BaseURL = server.URL
 	cfg.APIKeys = []string{"sk-test"}
+	cfg.BlockedKeywords = []string{"blocked-after-limit"}
 	rawCfg, err := json.Marshal(cfg)
 	require.NoError(t, err)
 	svc := &ContentModerationService{
@@ -1702,6 +1911,19 @@ func TestContentModerationCheck_StrictTruncatesCurrentUserTextToRuneLimit(t *tes
 	require.Equal(t, 1, requestCount)
 	require.Equal(t, want, gotInput)
 	require.Equal(t, maxStrictModerationTextRunes, len([]rune(gotInput.(string))))
+
+	blockedBody, err := json.Marshal(map[string]any{
+		"input": want + " blocked-after-limit",
+	})
+	require.NoError(t, err)
+	blocked, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: blockedBody,
+	})
+	require.NoError(t, err)
+	require.True(t, blocked.Blocked, "local keyword checks must cover text beyond the remote limit")
+	require.Equal(t, ContentModerationActionKeywordBlock, blocked.Action)
+	require.Equal(t, 1, requestCount, "local keyword blocks must not consume another Moderations call")
 }
 
 func TestContentModerationStatusTracksPreBlockSyncMetrics(t *testing.T) {
@@ -2174,7 +2396,7 @@ func TestContentModerationCheck_StrictImageOnlyRequestIsAllowedWithoutModeration
 	require.Zero(t, requestCount)
 }
 
-func TestContentModerationCheck_StrictControlOnlyRequestStillFailsClosed(t *testing.T) {
+func TestContentModerationCheck_StrictControlOnlyRequestAllowsWithoutModerationCall(t *testing.T) {
 	groupID := int64(12)
 	body := []byte(`{"input":[{"type":"compaction_trigger"}]}`)
 	requestCount := 0
@@ -2209,9 +2431,10 @@ func TestContentModerationCheck_StrictControlOnlyRequestStillFailsClosed(t *test
 		Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
 	})
 
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no auditable user text")
-	require.Nil(t, decision)
+	require.NoError(t, err)
+	require.NotNil(t, decision)
+	require.True(t, decision.Allowed)
+	require.Equal(t, ContentModerationActionAllow, decision.Action)
 	require.Zero(t, requestCount)
 }
 
@@ -2497,8 +2720,8 @@ func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcu
 	mu.Lock()
 	defer mu.Unlock()
 	require.NoError(t, handlerErr)
-	require.Equal(t, workers, requestCount)
-	require.Equal(t, workers, textRequests)
+	require.Equal(t, 1, requestCount)
+	require.Equal(t, 1, textRequests)
 	require.Zero(t, imageInputs)
 }
 
