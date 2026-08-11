@@ -234,6 +234,7 @@ func (e *handlerLegacyEngine) Check(context.Context, securityaudit.Request) (*se
 
 type handlerAllowLineageStore struct {
 	summary securityaudit.AuditSummary
+	loadErr error
 	loads   atomic.Int32
 	lookup  securityaudit.LineageLookup
 }
@@ -241,6 +242,9 @@ type handlerAllowLineageStore struct {
 func (s *handlerAllowLineageStore) Load(_ context.Context, lookup securityaudit.LineageLookup) (*securityaudit.AuditSummary, error) {
 	s.loads.Add(1)
 	s.lookup = lookup
+	if s.loadErr != nil {
+		return nil, s.loadErr
+	}
 	result := s.summary.Clone()
 	return &result, nil
 }
@@ -534,6 +538,7 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 		name       string
 		body       string
 		legacy     *handlerLegacyEngine
+		lineage    securityaudit.LineageStore
 		wantStatus int
 		wantCode   string
 	}{
@@ -548,6 +553,12 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
 		},
 		{
+			name: "legacy continuation missing lineage", body: `{"model":"gpt-test","previous_response_id":"resp_legacy","input":"continue"}`,
+			legacy:     &handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
+			lineage:    &handlerAllowLineageStore{loadErr: securityaudit.ErrLineageNotFound},
+			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
+		},
+		{
 			name: "audit unavailable", body: `{"model":"gpt-test","input":"safe"}`,
 			legacy:     &handlerLegacyEngine{strict: true, err: errors.New("moderation 429")},
 			wantStatus: http.StatusServiceUnavailable, wantCode: securityaudit.ErrorCodeAuditUnavailable,
@@ -556,12 +567,16 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			prompt := &handlerPromptEngine{mode: securityaudit.ModeOff}
+			coordinator := securityaudit.NewCoordinator(tt.legacy, prompt)
+			if tt.lineage != nil {
+				coordinator.SetLineageStore(tt.lineage)
+			}
 			h := &OpenAIGatewayHandler{
 				gatewayService:           &service.OpenAIGatewayService{},
 				billingCacheService:      &service.BillingCacheService{},
 				apiKeyService:            &service.APIKeyService{},
 				concurrencyHelper:        NewConcurrencyHelper(&service.ConcurrencyService{}, SSEPingFormatComment, time.Second),
-				securityAuditCoordinator: securityaudit.NewCoordinator(tt.legacy, prompt),
+				securityAuditCoordinator: coordinator,
 			}
 
 			router := gin.New()
@@ -590,7 +605,7 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 	}
 }
 
-func TestOpenAIResponsesStrictContinuationStickyMissStopsBeforeAllDownstreamDependencies(t *testing.T) {
+func TestOpenAIResponsesStrictContinuationStickyMissIsAuditUnavailableBeforeDownstreamDependencies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	groupID := int64(12)
 	lineage := &handlerAllowLineageStore{summary: securityaudit.AuditSummary{
@@ -652,8 +667,8 @@ func TestOpenAIResponsesStrictContinuationStickyMissStopsBeforeAllDownstreamDepe
 	recorder := httptest.NewRecorder()
 
 	require.NotPanics(t, func() { router.ServeHTTP(recorder, request) })
-	require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
-	require.Equal(t, securityaudit.ErrorCodeContextIncomplete, gjson.GetBytes(recorder.Body.Bytes(), "error.code").String())
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, gjson.GetBytes(recorder.Body.Bytes(), "error.code").String())
 	require.Equal(t, int32(1), lineage.loads.Load())
 	require.Equal(t, int64(9), lineage.lookup.APIKeyID)
 	require.Equal(t, groupID, *lineage.lookup.GroupID)

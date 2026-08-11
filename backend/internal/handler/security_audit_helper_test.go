@@ -75,6 +75,22 @@ type captureLineageStore struct {
 	bindErr    error
 }
 
+func TestBindAllowedSecurityAuditResponseSkipsStoreFalseFullHistoryLineage(t *testing.T) {
+	store := &captureLineageStore{}
+	h := &OpenAIGatewayHandler{
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, nil).SetLineageStore(store),
+	}
+	summary := &securityaudit.AuditSummary{
+		Verdict: securityaudit.AuditVerdictAllow, ContextComplete: true,
+		SkipResponseLineage: true,
+	}
+
+	require.False(t, securityAuditResponseLineageRequired(summary))
+	require.True(t, securityAuditResponseLineageRequired(&securityaudit.AuditSummary{}))
+	require.NoError(t, h.bindAllowedSecurityAuditResponse(context.Background(), nil, summary, nil))
+	require.Zero(t, store.calls)
+}
+
 func (s *captureLineageStore) Load(context.Context, securityaudit.LineageLookup) (*securityaudit.AuditSummary, error) {
 	return nil, securityaudit.ErrLineageNotFound
 }

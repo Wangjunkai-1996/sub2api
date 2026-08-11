@@ -45,7 +45,7 @@ func TestAppendResponsesOutputAcceptsLegacyAuditAndCurrentMessageShape(t *testin
 	require.Contains(t, augmented.RedactedContext, "TRACE")
 }
 
-func TestAppendResponsesOutputFailsClosedForUnknownMediaAndLimits(t *testing.T) {
+func TestAppendResponsesOutputFailsClosedForUnknownItemsAndMedia(t *testing.T) {
 	summary := AuditSummary{
 		ParserVersion: "auditinput/v1", ConfigVersion: 9, APIKeyID: 7,
 		PromptHash: strings.Repeat("a", 64), DocumentHash: strings.Repeat("b", 64),
@@ -57,7 +57,6 @@ func TestAppendResponsesOutputFailsClosedForUnknownMediaAndLimits(t *testing.T) 
 	}{
 		{name: "unknown item", output: []byte(`[{"type":"future_item","payload":"hidden"}]`)},
 		{name: "response media", output: []byte(`[{"type":"message","role":"assistant","content":[{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}]`)},
-		{name: "text limit", output: []byte(`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + strings.Repeat("x", 65_537) + `"}]}]`)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -65,4 +64,17 @@ func TestAppendResponsesOutputFailsClosedForUnknownMediaAndLimits(t *testing.T) 
 			require.ErrorIs(t, err, ErrLineageInvalid)
 		})
 	}
+}
+
+func TestAppendResponsesOutputAcceptsTextBeyondLegacy64KLimit(t *testing.T) {
+	summary := AuditSummary{
+		ParserVersion: "auditinput/v1", ConfigVersion: 9, APIKeyID: 7,
+		PromptHash: strings.Repeat("a", 64), DocumentHash: strings.Repeat("b", 64),
+		RedactedContext: "prior", ContextComplete: true, Verdict: AuditVerdictAllow,
+	}
+	outputText := strings.Repeat("x", 65_537)
+	augmented, err := AppendResponsesOutput(summary, []byte(`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"`+outputText+`"}]}]`))
+
+	require.NoError(t, err)
+	require.Contains(t, augmented.RedactedContext, outputText)
 }

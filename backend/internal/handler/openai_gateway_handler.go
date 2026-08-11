@@ -188,29 +188,21 @@ func openAIResponsesRequiredCapability(imageIntent bool, platform string) servic
 	return service.OpenAIEndpointCapabilityChatCompletions
 }
 
-func openAIStrictContinuationRejectedDecision() *securityaudit.Decision {
+func openAIStrictContinuationUnavailableDecision() *securityaudit.Decision {
 	return &securityaudit.Decision{
-		Kind:          securityaudit.DecisionInvalid,
-		HTTPStatus:    http.StatusUnprocessableEntity,
-		ErrorCode:     securityaudit.ErrorCodeContextIncomplete,
-		ClientMessage: "请求上下文无法完整审计，请重新发起完整请求",
+		Kind:          securityaudit.DecisionUnavailable,
+		HTTPStatus:    http.StatusServiceUnavailable,
+		ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
+		ClientMessage: "安全审计暂时不可用，请稍后重试",
 	}
 }
 
-func openAIStrictContinuationErrorDecision(err error) *securityaudit.Decision {
-	if errors.Is(err, service.ErrOpenAIResponseAccountStoreUnavailable) {
-		return &securityaudit.Decision{
-			Kind:          securityaudit.DecisionUnavailable,
-			HTTPStatus:    http.StatusServiceUnavailable,
-			ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
-			ClientMessage: "安全审计暂时不可用，请稍后重试",
-		}
-	}
-	return openAIStrictContinuationRejectedDecision()
+func openAIStrictContinuationErrorDecision(_ error) *securityaudit.Decision {
+	return openAIStrictContinuationUnavailableDecision()
 }
 
-func (h *OpenAIGatewayHandler) rejectOpenAIStrictContinuation(c *gin.Context) {
-	h.openAISecurityAuditError(c, openAIStrictContinuationRejectedDecision())
+func (h *OpenAIGatewayHandler) failOpenAIStrictContinuation(c *gin.Context, err error) {
+	h.openAISecurityAuditError(c, openAIStrictContinuationErrorDecision(err))
 }
 
 func allowOpenAICompatibleMessagesDispatch(apiKey *service.APIKey) bool {
@@ -380,7 +372,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		securityAuditSummary = cloneSecurityAuditSummary(decision)
 	}
-	if securityAuditSummary != nil {
+	if securityAuditResponseLineageRequired(securityAuditSummary) {
 		service.EnableOpenAIStrictLineageCapture(c)
 	}
 	// Strict groups may use HTTP continuation only after the referenced lineage
@@ -413,11 +405,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			requireCompact,
 		); err != nil {
 			reqLog.Warn("openai.strict_http_continuation_preflight_failed", zap.Error(err))
-			if errors.Is(err, service.ErrOpenAIResponseAccountStoreUnavailable) {
-				h.openAIStrictLineageCommitError(c)
-				return
-			}
-			h.rejectOpenAIStrictContinuation(c)
+			h.failOpenAIStrictContinuation(c, err)
 			return
 		}
 	}
@@ -501,17 +489,16 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 复用前置权限与并发阶段在未修改 body 上确认的显式生图意图，避免大 tools 请求重复扫描。
 	// 该判断已排除 Codex 被动 image_gen namespace，避免 CC-only 账号被误过滤（#4476）。
 	requiredCapability := openAIResponsesRequiredCapability(imageIntent, requestPlatform)
-	if securityAuditSummary != nil {
-		// Every strict turn must use a native Responses-capable account. Chat
-		// fallback synthesizes response IDs and cannot create trustworthy lineage
-		// for a later continuation.
+	if securityAuditResponseLineageRequired(securityAuditSummary) {
+		// Requests that will create strict continuation lineage must use a native
+		// Responses account. Explicit store=false full-history requests are fully
+		// audited but do not consume synthesized response IDs on a later turn.
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
 	requiredTransport := service.OpenAIUpstreamTransportAny
-	if securityAuditSummary != nil {
-		// Every strict response must come from an account that can accept the next
-		// audited turn over native Responses WSv2, even though the first client turn
-		// may still arrive and complete over HTTP.
+	if securityAuditResponseLineageRequired(securityAuditSummary) {
+		// A response that will be bound into strict lineage must come from an
+		// audited native transport. store=false full-history requests bind nothing.
 		requiredTransport = service.OpenAIUpstreamTransportResponsesWebsocketV2Audited
 	}
 
@@ -547,14 +534,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		)
 		if err != nil {
 			if strictHTTPContinuation {
-				switch {
-				case errors.Is(err, service.ErrOpenAIResponseAccountStoreUnavailable):
-					h.openAIStrictLineageCommitError(c)
-					return
-				case errors.Is(err, service.ErrOpenAIPreviousResponseAccountUnavailable):
-					h.rejectOpenAIStrictContinuation(c)
-					return
-				}
+				h.failOpenAIStrictContinuation(c, err)
+				return
 			}
 			if failoverClientGone(c) {
 				reqLog.Info("openai.account_select_aborted_client_disconnected", zap.Error(err))
@@ -586,7 +567,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		if selection == nil || selection.Account == nil {
 			if strictHTTPContinuation {
-				h.rejectOpenAIStrictContinuation(c)
+				h.failOpenAIStrictContinuation(c, service.ErrOpenAIPreviousResponseAccountUnavailable)
 				return
 			}
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
@@ -600,7 +581,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			if selection.ReleaseFunc != nil {
 				selection.ReleaseFunc()
 			}
-			h.rejectOpenAIStrictContinuation(c)
+			h.failOpenAIStrictContinuation(c, service.ErrOpenAIPreviousResponseAccountUnavailable)
 			return
 		}
 		if previousResponseID != "" && selection != nil && selection.Account != nil {
@@ -623,7 +604,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if slotResult == openAISlotAcquireProfitVetoed {
 			if strictHTTPContinuation {
-				h.rejectOpenAIStrictContinuation(c)
+				h.failOpenAIStrictContinuation(c, service.ErrOpenAIPreviousResponseAccountUnavailable)
 				return
 			}
 			// 利润终检否决：排除该账号重新选号，全池耗尽由下一轮选号报错；
@@ -640,7 +621,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 		// Forward request
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
-		if securityAuditSummary != nil {
+		if securityAuditResponseLineageRequired(securityAuditSummary) {
 			auditSummary := securityAuditSummary.Clone()
 			selectedAccountID := account.ID
 			service.SetOpenAIStrictLineageCommitter(c, func(_ int, result *service.OpenAIForwardResult) error {
@@ -1914,7 +1895,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 		firstTurnSecurityAuditSummary = cloneSecurityAuditSummary(decision)
 	}
-	if firstTurnSecurityAuditSummary != nil {
+	if securityAuditResponseLineageRequired(firstTurnSecurityAuditSummary) {
 		service.EnableOpenAIStrictLineageCapture(c)
 	}
 	strictAuditSession := firstTurnSecurityAuditSummary != nil
@@ -2145,7 +2126,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 		if selection == nil || selection.Account == nil {
 			if strictWSContinuation {
-				decision := openAIStrictContinuationRejectedDecision()
+				decision := openAIStrictContinuationUnavailableDecision()
 				writeSecurityAuditWSError(ctx, wsConn, decision)
 				closeOpenAIClientWS(wsConn, securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision))
 				return
@@ -2161,7 +2142,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			if selection.ReleaseFunc != nil {
 				selection.ReleaseFunc()
 			}
-			decision := openAIStrictContinuationRejectedDecision()
+			decision := openAIStrictContinuationUnavailableDecision()
 			writeSecurityAuditWSError(ctx, wsConn, decision)
 			closeOpenAIClientWS(wsConn, securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision))
 			return
@@ -2189,7 +2170,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				reqLog.Debug("openai.websocket_account_slot_profit_vetoed", zap.Int64("account_id", account.ID), zap.String("reason", reason))
 				if strictWSContinuation {
-					decision := openAIStrictContinuationRejectedDecision()
+					decision := openAIStrictContinuationUnavailableDecision()
 					writeSecurityAuditWSError(ctx, wsConn, decision)
 					closeOpenAIClientWS(wsConn, securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision))
 					return
@@ -2236,7 +2217,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				reqLog.Debug("openai.websocket_account_slot_profit_vetoed", zap.Int64("account_id", account.ID), zap.String("reason", reason))
 				if strictWSContinuation {
-					decision := openAIStrictContinuationRejectedDecision()
+					decision := openAIStrictContinuationUnavailableDecision()
 					writeSecurityAuditWSError(ctx, wsConn, decision)
 					closeOpenAIClientWS(wsConn, securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision))
 					return
@@ -2290,7 +2271,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		if firstTurnSecurityAuditSummary != nil {
 			turnAuditSummaries[1] = firstTurnSecurityAuditSummary.Clone()
 		}
-		if firstTurnSecurityAuditSummary != nil {
+		if securityAuditResponseLineageRequired(firstTurnSecurityAuditSummary) {
 			service.SetOpenAIStrictLineageCommitter(c, func(turn int, result *service.OpenAIForwardResult) error {
 				turnAuditMu.Lock()
 				turnAuditSummary, ok := turnAuditSummaries[turn]

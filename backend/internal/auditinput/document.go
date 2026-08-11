@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	ParserVersion = "auditinput/v1"
+	ParserVersion = "auditinput/v2"
 
-	MaxTextRunes  = 65_536
+	MaxTextRunes  = 64 * 1024 * 1024
 	MaxImages     = 4
 	MaxImageBytes = 8 * 1024 * 1024
 
@@ -46,7 +46,6 @@ const (
 	IssueTextLimit           = "text_limit_exceeded"
 	IssueImageLimit          = "image_limit_exceeded"
 	IssueImageSize           = "image_size_exceeded"
-	IssueLineageRequired     = "previous_response_id_required"
 )
 
 type Segment struct {
@@ -68,23 +67,39 @@ type Media struct {
 	Value     string `json:"-"`
 }
 
+// OpaqueState records only the digest of provider-generated assistant state.
+// The ciphertext itself must never enter normalized audit text or diagnostics.
+type OpaqueState struct {
+	Kind   string `json:"kind"`
+	Path   string `json:"path"`
+	Digest string `json:"digest"`
+}
+
+type ControlItem struct {
+	Kind string `json:"kind"`
+	Path string `json:"path"`
+}
+
 type Issue struct {
 	Code string `json:"code"`
 	Path string `json:"path,omitempty"`
 }
 
 type Document struct {
-	ParserVersion      string    `json:"parser_version"`
-	Protocol           string    `json:"protocol"`
-	Segments           []Segment `json:"segments"`
-	Media              []Media   `json:"media"`
-	PreviousResponseID string    `json:"previous_response_id,omitempty"`
-	NormalizedText     string    `json:"normalized_text"`
-	FoldedText         string    `json:"folded_text"`
-	Hash               string    `json:"hash"`
-	Complete           bool      `json:"complete"`
-	Truncated          bool      `json:"truncated"`
-	Issues             []Issue   `json:"issues,omitempty"`
+	ParserVersion      string        `json:"parser_version"`
+	Protocol           string        `json:"protocol"`
+	Segments           []Segment     `json:"segments"`
+	Media              []Media       `json:"media"`
+	OpaqueStates       []OpaqueState `json:"opaque_states,omitempty"`
+	ControlItems       []ControlItem `json:"control_items,omitempty"`
+	Store              *bool         `json:"store,omitempty"`
+	PreviousResponseID string        `json:"previous_response_id,omitempty"`
+	NormalizedText     string        `json:"normalized_text"`
+	FoldedText         string        `json:"folded_text"`
+	Hash               string        `json:"hash"`
+	Complete           bool          `json:"complete"`
+	Truncated          bool          `json:"truncated"`
+	Issues             []Issue       `json:"issues,omitempty"`
 }
 
 func (d *Document) Clone() *Document {
@@ -94,6 +109,12 @@ func (d *Document) Clone() *Document {
 	clone := *d
 	clone.Segments = append([]Segment(nil), d.Segments...)
 	clone.Media = append([]Media(nil), d.Media...)
+	clone.OpaqueStates = append([]OpaqueState(nil), d.OpaqueStates...)
+	clone.ControlItems = append([]ControlItem(nil), d.ControlItems...)
+	if d.Store != nil {
+		store := *d.Store
+		clone.Store = &store
+	}
 	clone.Issues = append([]Issue(nil), d.Issues...)
 	return &clone
 }
@@ -262,13 +283,12 @@ func scanJSONValueForDuplicateFields(decoder *json.Decoder, path string) (string
 }
 
 type builder struct {
-	doc             Document
-	textRunes       int
-	requiresLineage bool
+	doc       Document
+	textRunes int
 }
 
 func (b *builder) finish() *Document {
-	if len(b.doc.Segments) == 0 && len(b.doc.Media) == 0 && len(b.doc.Issues) == 0 {
+	if len(b.doc.Segments) == 0 && len(b.doc.Media) == 0 && len(b.doc.OpaqueStates) == 0 && len(b.doc.ControlItems) == 0 && len(b.doc.Issues) == 0 {
 		b.issue(IssueEmptyContent, "$")
 	}
 	texts := make([]string, 0, len(b.doc.Segments))
@@ -276,12 +296,18 @@ func (b *builder) finish() *Document {
 		texts = append(texts, segment.Normalized)
 	}
 	b.doc.NormalizedText = strings.Join(texts, "\n")
-	b.doc.FoldedText = FoldForMatching(b.doc.NormalizedText)
+	b.doc.FoldedText = foldNormalizedForMatching(b.doc.NormalizedText)
 	h := sha256.New()
 	_, _ = h.Write([]byte(ParserVersion))
 	_, _ = h.Write([]byte("\nprotocol:" + b.doc.Protocol + "\ntext:" + b.doc.NormalizedText))
 	for _, media := range b.doc.Media {
 		_, _ = h.Write([]byte("\nmedia:" + media.Digest))
+	}
+	for _, state := range b.doc.OpaqueStates {
+		_, _ = h.Write([]byte("\nopaque:" + state.Kind + ":" + state.Path + ":" + state.Digest))
+	}
+	for _, control := range b.doc.ControlItems {
+		_, _ = h.Write([]byte("\ncontrol:" + control.Kind + ":" + control.Path))
 	}
 	b.doc.Hash = hex.EncodeToString(h.Sum(nil))
 	b.doc.Complete = len(b.doc.Issues) == 0 && !b.doc.Truncated
@@ -312,18 +338,20 @@ func (b *builder) addText(value, role, kind, path string) {
 		b.issue(IssueTextLimit, path)
 		return
 	}
-	runes := []rune(normalized)
-	if len(runes) > remaining {
+	runeCount := utf8.RuneCountInString(normalized)
+	if runeCount > remaining {
+		runes := []rune(normalized)
 		runes = runes[:remaining]
 		normalized = string(runes)
+		runeCount = remaining
 		b.doc.Truncated = true
 		b.issue(IssueTextLimit, path)
 	}
 	b.doc.Segments = append(b.doc.Segments, Segment{
-		Text: value, Normalized: normalized, Folded: FoldForMatching(normalized),
-		Role: strings.ToLower(strings.TrimSpace(role)), Kind: kind, Path: path,
+		Normalized: normalized,
+		Role:       strings.ToLower(strings.TrimSpace(role)), Kind: kind, Path: path,
 	})
-	b.textRunes += separator + len(runes)
+	b.textRunes += separator + runeCount
 }
 
 func (b *builder) addJSON(value any, role, kind, path string) {
@@ -339,6 +367,19 @@ func (b *builder) addJSON(value any, role, kind, path string) {
 		return
 	}
 	b.addText(string(raw), role, kind, path)
+}
+
+func (b *builder) addOpaqueState(kind, value, path string) {
+	digest := sha256.Sum256([]byte(value))
+	b.doc.OpaqueStates = append(b.doc.OpaqueStates, OpaqueState{
+		Kind: strings.ToLower(strings.TrimSpace(kind)), Path: path, Digest: hex.EncodeToString(digest[:]),
+	})
+}
+
+func (b *builder) addControlItem(kind, path string) {
+	b.doc.ControlItems = append(b.doc.ControlItems, ControlItem{
+		Kind: strings.ToLower(strings.TrimSpace(kind)), Path: path,
+	})
 }
 
 func (b *builder) addImage(value, mimeType, path string) {
@@ -448,7 +489,10 @@ func NormalizeText(value string) string {
 }
 
 func FoldForMatching(value string) string {
-	value = NormalizeText(value)
+	return foldNormalizedForMatching(NormalizeText(value))
+}
+
+func foldNormalizedForMatching(value string) string {
 	var out strings.Builder
 	out.Grow(len(value))
 	for _, r := range value {

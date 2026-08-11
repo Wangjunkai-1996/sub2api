@@ -202,6 +202,10 @@ type AuditSummary struct {
 	MediaDigests       []string `json:"media_digests,omitempty"`
 	ContextComplete    bool     `json:"context_complete"`
 	Verdict            string   `json:"verdict"`
+	// SkipResponseLineage separates strict input admission from optional
+	// response capture. Explicit store=false full-history requests are fully
+	// audited but do not need a response-id lineage record.
+	SkipResponseLineage bool `json:"-"`
 }
 
 func (s AuditSummary) Clone() AuditSummary {
@@ -211,6 +215,10 @@ func (s AuditSummary) Clone() AuditSummary {
 	}
 	s.MediaDigests = append([]string(nil), s.MediaDigests...)
 	return s
+}
+
+func (s AuditSummary) ResponseLineageRequired() bool {
+	return !s.SkipResponseLineage
 }
 
 type IssueSummary struct {

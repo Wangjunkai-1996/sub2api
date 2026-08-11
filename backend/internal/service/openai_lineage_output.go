@@ -15,9 +15,8 @@ import (
 const (
 	openAIResponsesLineageCaptureContextKey = "sub2api.openai.strict_lineage_capture"
 	openAIResponsesLineageCommitContextKey  = "sub2api.openai.strict_lineage_commit"
-	// Response media is not accepted into lineage, so 2 MiB safely covers the
-	// 65,536-rune text limit plus JSON escaping and item metadata while bounding
-	// per-turn copies under Pro concurrency.
+	// Stored-response lineage keeps a tighter output cap than request auditing.
+	// Explicit store=false full-history requests never enable this capture path.
 	openAIResponsesLineageOutputMaxBytes = 2 * 1024 * 1024
 )
 

@@ -39,6 +39,14 @@ func (b *builder) parseResponses(root map[string]any, path string) {
 		return
 	}
 	b.doc.PreviousResponseID = previousResponseID
+	if rawStore, exists := root["store"]; exists {
+		store, ok := rawStore.(bool)
+		if !ok {
+			b.issue(IssueInvalidShape, childPath(path, "store"))
+		} else {
+			b.doc.Store = &store
+		}
+	}
 	b.parseInstruction(root["instructions"], "system", childPath(path, "instructions"))
 	b.parseToolDefinitions(root["tools"], childPath(path, "tools"))
 	b.addJSON(root["text"], "system", "text_config", childPath(path, "text"))
@@ -47,9 +55,6 @@ func (b *builder) parseResponses(root map[string]any, path string) {
 		return
 	}
 	b.parseResponsesInput(input, childPath(path, "input"))
-	if b.requiresLineage && strings.TrimSpace(b.doc.PreviousResponseID) == "" {
-		b.issue(IssueLineageRequired, childPath(path, "previous_response_id"))
-	}
 }
 
 func (b *builder) parseResponsesInput(value any, path string) {
@@ -89,11 +94,14 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 	}
 	typeName = strings.ToLower(typeName)
 	role = strings.ToLower(role)
+	assistantState := isResponsesAssistantStateType(typeName)
 	if role != "" && !knownResponsesRole(role) {
 		b.issue(IssueUnknownRole, childPath(path, "role"))
-		return
+		if !assistantState {
+			return
+		}
 	}
-	if b.containsOpaqueEncryptedContent(item, path) {
+	if !assistantState && b.containsOpaqueEncryptedContent(item, path) {
 		b.issue(IssueEncryptedContent, path)
 		return
 	}
@@ -147,7 +155,8 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 		b.rejectUnknownResponsesItemFields(item, path, "file_id", "fileId", "file_url", "fileUrl", "file_data", "filename", "name", "source", "data", "base64", "mime_type", "media_type", "mimeType")
 		b.parseFileObject(item, path)
 	case "function_call":
-		b.rejectUnknownResponsesItemFields(item, path, "name", "arguments", "call_id")
+		b.rejectUnknownResponsesItemFields(item, path, "name", "namespace", "arguments", "call_id")
+		b.parseResponsesFunctionNamespace(item, role, path)
 		name, valid := b.requiredStringField(item, "name", path)
 		if !valid {
 			return
@@ -161,26 +170,24 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 		}
 	case "function_call_output":
 		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output")
-		b.requiresLineage = true
 		b.parseRequiredResponsesToolPayloads(item, path, "output")
 	case "custom_tool_call":
-		b.rejectUnknownResponsesItemFields(item, path, "name", "input", "arguments", "call_id")
+		b.rejectUnknownResponsesItemFields(item, path, "name", "namespace", "input", "arguments", "call_id")
+		b.parseResponsesFunctionNamespace(item, role, path)
 		b.addText(name, role, typeName, childPath(path, "name"))
 		b.parseRequiredResponsesToolPayloads(item, path, "input", "arguments")
 	case "custom_tool_call_output", "local_shell_call_output", "apply_patch_call_output", "tool_search_output":
 		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output", "content")
-		b.requiresLineage = true
 		b.parseRequiredResponsesToolPayloads(item, path, "output", "content")
 	case "tool_call", "mcp_tool_call":
-		b.rejectUnknownResponsesItemFields(item, path, "function", "name", "arguments", "args", "call_id", "server_label")
+		b.rejectUnknownResponsesItemFields(item, path, "function", "name", "namespace", "arguments", "args", "call_id", "server_label")
+		b.parseResponsesFunctionNamespace(item, role, path)
 		b.parseFunctionCall(item, role, path)
 	case "tool_call_output", "mcp_tool_call_output":
 		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output", "content", "server_label")
-		b.requiresLineage = true
 		b.parseRequiredResponsesToolPayloads(item, path, "output", "content")
 	case "computer_call_output":
 		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output", "acknowledged_safety_checks")
-		b.requiresLineage = true
 		rawOutput, exists := item["output"]
 		if !exists || rawOutput == nil {
 			b.issue(IssueInvalidShape, childPath(path, "output"))
@@ -203,12 +210,22 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 		b.parseImageObject(output, childPath(path, "output"))
 		b.addJSON(item["acknowledged_safety_checks"], "tool", "safety_checks", childPath(path, "acknowledged_safety_checks"))
 	case "reasoning":
-		b.rejectUnknownResponsesItemFields(item, path, "summary", "content", "encrypted_content")
-		if summary, exists := item["summary"]; exists {
-			b.parseContentParts(summary, "assistant", childPath(path, "summary"), contentFlavorResponses)
+		b.parseResponsesAssistantState(item, path, typeName, role, false)
+	case "compaction", "compaction_summary":
+		b.parseResponsesAssistantState(item, path, typeName, role, true)
+	case "compaction_trigger":
+		b.rejectUnknownFields(item, path, "type")
+		b.addControlItem(typeName, path)
+	case "additional_tools":
+		b.rejectUnknownResponsesItemFields(item, path, "tools")
+		if role != "" && role != "developer" {
+			b.issue(IssueUnknownRole, childPath(path, "role"))
 		}
-		if content, exists := item["content"]; exists && content != nil {
-			b.parseContentParts(content, "assistant", childPath(path, "content"), contentFlavorResponses)
+		tools, exists := item["tools"]
+		if !exists || tools == nil {
+			b.issue(IssueInvalidShape, childPath(path, "tools"))
+		} else {
+			b.parseToolDefinitions(tools, childPath(path, "tools"))
 		}
 	case "item_reference":
 		b.rejectUnknownResponsesItemFields(item, path)
@@ -231,6 +248,55 @@ func (b *builder) rejectUnknownResponsesItemFields(item map[string]any, path str
 	allowed = append(allowed, "type", "id", "status", "phase", "role")
 	allowed = append(allowed, fields...)
 	b.rejectUnknownFields(item, path, allowed...)
+}
+
+func isResponsesAssistantStateType(typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "reasoning", "compaction", "compaction_summary":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *builder) parseResponsesAssistantState(item map[string]any, path, typeName, role string, encryptedRequired bool) {
+	b.rejectUnknownResponsesItemFields(item, path, "summary", "content", "encrypted_content")
+	if role != "" && role != "assistant" {
+		b.issue(IssueUnknownRole, childPath(path, "role"))
+	}
+	if b.containsOpaqueEncryptedFields(item, path, "encryptedContent", "signature") {
+		b.issue(IssueEncryptedContent, path)
+	}
+	b.parseCanonicalResponsesEncryptedContent(item, path, typeName, encryptedRequired)
+	if summary, exists := item["summary"]; exists {
+		b.parseContentParts(summary, "assistant", childPath(path, "summary"), contentFlavorResponses)
+	}
+	if content, exists := item["content"]; exists && content != nil {
+		b.parseContentParts(content, "assistant", childPath(path, "content"), contentFlavorResponses)
+	}
+}
+
+func (b *builder) parseCanonicalResponsesEncryptedContent(item map[string]any, path, typeName string, required bool) {
+	raw, exists := item["encrypted_content"]
+	if !exists {
+		if required {
+			b.issue(IssueInvalidShape, childPath(path, "encrypted_content"))
+		}
+		return
+	}
+	text, ok := raw.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		b.issue(IssueInvalidShape, childPath(path, "encrypted_content"))
+		return
+	}
+	b.addOpaqueState(typeName, text, childPath(path, "encrypted_content"))
+}
+
+func (b *builder) parseResponsesFunctionNamespace(item map[string]any, role, path string) {
+	namespace, valid := b.optionalStringField(item, "namespace", path)
+	if valid {
+		b.addText(namespace, role, "function_namespace", childPath(path, "namespace"))
+	}
 }
 
 func (b *builder) parseChat(root map[string]any, path string) {
@@ -971,7 +1037,11 @@ func (b *builder) parseFunctionCall(value any, role, path string) {
 		call, path = function, childPath(path, "function")
 		b.rejectUnknownFields(call, path, "name", "arguments", "args")
 	} else {
-		b.rejectUnknownFields(call, path, "id", "type", "name", "arguments", "args", "index", "call_id", "server_label")
+		allowed := []string{"id", "type", "name", "arguments", "args", "index", "call_id", "server_label"}
+		if b.doc.Protocol == ProtocolOpenAIResponses {
+			allowed = append(allowed, "namespace")
+		}
+		b.rejectUnknownFields(call, path, allowed...)
 	}
 	name, nameValid := b.requiredStringField(call, "name", path)
 	if !nameValid {
@@ -1422,7 +1492,11 @@ func (b *builder) parseGeminiInlineData(value any, path string) {
 }
 
 func (b *builder) containsOpaqueEncryptedContent(value map[string]any, path string) bool {
-	for _, key := range []string{"encrypted_content", "encryptedContent", "signature"} {
+	return b.containsOpaqueEncryptedFields(value, path, "encrypted_content", "encryptedContent", "signature")
+}
+
+func (b *builder) containsOpaqueEncryptedFields(value map[string]any, path string, keys ...string) bool {
+	for _, key := range keys {
 		raw, exists := value[key]
 		if !exists || raw == nil {
 			continue

@@ -56,7 +56,14 @@ func cloneSecurityAuditSummary(decision *securityaudit.Decision) *securityaudit.
 	return &cloned
 }
 
+func securityAuditResponseLineageRequired(summary *securityaudit.AuditSummary) bool {
+	return summary != nil && summary.ResponseLineageRequired()
+}
+
 func (h *OpenAIGatewayHandler) bindAllowedSecurityAuditResponse(ctx context.Context, reqLog *zap.Logger, summary *securityaudit.AuditSummary, result *service.OpenAIForwardResult) error {
+	if summary != nil && !summary.ResponseLineageRequired() {
+		return nil
+	}
 	if h == nil || h.securityAuditCoordinator == nil || summary == nil {
 		return fmt.Errorf("strict audit lineage coordinator is unavailable")
 	}

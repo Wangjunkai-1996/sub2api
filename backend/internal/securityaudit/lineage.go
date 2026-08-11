@@ -35,6 +35,9 @@ func (c *Coordinator) SetLineageStore(store LineageStore) *Coordinator {
 }
 
 func (c *Coordinator) BindAllowedResponse(ctx context.Context, summary AuditSummary, responseID string) error {
+	if summary.SkipResponseLineage {
+		return nil
+	}
 	if c == nil || c.lineage == nil {
 		return errors.New("strict audit lineage store unavailable")
 	}

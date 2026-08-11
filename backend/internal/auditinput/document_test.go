@@ -1,7 +1,10 @@
 package auditinput
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -29,19 +32,42 @@ func TestParseResponsesIncludesCompleteToolLoopAndLineage(t *testing.T) {
 	require.Equal(t, ParserVersion, doc.ParserVersion)
 }
 
-func TestParseResponsesToolOutputRequiresVerifiableLineage(t *testing.T) {
-	withoutLineage := Parse(ProtocolOpenAIResponses, []byte(`{
-		"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]
+func TestParseResponsesInspectableToolOutputSupportsStoreFalseFullHistory(t *testing.T) {
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{
+		"store":false,
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"pwd\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"/workspace"},
+			{"type":"message","role":"user","content":"continue"}
+		]
 	}`))
-	require.False(t, withoutLineage.Complete)
-	require.True(t, withoutLineage.HasIssue(IssueLineageRequired))
 
-	withLineage := Parse(ProtocolOpenAIResponses, []byte(`{
-		"previous_response_id":"resp_parent",
-		"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]
-	}`))
-	require.True(t, withLineage.Complete)
-	require.False(t, withLineage.HasIssue(IssueLineageRequired))
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Empty(t, doc.PreviousResponseID)
+	for _, value := range []string{"shell", "pwd", "/workspace", "continue"} {
+		require.Contains(t, doc.NormalizedText, value)
+	}
+}
+
+func TestParseResponsesCapturesExplicitStore(t *testing.T) {
+	stored := Parse(ProtocolOpenAIResponses, []byte(`{"store":true,"input":"hello"}`))
+	require.True(t, stored.Complete, "%+v", stored.Issues)
+	require.NotNil(t, stored.Store)
+	require.True(t, *stored.Store)
+
+	notStored := Parse(ProtocolOpenAIResponses, []byte(`{"store":false,"input":"hello"}`))
+	require.True(t, notStored.Complete, "%+v", notStored.Issues)
+	require.NotNil(t, notStored.Store)
+	require.False(t, *notStored.Store)
+
+	implicit := Parse(ProtocolOpenAIResponses, []byte(`{"input":"hello"}`))
+	require.True(t, implicit.Complete, "%+v", implicit.Issues)
+	require.Nil(t, implicit.Store)
+
+	invalid := Parse(ProtocolOpenAIResponses, []byte(`{"store":"false","input":"hello"}`))
+	require.False(t, invalid.Complete)
+	require.True(t, invalid.HasIssue(IssueInvalidShape), "%+v", invalid.Issues)
+	require.Contains(t, invalid.NormalizedText, "hello")
 }
 
 func TestParseResponsesIncludesMCPAndGenericToolLoops(t *testing.T) {
@@ -296,7 +322,7 @@ func TestParseStrictCompletenessFailures(t *testing.T) {
 		{name: "file source unknown type", protocol: ProtocolAnthropicMessages, body: `{"max_tokens":10,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"future","media_type":"text/plain","data":"c2FmZQ=="}}]}]}`, code: IssueUnknownType},
 		{name: "file source invalid shape", protocol: ProtocolAnthropicMessages, body: `{"max_tokens":10,"messages":[{"role":"user","content":[{"type":"document","source":"opaque"}]}]}`, code: IssueInvalidShape},
 		{name: "file source encrypted", protocol: ProtocolAnthropicMessages, body: `{"max_tokens":10,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"encrypted","data":"opaque"}}]}]}`, code: IssueEncryptedContent},
-		{name: "encrypted reasoning", protocol: ProtocolOpenAIResponses, body: `{"input":[{"type":"reasoning","encrypted_content":"opaque"}]}`, code: IssueEncryptedContent},
+		{name: "encrypted message", protocol: ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"safe","encrypted_content":"opaque"}]}`, code: IssueEncryptedContent},
 		{name: "unsupported audio", protocol: ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"aGVsbG8=","format":"wav"}}]}]}`, code: IssueUnsupportedMedia},
 	}
 	for _, tt := range tests {
@@ -504,6 +530,167 @@ func TestParseResponsesReasoningAuditsSummaryAndContent(t *testing.T) {
 	require.True(t, doc.Complete, "%+v", doc.Issues)
 	require.Contains(t, doc.NormalizedText, "visible summary")
 	require.Contains(t, doc.NormalizedText, "visible reasoning content")
+}
+
+func TestParseResponsesAcceptsCanonicalOpaqueAssistantState(t *testing.T) {
+	reasoningCipher := "reasoning-ciphertext"
+	compactionCipher := "compaction-ciphertext"
+	summaryCipher := "compaction-summary-ciphertext"
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{
+		"input":[
+			{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"`+reasoningCipher+`","summary":[{"type":"summary_text","text":"visible reasoning summary"}],"content":[{"type":"reasoning_text","text":"visible reasoning content"}]},
+			{"id":"cmp_1","type":"compaction","status":"completed","encrypted_content":"`+compactionCipher+`","summary":[{"type":"summary_text","text":"visible compaction summary"}]},
+			{"id":"cmp_2","type":"compaction_summary","encrypted_content":"`+summaryCipher+`","content":[{"type":"reasoning_text","text":"visible compacted content"}]},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Equal(t, "auditinput/v2", doc.ParserVersion)
+	require.Len(t, doc.OpaqueStates, 3)
+	require.Equal(t, OpaqueState{Kind: "reasoning", Path: "$.input[0].encrypted_content", Digest: sha256Hex(reasoningCipher)}, doc.OpaqueStates[0])
+	require.Equal(t, OpaqueState{Kind: "compaction", Path: "$.input[1].encrypted_content", Digest: sha256Hex(compactionCipher)}, doc.OpaqueStates[1])
+	require.Equal(t, OpaqueState{Kind: "compaction_summary", Path: "$.input[2].encrypted_content", Digest: sha256Hex(summaryCipher)}, doc.OpaqueStates[2])
+	for _, visible := range []string{"visible reasoning summary", "visible reasoning content", "visible compaction summary", "visible compacted content", "continue"} {
+		require.Contains(t, doc.NormalizedText, visible)
+	}
+	for _, ciphertext := range []string{reasoningCipher, compactionCipher, summaryCipher} {
+		require.NotContains(t, doc.NormalizedText, ciphertext)
+		for _, segment := range doc.Segments {
+			require.NotContains(t, segment.Text, ciphertext)
+		}
+	}
+	encoded, err := json.Marshal(doc)
+	require.NoError(t, err)
+	for _, ciphertext := range []string{reasoningCipher, compactionCipher, summaryCipher} {
+		require.NotContains(t, string(encoded), ciphertext)
+	}
+
+	changed := Parse(ProtocolOpenAIResponses, []byte(`{"input":[{"type":"reasoning","encrypted_content":"different-ciphertext","summary":[{"type":"summary_text","text":"visible reasoning summary"}],"content":[{"type":"reasoning_text","text":"visible reasoning content"}]},{"type":"message","role":"user","content":"continue"}]}`))
+	baseline := Parse(ProtocolOpenAIResponses, []byte(`{"input":[{"type":"reasoning","encrypted_content":"`+reasoningCipher+`","summary":[{"type":"summary_text","text":"visible reasoning summary"}],"content":[{"type":"reasoning_text","text":"visible reasoning content"}]},{"type":"message","role":"user","content":"continue"}]}`))
+	require.Equal(t, baseline.NormalizedText, changed.NormalizedText)
+	require.NotEqual(t, baseline.Hash, changed.Hash)
+}
+
+func TestParseResponsesOutputAcceptsCanonicalOpaqueAssistantState(t *testing.T) {
+	doc := ParseResponsesOutput([]byte(`[
+		{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"reasoning-output","summary":[{"type":"summary_text","text":"output summary"}]},
+		{"id":"cmp_1","type":"compaction","status":"completed","encrypted_content":"compaction-output"},
+		{"id":"cmp_2","type":"compaction_summary","encrypted_content":"compaction-summary-output","content":[{"type":"reasoning_text","text":"output compacted content"}]}
+	]`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Len(t, doc.OpaqueStates, 3)
+	require.Contains(t, doc.NormalizedText, "output summary")
+	require.Contains(t, doc.NormalizedText, "output compacted content")
+	require.NotContains(t, doc.NormalizedText, "reasoning-output")
+	require.NotContains(t, doc.NormalizedText, "compaction-output")
+	require.NotContains(t, doc.NormalizedText, "compaction-summary-output")
+
+	opaqueOnly := ParseResponsesOutput([]byte(`[{"id":"cmp_only","type":"compaction","status":"completed","encrypted_content":"opaque-only-output"}]`))
+	require.True(t, opaqueOnly.Complete, "%+v", opaqueOnly.Issues)
+	require.Empty(t, opaqueOnly.NormalizedText)
+	require.Equal(t, []OpaqueState{{Kind: "compaction", Path: "$.output[0].encrypted_content", Digest: sha256Hex("opaque-only-output")}}, opaqueOnly.OpaqueStates)
+}
+
+func TestParseResponsesCompactionTriggerIsExactControlItem(t *testing.T) {
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{"input":[{"type":"compaction_trigger"}]}`))
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Empty(t, doc.NormalizedText)
+	require.Equal(t, []ControlItem{{Kind: "compaction_trigger", Path: "$.input[0]"}}, doc.ControlItems)
+
+	withPayload := Parse(ProtocolOpenAIResponses, []byte(`{"input":[{"type":"compaction_trigger","payload":"hidden"}]}`))
+	require.False(t, withPayload.Complete)
+	require.True(t, withPayload.HasIssue(IssueUnknownField), "%+v", withPayload.Issues)
+}
+
+func TestParseResponsesRejectsOpaqueContentOutsideCanonicalAssistantState(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code string
+	}{
+		{name: "message", body: `{"input":[{"type":"message","role":"user","content":"safe","encrypted_content":"opaque"}]}`, code: IssueEncryptedContent},
+		{name: "tool output", body: `{"input":[{"type":"tool_call_output","call_id":"call_1","output":"safe","encrypted_content":"opaque"}]}`, code: IssueEncryptedContent},
+		{name: "content part", body: `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"safe","encrypted_content":"opaque"}]}]}`, code: IssueEncryptedContent},
+		{name: "unknown item", body: `{"input":[{"type":"future_item","encrypted_content":"opaque"}]}`, code: IssueEncryptedContent},
+		{name: "reasoning alias", body: `{"input":[{"type":"reasoning","encryptedContent":"opaque","summary":[{"type":"summary_text","text":"visible"}]}]}`, code: IssueEncryptedContent},
+		{name: "reasoning signature", body: `{"input":[{"type":"reasoning","signature":"opaque","summary":[{"type":"summary_text","text":"visible"}]}]}`, code: IssueEncryptedContent},
+		{name: "reasoning empty canonical", body: `{"input":[{"type":"reasoning","encrypted_content":"","summary":[{"type":"summary_text","text":"visible"}]}]}`, code: IssueInvalidShape},
+		{name: "reasoning malformed canonical", body: `{"input":[{"type":"reasoning","encrypted_content":{"opaque":true},"summary":[{"type":"summary_text","text":"visible"}]}]}`, code: IssueInvalidShape},
+		{name: "compaction missing canonical", body: `{"input":[{"type":"compaction","summary":[{"type":"summary_text","text":"visible"}]}]}`, code: IssueInvalidShape},
+		{name: "compaction trigger encrypted", body: `{"input":[{"type":"compaction_trigger","encrypted_content":"opaque"}]}`, code: IssueEncryptedContent},
+		{name: "assistant state user role", body: `{"input":[{"type":"reasoning","role":"user","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"visible"}]}]}`, code: IssueUnknownRole},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := Parse(ProtocolOpenAIResponses, []byte(tt.body))
+			require.False(t, doc.Complete)
+			require.True(t, doc.HasIssue(tt.code), "%+v", doc.Issues)
+			if strings.Contains(tt.body, "visible") {
+				require.Contains(t, doc.NormalizedText, "visible")
+			}
+		})
+	}
+}
+
+func TestParseResponsesSupportsAdditionalToolsAndFunctionNamespace(t *testing.T) {
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"collaboration","description":"multi-agent tools","tools":[{"type":"function","name":"spawn_agent","description":"spawn a bounded agent","parameters":{"type":"object","properties":{"task":{"type":"string"}}}}]}]},
+			{"type":"function_call","namespace":"collaboration","name":"spawn_agent","call_id":"call_1","arguments":"{\"task\":\"inspect parser\"}"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	for _, visible := range []string{"collaboration", "multi-agent tools", "spawn_agent", "spawn a bounded agent", "inspect parser", "continue"} {
+		require.Contains(t, doc.NormalizedText, visible)
+	}
+	require.Equal(t, "function_namespace", doc.Segments[1].Kind)
+	require.Equal(t, "$.input[1].namespace", doc.Segments[1].Path)
+}
+
+func TestParseProductionLikeLargeCodexFullHistory(t *testing.T) {
+	largeToolDescription := strings.Repeat("inspect repository state and return structured evidence; ", 24_000)
+	responsesBody := []byte(`{
+		"model":"gpt-5.6-sol",
+		"store":false,
+		"tools":[{"type":"function","name":"exec_command","description":` + quoteJSON(largeToolDescription) + `,"parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}],
+		"input":[
+			{"id":"rs_1","type":"reasoning","encrypted_content":"reasoning-state","summary":[{"type":"summary_text","text":"inspect the current failure"}]},
+			{"id":"cmp_1","type":"compaction","encrypted_content":"compaction-state"},
+			{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]},
+			{"type":"function_call","namespace":"collaboration","name":"spawn_agent","call_id":"call_1","arguments":"{\"task\":\"inspect 422\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"parser evidence collected"},
+			{"type":"message","role":"user","content":"continue without previous_response_id"}
+		]
+	}`)
+	require.Greater(t, len(responsesBody), 1<<20)
+
+	responses := Parse(ProtocolOpenAIResponses, responsesBody)
+	require.True(t, responses.Complete, "%+v", responses.Issues)
+	require.Empty(t, responses.PreviousResponseID)
+	require.NotNil(t, responses.Store)
+	require.False(t, *responses.Store)
+	require.Len(t, responses.OpaqueStates, 2)
+	for _, visible := range []string{"exec_command", "inspect the current failure", "spawn_agent", "inspect 422", "parser evidence collected", "continue without previous_response_id"} {
+		require.Contains(t, responses.NormalizedText, visible)
+	}
+	require.NotContains(t, responses.NormalizedText, "reasoning-state")
+	require.NotContains(t, responses.NormalizedText, "compaction-state")
+
+	chatBody := []byte(`{"model":"gpt-5.6-sol","store":false,"tools":[{"type":"function","function":{"name":"exec_command","description":` + quoteJSON(largeToolDescription) + `,"parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"continue chat"}]}`)
+	require.Greater(t, len(chatBody), 1<<20)
+	chat := Parse(ProtocolOpenAIChat, chatBody)
+	require.True(t, chat.Complete, "%+v", chat.Issues)
+	require.Contains(t, chat.NormalizedText, "continue chat")
+	require.Contains(t, chat.NormalizedText, "exec_command")
+}
+
+func sha256Hex(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
 }
 
 func TestParseResponsesOutputRejectsDuplicateFields(t *testing.T) {
@@ -808,10 +995,16 @@ func TestParseRetainsRepeatedSegmentsPathsAndCountsThemTowardTextLimit(t *testin
 }
 
 func TestDocumentCloneDoesNotAliasSlices(t *testing.T) {
-	doc := Parse(ProtocolOpenAIResponses, []byte(`{"input":"hello"}`))
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{"store":false,"input":[{"type":"reasoning","encrypted_content":"opaque"},{"type":"compaction_trigger"},{"type":"message","role":"user","content":"hello"}]}`))
 	clone := doc.Clone()
 	clone.Segments[0].Normalized = "changed"
+	clone.OpaqueStates[0].Digest = "changed"
+	clone.ControlItems[0].Kind = "changed"
+	*clone.Store = true
 	require.Equal(t, "hello", doc.Segments[0].Normalized)
+	require.NotEqual(t, "changed", doc.OpaqueStates[0].Digest)
+	require.Equal(t, "compaction_trigger", doc.ControlItems[0].Kind)
+	require.False(t, *doc.Store)
 }
 
 func TestParseResponsesOutputUsesStrictResponsesItemRules(t *testing.T) {

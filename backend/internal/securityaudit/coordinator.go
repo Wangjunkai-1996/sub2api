@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -114,6 +115,7 @@ func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, 
 		document = auditinput.Parse(req.Protocol, req.Body)
 	}
 	if document == nil || !document.Complete {
+		logStrictInputIncomplete(req, document)
 		decision := contextIncompleteDecision(nil, nil)
 		return req, &decision
 	}
@@ -157,6 +159,73 @@ func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, 
 	req.PriorAudit = &cloned
 	req.AuditContext = contextText
 	return req, nil
+}
+
+type strictInputIssueLog struct {
+	Code      string
+	PathClass string
+	Count     int
+}
+
+func logStrictInputIncomplete(req Request, document *auditinput.Document) {
+	issues := []auditinput.Issue(nil)
+	truncated := false
+	if document != nil {
+		issues = document.Issues
+		truncated = document.Truncated
+	}
+	slog.Warn("security_audit.strict_input_incomplete",
+		"request_id", req.RequestID,
+		"api_key_id", req.APIKeyID,
+		"group_id", pointerLogID(req.GroupID),
+		"protocol", req.Protocol,
+		"body_bytes", len(req.Body),
+		"issue_count", len(issues),
+		"truncated", truncated,
+		"issues", summarizeStrictInputIssues(issues))
+}
+
+func summarizeStrictInputIssues(issues []auditinput.Issue) []strictInputIssueLog {
+	counts := make(map[string]int)
+	for _, issue := range issues {
+		code := strings.TrimSpace(issue.Code)
+		pathClass := strictInputPathClass(issue.Path)
+		counts[code+"\x00"+pathClass]++
+	}
+	summary := make([]strictInputIssueLog, 0, len(counts))
+	for key, count := range counts {
+		parts := strings.SplitN(key, "\x00", 2)
+		summary = append(summary, strictInputIssueLog{Code: parts[0], PathClass: parts[1], Count: count})
+	}
+	sort.Slice(summary, func(i, j int) bool {
+		if summary[i].Code == summary[j].Code {
+			return summary[i].PathClass < summary[j].PathClass
+		}
+		return summary[i].Code < summary[j].Code
+	})
+	return summary
+}
+
+func strictInputPathClass(path string) string {
+	path = strings.TrimSpace(path)
+	switch {
+	case path == "" || path == "$":
+		return "root"
+	case strings.HasPrefix(path, "$.input[") || path == "$.input":
+		return "responses_input_item"
+	case strings.HasPrefix(path, "$.output[") || path == "$.output":
+		return "responses_output_item"
+	case strings.HasPrefix(path, "$.messages[") || path == "$.messages":
+		return "message"
+	case strings.HasPrefix(path, "$.tools[") || strings.HasPrefix(path, "$.functions["):
+		return "tool_definition"
+	case strings.HasPrefix(path, "$.instructions"):
+		return "instructions"
+	case strings.HasPrefix(path, "$.previous_response_id"):
+		return "previous_response_id"
+	default:
+		return "other"
+	}
 }
 
 func validPriorAudit(prior *AuditSummary, req Request, previousResponseID string) bool {
@@ -373,20 +442,43 @@ func buildAuditSummary(req Request, prompt *PromptDecision) *AuditSummary {
 		parentPromptHash = req.PriorAudit.PromptHash
 		mediaDigests = append(mediaDigests, req.PriorAudit.MediaDigests...)
 	}
-	contextText, ok := cumulativeContext(priorContext, req.Document.NormalizedText)
-	if !ok {
+	contextText := strings.TrimSpace(req.AuditContext)
+	if contextText == "" {
+		var ok bool
+		contextText, ok = cumulativeContext(priorContext, req.Document.NormalizedText)
+		if !ok {
+			return nil
+		}
+	} else if utf8.RuneCountInString(contextText) > auditinput.MaxTextRunes {
 		return nil
 	}
 	for _, media := range req.Document.Media {
 		mediaDigests = append(mediaDigests, media.Digest)
 	}
+	skipResponseLineage := skipsResponseLineage(req)
+	normalizedContext := contextText
+	redactedContext := ""
+	if skipResponseLineage {
+		normalizedContext = ""
+	} else {
+		redactedContext = RedactContext(contextText)
+	}
 	return &AuditSummary{
 		ParserVersion: auditinput.ParserVersion, ConfigVersion: configVersion,
 		APIKeyID: req.APIKeyID, GroupID: cloneInt64Ptr(req.GroupID), PreviousResponseID: req.Document.PreviousResponseID,
 		PromptHash: hashAuditContext(contextText, mediaDigests), ParentPromptHash: parentPromptHash, DocumentHash: req.Document.Hash,
-		NormalizedContext: contextText, RedactedContext: RedactContext(contextText),
+		NormalizedContext: normalizedContext, RedactedContext: redactedContext,
 		MediaDigests: mediaDigests, ContextComplete: true, Verdict: AuditVerdictAllow,
+		SkipResponseLineage: skipResponseLineage,
 	}
+}
+
+func skipsResponseLineage(req Request) bool {
+	if !strings.EqualFold(strings.TrimSpace(req.Protocol), auditinput.ProtocolOpenAIResponses) ||
+		req.Document == nil || strings.TrimSpace(req.Document.PreviousResponseID) != "" || req.Document.Store == nil {
+		return false
+	}
+	return !*req.Document.Store
 }
 
 func hashAuditContext(contextText string, mediaDigests []string) string {

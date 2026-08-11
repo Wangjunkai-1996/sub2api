@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -147,18 +148,18 @@ func TestPromptGuardWebSocketCloseMappingGolden(t *testing.T) {
 	require.Equal(t, securityaudit.ErrorCodeInvalidResponse, securityAuditWSCloseReason(promptGuardDecision(securityaudit.DecisionInvalid)))
 }
 
-func TestOpenAIStrictContinuationErrorDecisionDistinguishesStoreOutageFromMissingContext(t *testing.T) {
-	unavailable := openAIStrictContinuationErrorDecision(service.ErrOpenAIResponseAccountStoreUnavailable)
-	require.Equal(t, securityaudit.DecisionUnavailable, unavailable.Kind)
-	require.Equal(t, http.StatusServiceUnavailable, unavailable.HTTPStatus)
-	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, unavailable.ErrorCode)
-	require.Equal(t, coderws.StatusTryAgainLater, securityAuditWSCloseStatus(unavailable))
-
-	missing := openAIStrictContinuationErrorDecision(service.ErrOpenAIPreviousResponseAccountUnavailable)
-	require.Equal(t, securityaudit.DecisionInvalid, missing.Kind)
-	require.Equal(t, http.StatusUnprocessableEntity, missing.HTTPStatus)
-	require.Equal(t, securityaudit.ErrorCodeContextIncomplete, missing.ErrorCode)
-	require.Equal(t, coderws.StatusTryAgainLater, securityAuditWSCloseStatus(missing))
+func TestOpenAIStrictContinuationErrorsAreAuditUnavailableAfterCoordinatorAllows(t *testing.T) {
+	for _, err := range []error{
+		service.ErrOpenAIResponseAccountStoreUnavailable,
+		service.ErrOpenAIPreviousResponseAccountUnavailable,
+		errors.New("scheduler unavailable"),
+	} {
+		decision := openAIStrictContinuationErrorDecision(err)
+		require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
+		require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+		require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, decision.ErrorCode)
+		require.Equal(t, coderws.StatusTryAgainLater, securityAuditWSCloseStatus(decision))
+	}
 }
 
 func TestOpenAIStrictLineageCommitErrorReturnsStructuredHTTP503(t *testing.T) {

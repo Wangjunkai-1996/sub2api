@@ -192,9 +192,12 @@ func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
 		},
 		{
-			name: "tool output without lineage rejected before engines", body: `{"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`,
-			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
-			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
+			name: "inspectable tool output without lineage reaches engines", body: `{"store":false,"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`,
+			legacy: &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+				require.Contains(t, req.AuditContext, "done")
+				return &LegacyDecision{Allowed: true}, nil
+			}}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionBlock}},
+			wantKind: DecisionBlock, wantStatus: http.StatusForbidden, wantCode: ErrorCodePolicyBlocked, legacyCall: 1, promptCall: 1,
 		},
 		{
 			name: "legacy error is unavailable", body: `{"input":"hello"}`,
@@ -256,6 +259,72 @@ func TestCoordinatorStrictAllowExposesStableAuditSummaryOnlyForProtectedGroup(t 
 	).Check(context.Background(), Request{GroupID: &groupID, Protocol: "openai_responses", Body: []byte(`{"input":[{"type":"future_item"}]}`)})
 	require.True(t, outOfScope.AllowNextStage)
 	require.Nil(t, outOfScope.Audit)
+}
+
+func TestCoordinatorStoreFalseAuditsLargeFullHistoryWithoutResponseLineage(t *testing.T) {
+	groupID := int64(12)
+	largeInput := strings.Repeat("x", 1024*1024)
+	store := &fakeLineageStore{}
+	legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+		require.Len(t, []rune(req.AuditContext), len(largeInput))
+		require.Equal(t, largeInput, req.AuditContext)
+		return &LegacyDecision{Allowed: true}, nil
+	}}
+	coordinator := NewCoordinator(legacy, &fakePromptEngine{mode: ModeAsync}).SetLineageStore(store)
+	body := []byte(fmt.Sprintf(`{"store":false,"input":%q}`, largeInput))
+
+	decision := coordinator.Check(context.Background(), Request{
+		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Body: body,
+	})
+
+	require.True(t, decision.AllowNextStage)
+	require.NotNil(t, decision.Audit)
+	require.True(t, decision.Audit.SkipResponseLineage)
+	require.False(t, decision.Audit.ResponseLineageRequired())
+	require.Empty(t, decision.Audit.NormalizedContext)
+	require.Empty(t, decision.Audit.RedactedContext)
+	require.NoError(t, coordinator.BindAllowedResponse(context.Background(), *decision.Audit, "resp_unused"))
+	require.Nil(t, store.bound, "store=false full-history requests must not write lineage")
+}
+
+func TestResponseLineageSkipRequiresExplicitStoreFalseWithoutParent(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		body     string
+		want     bool
+	}{
+		{name: "responses store false", protocol: auditinput.ProtocolOpenAIResponses, body: `{"store":false,"input":"safe"}`, want: true},
+		{name: "responses default store", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":"safe"}`},
+		{name: "responses store true", protocol: auditinput.ProtocolOpenAIResponses, body: `{"store":true,"input":"safe"}`},
+		{name: "continuation still binds", protocol: auditinput.ProtocolOpenAIResponses, body: `{"store":false,"previous_response_id":"resp_parent","input":"safe"}`},
+		{name: "chat is unrelated", protocol: auditinput.ProtocolOpenAIChat, body: `{"store":false,"messages":[{"role":"user","content":"safe"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			document := auditinput.Parse(tt.protocol, []byte(tt.body))
+			require.True(t, document.Complete, "%+v", document.Issues)
+			require.Equal(t, tt.want, skipsResponseLineage(Request{
+				Protocol: tt.protocol, Body: []byte(tt.body), Document: document,
+			}))
+		})
+	}
+}
+
+func TestStrictInputIssueSummaryRedactsRawPaths(t *testing.T) {
+	summary := summarizeStrictInputIssues([]auditinput.Issue{
+		{Code: auditinput.IssueEncryptedContent, Path: "$.input[3].encrypted_content"},
+		{Code: auditinput.IssueEncryptedContent, Path: "$.input[9].signature"},
+		{Code: auditinput.IssueUnknownField, Path: "$.tools[1].secret_schema_key"},
+	})
+
+	require.Equal(t, []strictInputIssueLog{
+		{Code: auditinput.IssueEncryptedContent, PathClass: "responses_input_item", Count: 2},
+		{Code: auditinput.IssueUnknownField, PathClass: "tool_definition", Count: 1},
+	}, summary)
+	require.NotContains(t, fmt.Sprint(summary), "input[3]")
+	require.NotContains(t, fmt.Sprint(summary), "signature")
+	require.NotContains(t, fmt.Sprint(summary), "secret_schema_key")
 }
 
 type fakeLineageStore struct {
