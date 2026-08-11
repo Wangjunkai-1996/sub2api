@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -65,6 +66,9 @@ const (
 	maxContentModerationTimeoutMS     = 30000
 	maxModerationInputRunes           = 12000
 	maxModerationExcerptRunes         = 240
+	maxStrictModerationTextBatchItems = 32
+	maxStrictModerationAPICalls       = 8
+	maxStrictModerationTextRunes      = maxModerationInputRunes * maxStrictModerationTextBatchItems * maxStrictModerationAPICalls
 
 	defaultContentModerationWorkerCount          = 4
 	maxContentModerationWorkerCount              = 32
@@ -1101,6 +1105,10 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 		!cfg.includesModel(input.Model) {
 		return nil, errors.New("strict content moderation is not fully configured for request")
 	}
+	if strings.TrimSpace(document.NormalizedText) == "" && strictImageOnlyDocument(document) {
+		s.recordPreBlockSyncMetric(0, ContentModerationActionAllow)
+		return &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}, nil
+	}
 	content := contentModerationInputFromDocument(document)
 	hashText := content.Hash()
 	if keyword, hit := strictBlockedKeyword(document, cfg.BlockedKeywords); hit {
@@ -1141,23 +1149,19 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 	if len(cfg.apiKeys()) == 0 {
 		return nil, errors.New("strict content moderation has no audit API key")
 	}
-	units := strictModerationUnits(document)
-	if len(units) == 0 {
-		return nil, errors.New("strict content moderation produced no auditable unit")
+	batches, err := strictModerationBatches(document)
+	if err != nil {
+		return nil, err
 	}
 	strictKeyState := newStrictModerationKeyState(cfg)
-	for _, unit := range units {
-		decision := s.checkSync(ctx, input, cfg, unit, hashText, nil, true, contentModerationSyncOptions{
-			strictKeyState: strictKeyState,
-		})
-		if decision == nil || decision.Unavailable {
-			return nil, errors.New("strict content moderation audit API unavailable")
-		}
-		if decision.Blocked || decision.Flagged || !decision.Allowed {
-			return decision, nil
-		}
+	decision := s.checkSync(ctx, input, cfg, content, hashText, nil, true, contentModerationSyncOptions{
+		strictKeyState: strictKeyState,
+		strictBatches:  batches,
+	})
+	if decision == nil || decision.Unavailable {
+		return nil, errors.New("strict content moderation audit API unavailable")
 	}
-	return &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}, nil
+	return decision, nil
 }
 
 func strictContentModerationDocument(document *auditinput.Document, auditContext string) (*auditinput.Document, error) {
@@ -1196,29 +1200,61 @@ func strictBlockedKeyword(document *auditinput.Document, keywords []string) (str
 	return "", false
 }
 
-func strictModerationUnits(document *auditinput.Document) []ContentModerationInput {
+type strictModerationBatch struct {
+	input           any
+	expectedResults int
+}
+
+func strictModerationBatches(document *auditinput.Document) ([]strictModerationBatch, error) {
 	if document == nil {
-		return nil
+		return nil, errors.New("strict content moderation document is unavailable")
 	}
-	units := make([]ContentModerationInput, 0, (len([]rune(document.NormalizedText))/maxModerationInputRunes)+len(document.Media)+1)
+	textRuneCount := utf8.RuneCountInString(document.NormalizedText)
+	if textRuneCount > maxStrictModerationTextRunes {
+		requiredItems := (textRuneCount + maxModerationInputRunes - 1) / maxModerationInputRunes
+		requiredCalls := (requiredItems + maxStrictModerationTextBatchItems - 1) / maxStrictModerationTextBatchItems
+		return nil, fmt.Errorf("strict content moderation requires %d API calls, limit is %d", requiredCalls, maxStrictModerationAPICalls)
+	}
+	batches := make([]strictModerationBatch, 0, 2)
+	textInputs := make([]string, 0, maxStrictModerationTextBatchItems)
 	textRunes := []rune(document.NormalizedText)
 	for start := 0; start < len(textRunes); start += maxModerationInputRunes {
 		end := start + maxModerationInputRunes
 		if end > len(textRunes) {
 			end = len(textRunes)
 		}
-		units = append(units, ContentModerationInput{Text: string(textRunes[start:end])})
-	}
-	for _, media := range document.Media {
-		if media.Kind == "image" && strings.TrimSpace(media.Value) != "" {
-			units = append(units, ContentModerationInput{Images: []string{media.Value}})
+		textInputs = append(textInputs, string(textRunes[start:end]))
+		if len(textInputs) == maxStrictModerationTextBatchItems {
+			batches = append(batches, strictModerationBatch{
+				input:           append([]string(nil), textInputs...),
+				expectedResults: len(textInputs),
+			})
+			textInputs = textInputs[:0]
 		}
 	}
-	return units
+	if len(textInputs) > 0 {
+		batches = append(batches, strictModerationBatch{
+			input:           append([]string(nil), textInputs...),
+			expectedResults: len(textInputs),
+		})
+	}
+
+	if len(batches) == 0 {
+		return nil, errors.New("strict content moderation produced no auditable text batch")
+	}
+	if len(batches) > maxStrictModerationAPICalls {
+		return nil, fmt.Errorf("strict content moderation requires %d API calls, limit is %d", len(batches), maxStrictModerationAPICalls)
+	}
+	return batches, nil
+}
+
+func strictImageOnlyDocument(document *auditinput.Document) bool {
+	return document != nil && document.HasImages
 }
 
 type contentModerationSyncOptions struct {
 	strictKeyState *strictModerationKeyState
+	strictBatches  []strictModerationBatch
 }
 
 func (s *ContentModerationService) checkSync(ctx context.Context, input ContentModerationCheckInput, cfg *ContentModerationConfig, content ContentModerationInput, hashText string, queueDelay *int, allowBlock bool, options ...contentModerationSyncOptions) *ContentModerationDecision {
@@ -1237,7 +1273,7 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 	var result *moderationAPIResult
 	var err error
 	if strictFailure {
-		result, err = s.callModerationStrict(ctx, cfg, content.ModerationInput(), option.strictKeyState, trackPreBlock)
+		result, err = s.callModerationStrictBatches(ctx, cfg, option.strictBatches, option.strictKeyState, trackPreBlock)
 	} else {
 		result, err = s.callModeration(ctx, cfg, content.ModerationInput(), trackPreBlock)
 	}
@@ -1931,6 +1967,8 @@ type strictModerationKeyState struct {
 	currentKey   string
 	selectedKeys map[string]struct{}
 	maxKeys      int
+	calls        int
+	maxCalls     int
 }
 
 func newStrictModerationKeyState(cfg *ContentModerationConfig) *strictModerationKeyState {
@@ -1938,7 +1976,11 @@ func newStrictModerationKeyState(cfg *ContentModerationConfig) *strictModeration
 	if cfg != nil && cfg.RetryCount > 0 {
 		maxKeys = 2
 	}
-	return &strictModerationKeyState{selectedKeys: make(map[string]struct{}, maxKeys), maxKeys: maxKeys}
+	return &strictModerationKeyState{
+		selectedKeys: make(map[string]struct{}, maxKeys),
+		maxKeys:      maxKeys,
+		maxCalls:     maxStrictModerationAPICalls,
+	}
 }
 
 func (s *ContentModerationService) nextStrictModerationAPIKey(cfg *ContentModerationConfig, state *strictModerationKeyState) (string, bool) {
@@ -1969,13 +2011,25 @@ func (state *strictModerationKeyState) markFailed(key string) {
 	}
 }
 
-func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg *ContentModerationConfig, input any, state *strictModerationKeyState, trackKeyLoad ...bool) (*moderationAPIResult, error) {
+func (s *ContentModerationService) callModerationStrictBatch(ctx context.Context, cfg *ContentModerationConfig, batch strictModerationBatch, state *strictModerationKeyState, trackKeyLoad ...bool) ([]moderationAPIResult, error) {
 	if state == nil {
 		state = newStrictModerationKeyState(cfg)
+	}
+	if state.maxCalls <= 0 {
+		state.maxCalls = maxStrictModerationAPICalls
+	}
+	if batch.expectedResults <= 0 {
+		return nil, errors.New("strict moderation batch has no expected results")
 	}
 	trackLoad := len(trackKeyLoad) > 0 && trackKeyLoad[0]
 	var lastErr error
 	for {
+		if state.calls >= state.maxCalls {
+			if lastErr != nil {
+				return nil, fmt.Errorf("strict moderation API call limit reached: %w", lastErr)
+			}
+			return nil, errors.New("strict moderation API call limit reached")
+		}
 		key, ok := s.nextStrictModerationAPIKey(cfg, state)
 		if !ok {
 			if lastErr != nil {
@@ -1988,9 +2042,19 @@ func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg
 		}
 		start := time.Now()
 		httpStatus := 0
-		result, err := s.callModerationOnceWithInput(ctx, cfg, key, input, &httpStatus)
+		state.calls++
+		results, err := s.callModerationOnceWithInputResults(ctx, cfg, key, batch.input, &httpStatus)
 		if err == nil {
-			err = validateStrictModerationAPIResult(result)
+			if len(results) != batch.expectedResults {
+				err = fmt.Errorf("moderation api returned %d results, expected %d", len(results), batch.expectedResults)
+			} else {
+				for index := range results {
+					if resultErr := validateStrictModerationAPIResult(&results[index]); resultErr != nil {
+						err = fmt.Errorf("moderation api result %d: %w", index, resultErr)
+						break
+					}
+				}
+			}
 		}
 		latency := int(time.Since(start).Milliseconds())
 		if err == nil {
@@ -1998,7 +2062,7 @@ func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg
 				s.finishModerationAPIKeyCall(key, latency, true)
 			}
 			s.markAPIKeySuccess(key, latency, httpStatus)
-			return result, nil
+			return results, nil
 		}
 		if trackLoad {
 			s.finishModerationAPIKeyCall(key, latency, false)
@@ -2009,7 +2073,40 @@ func (s *ContentModerationService) callModerationStrict(ctx context.Context, cfg
 	}
 }
 
+func (s *ContentModerationService) callModerationStrictBatches(ctx context.Context, cfg *ContentModerationConfig, batches []strictModerationBatch, state *strictModerationKeyState, trackKeyLoad ...bool) (*moderationAPIResult, error) {
+	if len(batches) == 0 {
+		return nil, errors.New("strict moderation has no batches")
+	}
+	aggregate := &moderationAPIResult{
+		CategoryScores: make(map[string]float64, len(contentModerationCategoryOrder)),
+		flaggedPresent: true,
+	}
+	for _, batch := range batches {
+		results, err := s.callModerationStrictBatch(ctx, cfg, batch, state, trackKeyLoad...)
+		if err != nil {
+			return nil, err
+		}
+		for _, result := range results {
+			aggregate.Flagged = aggregate.Flagged || result.Flagged
+			for category, score := range result.CategoryScores {
+				if current, exists := aggregate.CategoryScores[category]; !exists || score > current {
+					aggregate.CategoryScores[category] = score
+				}
+			}
+		}
+	}
+	return aggregate, nil
+}
+
 func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Context, cfg *ContentModerationConfig, apiKey string, input any, httpStatus *int) (*moderationAPIResult, error) {
+	results, err := s.callModerationOnceWithInputResults(ctx, cfg, apiKey, input, httpStatus)
+	if err != nil {
+		return nil, err
+	}
+	return &results[0], nil
+}
+
+func (s *ContentModerationService) callModerationOnceWithInputResults(ctx context.Context, cfg *ContentModerationConfig, apiKey string, input any, httpStatus *int) ([]moderationAPIResult, error) {
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	endpoint, err := url.JoinPath(base, "/v1/moderations")
 	if err != nil {
@@ -2058,7 +2155,7 @@ func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Conte
 	if len(out.Results) == 0 {
 		return nil, errors.New("moderation api returned empty results")
 	}
-	return &out.Results[0], nil
+	return out.Results, nil
 }
 
 // moderationProxyURLCacheEntry 缓存 proxy_id 到代理 URL 的解析结果，

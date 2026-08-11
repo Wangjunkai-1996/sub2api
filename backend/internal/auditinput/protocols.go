@@ -92,6 +92,9 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 			return
 		}
 	}
+	if metadata, exists := item["internal_chat_message_metadata_passthrough"]; exists {
+		b.parseInternalChatMessageMetadataPassthrough(metadata, childPath(path, "internal_chat_message_metadata_passthrough"))
+	}
 	typeName = strings.ToLower(typeName)
 	role = strings.ToLower(role)
 	assistantState := isResponsesAssistantStateType(typeName)
@@ -139,6 +142,8 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 		if payloadCount == 0 || payloadCount > 1 {
 			b.issue(IssueInvalidShape, path)
 		}
+	case "agent_message":
+		b.parseResponsesAgentMessage(item, path, role)
 	case "input_text", "output_text", "text", "refusal":
 		b.rejectUnknownResponsesItemFields(item, path, "text", "annotations", "logprobs")
 		text, valid := b.requiredStringField(item, "text", path)
@@ -214,7 +219,7 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 	case "compaction", "compaction_summary":
 		b.parseResponsesAssistantState(item, path, typeName, role, true)
 	case "compaction_trigger":
-		b.rejectUnknownFields(item, path, "type")
+		b.rejectUnknownFields(item, path, "type", "internal_chat_message_metadata_passthrough")
 		b.addControlItem(typeName, path)
 	case "additional_tools":
 		b.rejectUnknownResponsesItemFields(item, path, "tools")
@@ -244,19 +249,110 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 }
 
 func (b *builder) rejectUnknownResponsesItemFields(item map[string]any, path string, fields ...string) {
-	allowed := make([]string, 0, len(fields)+5)
-	allowed = append(allowed, "type", "id", "status", "phase", "role")
+	allowed := make([]string, 0, len(fields)+6)
+	allowed = append(allowed, "type", "id", "status", "phase", "role", "internal_chat_message_metadata_passthrough")
 	allowed = append(allowed, fields...)
 	b.rejectUnknownFields(item, path, allowed...)
 }
 
 func isResponsesAssistantStateType(typeName string) bool {
 	switch strings.ToLower(strings.TrimSpace(typeName)) {
-	case "reasoning", "compaction", "compaction_summary":
+	case "reasoning", "compaction", "compaction_summary", "agent_message":
 		return true
 	default:
 		return false
 	}
+}
+
+func (b *builder) parseResponsesAgentMessage(item map[string]any, path, role string) {
+	b.rejectUnknownResponsesItemFields(item, path, "author", "recipient", "content", "encrypted_content")
+	if role != "" && role != "assistant" {
+		b.issue(IssueUnknownRole, childPath(path, "role"))
+	}
+	for _, field := range []string{"author", "recipient"} {
+		if _, exists := item[field]; exists {
+			value, valid := b.requiredStringField(item, field, path)
+			if valid && strings.TrimSpace(value) == "" {
+				b.issue(IssueInvalidShape, childPath(path, field))
+			}
+		}
+	}
+	if b.containsOpaqueEncryptedFields(item, path, "encryptedContent", "signature") {
+		b.issue(IssueEncryptedContent, path)
+	}
+	b.parseCanonicalResponsesEncryptedContent(item, path, "agent_message", false)
+	content, exists := item["content"]
+	if !exists || content == nil {
+		b.issue(IssueInvalidShape, childPath(path, "content"))
+	} else {
+		b.parseResponsesAgentMessageContent(content, childPath(path, "content"))
+	}
+}
+
+func (b *builder) parseResponsesAgentMessageContent(value any, path string) {
+	parts, ok := value.([]any)
+	if !ok || len(parts) == 0 {
+		b.issue(IssueInvalidShape, path)
+		return
+	}
+	for index, raw := range parts {
+		partPath := indexPath(path, index)
+		part, ok := raw.(map[string]any)
+		if !ok {
+			b.issue(IssueInvalidShape, partPath)
+			continue
+		}
+		typeName, valid := b.requiredStringField(part, "type", partPath)
+		if !valid {
+			continue
+		}
+		switch strings.ToLower(typeName) {
+		case "text", "input_text", "output_text":
+			b.rejectUnknownFields(part, partPath, "type", "text")
+			text, textValid := b.requiredStringField(part, "text", partPath)
+			if textValid {
+				b.addText(text, "assistant", typeName, childPath(partPath, "text"))
+			}
+		case "encrypted_content":
+			b.rejectUnknownFields(part, partPath, "type", "encrypted_content")
+			ciphertext, ciphertextValid := b.requiredStringField(part, "encrypted_content", partPath)
+			if ciphertextValid && strings.TrimSpace(ciphertext) != "" {
+				b.addOpaqueState("agent_message", ciphertext, childPath(partPath, "encrypted_content"))
+			} else if ciphertextValid {
+				b.issue(IssueInvalidShape, childPath(partPath, "encrypted_content"))
+			}
+		default:
+			b.issue(IssueUnknownType, childPath(partPath, "type"))
+		}
+	}
+}
+
+func (b *builder) parseInternalChatMessageMetadataPassthrough(value any, path string) {
+	metadata, ok := value.(map[string]any)
+	if !ok {
+		b.issue(IssueInvalidShape, path)
+		return
+	}
+	hasUnknownField := false
+	for field := range metadata {
+		if field != "turn_id" {
+			hasUnknownField = true
+			break
+		}
+	}
+	b.rejectUnknownFields(metadata, path, "turn_id")
+	if hasUnknownField {
+		return
+	}
+	turnID, valid := b.requiredStringField(metadata, "turn_id", path)
+	if !valid {
+		return
+	}
+	if turnID == "" {
+		b.issue(IssueInvalidShape, childPath(path, "turn_id"))
+		return
+	}
+	b.addControlItem("internal_chat_message_metadata_passthrough", path)
 }
 
 func (b *builder) parseResponsesAssistantState(item map[string]any, path, typeName, role string, encryptedRequired bool) {
@@ -1207,6 +1303,10 @@ func knownToolOutputContentType(typeName string) bool {
 }
 
 func (b *builder) parseImageObject(value map[string]any, path string) {
+	if b.ignoreImages {
+		b.addImage("", "", path)
+		return
+	}
 	mimeType, _, mimeExists, mimeValid := b.optionalStringAlias(value, path, "mime_type", "media_type", "mimeType")
 	if !mimeValid {
 		return
@@ -1321,6 +1421,10 @@ func (b *builder) parseImageObject(value map[string]any, path string) {
 }
 
 func (b *builder) parseImageValue(value any, path string) {
+	if b.ignoreImages {
+		b.addImage("", "", path)
+		return
+	}
 	switch typed := value.(type) {
 	case string:
 		b.addImage(typed, "", path)
@@ -1466,6 +1570,15 @@ func (b *builder) requiredStringField(value map[string]any, field, path string) 
 }
 
 func (b *builder) parseGeminiInlineData(value any, path string) {
+	if b.ignoreImages {
+		if data, ok := value.(map[string]any); ok {
+			mimeType, _, _, mimeValid := b.optionalStringAlias(data, path, "mimeType", "mime_type")
+			if mimeValid && strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+				b.addImage("", "", path)
+				return
+			}
+		}
+	}
 	data, ok := value.(map[string]any)
 	if !ok {
 		b.issue(IssueInvalidShape, path)

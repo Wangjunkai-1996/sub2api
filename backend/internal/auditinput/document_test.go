@@ -572,6 +572,101 @@ func TestParseResponsesAcceptsCanonicalOpaqueAssistantState(t *testing.T) {
 	require.NotEqual(t, baseline.Hash, changed.Hash)
 }
 
+func TestParseResponsesAcceptsRedactedCodexAgentMessageReplay(t *testing.T) {
+	ciphertext := "redacted-agent-message-ciphertext"
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{
+		"model":"gpt-5.6-sol",
+		"store":false,
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[{"type":"input_text","text":"redacted user prompt"}],
+				"internal_chat_message_metadata_passthrough":{"turn_id":"turn-redacted-user"}
+			},
+			{
+				"id":"msg_redacted_agent",
+				"type":"agent_message",
+				"role":"assistant",
+				"content":[{"type":"input_text","text":"redacted assistant reply"}],
+				"encrypted_content":"`+ciphertext+`",
+				"internal_chat_message_metadata_passthrough":{"turn_id":"turn-redacted-agent"}
+			}
+		]
+	}`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Equal(t, "redacted user prompt\nredacted assistant reply", doc.NormalizedText)
+	require.Equal(t, []string{"user", "assistant"}, []string{doc.Segments[0].Role, doc.Segments[1].Role})
+	require.Equal(t, []OpaqueState{{
+		Kind: "agent_message", Path: "$.input[1].encrypted_content", Digest: sha256Hex(ciphertext),
+	}}, doc.OpaqueStates)
+	require.Equal(t, []ControlItem{
+		{Kind: "internal_chat_message_metadata_passthrough", Path: "$.input[0].internal_chat_message_metadata_passthrough"},
+		{Kind: "internal_chat_message_metadata_passthrough", Path: "$.input[1].internal_chat_message_metadata_passthrough"},
+	}, doc.ControlItems)
+
+	serialized, err := json.Marshal(doc)
+	require.NoError(t, err)
+	require.NotContains(t, string(serialized), ciphertext)
+	require.NotContains(t, string(serialized), "turn-redacted-user")
+	require.NotContains(t, string(serialized), "turn-redacted-agent")
+}
+
+func TestParseResponsesStrictlyValidatesInternalChatMessageMetadataPassthrough(t *testing.T) {
+	tests := []struct {
+		name      string
+		metadata  string
+		issueCode string
+	}{
+		{name: "not object", metadata: `"turn-1"`, issueCode: IssueInvalidShape},
+		{name: "missing turn id", metadata: `{}`, issueCode: IssueInvalidShape},
+		{name: "non string turn id", metadata: `{"turn_id":42}`, issueCode: IssueInvalidShape},
+		{name: "empty turn id", metadata: `{"turn_id":" "}`, issueCode: IssueInvalidShape},
+		{name: "turn id alias", metadata: `{"turnId":"turn-1"}`, issueCode: IssueUnknownField},
+		{name: "unknown field", metadata: `{"turn_id":"turn-1","payload":"hidden"}`, issueCode: IssueUnknownField},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := Parse(ProtocolOpenAIResponses, []byte(`{
+				"input":[{
+					"type":"message",
+					"role":"user",
+					"content":[{"type":"input_text","text":"visible"}],
+					"internal_chat_message_metadata_passthrough":`+tt.metadata+`
+				}]
+			}`))
+			require.False(t, doc.Complete)
+			require.True(t, doc.HasIssue(tt.issueCode), "%+v", doc.Issues)
+			require.Equal(t, "visible", doc.NormalizedText)
+			require.Empty(t, doc.ControlItems)
+		})
+	}
+}
+
+func TestParseResponsesStrictlyValidatesAgentMessage(t *testing.T) {
+	tests := []struct {
+		name      string
+		item      string
+		issueCode string
+	}{
+		{name: "missing content", item: `{"type":"agent_message","encrypted_content":"opaque"}`, issueCode: IssueInvalidShape},
+		{name: "invalid content", item: `{"type":"agent_message","content":42}`, issueCode: IssueInvalidShape},
+		{name: "unknown content type", item: `{"type":"agent_message","content":[{"type":"future_text","text":"hidden"}]}`, issueCode: IssueUnknownType},
+		{name: "empty encrypted content", item: `{"type":"agent_message","content":[{"type":"input_text","text":"visible"}],"encrypted_content":" "}`, issueCode: IssueInvalidShape},
+		{name: "encrypted content alias", item: `{"type":"agent_message","content":[{"type":"input_text","text":"visible"}],"encryptedContent":"opaque"}`, issueCode: IssueEncryptedContent},
+		{name: "wrong role", item: `{"type":"agent_message","role":"user","content":[{"type":"input_text","text":"visible"}]}`, issueCode: IssueUnknownRole},
+		{name: "unknown field", item: `{"type":"agent_message","content":[{"type":"input_text","text":"visible"}],"payload":"hidden"}`, issueCode: IssueUnknownField},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := Parse(ProtocolOpenAIResponses, []byte(`{"input":[`+tt.item+`]}`))
+			require.False(t, doc.Complete)
+			require.True(t, doc.HasIssue(tt.issueCode), "%+v", doc.Issues)
+		})
+	}
+}
+
 func TestParseResponsesOutputAcceptsCanonicalOpaqueAssistantState(t *testing.T) {
 	doc := ParseResponsesOutput([]byte(`[
 		{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"reasoning-output","summary":[{"type":"summary_text","text":"output summary"}]},

@@ -14,7 +14,7 @@ func ExtractContentModerationText(protocol string, body []byte) string {
 }
 
 func ExtractContentModerationDocument(protocol string, body []byte) *auditinput.Document {
-	return auditinput.Parse(protocol, body)
+	return auditinput.ParseForTextAudit(protocol, body)
 }
 
 func ExtractContentModerationInput(protocol string, body []byte) ContentModerationInput {

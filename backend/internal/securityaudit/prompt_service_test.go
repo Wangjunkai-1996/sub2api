@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
@@ -85,6 +86,36 @@ func TestPromptServiceBlockingAlwaysUsesCompleteSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DecisionAllow, decision.Kind)
 	require.Equal(t, []string{"latest user input", "system instruction\n\nolder user input\n\nprevious output"}, seen)
+}
+
+func TestPromptServiceBlockingAllowsStrictImageOnlyWithoutScanning(t *testing.T) {
+	scannerCalled := false
+	evaluator := newGuardEvaluator(PromptScannerFunc(func(_ context.Context, _ ActiveEndpoint, _ string, _ []string) (*NormalizedResult, error) {
+		scannerCalled = true
+		return nil, nil
+	}), nil, NewAtomicMetrics(), 2, 2)
+	service := &PromptService{
+		config: &fakeConfigStore{active: true, cfg: ActiveConfig{
+			RiskControlEnabled: true, Enabled: true, BlockingEnabled: true, AllGroups: true,
+			Scanners: AllScannerIDs, Endpoints: []ActiveEndpoint{{ID: "guard-1", Enabled: true, TimeoutMS: 1000, InputLimit: 4096}},
+		}},
+		evaluator: evaluator,
+	}
+	body := []byte(`{"input":[{"type":"input_image","image_url":"not-validated-by-text-audit"}]}`)
+	document := auditinput.ParseForTextAudit(auditinput.ProtocolOpenAIResponses, body)
+	require.True(t, document.Complete, "%+v", document.Issues)
+	require.True(t, document.HasImages)
+	require.Empty(t, document.Media)
+
+	decision, err := service.Evaluate(context.Background(), Request{
+		Strict: true, Protocol: auditinput.ProtocolOpenAIResponses, Body: body, Document: document,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, decision)
+	require.Equal(t, DecisionAllow, decision.Kind)
+	require.True(t, decision.AllowNextStage)
+	require.False(t, scannerCalled)
 }
 
 func TestPromptServiceBlockingScopeNeverExpandsWithoutTrustedConfig(t *testing.T) {

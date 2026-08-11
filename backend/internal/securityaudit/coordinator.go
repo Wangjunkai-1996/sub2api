@@ -110,9 +110,11 @@ func (c *Coordinator) promptBlockingApplies(req Request) bool {
 }
 
 func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, *Decision) {
-	document := req.Document.Clone()
-	if document == nil {
-		document = auditinput.Parse(req.Protocol, req.Body)
+	var document *auditinput.Document
+	if len(req.Body) > 0 {
+		document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
+	} else {
+		document = req.Document.Clone()
 	}
 	if document == nil || !document.Complete {
 		logStrictInputIncomplete(req, document)

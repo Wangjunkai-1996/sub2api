@@ -44,7 +44,11 @@ func ExtractBlockingPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnap
 func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
 	document := req.Document.Clone()
 	if document == nil {
-		document = auditinput.Parse(req.Protocol, req.Body)
+		if req.Strict {
+			document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
+		} else {
+			document = auditinput.Parse(req.Protocol, req.Body)
+		}
 	}
 	if document == nil || !document.Complete {
 		if document != nil && document.HasIssue(auditinput.IssueEmptyContent) && len(document.Issues) == 1 {

@@ -174,7 +174,7 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	// historical latest-turn setting remains relevant only to old config views.
 	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
 	if errors.Is(err, ErrNoPromptText) {
-		if req.Document != nil && req.Document.Complete && len(req.Document.Media) > 0 {
+		if req.Document != nil && req.Document.Complete && req.Document.HasImages {
 			return &PromptDecision{Kind: DecisionAllow, ConfigVersion: cfg.ConfigVersion, AllowNextStage: true}, nil
 		}
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}

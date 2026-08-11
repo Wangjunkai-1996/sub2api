@@ -93,6 +93,36 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 		require.Zero(t, prompt.evaluates.Load())
 	})
 
+	t.Run("image only input bypasses text auditors without a 422", func(t *testing.T) {
+		images := make([]string, 59)
+		for index := range images {
+			images[index] = fmt.Sprintf(`{"type":"input_image","image_url":"opaque-image-%02d"}`, index)
+		}
+		body := []byte(`{"store":false,"input":[{"type":"message","role":"user","content":[` + strings.Join(images, ",") + `]}]}`)
+		legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+			require.True(t, req.Strict)
+			require.NotNil(t, req.Document)
+			require.True(t, req.Document.Complete, "%+v", req.Document.Issues)
+			require.True(t, req.Document.HasImages)
+			require.Empty(t, req.Document.Media)
+			require.Empty(t, req.Document.NormalizedText)
+			return &LegacyDecision{Allowed: true}, nil
+		}}
+		prompt := &fakePromptEngine{mode: ModeOff}
+
+		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+			APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Body: body,
+		})
+
+		require.True(t, decision.AllowNextStage)
+		require.Equal(t, DecisionAllow, decision.Kind)
+		require.Equal(t, http.StatusOK, decision.HTTPStatus)
+		require.NotNil(t, decision.Audit)
+		require.Empty(t, decision.Audit.MediaDigests)
+		require.Equal(t, int64(1), legacy.calls.Load())
+		require.Zero(t, prompt.evaluates.Load())
+	})
+
 	t.Run("incomplete input stops before every auditor", func(t *testing.T) {
 		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
 		prompt := &fakePromptEngine{mode: ModeOff}

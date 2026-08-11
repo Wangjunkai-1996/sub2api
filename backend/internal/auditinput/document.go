@@ -90,6 +90,7 @@ type Document struct {
 	Protocol           string        `json:"protocol"`
 	Segments           []Segment     `json:"segments"`
 	Media              []Media       `json:"media"`
+	HasImages          bool          `json:"has_images,omitempty"`
 	OpaqueStates       []OpaqueState `json:"opaque_states,omitempty"`
 	ControlItems       []ControlItem `json:"control_items,omitempty"`
 	Store              *bool         `json:"store,omitempty"`
@@ -132,8 +133,19 @@ func (d *Document) HasIssue(code string) bool {
 }
 
 func Parse(protocol string, body []byte) *Document {
+	return parse(protocol, body, false)
+}
+
+// ParseForTextAudit extracts auditable text while treating image payloads as
+// opaque request data. It records only that an image is present and never
+// decodes, hashes, counts, size-checks, or retains image content.
+func ParseForTextAudit(protocol string, body []byte) *Document {
+	return parse(protocol, body, true)
+}
+
+func parse(protocol string, body []byte, ignoreImages bool) *Document {
 	protocol = canonicalProtocol(protocol)
-	b := &builder{doc: Document{ParserVersion: ParserVersion, Protocol: protocol}}
+	b := &builder{doc: Document{ParserVersion: ParserVersion, Protocol: protocol}, ignoreImages: ignoreImages}
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
 		b.issue(IssueEmptyContent, "$")
@@ -283,12 +295,13 @@ func scanJSONValueForDuplicateFields(decoder *json.Decoder, path string) (string
 }
 
 type builder struct {
-	doc       Document
-	textRunes int
+	doc          Document
+	textRunes    int
+	ignoreImages bool
 }
 
 func (b *builder) finish() *Document {
-	if len(b.doc.Segments) == 0 && len(b.doc.Media) == 0 && len(b.doc.OpaqueStates) == 0 && len(b.doc.ControlItems) == 0 && len(b.doc.Issues) == 0 {
+	if len(b.doc.Segments) == 0 && len(b.doc.Media) == 0 && !b.doc.HasImages && len(b.doc.OpaqueStates) == 0 && len(b.doc.ControlItems) == 0 && len(b.doc.Issues) == 0 {
 		b.issue(IssueEmptyContent, "$")
 	}
 	texts := make([]string, 0, len(b.doc.Segments))
@@ -383,6 +396,10 @@ func (b *builder) addControlItem(kind, path string) {
 }
 
 func (b *builder) addImage(value, mimeType, path string) {
+	b.doc.HasImages = true
+	if b.ignoreImages {
+		return
+	}
 	if len(b.doc.Media) >= MaxImages {
 		b.issue(IssueImageLimit, path)
 		return
