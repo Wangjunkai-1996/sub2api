@@ -19,21 +19,12 @@ func (a *LegacyModerationAdapter) BlockingApplies(ctx context.Context, req Reque
 	if a == nil || a.service == nil {
 		return false, errors.New("strict content moderation service unavailable")
 	}
-	return a.service.StrictRequestPreBlockApplies(ctx, cloneInt64Ptr(req.GroupID), req.Protocol, req.Model)
+	return a.service.StrictPreBlockApplies(ctx, cloneInt64Ptr(req.GroupID))
 }
 
 func (a *LegacyModerationAdapter) Check(ctx context.Context, req Request) (*LegacyDecision, error) {
 	if a == nil || a.service == nil {
 		return nil, nil
-	}
-	if !req.Strict {
-		strictGroup, err := a.service.StrictPreBlockApplies(ctx, cloneInt64Ptr(req.GroupID))
-		if err != nil {
-			return nil, err
-		}
-		if strictGroup && !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
-			return &LegacyDecision{Allowed: true, Action: service.ContentModerationActionAllow}, nil
-		}
 	}
 	decision, err := a.service.Check(ctx, service.ContentModerationCheckInput{
 		RequestID: req.RequestID, UserID: req.UserID, UserEmail: req.UserEmail,

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -681,50 +682,9 @@ func TestContentModerationStrictPreBlockAppliesUsesEffectiveGroupScope(t *testin
 	}
 }
 
-func TestStrictContentModerationRequestSupportedNarrowsToOpenAIGPTText(t *testing.T) {
-	tests := []struct {
-		name     string
-		protocol string
-		model    string
-		want     bool
-	}{
-		{name: "responses GPT", protocol: ContentModerationProtocolOpenAIResponses, model: "gpt-5.5", want: true},
-		{name: "chat GPT with surrounding whitespace", protocol: "  OPENAI_CHAT_COMPLETIONS  ", model: " GPT-5.4 ", want: true},
-		{name: "responses image model", protocol: ContentModerationProtocolOpenAIResponses, model: "gpt-image-1"},
-		{name: "chat image model", protocol: ContentModerationProtocolOpenAIChat, model: "gpt-image-1.5"},
-		{name: "responses non GPT model", protocol: ContentModerationProtocolOpenAIResponses, model: "gemini-3-pro"},
-		{name: "anthropic protocol with GPT model", protocol: ContentModerationProtocolAnthropicMessages, model: "gpt-5.5"},
-		{name: "gemini protocol with GPT model", protocol: ContentModerationProtocolGemini, model: "gpt-5.5"},
-		{name: "OpenAI images protocol", protocol: ContentModerationProtocolOpenAIImages, model: "gpt-5.5"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, StrictContentModerationRequestSupported(tt.protocol, tt.model))
-		})
-	}
-}
-
-func TestContentModerationStrictRequestPreBlockAppliesRejectsUnsupportedBeforeConfigLoad(t *testing.T) {
+func TestContentModerationStrictPreBlockAppliesRequiresGroupConfig(t *testing.T) {
 	var svc *ContentModerationService
-	requests := []struct {
-		protocol string
-		model    string
-	}{
-		{protocol: ContentModerationProtocolOpenAIResponses, model: "gpt-image-1"},
-		{protocol: ContentModerationProtocolOpenAIResponses, model: "gemini-3-pro"},
-		{protocol: ContentModerationProtocolAnthropicMessages, model: "gpt-5.5"},
-		{protocol: ContentModerationProtocolGemini, model: "gpt-5.5"},
-		{protocol: ContentModerationProtocolOpenAIImages, model: "gpt-5.5"},
-	}
-
-	for _, request := range requests {
-		applies, err := svc.StrictRequestPreBlockApplies(context.Background(), nil, request.protocol, request.model)
-		require.NoError(t, err)
-		require.False(t, applies)
-	}
-
-	_, err := svc.StrictRequestPreBlockApplies(context.Background(), nil, ContentModerationProtocolOpenAIResponses, "gpt-5.5")
+	_, err := svc.StrictPreBlockApplies(context.Background(), nil)
 	require.ErrorContains(t, err, "service unavailable")
 }
 
@@ -2079,7 +2039,7 @@ func TestContentModerationStatusTracksPreBlockLocalBlocks(t *testing.T) {
 	require.Equal(t, int64(0), status.PreBlockErrors)
 }
 
-func TestBuildContentModerationTestAuditResult_HonorsAPIFlagAndConfiguredThresholds(t *testing.T) {
+func TestBuildContentModerationTestAuditResult_UsesConfiguredThresholds(t *testing.T) {
 	result := buildContentModerationTestAuditResult(&moderationAPIResult{
 		Flagged: true,
 		CategoryScores: map[string]float64{
@@ -2088,7 +2048,7 @@ func TestBuildContentModerationTestAuditResult_HonorsAPIFlagAndConfiguredThresho
 	}, nil)
 
 	require.NotNil(t, result)
-	require.True(t, result.Flagged)
+	require.False(t, result.Flagged)
 	require.Equal(t, "harassment", result.HighestCategory)
 	require.Equal(t, 0.65, result.HighestScore)
 	require.Equal(t, 0.65, result.CompositeScore)
@@ -2157,10 +2117,12 @@ func TestContentModerationCheck_StrictFindingsLogWithoutUserSideEffects(t *testi
 		assertBlockedWithoutSideEffects(t, svc, repo, userRepo, invalidator, []byte(`{"input":"cyber request"}`))
 	})
 
-	t.Run("moderation api flag", func(t *testing.T) {
+	t.Run("moderation score threshold", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			scores := completeModerationCategoryScores(0.01)
+			scores["violence"] = 0.99
 			_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
-				Flagged: true, CategoryScores: completeModerationCategoryScores(0.01),
+				Flagged: false, CategoryScores: scores,
 			}}})
 		}))
 		defer server.Close()
@@ -2174,6 +2136,90 @@ func TestContentModerationCheck_StrictFindingsLogWithoutUserSideEffects(t *testi
 		svc, repo, userRepo, invalidator := newService(t, cfg, server.Client())
 		assertBlockedWithoutSideEffects(t, svc, repo, userRepo, invalidator, []byte(`{"input":"clean request"}`))
 	})
+}
+
+func TestContentModerationCheck_StrictLowScoreUpstreamFlagIsAllowedAndNotHashed(t *testing.T) {
+	groupID := int64(12)
+	tests := []struct {
+		name     string
+		category string
+		score    float64
+		protocol string
+		body     []byte
+	}{
+		{
+			name: "screenshot chat harassment 48.8 percent", category: "harassment", score: 0.488,
+			protocol: ContentModerationProtocolOpenAIChat,
+			body:     []byte(`{"messages":[{"role":"user","content":"实习生月薪预涨五倍，合同到期妻子追求谈续约"}]}`),
+		},
+		{
+			name: "screenshot responses violence 20.5 percent", category: "violence", score: 0.205,
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body:     []byte(`{"input":"要求重新生成，歌词不要超过1000字"}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				scores := completeModerationCategoryScores(0.01)
+				scores[tt.category] = tt.score
+				require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+					Flagged: true, CategoryScores: scores,
+				}}}))
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.AllGroups = false
+			cfg.GroupIDs = []int64{groupID}
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = []string{"sk-test"}
+			cfg.RetryCount = 0
+			rawCfg, err := json.Marshal(cfg)
+			require.NoError(t, err)
+
+			repo := &contentModerationTestRepo{}
+			hashCache := &contentModerationTestHashCache{}
+			svc := &ContentModerationService{
+				settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+					SettingKeyRiskControlEnabled:      "true",
+					SettingKeyContentModerationConfig: string(rawCfg),
+				}},
+				repo:       repo,
+				hashCache:  hashCache,
+				httpClient: server.Client(),
+				asyncQueue: make(chan contentModerationTask, 1),
+				keyHealth:  make(map[string]*contentModerationKeyHealth),
+			}
+
+			for attempt := 1; attempt <= 2; attempt++ {
+				decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+					Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
+					Protocol: tt.protocol, Body: tt.body,
+				})
+
+				require.NoError(t, err, "attempt %d", attempt)
+				require.NotNil(t, decision, "attempt %d", attempt)
+				require.True(t, decision.Allowed, "attempt %d", attempt)
+				require.False(t, decision.Blocked, "attempt %d", attempt)
+				require.False(t, decision.Flagged, "attempt %d", attempt)
+				require.Equal(t, ContentModerationActionAllow, decision.Action, "attempt %d", attempt)
+			}
+
+			require.Equal(t, int32(1), upstreamCalls.Load(), "second request should reuse the cached upstream result")
+			require.Empty(t, hashCache.snapshotRecorded())
+			require.Empty(t, repo.snapshotLogs())
+			select {
+			case task := <-svc.asyncQueue:
+				require.Failf(t, "unexpected moderation task", "task=%+v", task)
+			default:
+			}
+		})
+	}
 }
 
 func TestContentModerationCheck_StrictValidatesCompleteModerationVerdict(t *testing.T) {

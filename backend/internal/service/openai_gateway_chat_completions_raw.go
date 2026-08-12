@@ -43,7 +43,7 @@ var openaiCCRawAllowedHeaders = map[string]bool{
 //
 // 与 ForwardAsChatCompletions 的关键差异：
 //
-//   - 不调用 apicompat.ChatCompletionsToResponses，body 仅做模型 ID 改写
+//   - 不调用 apicompat.ChatCompletionsToResponses，body 仅做模型 ID 和上游兼容改写
 //   - 上游 URL 拼到 /v1/chat/completions 而非 /v1/responses
 //   - 流式响应 SSE 直接透传给客户端（上游 chunk 已是 CC 格式）
 //   - 非流式响应 JSON 直接透传，仅按需提取 usage
@@ -75,6 +75,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	// 2. Resolve model mapping (same as ForwardAsChatCompletions)
 	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	applyStrictGroupTransforms := IsOpenAIStrictAuditRequest(c)
 	grokCacheIdentity := ""
 	if account.Platform == PlatformGrok {
 		// Resolve before image bridging or other body rewrites so the fallback is
@@ -94,17 +95,20 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		upstreamBody = normalizedBody
 	}
 
-	// 4. Apply OpenAI fast policy on the CC body
-	updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, upstreamBody)
-	if policyErr != nil {
-		var blocked *OpenAIFastBlockedError
-		if errors.As(policyErr, &blocked) {
-			MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
-			writeChatCompletionsError(c, http.StatusForbidden, "permission_error", blocked.Message)
+	// 4. Request-body policy belongs only to the configured strict group.
+	// Other groups are forwarded without policy rewrites.
+	if applyStrictGroupTransforms {
+		updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, upstreamBody)
+		if policyErr != nil {
+			var blocked *OpenAIFastBlockedError
+			if errors.As(policyErr, &blocked) {
+				MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
+				writeChatCompletionsError(c, http.StatusForbidden, "permission_error", blocked.Message)
+			}
+			return nil, policyErr
 		}
-		return nil, policyErr
+		upstreamBody = updatedBody
 	}
-	upstreamBody = updatedBody
 
 	// Grok Composer does not accept image_url parts directly, but Grok Build
 	// can describe the images first. Bridge only this exact failure mode.
@@ -152,6 +156,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		zap.String("billing_model", billingModel),
 		zap.String("upstream_model", upstreamModel),
 		zap.Bool("stream", clientStream),
+		zap.Bool("strict_group_transforms", applyStrictGroupTransforms),
 	)
 
 	// 5. Build and send upstream request via the shared CC pipeline

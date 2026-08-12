@@ -561,9 +561,9 @@ func TestStrictAsyncJobMarkerRequiresEveryInvariant(t *testing.T) {
 		{name: "nil job", job: nil},
 		{name: "blocking mode", job: func() *Job { job := base; job.ExecutionMode = ModeBlocking; return &job }()},
 		{name: "standard attempts", job: func() *Job { job := base; job.MaxAttempts = standardAsyncMaxAttempts; return &job }()},
-		{name: "unsupported protocol", job: func() *Job { job := base; job.Snapshot.Protocol = "anthropic_messages"; return &job }()},
-		{name: "non GPT model", job: func() *Job { job := base; job.Snapshot.Model = "gemini-3-pro"; return &job }()},
-		{name: "image model", job: func() *Job { job := base; job.Snapshot.Model = "gpt-image-1.5"; return &job }()},
+		{name: "anthropic protocol", job: func() *Job { job := base; job.Snapshot.Protocol = "anthropic_messages"; return &job }(), want: true},
+		{name: "non GPT model", job: func() *Job { job := base; job.Snapshot.Model = "gemini-3-pro"; return &job }(), want: true},
+		{name: "image model", job: func() *Job { job := base; job.Snapshot.Model = "gpt-image-1.5"; return &job }(), want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

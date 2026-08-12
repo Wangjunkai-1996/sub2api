@@ -210,7 +210,7 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 }
 
 func promptGuardRequestSupported(req Request) bool {
-	return service.StrictContentModerationRequestSupported(req.Protocol, req.Model)
+	return true
 }
 
 func strictImageOnlyDocument(document *auditinput.Document) bool {

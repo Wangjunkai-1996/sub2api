@@ -79,19 +79,20 @@ func TestBuildOpenAIResponsesURL_ProbeURL(t *testing.T) {
 	}
 }
 
-func TestForwardAsRawChatCompletions_ForcesStreamUsageUpstreamAndPassesUsageDownstream(t *testing.T) {
+func TestForwardAsRawChatCompletions_MarkedProForcesStreamUsageWithoutModelPrefixGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	body := []byte(`{"model":"pro-model-alias","messages":[{"role":"user","content":"hello"}],"stream":true}`)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	MarkOpenAIStrictAuditRequest(c)
 
 	upstreamBody := strings.Join([]string{
-		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"pro-model-alias","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
 		"",
-		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":3}}}`,
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"pro-model-alias","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":3}}}`,
 		"",
 		"data: [DONE]",
 		"",
@@ -120,6 +121,30 @@ func TestForwardAsRawChatCompletions_ForcesStreamUsageUpstreamAndPassesUsageDown
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream_options.include_usage").Bool())
 	require.Contains(t, rec.Body.String(), `"usage"`)
 	require.Contains(t, rec.Body.String(), "data: [DONE]")
+}
+
+func TestForwardAsRawChatCompletions_UnmarkedGPTSkipsStrictPolicyRewrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false,"prompt_cache_key":"client-cache","service_tier":"fast"}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: rawChatCompletionsStreamingResponse("gpt-5.4")}
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAsRawChatCompletions(context.Background(), c, rawChatCompletionsTestAccount(), body, "")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.JSONEq(t, string(body), string(upstream.lastBody))
+	require.Equal(t, "client-cache", gjson.GetBytes(upstream.lastBody, "prompt_cache_key").String())
+	require.Equal(t, "fast", gjson.GetBytes(upstream.lastBody, "service_tier").String())
 }
 
 func TestForwardAsRawChatCompletions_PreservesMappedGPT56MaxEffort(t *testing.T) {
@@ -494,6 +519,7 @@ func TestForwardAsRawChatCompletions_ClientDisconnectDrainsUsage(t *testing.T) {
 	c.Writer = &openAIChatFailingWriter{ResponseWriter: c.Writer, failAfter: 0}
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	MarkOpenAIStrictAuditRequest(c)
 
 	upstreamBody := strings.Join([]string{
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
@@ -666,6 +692,20 @@ func rawChatCompletionsTestAccount() *Account {
 			"api_key":  "sk-test",
 			"base_url": "http://upstream.example",
 		},
+	}
+}
+
+func rawChatCompletionsStreamingResponse(model string) *http.Response {
+	body := strings.Join([]string{
+		`data: {"id":"chatcmpl_passthrough","object":"chat.completion.chunk","model":"` + model + `","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
 

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,6 +39,38 @@ func TestRunSecurityAuditMissingCoordinatorFailsClosed(t *testing.T) {
 	require.False(t, decision.AllowNextStage)
 	require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
 	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, decision.ErrorCode)
+}
+
+func TestRunSecurityAuditOutOfScopeGroupSkipsBeforeCoordinator(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	proGroupID := int64(12)
+	plusGroupID := int64(13)
+	cfg := service.ContentModerationConfig{
+		Enabled: true, Mode: service.ContentModerationModePreBlock, SampleRate: 100,
+		AllGroups: false, GroupIDs: []int64{proGroupID}, APIKeys: []string{"sk-test"},
+	}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	moderationSvc := service.NewContentModerationService(
+		&contentModerationHandlerSettingRepo{values: map[string]string{
+			service.SettingKeyRiskControlEnabled:      "true",
+			service.SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		&contentModerationHandlerTestRepo{}, nil, nil, nil, nil, nil, nil,
+	)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	apiKey := &service.APIKey{ID: 2, GroupID: &plusGroupID, Group: &service.Group{ID: plusGroupID, Name: "Plus"}}
+
+	decision := runSecurityAudit(
+		c, nil, nil, moderationSvc, apiKey, middleware2.AuthSubject{UserID: 7},
+		service.ContentModerationProtocolOpenAIResponses, "gpt-5.5", []byte(`{"input":"safe"}`), "http",
+	)
+
+	require.Nil(t, decision)
+	require.False(t, service.IsOpenAIStrictAuditRequest(c))
 }
 
 func TestRunSecurityAuditDoesNotSkipSubsequentWebSocketTurns(t *testing.T) {

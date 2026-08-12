@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -36,12 +37,9 @@ type handlerPromptEngine struct {
 
 func (e *handlerPromptEngine) EffectiveMode() securityaudit.Mode { return e.mode }
 func (e *handlerPromptEngine) BlockingApplies(req securityaudit.Request) bool {
-	return e.strict && service.StrictContentModerationRequestSupported(req.Protocol, req.Model)
+	return e.strict
 }
 func (e *handlerPromptEngine) Enqueue(_ context.Context, req securityaudit.Request) error {
-	if !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
-		return nil
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.enqueued++
@@ -49,9 +47,6 @@ func (e *handlerPromptEngine) Enqueue(_ context.Context, req securityaudit.Reque
 	return e.err
 }
 func (e *handlerPromptEngine) Evaluate(_ context.Context, req securityaudit.Request) (*securityaudit.PromptDecision, error) {
-	if !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
-		return &securityaudit.PromptDecision{Kind: securityaudit.DecisionAllow, AllowNextStage: true}, nil
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.evaluated++
@@ -83,12 +78,30 @@ func blockingHandlerPromptEngine() *handlerPromptEngine {
 	}}
 }
 
+func nonStrictMediaModerationService(t *testing.T) *service.ContentModerationService {
+	t.Helper()
+	strictGroupID := int64(999)
+	cfg := service.ContentModerationConfig{
+		Enabled: true, Mode: service.ContentModerationModePreBlock, SampleRate: 100,
+		AllGroups: false, GroupIDs: []int64{strictGroupID}, APIKeys: []string{"sk-test"},
+	}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	return service.NewContentModerationService(
+		&contentModerationHandlerSettingRepo{values: map[string]string{
+			service.SettingKeyRiskControlEnabled:      "true",
+			service.SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		&contentModerationHandlerTestRepo{}, nil, nil, nil, nil, nil, nil,
+	)
+}
+
 func TestAsyncImageRouteBypassesPromptGuardAndCreatesTask(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
 	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
 	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine), contentModerationService: nonStrictMediaModerationService(t)}
 	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
 	var executions atomic.Int32
 	h.execute = func(_ string, c *gin.Context) {
@@ -121,7 +134,7 @@ func TestAsyncImageAuditBypassIsNotRepeatedByDetachedExecution(t *testing.T) {
 	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
 	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
 	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine), contentModerationService: nonStrictMediaModerationService(t)}
 	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
 	var executionMu sync.Mutex
 	repeatedDecision := false
@@ -165,7 +178,7 @@ func TestAsyncImageAuditBypassIsNotRepeatedByDetachedExecution(t *testing.T) {
 func TestBatchImageRouteBypassesPromptGuard(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine), contentModerationService: nonStrictMediaModerationService(t)}
 	h := &BatchImageHandler{openAI: openAI}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)

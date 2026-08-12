@@ -386,7 +386,7 @@ func TestPromptServiceBlockingScopeNeverExpandsWithoutTrustedConfig(t *testing.T
 	require.False(t, service.BlockingApplies(Request{GroupID: &group13, Protocol: auditinput.ProtocolOpenAIResponses, Model: "gpt-5.6-terra"}))
 }
 
-func TestPromptServiceSkipsUnsupportedRequestsBeforeDependencies(t *testing.T) {
+func TestPromptServiceNoLongerUsesProtocolOrModelAsScope(t *testing.T) {
 	tests := []Request{
 		{Protocol: "anthropic_messages", Model: "gpt-5.6-terra"},
 		{Protocol: "gemini", Model: "gpt-5.6-terra"},
@@ -400,10 +400,8 @@ func TestPromptServiceSkipsUnsupportedRequestsBeforeDependencies(t *testing.T) {
 	for _, req := range tests {
 		require.False(t, promptService.BlockingApplies(req), "%s/%s", req.Protocol, req.Model)
 		require.NoError(t, promptService.Enqueue(context.Background(), req), "%s/%s", req.Protocol, req.Model)
-		decision, err := promptService.Evaluate(context.Background(), req)
-		require.NoError(t, err, "%s/%s", req.Protocol, req.Model)
-		require.Equal(t, DecisionAllow, decision.Kind)
-		require.True(t, decision.AllowNextStage)
+		_, err := promptService.Evaluate(context.Background(), req)
+		require.Error(t, err, "%s/%s", req.Protocol, req.Model)
 	}
 }
 

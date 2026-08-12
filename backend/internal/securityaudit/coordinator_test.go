@@ -70,13 +70,10 @@ type proScopedLegacySpy struct {
 
 func (s *proScopedLegacySpy) BlockingApplies(_ context.Context, req Request) (bool, error) {
 	s.scopeCalls.Add(1)
-	return s.strictGroup && service.StrictContentModerationRequestSupported(req.Protocol, req.Model), nil
+	return s.strictGroup, nil
 }
 
 func (s *proScopedLegacySpy) Check(_ context.Context, req Request) (*LegacyDecision, error) {
-	if s.strictGroup && !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
-		return &LegacyDecision{Allowed: true}, nil
-	}
 	s.moderationCalls.Add(1)
 	s.strictSeen.Store(req.Strict)
 	return s.decision, s.err
@@ -93,21 +90,15 @@ type proScopedPromptSpy struct {
 func (s *proScopedPromptSpy) EffectiveMode() Mode { return s.mode }
 
 func (s *proScopedPromptSpy) BlockingApplies(req Request) bool {
-	return s.mode == ModeBlocking && service.StrictContentModerationRequestSupported(req.Protocol, req.Model)
+	return s.mode == ModeBlocking
 }
 
 func (s *proScopedPromptSpy) Enqueue(_ context.Context, req Request) error {
-	if !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
-		return nil
-	}
 	s.enqueues.Add(1)
 	return s.err
 }
 
 func (s *proScopedPromptSpy) Evaluate(_ context.Context, req Request) (*PromptDecision, error) {
-	if !service.StrictContentModerationRequestSupported(req.Protocol, req.Model) {
-		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
-	}
 	s.evaluates.Add(1)
 	return s.decision, s.err
 }
@@ -247,7 +238,7 @@ func TestCoordinatorContentModerationOutOfScopeRemainsNonStrict(t *testing.T) {
 	}
 }
 
-func TestCoordinatorProScopeSkipsNonGPTAndImageAuditors(t *testing.T) {
+func TestCoordinatorStrictScopeDoesNotDependOnProtocolOrModel(t *testing.T) {
 	groupID := int64(12)
 	tests := []struct {
 		name     string
@@ -257,7 +248,7 @@ func TestCoordinatorProScopeSkipsNonGPTAndImageAuditors(t *testing.T) {
 	}{
 		{
 			name: "Responses non-GPT model", protocol: service.ContentModerationProtocolOpenAIResponses, model: "gemini-3-pro",
-			body: `{"previous_response_id":"must_not_load","input":"safe"}`,
+			body: `{"input":"safe"}`,
 		},
 		{
 			name: "Chat non-GPT model", protocol: service.ContentModerationProtocolOpenAIChat, model: "claude-sonnet-4-5",
@@ -265,7 +256,7 @@ func TestCoordinatorProScopeSkipsNonGPTAndImageAuditors(t *testing.T) {
 		},
 		{
 			name: "Responses image model", protocol: service.ContentModerationProtocolOpenAIResponses, model: "gpt-image-2",
-			body: `{"previous_response_id":"must_not_load","input":"draw"}`,
+			body: `{"input":"draw"}`,
 		},
 		{
 			name: "Chat image model", protocol: service.ContentModerationProtocolOpenAIChat, model: "gpt-image-1.5",
@@ -288,21 +279,24 @@ func TestCoordinatorProScopeSkipsNonGPTAndImageAuditors(t *testing.T) {
 	for _, mode := range []Mode{ModeBlocking, ModeAsync} {
 		for _, tt := range tests {
 			t.Run(string(mode)+"/"+tt.name, func(t *testing.T) {
-				legacy := &proScopedLegacySpy{strictGroup: true}
-				prompt := &proScopedPromptSpy{mode: mode}
-				lineage := &fakeLineageStore{loadErr: errors.New("lineage must not be loaded")}
-				decision := NewCoordinator(legacy, prompt).SetLineageStore(lineage).Check(context.Background(), Request{
+				legacy := &proScopedLegacySpy{strictGroup: true, decision: &LegacyDecision{Allowed: true}}
+				prompt := &proScopedPromptSpy{mode: mode, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}}
+				decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
 					APIKeyID: 7, GroupID: &groupID, Protocol: tt.protocol, Model: tt.model, Body: []byte(tt.body),
 				})
 
 				require.True(t, decision.AllowNextStage)
 				require.Equal(t, DecisionAllow, decision.Kind)
-				require.Nil(t, decision.Audit)
+				require.NotNil(t, decision.Audit)
 				require.Equal(t, int64(1), legacy.scopeCalls.Load())
-				require.Zero(t, legacy.moderationCalls.Load())
-				require.Zero(t, prompt.enqueues.Load())
-				require.Zero(t, prompt.evaluates.Load())
-				require.Zero(t, lineage.loads.Load())
+				require.Equal(t, int64(1), legacy.moderationCalls.Load())
+				if mode == ModeBlocking {
+					require.Equal(t, int64(1), prompt.evaluates.Load())
+					require.Zero(t, prompt.enqueues.Load())
+				} else {
+					require.Zero(t, prompt.evaluates.Load())
+					require.Equal(t, int64(1), prompt.enqueues.Load())
+				}
 			})
 		}
 	}

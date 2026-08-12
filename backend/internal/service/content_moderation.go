@@ -838,37 +838,6 @@ func (s *ContentModerationService) StrictPreBlockApplies(ctx context.Context, gr
 	return contentModerationStrictPreBlockApplies(runtimeSnapshot, groupID), nil
 }
 
-// StrictRequestPreBlockApplies narrows strict admission to GPT text requests.
-// Other protocol families retain their existing non-strict moderation behavior
-// outside a strict group, but can never enter the Pro fail-closed gate.
-func (s *ContentModerationService) StrictRequestPreBlockApplies(ctx context.Context, groupID *int64, protocol, model string) (bool, error) {
-	if !StrictContentModerationRequestSupported(protocol, model) {
-		return false, nil
-	}
-	if s == nil || s.settingRepo == nil || s.repo == nil {
-		return false, errors.New("strict content moderation service unavailable")
-	}
-	runtimeSnapshot, err := s.loadRuntimeSnapshot(ctx)
-	if err != nil {
-		return false, fmt.Errorf("load strict content moderation scope: %w", err)
-	}
-	if !contentModerationStrictPreBlockApplies(runtimeSnapshot, groupID) || runtimeSnapshot.config == nil {
-		return false, nil
-	}
-	return runtimeSnapshot.config.includesModel(model), nil
-}
-
-// StrictContentModerationRequestSupported is the code-level boundary for the
-// Pro text gate. WebSocket response.create frames use the Responses protocol.
-func StrictContentModerationRequestSupported(protocol, model string) bool {
-	protocol = strings.ToLower(strings.TrimSpace(protocol))
-	if protocol != ContentModerationProtocolOpenAIResponses && protocol != ContentModerationProtocolOpenAIChat {
-		return false
-	}
-	model = strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(model, "gpt-") && !strings.HasPrefix(model, "gpt-image")
-}
-
 func contentModerationStrictPreBlockApplies(runtimeSnapshot *contentModerationRuntimeSnapshot, groupID *int64) bool {
 	if runtimeSnapshot == nil || !runtimeSnapshot.riskControlEnabled || runtimeSnapshot.config == nil {
 		return false
@@ -1138,9 +1107,7 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 	}
 	cfg := runtimeSnapshot.config
 	if !contentModerationStrictPreBlockApplies(runtimeSnapshot, input.GroupID) ||
-		!StrictContentModerationRequestSupported(input.Protocol, input.Model) ||
-		cfg.SampleRate != 100 || cfg.KeywordBlockingMode != ContentModerationKeywordModeKeywordAndAPI ||
-		!cfg.includesModel(input.Model) {
+		cfg.SampleRate != 100 || cfg.KeywordBlockingMode != ContentModerationKeywordModeKeywordAndAPI {
 		return nil, errors.New("strict content moderation is not fully configured for request")
 	}
 	content := ContentModerationInput{}
@@ -1324,7 +1291,10 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 	}
 
 	scoreFlagged, highestCategory, highestScore := evaluateModerationScores(result.CategoryScores, cfg.Thresholds)
-	flagged := result.Flagged || scoreFlagged
+	// The upstream flagged bit uses OpenAI's policy thresholds. This service has
+	// its own configurable thresholds, so only the score evaluation determines
+	// whether the request is blocked or persisted as a flagged input.
+	flagged := scoreFlagged
 	action := ContentModerationActionAllow
 	blocked := false
 	if allowBlock && flagged && cfg.Mode == ContentModerationModePreBlock {
@@ -1344,6 +1314,8 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 		"protocol", input.Protocol,
 		"mode", cfg.Mode,
 		"allow_block", allowBlock,
+		"upstream_flagged", result.Flagged,
+		"score_flagged", scoreFlagged,
 		"flagged", flagged,
 		"blocked", blocked,
 		"action", action,
@@ -3094,7 +3066,7 @@ func buildContentModerationTestAuditResult(result *moderationAPIResult, threshol
 	}
 	thresholdSnapshot := mergeContentModerationThresholds(ContentModerationDefaultThresholds(), thresholds)
 	scoreFlagged, highestCategory, highestScore := evaluateModerationScores(scores, thresholdSnapshot)
-	flagged := result.Flagged || scoreFlagged
+	flagged := scoreFlagged
 	compositeScore := highestScore
 	return &ContentModerationTestAuditResult{
 		Flagged:         flagged,

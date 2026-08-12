@@ -120,6 +120,21 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 	if c == nil || c.Request == nil {
 		return nil
 	}
+	model = clientRequestedModel(c, model)
+	if legacy != nil {
+		scopeInput := buildContentModerationInput(c, apiKey, subject, protocol, model, body)
+		applies, err := legacy.StrictPreBlockApplies(c.Request.Context(), scopeInput.GroupID)
+		if err != nil {
+			return &securityaudit.Decision{
+				Kind: securityaudit.DecisionUnavailable, HTTPStatus: http.StatusServiceUnavailable,
+				ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
+				ClientMessage: "安全审计暂时不可用，请稍后重试",
+			}
+		}
+		if !applies {
+			return nil
+		}
+	}
 	cacheCompletion := cachesSecurityAuditCompletion(stage)
 	if cacheCompletion {
 		if completed, exists := c.Get(securityAuditCompletedContextKey); exists && completed == true {
@@ -143,6 +158,9 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 			zap.Int("body_bytes", len(body)))
 	}
 	decision := coordinator.Check(c.Request.Context(), request)
+	if decision.AllowNextStage && decision.Audit != nil {
+		service.MarkOpenAIStrictAuditRequest(c)
+	}
 	if decision.AllowNextStage && cacheCompletion {
 		c.Set(securityAuditCompletedContextKey, true)
 	}
