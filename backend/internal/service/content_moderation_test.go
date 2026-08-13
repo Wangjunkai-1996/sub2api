@@ -2577,37 +2577,44 @@ func TestContentModerationCheck_StrictResultCountMismatchFailsClosed(t *testing.
 	require.Equal(t, 1, requestCount)
 }
 
-func TestContentModerationCheck_StrictUsesOneCallAndNeverFailsOver(t *testing.T) {
+func TestContentModerationCheck_StrictFailsOverOnlyOn429(t *testing.T) {
 	groupID := int64(12)
 	tests := []struct {
-		name      string
-		respond   func(*testing.T, http.ResponseWriter, *http.Request)
-		wantError bool
+		name               string
+		respond            func(*testing.T, http.ResponseWriter, *http.Request, int)
+		wantError          bool
+		wantAuthorizations []string
 	}{
 		{
 			name: "success",
-			respond: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			respond: func(t *testing.T, w http.ResponseWriter, r *http.Request, _ int) {
 				writeCompleteModerationResponse(t, w, r)
 			},
+			wantAuthorizations: []string{"Bearer sk-primary"},
 		},
 		{
-			name: "429 does not select backup key",
-			respond: func(_ *testing.T, w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusTooManyRequests)
-				_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+			name: "429 selects backup key",
+			respond: func(t *testing.T, w http.ResponseWriter, r *http.Request, call int) {
+				if call == 1 {
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+					return
+				}
+				writeCompleteModerationResponse(t, w, r)
 			},
-			wantError: true,
+			wantAuthorizations: []string{"Bearer sk-primary", "Bearer sk-backup"},
 		},
 		{
 			name: "malformed verdict does not select backup key",
-			respond: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
+			respond: func(t *testing.T, w http.ResponseWriter, _ *http.Request, _ int) {
 				scores := completeModerationCategoryScores(0.01)
 				delete(scores, "sexual/minors")
 				require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
 					Flagged: false, CategoryScores: scores,
 				}}}))
 			},
-			wantError: true,
+			wantError:          true,
+			wantAuthorizations: []string{"Bearer sk-primary"},
 		},
 	}
 
@@ -2615,11 +2622,14 @@ func TestContentModerationCheck_StrictUsesOneCallAndNeverFailsOver(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			var mu sync.Mutex
 			var authorizations []string
+			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
+				calls++
 				authorizations = append(authorizations, r.Header.Get("Authorization"))
+				call := calls
 				mu.Unlock()
-				tt.respond(t, w, r)
+				tt.respond(t, w, r, call)
 			}))
 			defer server.Close()
 
@@ -2660,12 +2670,12 @@ func TestContentModerationCheck_StrictUsesOneCallAndNeverFailsOver(t *testing.T)
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			require.Equal(t, []string{"Bearer sk-primary"}, authorizations)
+			require.Equal(t, tt.wantAuthorizations, authorizations)
 		})
 	}
 }
 
-func TestContentModerationStrictAPICallLimitStopsRequestStorm(t *testing.T) {
+func TestContentModerationStrictAPICallLimitAllowsOneSuccessPerBatch(t *testing.T) {
 	var mu sync.Mutex
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2682,21 +2692,21 @@ func TestContentModerationStrictAPICallLimitStopsRequestStorm(t *testing.T) {
 	cfg.MaxRPM = 100000
 	cfg.RetryCount = 0
 	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
-	batches := make([]strictModerationBatch, maxStrictModerationAPICalls+1)
+	batches := make([]strictModerationBatch, 2)
 	for index := range batches {
 		batches[index] = strictModerationBatch{input: "safe", expectedResults: 1}
 	}
 
-	_, err := svc.callModerationStrictBatches(context.Background(), cfg, batches, newStrictModerationKeyState(cfg))
+	result, err := svc.callModerationStrictBatches(context.Background(), cfg, batches, newStrictModerationKeyState(cfg))
 
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "API call limit")
+	require.NoError(t, err)
+	require.NotNil(t, result)
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, maxStrictModerationAPICalls, requestCount)
+	require.Equal(t, len(batches), requestCount)
 }
 
-func TestContentModerationStrict429NeverFailsOverToAnotherKey(t *testing.T) {
+func TestContentModerationStrictAllKeys429ReturnsLast429(t *testing.T) {
 	var mu sync.Mutex
 	var authorizations []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2723,7 +2733,7 @@ func TestContentModerationStrict429NeverFailsOverToAnotherKey(t *testing.T) {
 	require.Contains(t, err.Error(), "moderation api status 429")
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, []string{"Bearer sk-primary"}, authorizations)
+	require.Equal(t, []string{"Bearer sk-primary", "Bearer sk-backup"}, authorizations)
 }
 
 func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcurrency(t *testing.T) {

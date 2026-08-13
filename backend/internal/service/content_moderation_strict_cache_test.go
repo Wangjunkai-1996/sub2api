@@ -483,32 +483,61 @@ func TestStrictModerationPoolWaitHonorsContextCancellation(t *testing.T) {
 	require.ErrorIs(t, result.err, context.Canceled)
 }
 
-func TestStrictModerationPool429OpensCircuitAndSkipsOutbound(t *testing.T) {
+func TestStrictModerationPool429FailsOverWithoutOpeningSharedCircuit(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.Header().Set("Retry-After", "60")
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+			return
+		}
+		writeStrictModerationCacheTestResponse(w, false, 0.01)
+	}))
+	defer server.Close()
+
+	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
+	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	startedAt := time.Now()
+	first := callStrictModerationCacheTest(context.Background(), svc, cfg, "fail over")
+	require.NoError(t, first.err)
+	require.Equal(t, 2, strictModerationCallCount(first.state))
+
+	second := callStrictModerationCacheTest(context.Background(), svc, cfg, "skip frozen key")
+	require.NoError(t, second.err)
+	require.Equal(t, 1, strictModerationCallCount(second.state))
+	require.EqualValues(t, 3, calls.Load())
+	require.Equal(t, []string{"Bearer sk-cache-a", "Bearer sk-cache-b", "Bearer sk-cache-b"}, authorizations)
+
+	status := svc.apiKeyStatusForHash(0, moderationAPIKeyHash("sk-cache-a"), maskSecretTail("sk-cache-a"), true)
+	require.NotNil(t, status.FrozenUntil)
+	require.False(t, status.FrozenUntil.Before(startedAt.Add(59*time.Second)))
+	pool, err := svc.strictModerationPool(cfg)
+	require.NoError(t, err)
+	pool.mu.Lock()
+	require.Equal(t, strictModerationCircuitClosed, pool.circuit)
+	pool.mu.Unlock()
+}
+
+func TestStrictModeration429FailoverReacquiresRPMGate(t *testing.T) {
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
 	}))
 	defer server.Close()
 
 	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
-	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a")
-	first := callStrictModerationCacheTest(context.Background(), svc, cfg, "trip circuit")
-	require.Error(t, first.err)
-	require.Contains(t, first.err.Error(), "status 429")
-	require.Equal(t, 1, strictModerationCallCount(first.state))
+	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	cfg.MaxRPM = 1
+	result := callStrictModerationCacheTest(context.Background(), svc, cfg, "respect rpm on failover")
 
-	second := callStrictModerationCacheTest(context.Background(), svc, cfg, "must not dispatch")
-	require.ErrorIs(t, second.err, errStrictModerationCircuitOpen)
-	require.Zero(t, strictModerationCallCount(second.state))
-	require.EqualValues(t, 1, calls.Load())
-	pool, err := svc.strictModerationPool(cfg)
-	require.NoError(t, err)
-	pool.mu.Lock()
-	require.Equal(t, strictModerationCircuitOpen, pool.circuit)
-	pool.mu.Unlock()
+	require.ErrorIs(t, result.err, errStrictModerationRateLimited)
+	require.Equal(t, 1, strictModerationCallCount(result.state))
+	require.Equal(t, []string{"Bearer sk-cache-a"}, authorizations)
 }
 
 func TestStrictModerationPoolHalfOpenAllowsSingleProbeAndClosesOnSuccess(t *testing.T) {
