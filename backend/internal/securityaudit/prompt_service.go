@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
-	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 type PromptService struct {
@@ -222,7 +221,7 @@ func strictNoCurrentUserTextDocument(document *auditinput.Document) bool {
 }
 
 func strictNoCurrentUserTextRequest(req Request) bool {
-	if service.ExtractStrictCurrentUserText(req.Protocol, req.Body) != "" {
+	if req.Document != nil && strings.TrimSpace(req.Document.NormalizedText) != "" {
 		return false
 	}
 	document := req.Document

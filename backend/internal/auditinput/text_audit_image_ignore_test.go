@@ -2,6 +2,7 @@ package auditinput
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -155,14 +156,6 @@ func TestParseForTextAuditDoesNotRewindPastFinalBusinessItem(t *testing.T) {
 		body     string
 	}{
 		{
-			name:     "responses tool output",
-			protocol: ProtocolOpenAIResponses,
-			body: `{"input":[
-				{"type":"message","role":"user","content":"historical user text"},
-				{"type":"function_call_output","call_id":"call_1","output":"ignored tool output"}
-			]}`,
-		},
-		{
 			name:     "responses assistant",
 			protocol: ProtocolOpenAIResponses,
 			body: `{"input":[
@@ -235,6 +228,46 @@ func TestParseForTextAuditDoesNotRewindPastFinalBusinessItem(t *testing.T) {
 			require.NotContains(t, string(serialized), "ignored")
 		})
 	}
+}
+
+func TestParseForTextAuditAuditsTrailingResponsesToolSuffixOnly(t *testing.T) {
+	body := []byte(`{"previous_response_id":"resp_parent","input":[
+		{"type":"message","role":"user","content":"historical user text"},
+		{"type":"message","role":"assistant","content":"historical assistant text"},
+		{"type":"function_call","name":"exec","arguments":"{\"cmd\":\"dangerous command\"}","call_id":"call_1"},
+		{"type":"function_call_output","call_id":"call_1","output":"tool output"},
+		{"type":"compaction_trigger"}
+	]}`)
+
+	document := ParseForTextAudit(ProtocolOpenAIResponses, body)
+
+	require.True(t, document.Complete, "%+v", document.Issues)
+	require.Contains(t, document.NormalizedText, "exec")
+	require.Contains(t, document.NormalizedText, "dangerous command")
+	require.Contains(t, document.NormalizedText, "tool output")
+	require.NotContains(t, document.NormalizedText, "historical user text")
+	require.NotContains(t, document.NormalizedText, "historical assistant text")
+}
+
+func TestParseForTextAuditRejectsDuplicateFieldsInSelectedResponsesTool(t *testing.T) {
+	document := ParseForTextAudit(ProtocolOpenAIResponses, []byte(
+		`{"input":[{"type":"function_call_output","call_id":"call_1","output":"first","output":"second"}]}`,
+	))
+
+	require.False(t, document.Complete)
+	require.True(t, document.HasIssue(IssueDuplicateField), "%+v", document.Issues)
+}
+
+func TestParseForTextAuditTracksTwelveThousandRuneBoundary(t *testing.T) {
+	atLimit := ParseForTextAudit(ProtocolOpenAIResponses, []byte(`{"input":"`+strings.Repeat("界", MaxAuditTextRunes)+`"}`))
+	require.True(t, atLimit.Complete, "%+v", atLimit.Issues)
+	require.Equal(t, MaxAuditTextRunes, atLimit.AuditTextRunes)
+	require.False(t, atLimit.AuditLimitExceeded)
+
+	overLimit := ParseForTextAudit(ProtocolOpenAIResponses, []byte(`{"input":"`+strings.Repeat("界", MaxAuditTextRunes+1)+`"}`))
+	require.True(t, overLimit.Complete, "%+v", overLimit.Issues)
+	require.Equal(t, MaxAuditTextRunes+1, overLimit.AuditTextRunes)
+	require.True(t, overLimit.AuditLimitExceeded)
 }
 
 func TestParseForTextAuditRejectsMalformedCurrentTextBoundary(t *testing.T) {
@@ -325,6 +358,7 @@ func TestParseForTextAuditTrailingCompactionOnlySkipsTransparentControl(t *testi
 				{"type":"function_call_output","call_id":"call_1","output":"ignored tool output"},
 				{"type":"compaction_trigger","future_control_field":"ignored"}
 			]}`,
+			want: "ignored tool output",
 		},
 	}
 
@@ -371,6 +405,7 @@ func TestParseForTextAuditMatchesForwardSanitizerAtResponsesBoundary(t *testing.
 				{"type":"function_call_output","call_id":"call_1","output":"done"},
 				{"type":"input_image","image_url":"data:image/png;base64,"}
 			]}`,
+			wantText: "done",
 		},
 		{
 			name: "real image remains the final current input",
@@ -534,7 +569,6 @@ func TestParseForTextAuditAllowsDuplicatesInsideCurrentImageNodes(t *testing.T) 
 func TestParseForTextAuditIgnoresOrdinaryDuplicatesInFinalOpaqueItem(t *testing.T) {
 	bodies := []string{
 		`{"input":[{"type":"message","role":"assistant","role":"assistant","content":"first","content":"second"}]}`,
-		`{"input":[{"type":"function_call_output","type":"function_call_output","role":"tool","role":"tool","call_id":"call_1","output":"first","output":"second"}]}`,
 		`{"input":[{"type":"compaction_trigger","type":"compaction_trigger","future_control_field":"first","future_control_field":"second"}]}`,
 	}
 

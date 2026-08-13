@@ -18,7 +18,9 @@ import (
 )
 
 const (
-	ParserVersion = "auditinput/v2"
+	ParserVersion = "auditinput/v3"
+
+	MaxAuditTextRunes = 12000
 
 	MaxTextRunes  = 64 * 1024 * 1024
 	MaxImages     = 4
@@ -100,6 +102,8 @@ type Document struct {
 	Hash               string        `json:"hash"`
 	Complete           bool          `json:"complete"`
 	Truncated          bool          `json:"truncated"`
+	AuditTextRunes     int           `json:"-"`
+	AuditLimitExceeded bool          `json:"-"`
 	Issues             []Issue       `json:"issues,omitempty"`
 }
 
@@ -428,6 +432,10 @@ func addResponsesTextAuditDuplicatePaths(paths map[string]struct{}, selectionFie
 	switch typed := input.(type) {
 	case map[string]any:
 		addTextAuditSelectionFields(selectionFields, path, "role", "type")
+		if responsesAuditableToolItem(typed) {
+			addResponsesAuditToolDuplicatePaths(paths, selectionFields, typed, path)
+			return
+		}
 		switch responsesCurrentUserItemClassification(typed) {
 		case responsesCurrentUserExplicit, responsesCurrentUserImplicit, responsesCurrentUserMalformedText:
 			addResponsesCurrentUserDuplicatePaths(paths, selectionFields, typed, path)
@@ -445,6 +453,23 @@ func addResponsesTextAuditDuplicatePaths(paths map[string]struct{}, selectionFie
 			break
 		}
 		if lastBusinessIndex < 0 {
+			return
+		}
+		if responsesAuditableToolItem(typed[lastBusinessIndex]) {
+			for index := lastBusinessIndex; index >= 0; index-- {
+				itemPath := indexPath(path, index)
+				if _, transparent := responsesTransparentControl(typed[index]); transparent {
+					if _, ok := typed[index].(map[string]any); ok {
+						addTextAuditSelectionFields(selectionFields, itemPath, "role", "type")
+					}
+					continue
+				}
+				item, ok := typed[index].(map[string]any)
+				if !ok || !responsesAuditableToolItem(item) {
+					break
+				}
+				addResponsesAuditToolDuplicatePaths(paths, selectionFields, item, itemPath)
+			}
 			return
 		}
 		if _, ok := typed[lastBusinessIndex].(map[string]any); ok {
@@ -472,6 +497,28 @@ func addResponsesTextAuditDuplicatePaths(paths map[string]struct{}, selectionFie
 				}
 			}
 		}
+	}
+}
+
+func addResponsesAuditToolDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, item map[string]any, path string) {
+	paths[path] = struct{}{}
+	addTextAuditSelectionFields(selectionFields, path, "role", "type")
+	typeName, _ := item["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "function_call":
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+	case "custom_tool_call":
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["input"], childPath(path, "input"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+	case "tool_call", "mcp_tool_call":
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["function"], childPath(path, "function"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["args"], childPath(path, "args"))
+	default:
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["input"], childPath(path, "input"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["output"], childPath(path, "output"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["content"], childPath(path, "content"))
 	}
 }
 
@@ -570,6 +617,8 @@ func (b *builder) finish() *Document {
 		texts = append(texts, segment.Normalized)
 	}
 	b.doc.NormalizedText = strings.Join(texts, "\n")
+	b.doc.AuditTextRunes = utf8.RuneCountInString(b.doc.NormalizedText)
+	b.doc.AuditLimitExceeded = b.ignoreImages && b.doc.AuditTextRunes > MaxAuditTextRunes
 	b.doc.FoldedText = foldNormalizedForMatching(b.doc.NormalizedText)
 	h := sha256.New()
 	_, _ = h.Write([]byte(ParserVersion))

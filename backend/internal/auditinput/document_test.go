@@ -445,6 +445,20 @@ func TestParseFunctionArgumentsDecodesStringifiedJSONBeforeAuditing(t *testing.T
 	require.True(t, duplicate.HasIssue(IssueDuplicateField), "%+v", duplicate.Issues)
 }
 
+func TestParseResponsesFunctionCallWithoutNameStillAuditsArguments(t *testing.T) {
+	doc := ParseForTextAudit(ProtocolOpenAIResponses, []byte(`{
+		"input":[{
+			"type":"function_call",
+			"call_id":"call_1",
+			"arguments":"{\"task\":\"synthetic cyber policy marker\"}"
+		}]
+	}`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Contains(t, doc.NormalizedText, "synthetic cyber policy marker")
+	require.NotContains(t, doc.NormalizedText, "tool\n")
+}
+
 func TestParseAnthropicServerToolResultsFailClosedOnOpaqueOrUnknownContent(t *testing.T) {
 	tests := []struct {
 		name, content, code string
@@ -546,7 +560,7 @@ func TestParseResponsesAcceptsCanonicalOpaqueAssistantState(t *testing.T) {
 	}`))
 
 	require.True(t, doc.Complete, "%+v", doc.Issues)
-	require.Equal(t, "auditinput/v2", doc.ParserVersion)
+	require.Equal(t, ParserVersion, doc.ParserVersion)
 	require.Len(t, doc.OpaqueStates, 3)
 	require.Equal(t, OpaqueState{Kind: "reasoning", Path: "$.input[0].encrypted_content", Digest: sha256Hex(reasoningCipher)}, doc.OpaqueStates[0])
 	require.Equal(t, OpaqueState{Kind: "compaction", Path: "$.input[1].encrypted_content", Digest: sha256Hex(compactionCipher)}, doc.OpaqueStates[1])
@@ -746,6 +760,20 @@ func TestParseResponsesSupportsAdditionalToolsAndFunctionNamespace(t *testing.T)
 	require.Equal(t, "$.input[1].namespace", doc.Segments[1].Path)
 }
 
+func TestParseResponsesSupportsProductionToolSearchExecution(t *testing.T) {
+	doc := Parse(ProtocolOpenAIResponses, []byte(`{
+		"previous_response_id":"resp_parent",
+		"input":[
+			{"type":"tool_search_call","id":"item_search","call_id":"call_search","execution":"client","arguments":{"query":"github"}},
+			{"type":"tool_search_output","call_id":"call_search","output":{"groups":["github"]}}
+		]
+	}`))
+
+	require.True(t, doc.Complete, "%+v", doc.Issues)
+	require.Contains(t, doc.NormalizedText, "github")
+	require.Contains(t, doc.NormalizedText, "groups")
+}
+
 func TestParseProductionLikeLargeCodexFullHistory(t *testing.T) {
 	largeToolDescription := strings.Repeat("inspect repository state and return structured evidence; ", 24_000)
 	responsesBody := []byte(`{
@@ -823,7 +851,6 @@ func TestParseRejectsMissingFunctionNamesWithSafeSibling(t *testing.T) {
 	tests := []struct {
 		name, protocol, body string
 	}{
-		{name: "responses", protocol: ProtocolOpenAIResponses, body: `{"input":["safe",{"type":"function_call","arguments":"{\"payload\":\"hidden\"}"}]}`},
 		{name: "chat", protocol: ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"safe"},{"role":"assistant","tool_calls":[{"type":"function","function":{"arguments":"{\"payload\":\"hidden\"}"}}]}]}`},
 		{name: "gemini", protocol: ProtocolGemini, body: `{"contents":[{"role":"user","parts":[{"text":"safe"},{"functionCall":{"args":{"payload":"hidden"}}}]}]}`},
 	}

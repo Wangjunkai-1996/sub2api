@@ -1231,13 +1231,23 @@ func buildOpenAIFastPolicyBlockedWSEvent(err *OpenAIFastBlockedError) []byte {
 	return payload
 }
 
-func openAIRequestBodyMayContainImageInput(body []byte) bool {
+// OpenAIRequestBodyMayContainImageInput reports whether the current OpenAI
+// request contains an input image. It inspects structure only and never reads,
+// validates, decodes, or retains the image value.
+func OpenAIRequestBodyMayContainImageInput(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
 	input := gjson.GetBytes(body, "input")
-	messages := gjson.GetBytes(body, "messages.#-1")
+	// Any input image makes the whole request a media request for strict-audit
+	// admission. Scan the full messages array so a multimodal turn cannot be
+	// missed because it is nested under content or not the final array item.
+	messages := gjson.GetBytes(body, "messages")
 	return openAIJSONValueMayContainImageInput(input) || openAIJSONValueMayContainImageInput(messages)
+}
+
+func openAIRequestBodyMayContainImageInput(body []byte) bool {
+	return OpenAIRequestBodyMayContainImageInput(body)
 }
 
 func openAIJSONValueMayContainImageInput(value gjson.Result) bool {

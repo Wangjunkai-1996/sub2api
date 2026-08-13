@@ -324,7 +324,7 @@ func TestPromptServiceStrictControlAndImageIsAllowedWithoutScanning(t *testing.T
 	require.False(t, scannerCalled)
 }
 
-func TestPromptServiceStrictCompleteNonUserTurnsAllowWithoutScanning(t *testing.T) {
+func TestPromptServiceStrictSafeEmptyTurnsAllowWithoutScanning(t *testing.T) {
 	scannerCalls := 0
 	evaluator := newGuardEvaluator(PromptScannerFunc(func(context.Context, ActiveEndpoint, string, []string) (*NormalizedResult, error) {
 		scannerCalls++
@@ -343,7 +343,6 @@ func TestPromptServiceStrictCompleteNonUserTurnsAllowWithoutScanning(t *testing.
 		body     string
 	}{
 		{name: "control only", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"compaction_trigger"}]}`},
-		{name: "responses tool output", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical user"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`},
 		{name: "responses missing input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-5.6-terra"}`},
 		{name: "chat tool output", protocol: auditinput.ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"historical user"},{"role":"tool","content":"ok"}]}`},
 		{name: "chat missing messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-5.6-terra"}`},
@@ -370,6 +369,31 @@ func TestPromptServiceStrictCompleteNonUserTurnsAllowWithoutScanning(t *testing.
 			require.Equal(t, 0, scannerCalls)
 		})
 	}
+}
+
+func TestPromptServiceStrictResponsesToolOutputIsScanned(t *testing.T) {
+	var scanned string
+	evaluator := newGuardEvaluator(PromptScannerFunc(func(_ context.Context, _ ActiveEndpoint, text string, _ []string) (*NormalizedResult, error) {
+		scanned = text
+		return &NormalizedResult{Action: ActionAllow}, nil
+	}), nil, NewAtomicMetrics(), 2, 2)
+	promptService := &PromptService{
+		config: &fakeConfigStore{active: true, cfg: ActiveConfig{
+			RiskControlEnabled: true, Enabled: true, BlockingEnabled: true, AllGroups: true,
+			Scanners: AllScannerIDs, Endpoints: []ActiveEndpoint{{ID: "guard-1", Enabled: true, TimeoutMS: 1000, InputLimit: 4096}},
+		}},
+		evaluator: evaluator,
+	}
+	body := []byte(`{"input":[{"type":"message","role":"user","content":"historical user"},{"type":"function_call_output","call_id":"call_1","output":"tool output"}]}`)
+	document := auditinput.ParseForTextAudit(auditinput.ProtocolOpenAIResponses, body)
+
+	decision, err := promptService.Evaluate(context.Background(), Request{
+		Strict: true, Protocol: auditinput.ProtocolOpenAIResponses, Model: "gpt-5.6-terra", Body: body, Document: document,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, DecisionAllow, decision.Kind)
+	require.Equal(t, "tool output", scanned)
 }
 
 func TestPromptServiceBlockingScopeNeverExpandsWithoutTrustedConfig(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -120,7 +121,16 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 	if c == nil || c.Request == nil {
 		return nil
 	}
+	// Strict admission is intentionally limited to OpenAI text protocols. A
+	// composite group is only eligible after its target platform has resolved to
+	// OpenAI; an unresolved composite target must not accidentally audit Grok.
+	if !strictAuditProtocolApplies(c, apiKey, protocol) {
+		return nil
+	}
 	model = clientRequestedModel(c, model)
+	if strictAuditRequestBypassesTextAudit(c, protocol, model, body) {
+		return nil
+	}
 	if legacy != nil {
 		scopeInput := buildContentModerationInput(c, apiKey, subject, protocol, model, body)
 		applies, err := legacy.StrictPreBlockApplies(c.Request.Context(), scopeInput.GroupID)
@@ -171,6 +181,51 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 			zap.String("stage", request.Stage))
 	}
 	return &decision
+}
+
+func strictAuditRequestBypassesTextAudit(c *gin.Context, protocol, model string, body []byte) bool {
+	if strings.EqualFold(strings.TrimSpace(protocol), service.ContentModerationProtocolOpenAIResponses) {
+		endpoint := "/v1/responses"
+		if c != nil && c.Request != nil && strings.TrimSpace(c.Request.URL.Path) != "" {
+			endpoint = c.Request.URL.Path
+		}
+		if service.IsExplicitImageGenerationIntent(endpoint, model, body) {
+			return true
+		}
+	}
+	if !service.OpenAIRequestBodyMayContainImageInput(body) {
+		return false
+	}
+	document := auditinput.ParseForTextAudit(protocol, body)
+	return document != nil && document.Complete && document.HasImages && strings.TrimSpace(document.NormalizedText) == ""
+}
+
+func strictAuditProtocolApplies(c *gin.Context, apiKey *service.APIKey, protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case service.ContentModerationProtocolOpenAIResponses, service.ContentModerationProtocolOpenAIChat:
+	default:
+		return false
+	}
+	platform := ""
+	if apiKey != nil && apiKey.Group != nil {
+		platform = strings.TrimSpace(apiKey.Group.Platform)
+	}
+	if c != nil && c.Request != nil {
+		ctx := c.Request.Context()
+		if resolved, ok := service.ResolvedTargetPlatformFromContext(ctx); ok {
+			platform = strings.TrimSpace(resolved)
+		}
+		if forced, ok := middleware2.GetForcePlatformFromContext(c); ok {
+			platform = strings.TrimSpace(forced)
+		}
+	}
+	if platform == "" {
+		return true
+	}
+	if platform == service.PlatformComposite {
+		return false
+	}
+	return platform == service.PlatformOpenAI
 }
 
 func buildSecurityAuditRequest(c *gin.Context, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string) securityaudit.Request {

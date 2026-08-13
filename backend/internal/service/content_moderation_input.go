@@ -53,19 +53,11 @@ func ExtractContentModerationInput(protocol string, body []byte) ContentModerati
 // payload values; image presence and structural completeness are handled by
 // auditinput.ParseForTextAudit before strict admission reaches this helper.
 func ExtractStrictCurrentUserText(protocol string, body []byte) string {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	document := auditinput.ParseForTextAudit(protocol, body)
+	if document == nil || !document.Complete {
 		return ""
 	}
-	var text string
-	switch strings.ToLower(strings.TrimSpace(protocol)) {
-	case ContentModerationProtocolOpenAIChat:
-		text = strictLastChatUserText(gjson.GetBytes(body, "messages"))
-	case ContentModerationProtocolOpenAIResponses:
-		text = strictLastResponsesUserText(gjson.GetBytes(body, "input"))
-	default:
-		return ""
-	}
-	return trimRunes(normalizeContentModerationText(text), maxStrictModerationTextRunes)
+	return trimRunes(normalizeContentModerationText(document.NormalizedText), maxStrictModerationTextRunes)
 }
 
 func strictLastChatUserText(messages gjson.Result) string {

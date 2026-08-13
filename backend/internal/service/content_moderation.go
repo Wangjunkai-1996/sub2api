@@ -1095,7 +1095,7 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 	}
 	moderationDocument, currentTextErr := strictCurrentUserModerationDocument(document, input.Protocol, input.Body)
 	if currentTextErr != nil {
-		if strictNoCurrentUserTextDocument(document) {
+		if strictNoCurrentUserTextDocument(document) && strictModerationEmptyTurn(document) {
 			s.recordPreBlockSyncMetric(0, ContentModerationActionAllow)
 			return &ContentModerationDecision{Allowed: true, Action: ContentModerationActionAllow}, nil
 		}
@@ -1170,11 +1170,11 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 	return decision, nil
 }
 
-func strictCurrentUserModerationDocument(document *auditinput.Document, protocol string, body []byte) (*auditinput.Document, error) {
+func strictCurrentUserModerationDocument(document *auditinput.Document, _ string, _ []byte) (*auditinput.Document, error) {
 	if document == nil || !document.Complete {
 		return nil, errors.New("strict content moderation input is incomplete")
 	}
-	text := strings.TrimSpace(ExtractStrictCurrentUserText(protocol, body))
+	text := strings.TrimSpace(normalizeContentModerationText(document.NormalizedText))
 	if text == "" {
 		return nil, errors.New("strict content moderation produced no auditable user text")
 	}
@@ -1212,11 +1212,36 @@ func strictModerationBatches(document *auditinput.Document) ([]strictModerationB
 	if document == nil {
 		return nil, errors.New("strict content moderation document is unavailable")
 	}
-	text := strings.TrimSpace(trimRunes(document.NormalizedText, maxStrictModerationTextRunes))
+	text := strings.TrimSpace(normalizeContentModerationText(document.NormalizedText))
 	if text == "" {
 		return nil, errors.New("strict content moderation produced no auditable text batch")
 	}
+	text = trimRunes(text, maxStrictModerationTextRunes)
 	return []strictModerationBatch{{input: text, expectedResults: 1}}, nil
+}
+
+func strictModerationEmptyTurn(document *auditinput.Document) bool {
+	if document == nil || !document.Complete {
+		return false
+	}
+	if strings.TrimSpace(document.NormalizedText) != "" {
+		return false
+	}
+	if document.HasImages {
+		return true
+	}
+	if len(document.ControlItems) == 0 {
+		return false
+	}
+	for _, item := range document.ControlItems {
+		switch item.Kind {
+		case "responses_empty_turn", "responses_empty_user_text", "chat_empty_turn",
+			"compaction_trigger", "sanitized_empty_input_image", "chat_non_text":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func strictImageOnlyDocument(document *auditinput.Document) bool {

@@ -193,7 +193,7 @@ func strictResponsesBodyWithImages(t *testing.T, imageCount int) []byte {
 	content := make([]any, 0, imageCount+1)
 	content = append(content, map[string]any{
 		"type": "input_text",
-		"text": strings.Repeat("safe", maxModerationInputRunes/4+1),
+		"text": strings.Repeat("safe", maxModerationInputRunes/4),
 	})
 	for index := 0; index < imageCount; index++ {
 		content = append(content, map[string]any{
@@ -1253,7 +1253,7 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 			forbidden: "later tool output",
 		},
 		{
-			name:     "responses does not rewind past final tool output",
+			name:     "responses audits final tool output without rewinding history",
 			protocol: ContentModerationProtocolOpenAIResponses,
 			body: []byte(`{"input":[
 				{"type":"message","role":"user","content":[{"type":"input_text","text":"historical user"}]},
@@ -1261,7 +1261,8 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
 				{"type":"function_call_output","call_id":"call_1","output":"tool output"}
 			]}`),
-			forbidden: "tool output",
+			want:      "tool output",
+			forbidden: "historical user",
 		},
 		{
 			name:     "latest image-only user does not fall back to history",
@@ -1271,6 +1272,7 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 				{"type":"message","role":"user","content":[{"type":"input_image","image_url":"opaque-image-secret"}]},
 				{"type":"function_call_output","call_id":"call_1","output":"tool output"}
 			]}`),
+			want:      "tool output",
 			forbidden: "historical user must not be reused",
 		},
 		{
@@ -1328,6 +1330,7 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 				{"type":"function_call_output","call_id":"call_1","output":"tool output"},
 				{"type":"compaction_trigger"}
 			]}`),
+			want:      "tool output",
 			forbidden: "historical user text",
 		},
 		{
@@ -1347,6 +1350,7 @@ func TestExtractStrictCurrentUserText(t *testing.T) {
 				{"type":"function_call_output","call_id":"call_1","output":"done"},
 				{"type":"input_image","image_url":"data:image/png;base64,"}
 			]}`),
+			want:      "done",
 			forbidden: "historical user text",
 		},
 		{
@@ -1698,7 +1702,6 @@ func TestContentModerationCheck_StrictCompleteNoCurrentUserTextAllowsWithoutRemo
 		{name: "responses missing input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"model":"gpt-5.5"}`},
 		{name: "responses null input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"model":"gpt-5.5","input":null}`},
 		{name: "responses empty websocket input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"type":"response.create","model":"gpt-5.5","input":[]}`},
-		{name: "responses tool output", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical user"},{"type":"function_call_output","call_id":"call_1","output":"done"}]}`},
 		{name: "responses empty continuation", protocol: ContentModerationProtocolOpenAIResponses, body: `{"previous_response_id":"resp_parent","input":[]}`},
 		{name: "responses empty string input", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":""}`},
 		{name: "responses empty input text", protocol: ContentModerationProtocolOpenAIResponses, body: `{"input":[{"type":"input_text","text":""}]}`},
@@ -1732,6 +1735,50 @@ func TestContentModerationCheck_StrictCompleteNoCurrentUserTextAllowsWithoutRemo
 			require.Equal(t, 0, requestCount)
 		})
 	}
+}
+
+func TestContentModerationCheck_StrictResponsesToolOutputCallsModerations(t *testing.T) {
+	groupID := int64(12)
+	requestCount := 0
+	var gotInput any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		var request moderationAPIRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		gotInput = request.Input
+		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+		}}}))
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.AllGroups = false
+	cfg.GroupIDs = []int64{groupID}
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-test"}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	svc := &ContentModerationService{
+		settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled: "true", SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		repo: &contentModerationTestRepo{}, httpClient: server.Client(),
+		asyncQueue: make(chan contentModerationTask, 1), keyHealth: make(map[string]*contentModerationKeyHealth),
+	}
+	body := []byte(`{"input":[{"type":"message","role":"user","content":"historical user"},{"type":"function_call_output","call_id":"call_1","output":"tool output"}]}`)
+
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-5.5",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+	})
+
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.Equal(t, 1, requestCount)
+	require.Equal(t, "tool output", gotInput)
 }
 
 func TestContentModerationCheck_StrictPenaltySignalsUseOnlyCurrentUserText(t *testing.T) {

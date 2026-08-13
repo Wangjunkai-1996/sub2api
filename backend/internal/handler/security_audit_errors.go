@@ -175,7 +175,8 @@ func usesLegacySecurityAuditWSError(decision *securityaudit.Decision) bool {
 		return false
 	}
 	switch strings.TrimSpace(decision.ErrorCode) {
-	case securityaudit.ErrorCodePolicyBlocked, securityaudit.ErrorCodeContextIncomplete, securityaudit.ErrorCodeAuditUnavailable:
+	case securityaudit.ErrorCodePolicyBlocked, securityaudit.ErrorCodeContextIncomplete, securityaudit.ErrorCodeLineageIncompatible,
+		securityaudit.ErrorCodeAuditInputTooLarge, securityaudit.ErrorCodeAuditUnavailable:
 		return false
 	default:
 		return true

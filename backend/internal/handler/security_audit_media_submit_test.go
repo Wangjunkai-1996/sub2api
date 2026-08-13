@@ -569,13 +569,13 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 		{
 			name: "context incomplete", body: `{"model":"gpt-test","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"current","future_field":true}]}]}`,
 			legacy:     &handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
-			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
+			wantStatus: http.StatusForbidden, wantCode: securityaudit.ErrorCodeContextIncomplete,
 		},
 		{
 			name: "legacy continuation missing lineage", body: `{"model":"gpt-test","previous_response_id":"resp_legacy","input":"continue"}`,
 			legacy:     &handlerLegacyEngine{strict: true, decision: &securityaudit.LegacyDecision{Allowed: true}},
 			lineage:    &handlerAllowLineageStore{loadErr: securityaudit.ErrLineageNotFound},
-			wantStatus: http.StatusUnprocessableEntity, wantCode: securityaudit.ErrorCodeContextIncomplete,
+			wantStatus: http.StatusForbidden, wantCode: securityaudit.ErrorCodeLineageIncompatible,
 		},
 		{
 			name: "audit unavailable", body: `{"model":"gpt-test","input":"safe"}`,
@@ -624,7 +624,7 @@ func TestOpenAIResponsesStrictGateStopsBeforeAllDownstreamDependencies(t *testin
 	}
 }
 
-func TestOpenAIResponsesStrictContinuationStickyMissIsAuditUnavailableBeforeDownstreamDependencies(t *testing.T) {
+func TestOpenAIResponsesStrictContinuationStickyMissIsLineageIncompatibleBeforeDownstreamDependencies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	groupID := int64(12)
 	lineage := &handlerAllowLineageStore{summary: securityaudit.AuditSummary{
@@ -680,14 +680,14 @@ func TestOpenAIResponsesStrictContinuationStickyMissIsAuditUnavailableBeforeDown
 	})
 	router.POST("/v1/responses", h.Responses)
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(
-		`{"model":"gpt-5.4","previous_response_id":"resp_parent","input":"draw","tools":[{"type":"image_generation"}]}`,
+		`{"model":"gpt-5.4","previous_response_id":"resp_parent","input":"continue with text"}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
 	require.NotPanics(t, func() { router.ServeHTTP(recorder, request) })
-	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, gjson.GetBytes(recorder.Body.Bytes(), "error.code").String())
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Equal(t, securityaudit.ErrorCodeLineageIncompatible, gjson.GetBytes(recorder.Body.Bytes(), "error.code").String())
 	require.Equal(t, int32(1), lineage.loads.Load())
 	require.Equal(t, int64(9), lineage.lookup.APIKeyID)
 	require.Equal(t, groupID, *lineage.lookup.GroupID)

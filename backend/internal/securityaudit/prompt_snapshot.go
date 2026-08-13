@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
-	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 var (
@@ -66,7 +65,7 @@ func extractPromptSnapshot(req Request, blocking, latestTurnOnly bool) (PromptSn
 		// remote synchronous guard only needs the latest user-authored text from
 		// the current request; history, instructions, tools, outputs, and images
 		// must not amplify one request into a large remote scan.
-		if text := service.ExtractStrictCurrentUserText(req.Protocol, req.Body); text != "" {
+		if text := strings.TrimSpace(document.NormalizedText); text != "" {
 			segments = []string{hardLimitRunes(text, StrictPromptGuardMaxRunes)}
 		}
 	} else if req.Strict && strings.TrimSpace(req.AuditContext) != "" {

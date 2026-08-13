@@ -24,6 +24,47 @@ func TestCachesSecurityAuditCompletionSkipsWebSocketStages(t *testing.T) {
 	require.False(t, cachesSecurityAuditCompletion("subsequent_turn"))
 }
 
+func TestStrictAuditRequestBypassesOnlyPureImageRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name     string
+		protocol string
+		path     string
+		body     string
+		bypass   bool
+	}{
+		{
+			name: "responses pure image", protocol: service.ContentModerationProtocolOpenAIResponses, path: "/v1/responses",
+			body:   `{"model":"gpt-5.1","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`,
+			bypass: true,
+		},
+		{
+			name: "responses text and sanitized image", protocol: service.ContentModerationProtocolOpenAIResponses, path: "/v1/responses",
+			body:   `{"model":"gpt-5.1","input":[{"type":"message","role":"user","content":"current user text"},{"type":"input_image","image_url":"data:image/png;base64,"}]}`,
+			bypass: false,
+		},
+		{
+			name: "chat pure image", protocol: service.ContentModerationProtocolOpenAIChat, path: "/v1/chat/completions",
+			body:   `{"model":"gpt-5.1","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
+			bypass: true,
+		},
+		{
+			name: "chat text and image", protocol: service.ContentModerationProtocolOpenAIChat, path: "/v1/chat/completions",
+			body:   `{"model":"gpt-5.1","messages":[{"role":"user","content":[{"type":"text","text":"current user text"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
+			bypass: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, tt.path, nil)
+			require.Equal(t, tt.bypass, strictAuditRequestBypassesTextAudit(c, tt.protocol, "gpt-5.1", []byte(tt.body)))
+		})
+	}
+}
+
 func TestRunSecurityAuditMissingCoordinatorFailsClosed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -286,4 +327,85 @@ func TestRunSecurityAuditOutOfScopePlusSkipsDegradedBlockingPrompt(t *testing.T)
 	require.Equal(t, securityaudit.DecisionAllow, decision.Kind)
 	require.Equal(t, int64(1), legacy.calls.Load())
 	require.Zero(t, prompt.evaluates.Load(), "out-of-scope Plus must not call a degraded blocking prompt auditor")
+}
+
+func TestRunSecurityAuditScopeSkipsNonOpenAITextProtocolsAndResolvedGrok(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{mode: securityaudit.ModeBlocking, blocking: true}
+	coordinator := securityaudit.NewCoordinator(nil, engine)
+	groupID := int64(12)
+	apiKey := &service.APIKey{ID: 9, GroupID: &groupID, Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI}}
+	subject := middleware2.AuthSubject{UserID: 7}
+	for _, protocol := range []string{service.ContentModerationProtocolAnthropicMessages, service.ContentModerationProtocolGemini, service.ContentModerationProtocolOpenAIImages} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/test", nil)
+		decision := runSecurityAudit(c, nil, coordinator, nil, apiKey, subject, protocol, "gpt-5.5", []byte(`{"input":"safe"}`), "http")
+		require.Nil(t, decision, protocol)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request = c.Request.WithContext(service.WithResolvedTargetPlatform(c.Request.Context(), service.PlatformGrok))
+	decision := runSecurityAudit(c, nil, coordinator, nil, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, "gpt-5.5", []byte(`{"input":"safe"}`), "http")
+	require.Nil(t, decision, "resolved Grok composite target must bypass strict OpenAI audit")
+	require.Zero(t, engine.evaluates.Load())
+}
+
+func TestRunSecurityAuditImageRequestDependencyBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(12)
+	apiKey := &service.APIKey{
+		ID: 9, GroupID: &groupID,
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+	}
+	tests := []struct {
+		name     string
+		protocol string
+		path     string
+		body     string
+		bypass   bool
+	}{
+		{
+			name: "responses input image", protocol: service.ContentModerationProtocolOpenAIResponses, path: "/v1/responses",
+			body: `{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"do not audit this text"},{"type":"input_image","image_url":"opaque"}]}]}`,
+		},
+		{
+			name: "chat input image", protocol: service.ContentModerationProtocolOpenAIChat, path: "/v1/chat/completions",
+			body: `{"model":"gpt-5.5","messages":[{"role":"user","content":[{"type":"text","text":"do not audit this text"},{"type":"image_url","image_url":{"url":"opaque"}}]}]}`,
+		},
+		{
+			name: "responses explicit image generation tool", protocol: service.ContentModerationProtocolOpenAIResponses, path: "/v1/responses",
+			body:   `{"model":"gpt-5.5","previous_response_id":"resp_legacy","input":"draw","tools":[{"type":"image_generation"}]}`,
+			bypass: true,
+		},
+		{
+			name: "responses explicit image tool choice", protocol: service.ContentModerationProtocolOpenAIResponses, path: "/v1/responses",
+			body:   `{"model":"gpt-5.5","input":"draw","tool_choice":{"type":"image_generation"}}`,
+			bypass: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, tt.path, nil)
+
+			decision := runSecurityAudit(
+				c, nil, nil, nil, apiKey, middleware2.AuthSubject{UserID: 7},
+				tt.protocol, "gpt-5.5", []byte(tt.body), "http",
+			)
+
+			if tt.bypass {
+				require.Nil(t, decision)
+			} else {
+				require.NotNil(t, decision, "text in a multimodal request must still enter strict audit")
+				require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+				require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, decision.ErrorCode)
+			}
+			require.False(t, service.IsOpenAIStrictAuditRequest(c))
+		})
+	}
 }

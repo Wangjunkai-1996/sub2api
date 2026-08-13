@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
-	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 type LegacyEngine interface {
@@ -62,13 +61,16 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 			return *rejected
 		}
 		req = prepared
-		if strings.TrimSpace(req.Document.NormalizedText) == "" &&
-			strings.TrimSpace(service.ExtractStrictCurrentUserText(req.Protocol, req.Body)) == "" {
+		if strictAuditEmptyTurn(req.Document) {
 			decision := allowDecision(nil, nil)
 			decision.Audit = buildAuditSummary(req, nil)
 			if decision.Audit == nil {
 				return auditUnavailableDecision(nil, nil)
 			}
+			return decision
+		}
+		if strings.TrimSpace(req.Document.NormalizedText) == "" {
+			decision := contextIncompleteDecision(nil, nil)
 			return decision
 		}
 		// A blocking mode may be the fail-closed effective state while the active
@@ -126,9 +128,16 @@ func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, 
 	} else {
 		document = req.Document.Clone()
 	}
+	if document != nil && document.AuditLimitExceeded {
+		decision := auditInputTooLargeDecision(nil, nil)
+		return req, &decision
+	}
 	if document == nil || !document.Complete {
 		logStrictInputIncomplete(req, document)
 		decision := contextIncompleteDecision(nil, nil)
+		if document != nil && document.HasIssue(auditinput.IssueTextLimit) {
+			decision = auditInputTooLargeDecision(nil, nil)
+		}
 		return req, &decision
 	}
 	req.Strict = true
@@ -152,14 +161,14 @@ func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, 
 	})
 	if err != nil {
 		if errors.Is(err, ErrLineageNotFound) || errors.Is(err, ErrLineageInvalid) {
-			decision := contextIncompleteDecision(nil, nil)
+			decision := lineageIncompatibleDecision(nil, nil)
 			return req, &decision
 		}
 		decision := auditUnavailableDecision(nil, nil)
 		return req, &decision
 	}
 	if !validPriorAudit(prior, req, previousResponseID) {
-		decision := contextIncompleteDecision(nil, nil)
+		decision := lineageIncompatibleDecision(nil, nil)
 		return req, &decision
 	}
 	contextText, ok := cumulativeContext(prior.RedactedContext, document.NormalizedText)
@@ -410,10 +419,55 @@ func policyBlockedDecision(legacy *LegacyDecision, prompt *PromptDecision) Decis
 }
 
 func contextIncompleteDecision(legacy *LegacyDecision, prompt *PromptDecision) Decision {
+	return policyInputBlockedDecision(
+		legacy, prompt, ErrorCodeContextIncomplete,
+		"请求内容无法完整审计，已在发送上游前拦截；请检查请求格式后重试",
+	)
+}
+
+func lineageIncompatibleDecision(legacy *LegacyDecision, prompt *PromptDecision) Decision {
+	return policyInputBlockedDecision(
+		legacy, prompt, ErrorCodeLineageIncompatible,
+		"当前会话没有有效的安全审计记录，已停止续接；请新建会话后重试",
+	)
+}
+
+func auditInputTooLargeDecision(legacy *LegacyDecision, prompt *PromptDecision) Decision {
+	return policyInputBlockedDecision(
+		legacy, prompt, ErrorCodeAuditInputTooLarge,
+		"请求中的可审计文本超过 12,000 字符，已在发送上游前拦截；请缩短内容后重试",
+	)
+}
+
+func policyInputBlockedDecision(legacy *LegacyDecision, prompt *PromptDecision, code, message string) Decision {
 	return Decision{
-		Kind: DecisionInvalid, HTTPStatus: http.StatusUnprocessableEntity, ErrorCode: ErrorCodeContextIncomplete,
-		ClientMessage: "请求上下文无法完整审计，请重新发起完整请求", Legacy: legacy, Prompt: prompt,
+		Kind: DecisionBlock, HTTPStatus: http.StatusForbidden, ErrorCode: code,
+		ClientMessage: message, Legacy: legacy, Prompt: prompt,
 	}
+}
+
+func strictAuditEmptyTurn(document *auditinput.Document) bool {
+	if document == nil || !document.Complete {
+		return false
+	}
+	if strings.TrimSpace(document.NormalizedText) != "" {
+		return false
+	}
+	if document.HasImages {
+		return true
+	}
+	if len(document.ControlItems) == 0 {
+		return false
+	}
+	for _, item := range document.ControlItems {
+		switch item.Kind {
+		case "responses_empty_turn", "responses_empty_user_text", "chat_empty_turn",
+			"chat_non_text", "compaction_trigger", "sanitized_empty_input_image":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func auditUnavailableDecision(legacy *LegacyDecision, prompt *PromptDecision) Decision {

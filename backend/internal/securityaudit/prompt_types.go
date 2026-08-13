@@ -22,9 +22,11 @@ const (
 	ErrorCodeEncryptionKeyRequired = "prompt_audit_encryption_key_required"
 	ErrorCodeRequiresEnabled       = "prompt_guard_requires_audit_enabled"
 
-	ErrorCodePolicyBlocked     = "request_policy_blocked"
-	ErrorCodeContextIncomplete = "policy_context_incomplete"
-	ErrorCodeAuditUnavailable  = "policy_audit_unavailable"
+	ErrorCodePolicyBlocked       = "request_policy_blocked"
+	ErrorCodeContextIncomplete   = "policy_context_incomplete"
+	ErrorCodeLineageIncompatible = "previous_response_id_incompatible"
+	ErrorCodeAuditInputTooLarge  = "policy_audit_input_too_large"
+	ErrorCodeAuditUnavailable    = "policy_audit_unavailable"
 
 	DefaultGuardModel = "sileader/qwen3guard:0.6b"
 )

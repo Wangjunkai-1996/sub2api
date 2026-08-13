@@ -107,10 +107,9 @@ const (
 	responsesCurrentUserMalformedText
 )
 
-// parseResponsesCurrentUserInput mirrors the Responses current-turn boundary
-// used by strict Moderations and Prompt Guard. Historical user messages,
-// assistant state, tool traffic, and unknown non-text items are outside the
-// text-audit scope and must not make an otherwise auditable request incomplete.
+// parseResponsesCurrentUserInput extracts the latest user turn together with
+// text-bearing tool traffic that follows it. Historical turns, assistant state,
+// opaque content, and images remain outside the text-audit scope.
 func (b *builder) parseResponsesCurrentUserInput(value any, path string) {
 	defer func() {
 		if len(b.doc.Segments) == 0 && !b.doc.HasImages && len(b.doc.ControlItems) == 0 {
@@ -124,6 +123,8 @@ func (b *builder) parseResponsesCurrentUserInput(value any, path string) {
 	case map[string]any:
 		if controlKind, transparent := responsesTransparentControl(typed); transparent {
 			b.addControlItem(controlKind, path)
+		} else if responsesAuditableToolItem(typed) {
+			b.parseResponsesAuditToolItem(typed, path)
 		} else if responsesCurrentUserItemClassification(typed) != responsesCurrentUserNone {
 			b.parseResponsesCurrentUserItem(typed, path)
 		} else {
@@ -143,38 +144,172 @@ func (b *builder) parseResponsesCurrentUserInput(value any, path string) {
 			return
 		}
 
-		switch responsesCurrentUserItemClassification(typed[lastBusinessIndex]) {
-		case responsesCurrentUserExplicit, responsesCurrentUserMalformedText:
-			b.parseResponsesCurrentUserItem(typed[lastBusinessIndex].(map[string]any), indexPath(path, lastBusinessIndex))
-		case responsesCurrentUserImplicit:
-			selected := make([]int, 0, 2)
-			for index := lastBusinessIndex; index >= 0; index-- {
-				if controlKind, transparent := responsesTransparentControl(typed[index]); transparent {
-					b.addControlItem(controlKind, indexPath(path, index))
-					continue
-				}
-				if responsesCurrentUserItemClassification(typed[index]) != responsesCurrentUserImplicit {
-					break
-				}
-				selected = append(selected, index)
-			}
-			for index := len(selected) - 1; index >= 0; index-- {
-				itemIndex := selected[index]
-				itemPath := indexPath(path, itemIndex)
-				switch item := typed[itemIndex].(type) {
-				case string:
-					b.addText(item, "user", "input_text", itemPath)
-				case map[string]any:
-					b.parseResponsesCurrentUserItem(item, itemPath)
-				}
-			}
-		default:
+		start := responsesCurrentAuditStart(typed, lastBusinessIndex)
+		if start < 0 {
 			itemPath := indexPath(path, lastBusinessIndex)
-			b.addControlItem("responses_non_text", itemPath)
+			if responsesAuditableToolItem(typed[lastBusinessIndex]) {
+				b.parseResponsesAuditToolItem(typed[lastBusinessIndex].(map[string]any), itemPath)
+			} else {
+				b.addControlItem("responses_non_text", itemPath)
+			}
+			return
+		}
+		for index := start; index <= lastBusinessIndex; index++ {
+			itemPath := indexPath(path, index)
+			if controlKind, transparent := responsesTransparentControl(typed[index]); transparent {
+				b.addControlItem(controlKind, itemPath)
+				continue
+			}
+			switch item := typed[index].(type) {
+			case string:
+				b.addText(item, "user", "input_text", itemPath)
+			case map[string]any:
+				switch {
+				case responsesCurrentUserItemClassification(item) != responsesCurrentUserNone:
+					b.parseResponsesCurrentUserItem(item, itemPath)
+				case responsesAuditableToolItem(item):
+					b.parseResponsesAuditToolItem(item, itemPath)
+				}
+			}
 		}
 	default:
 		b.issue(IssueInvalidShape, path)
 	}
+}
+
+func responsesCurrentAuditStart(items []any, end int) int {
+	if end >= 0 && responsesAuditableToolItem(items[end]) {
+		// A trailing tool continuation is its own audit increment. Do not rewind
+		// into the user turn that caused the tool call: that text was already
+		// admitted on the prior request and can be stale or unrelated.
+		start := end
+		for start > 0 {
+			if _, transparent := responsesTransparentControl(items[start-1]); transparent {
+				start--
+				continue
+			}
+			if !responsesAuditableToolItem(items[start-1]) {
+				break
+			}
+			start--
+		}
+		return start
+	}
+	if end < 0 {
+		return -1
+	}
+	switch responsesCurrentUserItemClassification(items[end]) {
+	case responsesCurrentUserExplicit, responsesCurrentUserMalformedText:
+		return end
+	case responsesCurrentUserImplicit:
+		start := end
+		for start > 0 {
+			if _, transparent := responsesTransparentControl(items[start-1]); transparent {
+				start--
+				continue
+			}
+			if responsesCurrentUserItemClassification(items[start-1]) != responsesCurrentUserImplicit {
+				break
+			}
+			start--
+		}
+		return start
+	default:
+		return -1
+	}
+}
+
+func responsesAuditableToolItem(value any) bool {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	typeName, ok := item["type"].(string)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+		"local_shell_call", "local_shell_call_output", "apply_patch_call", "apply_patch_call_output",
+		"tool_search_call", "tool_search_output", "tool_call", "tool_call_output", "mcp_tool_call", "mcp_tool_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *builder) parseResponsesAuditToolItem(item map[string]any, path string) {
+	before := len(b.doc.Segments)
+	b.parseResponsesAuditToolPayload(item, path)
+	if len(b.doc.Segments) == before && len(b.doc.Issues) == 0 {
+		b.addControlItem("responses_non_text_tool", path)
+	}
+}
+
+func (b *builder) parseResponsesAuditToolPayload(item map[string]any, path string) {
+	typeName, valid := b.requiredStringField(item, "type", path)
+	if !valid {
+		return
+	}
+	typeName = strings.ToLower(strings.TrimSpace(typeName))
+	switch typeName {
+	case "function_call":
+		b.rejectUnknownResponsesItemFields(item, path, "name", "namespace", "arguments", "call_id")
+		b.parseResponsesFunctionNamespace(item, "tool", path)
+		name, valid := b.optionalStringField(item, "name", path)
+		if valid && name != "" {
+			b.addText(name, "tool", typeName, childPath(path, "name"))
+		}
+		arguments, exists := item["arguments"]
+		if !exists || arguments == nil {
+			b.issue(IssueInvalidShape, childPath(path, "arguments"))
+		} else {
+			b.addTextOrJSON(arguments, "tool", typeName, childPath(path, "arguments"))
+		}
+	case "function_call_output":
+		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output")
+		b.parseRequiredResponsesToolPayloads(item, path, "output")
+	case "custom_tool_call":
+		b.rejectUnknownResponsesItemFields(item, path, "name", "namespace", "input", "arguments", "call_id")
+		b.parseResponsesFunctionNamespace(item, "tool", path)
+		if name, exists := item["name"]; exists && name != nil {
+			text, ok := b.requiredStringField(item, "name", path)
+			if ok {
+				b.addText(text, "tool", typeName, childPath(path, "name"))
+			}
+		}
+		b.parseRequiredResponsesToolPayloads(item, path, "input", "arguments")
+	case "custom_tool_call_output", "local_shell_call_output", "apply_patch_call_output", "tool_search_output":
+		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output", "content")
+		b.parseRequiredResponsesToolPayloads(item, path, "output", "content")
+	case "tool_call", "mcp_tool_call":
+		b.rejectUnknownResponsesItemFields(item, path, "function", "name", "namespace", "arguments", "args", "call_id", "server_label")
+		b.parseResponsesFunctionNamespace(item, "tool", path)
+		b.parseFunctionCall(item, "tool", path)
+	case "tool_call_output", "mcp_tool_call_output":
+		b.rejectUnknownResponsesItemFields(item, path, "call_id", "output", "content", "server_label")
+		b.parseRequiredResponsesToolPayloads(item, path, "output", "content")
+	case "local_shell_call", "apply_patch_call", "tool_search_call":
+		b.rejectUnknownResponsesItemFields(item, path,
+			"name", "arguments", "input", "call_id", "output", "content", "summary", "action",
+			"results", "queries", "error", "command", "timeout_ms", "max_output_chars", "metadata", "function", "args", "execution")
+		b.addJSON(stripAuditToolMetadata(item), "tool", typeName, path)
+	default:
+		b.issue(IssueUnknownType, childPath(path, "type"))
+	}
+}
+
+func stripAuditToolMetadata(item map[string]any) map[string]any {
+	result := make(map[string]any, len(item))
+	for key, value := range item {
+		switch key {
+		case "type", "id", "call_id", "status", "phase", "role", "internal_chat_message_metadata_passthrough":
+			continue
+		default:
+			result[key] = value
+		}
+	}
+	return result
 }
 
 func responsesTransparentControl(value any) (string, bool) {
@@ -526,7 +661,7 @@ func (b *builder) parseResponsesItem(item map[string]any, path string) {
 		b.rejectUnknownResponsesItemFields(item, path,
 			"name", "arguments", "input", "call_id", "output", "content", "summary", "action", "pending_safety_checks",
 			"acknowledged_safety_checks", "results", "queries", "server_label", "error", "tools", "approval_request_id",
-			"approve", "reason", "command", "timeout_ms", "max_output_chars", "metadata", "function", "args")
+			"approve", "reason", "command", "timeout_ms", "max_output_chars", "metadata", "function", "args", "execution")
 		b.addJSON(stripOpaqueIdentifiers(item), role, typeName, path)
 	default:
 		b.issue(IssueUnknownType, childPath(path, "type"))

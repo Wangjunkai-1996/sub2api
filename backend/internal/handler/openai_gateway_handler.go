@@ -197,7 +197,15 @@ func openAIStrictContinuationUnavailableDecision() *securityaudit.Decision {
 	}
 }
 
-func openAIStrictContinuationErrorDecision(_ error) *securityaudit.Decision {
+func openAIStrictContinuationErrorDecision(err error) *securityaudit.Decision {
+	if errors.Is(err, service.ErrOpenAIPreviousResponseAccountUnavailable) || errors.Is(err, service.ErrStickySessionNotFound) {
+		return &securityaudit.Decision{
+			Kind:          securityaudit.DecisionBlock,
+			HTTPStatus:    http.StatusForbidden,
+			ErrorCode:     securityaudit.ErrorCodeLineageIncompatible,
+			ClientMessage: "当前会话没有有效的安全审计记录或原账号已不可用，已停止续接；请新建会话后重试",
+		}
+	}
 	return openAIStrictContinuationUnavailableDecision()
 }
 
@@ -1525,6 +1533,14 @@ type openAIWSTurnPricing struct {
 	at time.Time
 }
 
+type openAIWSSecurityAuditTurnState uint8
+
+const (
+	openAIWSSecurityAuditTurnUnknown openAIWSSecurityAuditTurnState = iota
+	openAIWSSecurityAuditTurnAudited
+	openAIWSSecurityAuditTurnImageBypass
+)
+
 func (p *openAIWSTurnPricing) freeze(at time.Time) {
 	p.mu.Lock()
 	p.at = at
@@ -2270,21 +2286,32 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 		var turnAuditMu sync.Mutex
 		turnAuditSummaries := make(map[int]securityaudit.AuditSummary)
+		turnAuditStates := make(map[int]openAIWSSecurityAuditTurnState)
 		turnRequestPayloadHashes := make(map[int]string)
 		if firstTurnSecurityAuditSummary != nil {
 			turnAuditSummaries[1] = firstTurnSecurityAuditSummary.Clone()
+			turnAuditStates[1] = openAIWSSecurityAuditTurnAudited
 		}
 		if securityAuditResponseLineageRequired(firstTurnSecurityAuditSummary) {
 			service.SetOpenAIStrictLineageCommitter(c, func(turn int, result *service.OpenAIForwardResult) error {
 				turnAuditMu.Lock()
 				turnAuditSummary, ok := turnAuditSummaries[turn]
+				turnAuditState := turnAuditStates[turn]
 				turnAuditMu.Unlock()
 
 				var err error
-				if !ok {
+				switch turnAuditState {
+				case openAIWSSecurityAuditTurnAudited:
+					if !ok {
+						err = fmt.Errorf("%w: audit summary is unavailable for websocket turn %d", securityaudit.ErrLineageInvalid, turn)
+					} else {
+						err = h.bindAllowedSecurityAuditResponse(ctx, reqLog, &turnAuditSummary, result)
+					}
+				case openAIWSSecurityAuditTurnImageBypass:
+					// Image turns do not create text lineage. The response still binds
+					// to the current account before its success terminal is released.
+				default:
 					err = fmt.Errorf("%w: audit summary is unavailable for websocket turn %d", securityaudit.ErrLineageInvalid, turn)
-				} else {
-					err = h.bindAllowedSecurityAuditResponse(ctx, reqLog, &turnAuditSummary, result)
 				}
 				if err == nil {
 					err = h.gatewayService.BindStrictWSResponseAccount(ctx, apiKey.GroupID, result.ResponseID, account.ID)
@@ -2359,26 +2386,30 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, model, turnCyberBlockKey)
 					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "session blocked by cyber-security policy", nil)
 				}
-				decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, model, payload, "subsequent_turn")
-				if decision != nil && !decision.AllowNextStage {
-					writeSecurityAuditWSError(ctx, wsConn, decision)
-					return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision), nil)
-				}
-				summary := cloneSecurityAuditSummary(decision)
-				if strictAuditSession && summary == nil {
-					unavailable := &securityaudit.Decision{
-						Kind:          securityaudit.DecisionUnavailable,
-						HTTPStatus:    http.StatusServiceUnavailable,
-						ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
-						ClientMessage: "安全审计暂时不可用，请稍后重试",
+				turnAuditState := openAIWSSecurityAuditTurnUnknown
+				var summary *securityaudit.AuditSummary
+				if strictAuditSession && strictAuditRequestBypassesTextAudit(c, service.ContentModerationProtocolOpenAIResponses, model, payload) {
+					turnAuditState = openAIWSSecurityAuditTurnImageBypass
+				} else {
+					decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, model, payload, "subsequent_turn")
+					if decision != nil && !decision.AllowNextStage {
+						writeSecurityAuditWSError(ctx, wsConn, decision)
+						return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision), nil)
 					}
-					writeSecurityAuditWSError(ctx, wsConn, unavailable)
-					return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(unavailable), securityAuditWSCloseReason(unavailable), nil)
-				}
-				if summary != nil {
-					turnAuditMu.Lock()
-					turnAuditSummaries[turn] = summary.Clone()
-					turnAuditMu.Unlock()
+					summary = cloneSecurityAuditSummary(decision)
+					if strictAuditSession && summary == nil {
+						unavailable := &securityaudit.Decision{
+							Kind:          securityaudit.DecisionUnavailable,
+							HTTPStatus:    http.StatusServiceUnavailable,
+							ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
+							ClientMessage: "安全审计暂时不可用，请稍后重试",
+						}
+						writeSecurityAuditWSError(ctx, wsConn, unavailable)
+						return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(unavailable), securityAuditWSCloseReason(unavailable), nil)
+					}
+					if summary != nil {
+						turnAuditState = openAIWSSecurityAuditTurnAudited
+					}
 				}
 				if strictAuditSession {
 					currentPreviousResponseID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String())
@@ -2404,6 +2435,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					strictContinuationActive.Store(true)
 				}
 				turnAuditMu.Lock()
+				turnAuditStates[turn] = turnAuditState
+				if summary != nil {
+					turnAuditSummaries[turn] = summary.Clone()
+				}
 				turnRequestPayloadHashes[turn] = service.HashUsageRequestPayload(payload)
 				turnAuditMu.Unlock()
 				return nil
@@ -2485,6 +2520,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				turnAuditMu.Lock()
 				turnRequestPayloadHash := turnRequestPayloadHashes[turn]
 				delete(turnAuditSummaries, turn)
+				delete(turnAuditStates, turn)
 				delete(turnRequestPayloadHashes, turn)
 				turnAuditMu.Unlock()
 				turnRequestedModel := reqModel

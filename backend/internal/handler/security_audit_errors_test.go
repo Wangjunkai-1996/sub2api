@@ -148,12 +148,15 @@ func TestPromptGuardWebSocketCloseMappingGolden(t *testing.T) {
 	require.Equal(t, securityaudit.ErrorCodeInvalidResponse, securityAuditWSCloseReason(promptGuardDecision(securityaudit.DecisionInvalid)))
 }
 
-func TestOpenAIStrictContinuationErrorsAreAuditUnavailableAfterCoordinatorAllows(t *testing.T) {
-	for _, err := range []error{
-		service.ErrOpenAIResponseAccountStoreUnavailable,
-		service.ErrOpenAIPreviousResponseAccountUnavailable,
-		errors.New("scheduler unavailable"),
-	} {
+func TestOpenAIStrictContinuationErrorsSeparateInvalidLineageFromInfrastructure(t *testing.T) {
+	invalid := openAIStrictContinuationErrorDecision(service.ErrOpenAIPreviousResponseAccountUnavailable)
+	require.Equal(t, securityaudit.DecisionBlock, invalid.Kind)
+	require.Equal(t, http.StatusForbidden, invalid.HTTPStatus)
+	require.Equal(t, securityaudit.ErrorCodeLineageIncompatible, invalid.ErrorCode)
+	require.Contains(t, invalid.ClientMessage, "新建会话")
+	require.Equal(t, coderws.StatusCode(4403), securityAuditWSCloseStatus(invalid))
+
+	for _, err := range []error{service.ErrOpenAIResponseAccountStoreUnavailable, errors.New("scheduler unavailable")} {
 		decision := openAIStrictContinuationErrorDecision(err)
 		require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
 		require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)

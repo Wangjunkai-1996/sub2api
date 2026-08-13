@@ -172,8 +172,8 @@ func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *test
 			Body: []byte(`{"input":[{"type":"input_text","role":null,"text":"blocked current text"}]}`),
 		})
 
-		require.Equal(t, DecisionInvalid, decision.Kind)
-		require.Equal(t, http.StatusUnprocessableEntity, decision.HTTPStatus)
+		require.Equal(t, DecisionBlock, decision.Kind)
+		require.Equal(t, http.StatusForbidden, decision.HTTPStatus)
 		require.Equal(t, ErrorCodeContextIncomplete, decision.ErrorCode)
 		require.Zero(t, legacy.calls.Load())
 		require.Zero(t, prompt.evaluates.Load())
@@ -365,7 +365,7 @@ func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 		{
 			name: "malformed current text rejected before engines", body: `{"input":[{"type":"input_text","role":null,"text":"blocked current text"}]}`,
 			legacy: &fakeLegacyEngine{strict: true}, prompt: &fakePromptEngine{mode: ModeBlocking, strict: &strict},
-			wantKind: DecisionInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: ErrorCodeContextIncomplete,
+			wantKind: DecisionBlock, wantStatus: http.StatusForbidden, wantCode: ErrorCodeContextIncomplete,
 		},
 		{
 			name: "legacy error is unavailable", body: `{"input":"hello"}`,
@@ -399,7 +399,7 @@ func TestCoordinatorStrictInputAndEngineFailuresAreFailClosed(t *testing.T) {
 	}
 }
 
-func TestCoordinatorStrictCompleteNoCurrentUserTextSkipsAllEngines(t *testing.T) {
+func TestCoordinatorStrictSafeEmptyTurnsSkipAllEngines(t *testing.T) {
 	groupID := int64(12)
 	strict := true
 	tests := []struct {
@@ -410,12 +410,12 @@ func TestCoordinatorStrictCompleteNoCurrentUserTextSkipsAllEngines(t *testing.T)
 		{name: "responses missing input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-test"}`},
 		{name: "responses null input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"model":"gpt-test","input":null}`},
 		{name: "responses empty websocket input", protocol: auditinput.ProtocolOpenAIResponses, body: `{"type":"response.create","model":"gpt-test","input":[]}`},
-		{name: "responses null tail", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical"},null]}`},
-		{name: "responses numeric tail", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"message","role":"user","content":"historical"},42]}`},
-		{name: "responses tool output", protocol: auditinput.ProtocolOpenAIResponses, body: `{"store":false,"input":[{"type":"function_call_output","call_id":"call_1","output":"done"}]}`},
 		{name: "chat missing messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-test"}`},
 		{name: "chat empty messages", protocol: auditinput.ProtocolOpenAIChat, body: `{"model":"gpt-test","messages":[]}`},
 		{name: "chat trailing tool", protocol: auditinput.ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"historical"},{"role":"tool","content":"done"}]}`},
+		{name: "chat trailing assistant", protocol: auditinput.ProtocolOpenAIChat, body: `{"messages":[{"role":"user","content":"historical"},{"role":"assistant","content":"done"}]}`},
+		{name: "responses pure compaction", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"compaction_trigger"}]}`},
+		{name: "responses pure image", protocol: auditinput.ProtocolOpenAIResponses, body: `{"input":[{"type":"input_image","image_url":"opaque"}]}`},
 	}
 
 	for _, test := range tests {
@@ -435,6 +435,224 @@ func TestCoordinatorStrictCompleteNoCurrentUserTextSkipsAllEngines(t *testing.T)
 			require.Zero(t, prompt.evaluates.Load())
 		})
 	}
+}
+
+func TestCoordinatorStrictOpaqueTailBlocksWithoutRewindingHistory(t *testing.T) {
+	groupID := int64(12)
+	strict := true
+	for _, body := range []string{
+		`{"input":[{"type":"message","role":"user","content":"historical"},null]}`,
+		`{"input":[{"type":"message","role":"user","content":"historical"},42]}`,
+		`{"input":[{"type":"message","role":"user","content":"historical"},{"type":"message","role":"assistant","content":"done"}]}`,
+	} {
+		legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
+		prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}}
+		decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+			APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Body: []byte(body),
+		})
+
+		require.Equal(t, DecisionBlock, decision.Kind)
+		require.Equal(t, http.StatusForbidden, decision.HTTPStatus)
+		require.Equal(t, ErrorCodeContextIncomplete, decision.ErrorCode)
+		require.Zero(t, legacy.calls.Load())
+		require.Zero(t, prompt.evaluates.Load())
+	}
+}
+
+func TestCoordinatorStrictResponsesToolOutputRunsAuditors(t *testing.T) {
+	groupID := int64(12)
+	strict := true
+	legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+		require.Equal(t, "dangerous tool output", req.Document.NormalizedText)
+		require.NotContains(t, req.Document.NormalizedText, "historical")
+		return &LegacyDecision{Allowed: true}, nil
+	}}
+	prompt := &fakePromptEngine{mode: ModeBlocking, strict: &strict, decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}}
+	decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses,
+		Body: []byte(`{"store":false,"input":[{"type":"message","role":"user","content":"historical"},{"type":"function_call_output","call_id":"call_1","output":"dangerous tool output"}]}`),
+	})
+
+	require.True(t, decision.AllowNextStage)
+	require.Equal(t, int64(1), legacy.calls.Load())
+	require.Equal(t, int64(1), prompt.evaluates.Load())
+}
+
+func TestCoordinatorStrictProductionShapedCyberToolIncrementBlocksBeforeUpstream(t *testing.T) {
+	groupID := int64(12)
+	strict := true
+	tests := []struct {
+		name string
+		item string
+	}{
+		{
+			name: "function call arguments",
+			item: `{"type":"function_call","name":"synthetic_runner","arguments":"{\"task\":\"synthetic cyber policy marker\"}","call_id":"call_synthetic"}`,
+		},
+		{
+			name: "function call output",
+			item: `{"type":"function_call_output","call_id":"call_synthetic","output":"synthetic cyber policy marker"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+				require.NotNil(t, req.Document)
+				require.True(t, req.Document.Complete, "%+v", req.Document.Issues)
+				require.Contains(t, req.Document.FoldedText, "cyber")
+				require.NotContains(t, req.Document.NormalizedText, "synthetic root instruction marker")
+				require.NotContains(t, req.Document.NormalizedText, "synthetic historical user marker")
+				require.NotContains(t, req.Document.NormalizedText, "synthetic historical assistant marker")
+				require.NotEmpty(t, req.Document.Segments)
+				for _, segment := range req.Document.Segments {
+					require.True(t, strings.HasPrefix(segment.Path, "$.input[2]"), segment.Path)
+				}
+				return &LegacyDecision{Blocked: true, Flagged: true}, nil
+			}}
+			prompt := &fakePromptEngine{
+				mode: ModeBlocking, strict: &strict,
+				decision: &PromptDecision{Kind: DecisionAllow, AllowNextStage: true},
+			}
+			body := []byte(`{
+				"model":"gpt-5.5",
+				"store":false,
+				"instructions":"synthetic root instruction marker",
+				"input":[
+					{"type":"message","role":"user","content":"synthetic historical user marker"},
+					{"type":"message","role":"assistant","content":"synthetic historical assistant marker"},
+					` + tt.item + `
+				]
+			}`)
+
+			decision := NewCoordinator(legacy, prompt).Check(context.Background(), Request{
+				RequestID: "d128b2c4-3875-45b7-823e-fa0b4960053e",
+				APIKeyID:  7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Body: body,
+			})
+
+			require.Equal(t, DecisionBlock, decision.Kind)
+			require.Equal(t, http.StatusForbidden, decision.HTTPStatus)
+			require.Equal(t, ErrorCodePolicyBlocked, decision.ErrorCode)
+			require.False(t, decision.AllowNextStage)
+			require.Nil(t, decision.Audit)
+			require.Equal(t, int64(1), legacy.calls.Load())
+			require.Zero(t, prompt.evaluates.Load())
+		})
+	}
+}
+
+func TestCoordinatorStrictSanitizedProductionRegressionMatrix(t *testing.T) {
+	groupID := int64(12)
+	tests := []struct {
+		name      string
+		requestID string
+		model     string
+		body      string
+		legacy    *LegacyDecision
+		legacyErr error
+		wantKind  DecisionKind
+		wantCode  string
+		wantHTTP  int
+	}{
+		{
+			name: "cyber tool call without name", requestID: "d128b2c4-3875-45b7-823e-fa0b4960053e", model: "gpt-5.5",
+			body:   `{"store":false,"instructions":"sanitized root instruction","input":[{"type":"message","role":"user","content":"sanitized historical user"},{"type":"message","role":"assistant","content":"sanitized historical assistant"},{"type":"function_call","call_id":"call_synthetic","arguments":"{\"task\":\"synthetic cyber policy marker\"}"}]}`,
+			legacy: &LegacyDecision{Blocked: true, Flagged: true}, wantKind: DecisionBlock, wantCode: ErrorCodePolicyBlocked, wantHTTP: http.StatusForbidden,
+		},
+		{
+			name: "illicit current text", requestID: "2e157a35-244d-49cd-baee-db133d18e432", model: "gpt-5.6-terra",
+			body:   `{"input":[{"type":"message","role":"user","content":"synthetic illicit policy marker"}]}`,
+			legacy: &LegacyDecision{Blocked: true, Flagged: true}, wantKind: DecisionBlock, wantCode: ErrorCodePolicyBlocked, wantHTTP: http.StatusForbidden,
+		},
+		{
+			name: "harassment tool output", requestID: "e740da58-d7d7-4369-aec5-4b79f2a106c0", model: "gpt-5.6-sol",
+			body:   `{"store":false,"input":[{"type":"message","role":"user","content":"sanitized history"},{"type":"function_call_output","call_id":"call_synthetic","output":"synthetic harassment policy marker"}]}`,
+			legacy: &LegacyDecision{Blocked: true, Flagged: true}, wantKind: DecisionBlock, wantCode: ErrorCodePolicyBlocked, wantHTTP: http.StatusForbidden,
+		},
+		{
+			name: "violence current text", requestID: "4dcc1742-9191-45b9-a607-8ea73c96b4c9", model: "gpt-5.5",
+			body:   `{"input":"synthetic violence policy marker"}`,
+			legacy: &LegacyDecision{Blocked: true, Flagged: true}, wantKind: DecisionBlock, wantCode: ErrorCodePolicyBlocked, wantHTTP: http.StatusForbidden,
+		},
+		{
+			name: "moderations unavailable", requestID: "sanitized-moderations-429", model: "codex-auto-review",
+			body:      `{"input":"synthetic safe current turn"}`,
+			legacyErr: errors.New("moderations upstream 429"), wantKind: DecisionUnavailable, wantCode: ErrorCodeAuditUnavailable, wantHTTP: http.StatusServiceUnavailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			legacy := &fakeLegacyEngine{strict: true, decision: tt.legacy, err: tt.legacyErr, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+				require.Equal(t, tt.requestID, req.RequestID)
+				require.Equal(t, tt.model, req.Model)
+				require.NotNil(t, req.Document)
+				require.True(t, req.Document.Complete, "%+v", req.Document.Issues)
+				require.NotContains(t, req.Document.NormalizedText, "sanitized historical user")
+				require.NotContains(t, req.Document.NormalizedText, "sanitized historical assistant")
+				return tt.legacy, tt.legacyErr
+			}}
+			decision := NewCoordinator(legacy, &fakePromptEngine{mode: ModeOff}).Check(context.Background(), Request{
+				RequestID: tt.requestID, APIKeyID: 7, GroupID: &groupID,
+				Protocol: auditinput.ProtocolOpenAIResponses, Model: tt.model, Body: []byte(tt.body),
+			})
+
+			require.Equal(t, tt.wantKind, decision.Kind)
+			require.Equal(t, tt.wantCode, decision.ErrorCode)
+			require.Equal(t, tt.wantHTTP, decision.HTTPStatus)
+			require.False(t, decision.AllowNextStage)
+			require.Equal(t, int64(1), legacy.calls.Load())
+		})
+	}
+}
+
+func TestCoordinatorStrictProductionVolumeBoundariesUseCurrentAuditableText(t *testing.T) {
+	groupID := int64(12)
+	models := []string{"gpt-5.5", "gpt-5.5-fast", "gpt-5.6-sol", "gpt-5.6-terra", "codex-auto-review"}
+	for _, model := range models {
+		model := model
+		t.Run(model+" at limit", func(t *testing.T) {
+			legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
+			decision := NewCoordinator(legacy, &fakePromptEngine{mode: ModeOff}).Check(context.Background(), Request{
+				APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Model: model,
+				Body: []byte(fmt.Sprintf(`{"store":false,"instructions":%q,"input":%q}`,
+					strings.Repeat("historical tool definition ", 20_000), strings.Repeat("界", auditinput.MaxAuditTextRunes))),
+			})
+
+			require.True(t, decision.AllowNextStage)
+			require.Equal(t, DecisionAllow, decision.Kind)
+			require.Equal(t, int64(1), legacy.calls.Load())
+		})
+
+		t.Run(model+" over limit", func(t *testing.T) {
+			legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
+			decision := NewCoordinator(legacy, &fakePromptEngine{mode: ModeOff}).Check(context.Background(), Request{
+				APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Model: model,
+				Body: []byte(fmt.Sprintf(`{"store":false,"input":%q}`, strings.Repeat("界", auditinput.MaxAuditTextRunes+1))),
+			})
+
+			require.False(t, decision.AllowNextStage)
+			require.Equal(t, DecisionBlock, decision.Kind)
+			require.Equal(t, http.StatusForbidden, decision.HTTPStatus)
+			require.Equal(t, ErrorCodeAuditInputTooLarge, decision.ErrorCode)
+			require.Zero(t, legacy.calls.Load())
+		})
+	}
+}
+
+func TestCoordinatorStrictAuditTextLimitBlocksAtTwelveThousandPlusOne(t *testing.T) {
+	groupID := int64(12)
+	legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
+	decision := NewCoordinator(legacy, &fakePromptEngine{mode: ModeOff}).Check(context.Background(), Request{
+		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses,
+		Body: []byte(`{"input":"` + strings.Repeat("界", auditinput.MaxAuditTextRunes+1) + `"}`),
+	})
+
+	require.Equal(t, DecisionBlock, decision.Kind)
+	require.Equal(t, http.StatusForbidden, decision.HTTPStatus)
+	require.Equal(t, ErrorCodeAuditInputTooLarge, decision.ErrorCode)
+	require.Contains(t, decision.ClientMessage, "12,000")
+	require.Zero(t, legacy.calls.Load())
 }
 
 func TestCoordinatorStrictAllowExposesStableAuditSummaryOnlyForProtectedGroup(t *testing.T) {
@@ -469,13 +687,9 @@ func TestCoordinatorStrictAllowExposesStableAuditSummaryOnlyForProtectedGroup(t 
 
 func TestCoordinatorStoreFalseBuildsLargeLocalContextWithoutResponseLineage(t *testing.T) {
 	groupID := int64(12)
-	largeInput := strings.Repeat("x", 1024*1024)
+	largeInput := strings.Repeat("x", auditinput.MaxAuditTextRunes+1)
 	store := &fakeLineageStore{}
-	legacy := &fakeLegacyEngine{strict: true, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
-		require.Len(t, []rune(req.AuditContext), len(largeInput))
-		require.Equal(t, largeInput, req.AuditContext)
-		return &LegacyDecision{Allowed: true}, nil
-	}}
+	legacy := &fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}
 	coordinator := NewCoordinator(legacy, &fakePromptEngine{mode: ModeAsync}).SetLineageStore(store)
 	body := []byte(fmt.Sprintf(`{"store":false,"input":%q}`, largeInput))
 
@@ -483,14 +697,13 @@ func TestCoordinatorStoreFalseBuildsLargeLocalContextWithoutResponseLineage(t *t
 		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses, Body: body,
 	})
 
-	require.True(t, decision.AllowNextStage)
-	require.NotNil(t, decision.Audit)
-	require.True(t, decision.Audit.SkipResponseLineage)
-	require.False(t, decision.Audit.ResponseLineageRequired())
-	require.Empty(t, decision.Audit.NormalizedContext)
-	require.Empty(t, decision.Audit.RedactedContext)
-	require.NoError(t, coordinator.BindAllowedResponse(context.Background(), *decision.Audit, "resp_unused"))
-	require.Nil(t, store.bound, "store=false full-history requests must not write lineage")
+	require.False(t, decision.AllowNextStage)
+	require.Equal(t, DecisionBlock, decision.Kind)
+	require.Equal(t, http.StatusForbidden, decision.HTTPStatus)
+	require.Equal(t, ErrorCodeAuditInputTooLarge, decision.ErrorCode)
+	require.Nil(t, decision.Audit)
+	require.Zero(t, legacy.calls.Load())
+	require.Nil(t, store.bound)
 }
 
 func TestResponseLineageSkipRequiresExplicitStoreFalseWithoutParent(t *testing.T) {
@@ -581,8 +794,8 @@ func TestCoordinatorLineageIsResolvedBeforeEnginesAndBoundOnlyFromAllowSummary(t
 		APIKeyID: 7, GroupID: &groupID, Protocol: "openai_responses",
 		Body: []byte(`{"previous_response_id":"missing","input":"child"}`),
 	})
-	require.Equal(t, ErrorCodeContextIncomplete, missingDecision.ErrorCode)
-	require.Equal(t, http.StatusUnprocessableEntity, missingDecision.HTTPStatus)
+	require.Equal(t, ErrorCodeLineageIncompatible, missingDecision.ErrorCode)
+	require.Equal(t, http.StatusForbidden, missingDecision.HTTPStatus)
 }
 
 func TestCoordinatorEmptyContinuationStillRequiresValidLineageBeforeSkippingEngines(t *testing.T) {
@@ -617,9 +830,9 @@ func TestCoordinatorEmptyContinuationStillRequiresValidLineageBeforeSkippingEngi
 	})
 
 	require.False(t, missing.AllowNextStage)
-	require.Equal(t, DecisionInvalid, missing.Kind)
-	require.Equal(t, http.StatusUnprocessableEntity, missing.HTTPStatus)
-	require.Equal(t, ErrorCodeContextIncomplete, missing.ErrorCode)
+	require.Equal(t, DecisionBlock, missing.Kind)
+	require.Equal(t, http.StatusForbidden, missing.HTTPStatus)
+	require.Equal(t, ErrorCodeLineageIncompatible, missing.ErrorCode)
 	require.Zero(t, missingLegacy.calls.Load())
 	require.Zero(t, missingPrompt.evaluates.Load())
 }

@@ -389,7 +389,7 @@ func TestStrictBlockingPromptSnapshotUsesOnlyLatestCurrentUserText(t *testing.T)
 	}
 	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
 	require.NoError(t, err)
-	require.Equal(t, "current part one current part two", snapshot.ScanText)
+	require.Equal(t, "current part one\ncurrent part two", snapshot.ScanText)
 	require.Equal(t, 1, snapshot.MessageCount)
 	require.NotContains(t, snapshot.ScanText, promptAuditPrioritySeparator)
 	for _, omitted := range []string{"redacted parent", "system instruction", "older user", "assistant output", "tool output", "opaque"} {
