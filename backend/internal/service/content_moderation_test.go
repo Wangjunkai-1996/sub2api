@@ -2835,7 +2835,7 @@ func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcu
 	require.Zero(t, imageInputs)
 }
 
-func TestContentModerationCheck_Strict429ConcurrencyFailsClosedWithinOneCallPerRequest(t *testing.T) {
+func TestContentModerationCheck_Strict429ConcurrencyFailsClosedAfterAllKeysFreeze(t *testing.T) {
 	const workers = 32
 	groupID := int64(12)
 	body := strictResponsesBodyWithImages(t, 59)
@@ -2906,8 +2906,7 @@ func TestContentModerationCheck_Strict429ConcurrencyFailsClosedWithinOneCallPerR
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Greater(t, requestCount, 0)
-	require.LessOrEqual(t, requestCount, workers)
+	require.Equal(t, len(cfg.APIKeys), requestCount)
 }
 
 func TestContentModerationCallModeration_400DoesNotFreezeAPIKey(t *testing.T) {
