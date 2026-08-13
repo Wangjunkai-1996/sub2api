@@ -70,6 +70,26 @@ func TestParseResponsesCapturesExplicitStore(t *testing.T) {
 	require.Contains(t, invalid.NormalizedText, "hello")
 }
 
+func TestParseResponsesAcceptsCodexOutputSchemaWithoutWeakeningUnknownFieldChecks(t *testing.T) {
+	body := []byte(`{
+		"codex_output_schema":{"type":"object","properties":{"answer":{"type":"string","description":"include the schema description"}}},
+		"input":"safe current input"
+	}`)
+
+	full := Parse(ProtocolOpenAIResponses, body)
+	require.True(t, full.Complete, "%+v", full.Issues)
+	require.Contains(t, full.NormalizedText, "include the schema description")
+	require.Contains(t, full.NormalizedText, "safe current input")
+
+	strict := ParseForTextAudit(ProtocolOpenAIResponses, body)
+	require.True(t, strict.Complete, "%+v", strict.Issues)
+	require.Equal(t, "safe current input", strict.NormalizedText)
+
+	unknown := ParseForTextAudit(ProtocolOpenAIResponses, []byte(`{"codex_output_schema":{"type":"object"},"input":"safe","future_payload":"hidden"}`))
+	require.False(t, unknown.Complete)
+	require.True(t, unknown.HasIssue(IssueUnknownField), "%+v", unknown.Issues)
+}
+
 func TestParseResponsesIncludesMCPAndGenericToolLoops(t *testing.T) {
 	doc := Parse(ProtocolOpenAIResponses, []byte(`{
 		"previous_response_id":"resp_parent",

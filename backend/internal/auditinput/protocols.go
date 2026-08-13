@@ -51,6 +51,7 @@ func (b *builder) parseResponses(root map[string]any, path string) {
 		b.parseInstruction(root["instructions"], "system", childPath(path, "instructions"))
 		b.parseToolDefinitions(root["tools"], childPath(path, "tools"))
 		b.addJSON(root["text"], "system", "text_config", childPath(path, "text"))
+		b.addJSON(root["codex_output_schema"], "system", "output_schema", childPath(path, "codex_output_schema"))
 	}
 	input, exists := root["input"]
 	if b.ignoreImages && responsesEmptyInput(input, exists) {
@@ -1181,7 +1182,7 @@ var responseRootFields = []string{
 	"max_output_tokens", "max_tool_calls", "metadata", "model", "parallel_tool_calls", "previous_response_id",
 	"prompt", "prompt_cache_key", "reasoning", "safety_identifier", "service_tier", "store", "stream",
 	"stream_options", "temperature", "text", "tool_choice", "tools", "top_logprobs", "top_p", "truncation",
-	"user", "generate", "client_metadata",
+	"user", "generate", "client_metadata", "codex_output_schema",
 }
 
 var chatRootFields = []string{

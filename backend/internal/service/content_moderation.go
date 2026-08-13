@@ -69,7 +69,7 @@ const (
 	maxModerationInputRunes           = 12000
 	maxModerationExcerptRunes         = 240
 	maxStrictModerationAPICalls       = 1
-	defaultStrictModerationMaxRPM     = 0 // strict mode must opt in explicitly
+	defaultStrictModerationMaxRPM     = 0 // zero means unlimited
 
 	defaultContentModerationWorkerCount          = 4
 	maxContentModerationWorkerCount              = 32
@@ -155,7 +155,7 @@ type ContentModerationConfig struct {
 	APIKey    string   `json:"api_key,omitempty"`
 	APIKeys   []string `json:"api_keys,omitempty"`
 	TimeoutMS int      `json:"timeout_ms"`
-	// MaxRPM is required for strict audit. Zero deliberately means disabled.
+	// MaxRPM limits strict audit dispatches per minute. Zero means unlimited.
 	MaxRPM               int                          `json:"max_rpm"`
 	SampleRate           int                          `json:"sample_rate"`
 	AllGroups            bool                         `json:"all_groups"`
