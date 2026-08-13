@@ -44,6 +44,9 @@ const (
 	PlatformAntigravity = domain.PlatformAntigravity
 	PlatformGrok        = domain.PlatformGrok
 	PlatformComposite   = domain.PlatformComposite
+	// PlatformKiro is retained for unsupported-platform threshold tests and legacy
+	// account rows. Scheduling-threshold evaluation never pauses kiro accounts.
+	PlatformKiro = "kiro"
 )
 
 // AllowedQuotaPlatforms 是允许设置 user × platform quota 的平台列表（单一权威来源）。
@@ -54,6 +57,14 @@ var AllowedQuotaPlatforms = []string{
 	PlatformOpenAI,
 	PlatformGemini,
 	PlatformAntigravity,
+	PlatformGrok,
+}
+
+// AllowedSchedulingThresholdPlatforms 是允许设置账号自动停调阈值的平台列表。
+// 仅 openai / anthropic / grok 有原生用量窗口可供评估；其他平台写入阈值无效果。
+var AllowedSchedulingThresholdPlatforms = []string{
+	PlatformOpenAI,
+	PlatformAnthropic,
 	PlatformGrok,
 }
 
@@ -131,22 +142,23 @@ const (
 	SettingKeyRegistrationEnabled                        = "registration_enabled"                // 是否开放注册
 	SettingKeyEmailVerifyEnabled                         = "email_verify_enabled"                // 是否开启邮件验证
 	SettingKeyRegistrationEmailSuffixWhitelist           = "registration_email_suffix_whitelist" // 注册邮箱后缀白名单（JSON 数组）
-	SettingKeyPromoCodeEnabled                           = "promo_code_enabled"                  // 是否启用优惠码功能
-	SettingKeyPasswordResetEnabled                       = "password_reset_enabled"              // 是否启用忘记密码功能（需要先开启邮件验证）
-	SettingKeyFrontendURL                                = "frontend_url"                        // 前端基础URL，用于生成邮件中的重置密码链接
-	SettingKeyInvitationCodeEnabled                      = "invitation_code_enabled"             // 是否启用邀请码注册
-	SettingKeyAffiliateEnabled                           = "affiliate_enabled"                   // 邀请返利功能总开关
-	SettingKeyAffiliateRebateRate                        = "affiliate_rebate_rate"               // 邀请返利比例（百分比，0-100）
-	SettingKeyAffiliateRebateFreezeHours                 = "affiliate_rebate_freeze_hours"       // 返利冻结期（小时，0=不冻结）
-	SettingKeyAffiliateRebateDurationDays                = "affiliate_rebate_duration_days"      // 返利有效期（天，0=永久）
-	SettingKeyAffiliateRebatePerInviteeCap               = "affiliate_rebate_per_invitee_cap"    // 单人返利上限（0=无上限）
-	SettingKeyAffiliateAdminRechargeEnabled              = "affiliate_admin_recharge_enabled"    // 管理员充值是否产生返利
-	SettingKeyRiskControlEnabled                         = "risk_control_enabled"                // 是否启用风控中心入口与审计链路
-	SettingKeyContentModerationConfig                    = "content_moderation_config"           // 内容审计配置（JSON）
-	SettingKeyCyberSessionBlockEnabled                   = "cyber_session_block_enabled"         // cyber 命中后会话级自动屏蔽总开关(默认关)
-	SettingKeyCyberSessionBlockTTLSeconds                = "cyber_session_block_ttl_seconds"     // 会话屏蔽 TTL 秒数(默认 3600)
-	SettingKeyCyberSessionBlockAllGroups                 = "cyber_session_block_all_groups"      // 是否对全部 API Key 分组执行本地会话屏蔽(默认 true)
-	SettingKeyCyberSessionBlockGroupIDs                  = "cyber_session_block_group_ids"       // 指定分组模式下的分组 ID（JSON 数组）
+	SettingKeyRegistrationEmailDomainQuotaEnabled        = "registration_email_domain_quota_enabled"
+	SettingKeyPromoCodeEnabled                           = "promo_code_enabled"               // 是否启用优惠码功能
+	SettingKeyPasswordResetEnabled                       = "password_reset_enabled"           // 是否启用忘记密码功能（需要先开启邮件验证）
+	SettingKeyFrontendURL                                = "frontend_url"                     // 前端基础URL，用于生成邮件中的重置密码链接
+	SettingKeyInvitationCodeEnabled                      = "invitation_code_enabled"          // 是否启用邀请码注册
+	SettingKeyAffiliateEnabled                           = "affiliate_enabled"                // 邀请返利功能总开关
+	SettingKeyAffiliateRebateRate                        = "affiliate_rebate_rate"            // 邀请返利比例（百分比，0-100）
+	SettingKeyAffiliateRebateFreezeHours                 = "affiliate_rebate_freeze_hours"    // 返利冻结期（小时，0=不冻结）
+	SettingKeyAffiliateRebateDurationDays                = "affiliate_rebate_duration_days"   // 返利有效期（天，0=永久）
+	SettingKeyAffiliateRebatePerInviteeCap               = "affiliate_rebate_per_invitee_cap" // 单人返利上限（0=无上限）
+	SettingKeyAffiliateAdminRechargeEnabled              = "affiliate_admin_recharge_enabled" // 管理员充值是否产生返利
+	SettingKeyRiskControlEnabled                         = "risk_control_enabled"             // 是否启用风控中心入口与审计链路
+	SettingKeyContentModerationConfig                    = "content_moderation_config"        // 内容审计配置（JSON）
+	SettingKeyCyberSessionBlockEnabled                   = "cyber_session_block_enabled"      // cyber 命中后会话级自动屏蔽总开关(默认关)
+	SettingKeyCyberSessionBlockTTLSeconds                = "cyber_session_block_ttl_seconds"  // 会话屏蔽 TTL 秒数(默认 3600)
+	SettingKeyCyberSessionBlockAllGroups                 = "cyber_session_block_all_groups"   // 是否对全部 API Key 分组执行本地会话屏蔽(默认 true)
+	SettingKeyCyberSessionBlockGroupIDs                  = "cyber_session_block_group_ids"    // 指定分组模式下的分组 ID（JSON 数组）
 	SettingKeyOpenAICyberAccountCooldownEnabled          = "openai_cyber_account_cooldown_enabled"
 	SettingKeyOpenAICyberAccountCooldownWindowSeconds    = "openai_cyber_account_cooldown_window_seconds"
 	SettingKeyOpenAICyberAccountCooldownFirstSeconds     = "openai_cyber_account_cooldown_first_seconds"
@@ -399,9 +411,36 @@ const (
 	// When false: runner skips scheduling and user-facing endpoints return an empty list.
 	SettingKeyChannelMonitorEnabled = "channel_monitor_enabled"
 
+	// SettingKeyChannelMonitorMode selects exclusive implementation:
+	// "v1" active probes, "v2" passive aggregation. Default "v1" (opt-in to v2).
+	SettingKeyChannelMonitorMode = "channel_monitor_mode"
+
+	// ChannelMonitorModeV1/V2 are the only accepted mode values.
+	ChannelMonitorModeV1 = "v1"
+	ChannelMonitorModeV2 = "v2"
+
 	// SettingKeyChannelMonitorDefaultIntervalSeconds controls the default interval (seconds)
 	// pre-filled when creating a new channel monitor from the admin UI. Range: [15, 3600].
 	SettingKeyChannelMonitorDefaultIntervalSeconds = "channel_monitor_default_interval_seconds"
+
+	// SettingKeyChannelMonitorHideThroughput hides RPM/TPM (and similar absolute
+	// throughput rates) from non-admin user-facing monitor APIs and UI, so users
+	// cannot reverse-estimate fleet volume from rates × window length.
+	// Default false (show rates). Admin endpoints always keep full metrics.
+	SettingKeyChannelMonitorHideThroughput = "channel_monitor_hide_throughput"
+
+	// SettingKeyGrokDefaultTextModel is the fallback Grok text model for empty
+	// request models and built-in Grok aliases (e.g. "grok" → this id). Default grok-4.5.
+	SettingKeyGrokDefaultTextModel = "grok_default_text_model"
+
+	// SettingKeyGrokCrossClientModelMapEnabled, when true, includes gpt-*/codex-*/o*/claude-*
+	// wildcards in the default Grok account model_mapping so foreign client model names
+	// can reach Grok groups. Default false (no silent cross-vendor rewrite).
+	SettingKeyGrokCrossClientModelMapEnabled = "grok_cross_client_model_map_enabled"
+
+	// SettingKeyGrokDefaultBaseURLMode controls the default text upstream for
+	// Grok accounts without an explicit credentials.base_url.
+	SettingKeyGrokDefaultBaseURLMode = "grok_default_base_url_mode"
 
 	// SettingKeyAvailableChannelsEnabled is a DB-backed soft switch for the "Available Channels"
 	// user-facing aggregate view. When false: user endpoint returns an empty list and the
@@ -581,6 +620,10 @@ const (
 // SettingKeyDefaultPlatformQuotas —— 系统全局：每用户 × 平台日/周/月 USD 上限（JSON）。
 // 值为 map[platform]{daily,weekly,monthly}，null/缺省 = 不限制；0 = 禁用；>0 = USD 上限。
 const SettingKeyDefaultPlatformQuotas = "default_platform_quotas"
+
+// SettingKeyAccountSchedulingThresholds —— 系统全局：按平台自动停调阈值（JSON map）。
+// 值为 map[platform]percent，1..100；100 = 禁用该平台自动停调。
+const SettingKeyAccountSchedulingThresholds = "account_scheduling_thresholds"
 
 // SettingKeyAuthSourcePlatformQuotas 返回某 auth source 的 platform quota JSON key。
 // 形如 auth_source_default_{source}_platform_quotas
