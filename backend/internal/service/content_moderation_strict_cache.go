@@ -307,12 +307,10 @@ func (l *strictModerationPoolLease) recordResult(resultErr error) {
 	var apiErr *moderationAPIError
 	is429 := errors.As(resultErr, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests
 	if is429 {
-		cooldown := apiErr.retryAfterDuration
-		if cooldown <= 0 {
-			cooldown = strictModerationPoolCooldown
+		if l.probe {
+			pool.circuit = strictModerationCircuitClosed
+			pool.openUntil = time.Time{}
 		}
-		pool.circuit = strictModerationCircuitOpen
-		pool.openUntil = now.Add(cooldown)
 	} else if l.probe {
 		if resultErr == nil {
 			pool.circuit = strictModerationCircuitClosed

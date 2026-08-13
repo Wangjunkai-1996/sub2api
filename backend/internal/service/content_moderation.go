@@ -68,7 +68,6 @@ const (
 	maxContentModerationTimeoutMS     = 30000
 	maxModerationInputRunes           = 12000
 	maxModerationExcerptRunes         = 240
-	maxStrictModerationAPICalls       = 1
 	defaultStrictModerationMaxRPM     = 0 // zero means unlimited
 
 	defaultContentModerationWorkerCount          = 4
@@ -2001,10 +2000,14 @@ type strictModerationKeyState struct {
 }
 
 func newStrictModerationKeyState(cfg *ContentModerationConfig, inputs ...ContentModerationCheckInput) *strictModerationKeyState {
+	maxKeys := 0
+	if cfg != nil {
+		maxKeys = len(cfg.apiKeys())
+	}
 	state := &strictModerationKeyState{
-		selectedKeys: make(map[string]struct{}, 1),
-		maxKeys:      1,
-		maxCalls:     maxStrictModerationAPICalls,
+		selectedKeys: make(map[string]struct{}, maxKeys),
+		maxKeys:      maxKeys,
+		maxCalls:     maxKeys,
 	}
 	if len(inputs) > 0 {
 		state.clientAPIKeyID = inputs[0].APIKeyID
@@ -2060,31 +2063,42 @@ func (s *ContentModerationService) callModerationStrictBatch(ctx context.Context
 			return results, nil
 		}
 	}
-	lease, err := s.acquireStrictModerationPool(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	defer lease.release()
-	if cacheable {
-		if results, ok := cache.get(cacheKey); ok {
-			state.cacheHit = true
-			state.shared = true
+	var lastRateLimitErr error
+	for {
+		lease, err := s.acquireStrictModerationPool(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if cacheable {
+			if results, ok := cache.get(cacheKey); ok {
+				state.cacheHit = true
+				state.shared = true
+				lease.release()
+				return results, nil
+			}
+		}
+		results, err := s.callModerationStrictBatchUncached(ctx, cfg, batch, state, lease, trackKeyLoad...)
+		lease.release()
+		if err == nil {
+			if cacheable {
+				cache.put(cacheKey, results)
+			}
 			return results, nil
 		}
+		var apiErr *moderationAPIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+			return nil, err
+		}
+		lastRateLimitErr = err
+		if _, ok := s.nextStrictModerationAPIKey(cfg, state); !ok {
+			return nil, lastRateLimitErr
+		}
 	}
-	results, err := s.callModerationStrictBatchUncached(ctx, cfg, batch, state, lease, trackKeyLoad...)
-	if err == nil && cacheable {
-		cache.put(cacheKey, results)
-	}
-	return results, err
 }
 
 func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context.Context, cfg *ContentModerationConfig, batch strictModerationBatch, state *strictModerationKeyState, lease *strictModerationPoolLease, trackKeyLoad ...bool) ([]moderationAPIResult, error) {
 	if state == nil {
 		state = newStrictModerationKeyState(cfg)
-	}
-	if state.maxCalls <= 0 {
-		state.maxCalls = maxStrictModerationAPICalls
 	}
 	if batch.expectedResults <= 0 {
 		return nil, errors.New("strict moderation batch has no expected results")
@@ -2144,6 +2158,12 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 func (s *ContentModerationService) callModerationStrictBatches(ctx context.Context, cfg *ContentModerationConfig, batches []strictModerationBatch, state *strictModerationKeyState, trackKeyLoad ...bool) (*moderationAPIResult, error) {
 	if len(batches) == 0 {
 		return nil, errors.New("strict moderation has no batches")
+	}
+	if state == nil {
+		state = newStrictModerationKeyState(cfg)
+	}
+	if state.maxKeys > 0 {
+		state.maxCalls = len(batches) + state.maxKeys - 1
 	}
 	aggregate := &moderationAPIResult{
 		CategoryScores: make(map[string]float64, len(contentModerationCategoryOrder)),
