@@ -101,17 +101,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	if policyModel == "" {
 		policyModel = reqModel
 	}
-	if IsOpenAIStrictAuditRequest(c) {
-		updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, policyModel, body)
-		if policyErr != nil {
-			var blocked *OpenAIFastBlockedError
-			if errors.As(policyErr, &blocked) {
-				writeOpenAIFastPolicyBlockedResponse(c, blocked)
-			}
-			return nil, policyErr
+	updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, policyModel, body)
+	if policyErr != nil {
+		var blocked *OpenAIFastBlockedError
+		if errors.As(policyErr, &blocked) {
+			writeOpenAIFastPolicyBlockedResponse(c, blocked)
 		}
-		body = updatedBody
+		return nil, policyErr
 	}
+	body = updatedBody
 
 	apiKey := getAPIKeyFromContext(c)
 	// 同一 attempt 的最终 model/body 只判定一次，权限检查与后续图片状态设置共用该结果。

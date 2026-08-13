@@ -68,7 +68,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	// 预取一次 OpenAI Fast Policy settings，绑定到 ctx，让该 WS session
 	// 内所有帧的 evaluateOpenAIFastPolicy 调用复用同一份快照，避免每帧
 	// 进入 DB / settingRepo。Trade-off 见 withOpenAIFastPolicyContext 注释。
-	if hooks != nil && hooks.StrictAudit && s.settingService != nil {
+	if s.settingService != nil {
 		if settings, err := s.settingService.GetOpenAIFastPolicySettings(ctx); err == nil && settings != nil {
 			ctx = withOpenAIFastPolicyContext(ctx, settings)
 		}
@@ -224,7 +224,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				nil,
 			)
 		}
-		if hooks != nil && hooks.StrictAudit && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
+		if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
 			if capped, changed := ApplyOpenAIReasoningEffortPolicy(normalized, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
 				normalized = capped
 			}
@@ -374,12 +374,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// follow-up response.create frames may omit it and then reuse
 		// ingressSessionOriginalModel. We always write a concrete upstream model
 		// before evaluating policy, so whitelist / filter behavior remains stable.
-		policyApplied := normalized
-		var blocked *OpenAIFastBlockedError
-		var policyErr error
-		if hooks != nil && hooks.StrictAudit {
-			policyApplied, blocked, policyErr = s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, upstreamModel, normalized)
-		}
+		policyApplied, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, upstreamModel, normalized)
 		if policyErr != nil {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", policyErr)
 		}

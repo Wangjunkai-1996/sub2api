@@ -72,15 +72,13 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	if err != nil {
 		return nil, fmt.Errorf("marshal chat completions fallback request: %w", err)
 	}
-	if IsOpenAIStrictAuditRequest(c) {
-		chatBody, err = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
-		if err != nil {
-			var blocked *OpenAIFastBlockedError
-			if errors.As(err, &blocked) {
-				writeOpenAIFastPolicyBlockedResponse(c, blocked)
-			}
-			return nil, err
+	chatBody, err = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
+	if err != nil {
+		var blocked *OpenAIFastBlockedError
+		if errors.As(err, &blocked) {
+			writeOpenAIFastPolicyBlockedResponse(c, blocked)
 		}
+		return nil, err
 	}
 	if serviceTier == nil {
 		serviceTier = extractOpenAIServiceTierFromBody(chatBody)

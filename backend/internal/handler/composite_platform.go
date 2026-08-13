@@ -73,9 +73,6 @@ func openAIReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.APIKe
 }
 
 func applyOpenAIReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.APIKey, body []byte) ([]byte, bool) {
-	if !service.IsOpenAIStrictAuditRequest(c) {
-		return body, false
-	}
 	maxEffort, mappings, ok := openAIReasoningEffortPolicyForRequest(c, apiKey)
 	if !ok {
 		return body, false
@@ -85,9 +82,6 @@ func applyOpenAIReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.
 
 func bindOpenAIReasoningEffortPolicyForMessagesRequest(c *gin.Context, apiKey *service.APIKey, body []byte) {
 	if c == nil || c.Request == nil {
-		return
-	}
-	if !service.IsOpenAIStrictAuditRequest(c) {
 		return
 	}
 	// The Messages bridge synthesizes a default OpenAI effort when

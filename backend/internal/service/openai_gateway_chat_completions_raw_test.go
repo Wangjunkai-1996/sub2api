@@ -80,20 +80,19 @@ func TestBuildOpenAIResponsesURL_ProbeURL(t *testing.T) {
 	}
 }
 
-func TestForwardAsRawChatCompletions_MarkedProForcesStreamUsageWithoutModelPrefixGate(t *testing.T) {
+func TestForwardAsRawChatCompletions_ForcesStreamUsageUpstreamAndPassesUsageDownstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	body := []byte(`{"model":"pro-model-alias","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":true}`)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	MarkOpenAIStrictAuditRequest(c)
 
 	upstreamBody := strings.Join([]string{
-		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"pro-model-alias","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
 		"",
-		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"pro-model-alias","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":3}}}`,
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":3}}}`,
 		"",
 		"data: [DONE]",
 		"",
@@ -124,7 +123,7 @@ func TestForwardAsRawChatCompletions_MarkedProForcesStreamUsageWithoutModelPrefi
 	require.Contains(t, rec.Body.String(), "data: [DONE]")
 }
 
-func TestForwardAsRawChatCompletions_UnmarkedGPTSkipsStrictPolicyRewrite(t *testing.T) {
+func TestForwardAsRawChatCompletions_UnmarkedRequestStillAppliesFastPolicy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false,"prompt_cache_key":"client-cache","service_tier":"fast"}`)
@@ -143,9 +142,8 @@ func TestForwardAsRawChatCompletions_UnmarkedGPTSkipsStrictPolicyRewrite(t *test
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	require.JSONEq(t, string(body), string(upstream.lastBody))
 	require.Equal(t, "client-cache", gjson.GetBytes(upstream.lastBody, "prompt_cache_key").String())
-	require.Equal(t, "fast", gjson.GetBytes(upstream.lastBody, "service_tier").String())
+	require.Equal(t, OpenAIFastTierPriority, gjson.GetBytes(upstream.lastBody, "service_tier").String())
 }
 
 func TestForwardAsChatCompletions_OpenAICompatibleGrokRawMissingUsageFailsBeforeWrite(t *testing.T) {
@@ -641,7 +639,6 @@ func TestForwardAsRawChatCompletions_ClientDisconnectDrainsUsage(t *testing.T) {
 	c.Writer = &openAIChatFailingWriter{ResponseWriter: c.Writer, failAfter: 0}
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	MarkOpenAIStrictAuditRequest(c)
 
 	upstreamBody := strings.Join([]string{
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"}}]}`,

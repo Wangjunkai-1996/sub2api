@@ -570,18 +570,16 @@ func (s *OpenAIGatewayService) forwardGrokChatCompletionsViaResponses(
 		return nil, fmt.Errorf("apply grok responses bridge function-tool cache route: %w", err)
 	}
 
-	if IsOpenAIStrictAuditRequest(c) {
-		updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, responsesBody)
-		if policyErr != nil {
-			var blocked *OpenAIFastBlockedError
-			if errors.As(policyErr, &blocked) {
-				MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
-				writeChatCompletionsError(c, http.StatusForbidden, "permission_error", blocked.Message)
-			}
-			return nil, policyErr
+	updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, responsesBody)
+	if policyErr != nil {
+		var blocked *OpenAIFastBlockedError
+		if errors.As(policyErr, &blocked) {
+			MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
+			writeChatCompletionsError(c, http.StatusForbidden, "permission_error", blocked.Message)
 		}
-		responsesBody = updatedBody
+		return nil, policyErr
 	}
+	responsesBody = updatedBody
 
 	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {

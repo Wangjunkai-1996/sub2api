@@ -115,7 +115,6 @@ func TestForwardAsAnthropic_ForceChatCompletionsPreservesFinalModelReasoningEffo
 			ctx := context.Background()
 			if tt.maxPolicy != "" {
 				ctx = WithOpenAIReasoningEffortPolicy(ctx, tt.maxPolicy, nil)
-				MarkOpenAIStrictAuditRequest(c)
 			}
 			result, err := svc.ForwardAsAnthropic(ctx, c, account, []byte(body), "", "")
 			require.NoError(t, err)
@@ -464,7 +463,6 @@ func TestForwardAsAnthropic_ResponsesSupportedAccountStillUsesResponsesEndpoint(
 	}
 
 	ctx := WithOpenAIReasoningEffortPolicy(context.Background(), "medium", nil)
-	MarkOpenAIStrictAuditRequest(c)
 	result, err := svc.ForwardAsAnthropic(ctx, c, account, body, "", "")
 	require.NoError(t, err)
 	require.NotNil(t, result)
