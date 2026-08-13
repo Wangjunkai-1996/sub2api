@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -21,12 +22,13 @@ var errOpenAICyberPolicyForwarded = errors.New("openai cyber_policy forwarded to
 
 // CyberPolicyMark 记录一次 cyber_policy 硬阻断的上游证据。
 type CyberPolicyMark struct {
-	Code           string // 固定 "cyber_policy"
-	Message        string // 上游 error.message
-	Body           string // 上游 response.failed / 400 原始 body（已截断；未脱敏，ops_error 落库由 sanitizeErrorBodyForStorage、风控日志由 redactContentModerationSecrets 统一脱敏）
-	UpstreamStatus int    // 上游 HTTP 状态（流式=200，非流式=400）
-	UpstreamInTok  int    // 上游已报 input tokens（如有）
-	UpstreamOutTok int    // 上游已报 output tokens（如有）
+	Code           string    // 固定 "cyber_policy"
+	Message        string    // 上游 error.message
+	Body           string    // 上游 response.failed / 400 原始 body（已截断；未脱敏，ops_error 落库由 sanitizeErrorBodyForStorage、风控日志由 redactContentModerationSecrets 统一脱敏）
+	UpstreamStatus int       // 上游 HTTP 状态（流式=200，非流式=400）
+	UpstreamInTok  int       // 上游已报 input tokens（如有）
+	UpstreamOutTok int       // 上游已报 output tokens（如有）
+	ObservedAt     time.Time // 首次识别该真实上游事件的时间，用于生成稳定的事件指纹
 }
 
 // MarkOpsCyberPolicy 记录 cyber 标记；首个写入生效，后续忽略（同一 turn 只记一次）。
@@ -41,6 +43,9 @@ func MarkOpsCyberPolicy(c *gin.Context, mark CyberPolicyMark) {
 	mark.Code = "cyber_policy"
 	mark.Message = strings.TrimSpace(mark.Message)
 	mark.Body = strings.TrimSpace(mark.Body)
+	if mark.ObservedAt.IsZero() {
+		mark.ObservedAt = time.Now().UTC()
+	}
 	c.Set(opsCyberPolicyKey, &mark)
 }
 

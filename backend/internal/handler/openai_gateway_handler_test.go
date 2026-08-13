@@ -18,6 +18,7 @@ import (
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
@@ -957,16 +958,25 @@ func TestOpenAIResponsesWebSocket_IngressCapacityRejected(t *testing.T) {
 	defer wsServer.Close()
 
 	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
-	clientConn, response, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http")+"/openai/v1/responses", nil)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http")+"/openai/v1/responses", nil)
 	cancelDial()
-	require.Error(t, err)
-	require.Nil(t, clientConn)
-	require.NotNil(t, response)
-	require.Equal(t, http.StatusTooManyRequests, response.StatusCode)
-	_ = response.Body.Close()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	require.NoError(t, clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","input":"safe"}`)))
+	cancelWrite()
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = clientConn.Read(readCtx)
+	cancelRead()
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
+	require.Equal(t, int32(1), atomic.LoadInt32(&cache.acquireIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireUserCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireAccountCalled))
 }
 
-func TestOpenAIResponsesWebSocket_IngressLeaseBackendUnavailableBeforeUpgrade(t *testing.T) {
+func TestOpenAIResponsesWebSocket_IngressLeaseBackendUnavailableAfterFirstTurnAudit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cache := &concurrencyCacheMock{
 		acquireIngressLeaseFn: func(context.Context, int64, int, string) (bool, error) {
@@ -980,13 +990,22 @@ func TestOpenAIResponsesWebSocket_IngressLeaseBackendUnavailableBeforeUpgrade(t 
 	defer wsServer.Close()
 
 	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
-	clientConn, response, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http")+"/openai/v1/responses", nil)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http")+"/openai/v1/responses", nil)
 	cancelDial()
-	require.Error(t, err)
-	require.Nil(t, clientConn)
-	require.NotNil(t, response)
-	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
-	_ = response.Body.Close()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	require.NoError(t, clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","input":"safe"}`)))
+	cancelWrite()
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = clientConn.Read(readCtx)
+	cancelRead()
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
+	require.Equal(t, int32(1), atomic.LoadInt32(&cache.acquireIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireUserCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireAccountCalled))
 }
 
 func TestOpenAIResponsesWebSocket_FirstMessageTimeoutUsesConfig(t *testing.T) {
@@ -1023,7 +1042,7 @@ func TestOpenAIResponsesWebSocket_FirstMessageTimeoutUsesConfig(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestOpenAIResponsesWebSocket_IngressLeaseReleasedOnEarlyReturn(t *testing.T) {
+func TestOpenAIResponsesWebSocket_InvalidFirstMessageDoesNotAcquireIngressLease(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cache := &concurrencyCacheMock{
 		acquireIngressLeaseFn: func(context.Context, int64, int, string) (bool, error) {
@@ -1053,12 +1072,13 @@ func TestOpenAIResponsesWebSocket_IngressLeaseReleasedOnEarlyReturn(t *testing.T
 	var closeErr coderws.CloseError
 	require.ErrorAs(t, err, &closeErr)
 	require.Equal(t, coderws.StatusPolicyViolation, closeErr.Code)
-	require.Eventually(t, func() bool {
-		return atomic.LoadInt32(&cache.releaseIngressCalled) == 1
-	}, time.Second, 10*time.Millisecond)
+	require.Zero(t, atomic.LoadInt32(&cache.acquireIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.releaseIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireUserCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.acquireAccountCalled))
 }
 
-func TestOpenAIResponsesWebSocket_IngressLeaseReleasedWhenUpgradeFails(t *testing.T) {
+func TestOpenAIResponsesWebSocket_UpgradeFailureDoesNotAcquireIngressLease(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cache := &concurrencyCacheMock{
 		acquireIngressLeaseFn: func(context.Context, int64, int, string) (bool, error) {
@@ -1080,9 +1100,8 @@ func TestOpenAIResponsesWebSocket_IngressLeaseReleasedWhenUpgradeFails(t *testin
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.NotEqual(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	require.Eventually(t, func() bool {
-		return atomic.LoadInt32(&cache.releaseIngressCalled) == 1
-	}, time.Second, 10*time.Millisecond)
+	require.Zero(t, atomic.LoadInt32(&cache.acquireIngressCalled))
+	require.Zero(t, atomic.LoadInt32(&cache.releaseIngressCalled))
 }
 
 func TestOpenAIResponsesWebSocket_RejectsMessageIDAsPreviousResponseID(t *testing.T) {
@@ -1260,7 +1279,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 
 	moderationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/moderations", r.URL.Path)
-		_, _ = w.Write([]byte(`{"results":[{"category_scores":{"sexual":0.9}}]}`))
+		_, _ = w.Write([]byte(`{"results":[{"flagged":true,"category_scores":{"harassment":0.01,"harassment/threatening":0.01,"hate":0.01,"hate/threatening":0.01,"illicit":0.01,"illicit/violent":0.01,"self-harm":0.01,"self-harm/intent":0.01,"self-harm/instructions":0.01,"sexual":0.9,"sexual/minors":0.01,"violence":0.01,"violence/graphic":0.01}}]}`))
 	}))
 	defer moderationServer.Close()
 
@@ -1270,6 +1289,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 		BaseURL:      moderationServer.URL,
 		Model:        "omni-moderation-latest",
 		APIKeys:      []string{"sk-test"},
+		MaxRPM:       100000,
 		SampleRate:   100,
 		AllGroups:    true,
 		BlockMessage: "内容审计测试阻断",
@@ -1312,6 +1332,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 		apiKeyService:            &service.APIKeyService{},
 		contentModerationService: moderationSvc,
 		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(&concurrencyCacheMock{}), SSEPingFormatNone, time.Second),
+		securityAuditCoordinator: securityaudit.NewCoordinator(securityaudit.NewLegacyModerationAdapter(moderationSvc), nil),
 	}
 	wsServer := newOpenAIWSHandlerTestServer(t, h, middleware.AuthSubject{UserID: 1, Concurrency: 1})
 	defer wsServer.Close()
@@ -1337,7 +1358,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 	_, payload, readErr := clientConn.Read(readCtx)
 	cancelRead()
 	if readErr == nil {
-		require.Contains(t, string(payload), "content_policy_violation")
+		require.Contains(t, string(payload), "request_policy_blocked")
 		require.Contains(t, string(payload), "内容审计测试阻断")
 	} else {
 		var closeErr coderws.CloseError
@@ -1350,7 +1371,7 @@ func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T
 		logs = repo.logSnapshot()
 		return len(logs) == 1
 	}, time.Second, 10*time.Millisecond)
-	require.True(t, logs[0].Flagged)
+	require.False(t, logs[0].Flagged)
 	require.Equal(t, service.ContentModerationActionBlock, logs[0].Action)
 	require.Equal(t, "bad prompt", logs[0].InputExcerpt)
 }
@@ -1604,6 +1625,15 @@ func TestShouldReportOpenAIWSProxyAccountFailure(t *testing.T) {
 		require.Equal(t, "model switch requires reconnect", closeErr.Reason())
 	})
 
+	t.Run("strict passthrough policy rejection does not penalize account", func(t *testing.T) {
+		err := service.NewOpenAIWSClientCloseError(
+			coderws.StatusTryAgainLater,
+			"strict security audit is unavailable for websocket passthrough mode",
+			service.ErrOpenAIWSStrictAuditPassthroughUnsupported,
+		)
+		require.False(t, shouldReportOpenAIWSProxyAccountFailure(fmt.Errorf("wrapped local rejection: %w", err)))
+	})
+
 	t.Run("upstream policy violation still penalizes account", func(t *testing.T) {
 		err := service.NewOpenAIWSClientCloseError(
 			coderws.StatusPolicyViolation,
@@ -1739,10 +1769,11 @@ func newOpenAIHandlerForPreviousResponseIDValidation(t *testing.T, cache *concur
 		}
 	}
 	return &OpenAIGatewayHandler{
-		gatewayService:      &service.OpenAIGatewayService{},
-		billingCacheService: &service.BillingCacheService{},
-		apiKeyService:       &service.APIKeyService{},
-		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		gatewayService:           &service.OpenAIGatewayService{},
+		billingCacheService:      &service.BillingCacheService{},
+		apiKeyService:            &service.APIKeyService{},
+		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, nil),
 	}
 }
 
@@ -2081,6 +2112,7 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 		nil,
 		cfg,
 	)
+	h.securityAuditCoordinator = securityaudit.NewCoordinator(nil, nil)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2182,6 +2214,7 @@ func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHe
 				nil,
 				cfg,
 			)
+			h.securityAuditCoordinator = securityaudit.NewCoordinator(nil, nil)
 
 			rec := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(rec)
@@ -2264,6 +2297,7 @@ func TestOpenAIResponses_APIKeyPassthroughSSERateLimitUsesConfiguredPoolRetry(t 
 		nil,
 		cfg,
 	)
+	h.securityAuditCoordinator = securityaudit.NewCoordinator(nil, nil)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2423,11 +2457,12 @@ func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T
 		},
 	}
 	h := &OpenAIGatewayHandler{
-		gatewayService:      gatewaySvc,
-		billingCacheService: billingCacheSvc,
-		apiKeyService:       &service.APIKeyService{},
-		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
-		maxAccountSwitches:  3,
+		gatewayService:           gatewaySvc,
+		billingCacheService:      billingCacheSvc,
+		apiKeyService:            &service.APIKeyService{},
+		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		maxAccountSwitches:       3,
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, nil),
 	}
 
 	apiKey := &service.APIKey{
@@ -2609,11 +2644,12 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 		},
 	}
 	h := &OpenAIGatewayHandler{
-		gatewayService:      gatewaySvc,
-		billingCacheService: billingCacheSvc,
-		apiKeyService:       &service.APIKeyService{},
-		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
-		maxAccountSwitches:  3,
+		gatewayService:           gatewaySvc,
+		billingCacheService:      billingCacheSvc,
+		apiKeyService:            &service.APIKeyService{},
+		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		maxAccountSwitches:       3,
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, nil),
 	}
 
 	apiKey := &service.APIKey{
@@ -2835,10 +2871,11 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		},
 	}
 	h := &OpenAIGatewayHandler{
-		gatewayService:      gatewaySvc,
-		billingCacheService: billingCacheSvc,
-		apiKeyService:       &service.APIKeyService{},
-		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		gatewayService:           gatewaySvc,
+		billingCacheService:      billingCacheSvc,
+		apiKeyService:            &service.APIKeyService{},
+		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, nil),
 	}
 
 	apiKey := &service.APIKey{

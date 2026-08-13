@@ -522,7 +522,7 @@ func (s *OpenAIGatewayService) handleAnthropicErrorResponse(
 	account *Account,
 	requestedModel ...string,
 ) (*OpenAIForwardResult, error) {
-	return s.handleCompatErrorResponse(resp, c, account, writeAnthropicError, requestedModel...)
+	return s.handleCompatErrorResponse(resp, c, account, writeAnthropicErrorWithCode, requestedModel...)
 }
 
 // handleAnthropicBufferedStreamingResponse reads all Responses SSE events from
@@ -568,11 +568,7 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 				UpstreamInTok:  usage.InputTokens,
 				UpstreamOutTok: usage.OutputTokens,
 			})
-			clientMsg := msg
-			if clientMsg == "" {
-				clientMsg = "Request blocked by upstream cyber-security policy"
-			}
-			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", clientMsg)
+			writeAnthropicErrorWithCode(c, http.StatusBadRequest, "invalid_request_error", "cyber_policy", "Request blocked by upstream cyber-security policy")
 			return nil, fmt.Errorf("openai cyber_policy: %s", msg)
 		}
 		message := openAICompatFailedResponseMessage(finalResponse)
@@ -945,11 +941,8 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 					})
 					if !clientDisconnected {
 						writeStreamHeaders()
-						clientMsg := msg
-						if clientMsg == "" {
-							clientMsg = "Request blocked by upstream cyber-security policy"
-						}
-						if _, err := fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE("invalid_request_error", clientMsg)); err == nil {
+						clientMsg := "Request blocked by upstream cyber-security policy"
+						if _, err := fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE("invalid_request_error", "cyber_policy", clientMsg)); err == nil {
 							c.Writer.Flush()
 						}
 						clientDisconnected = true
@@ -983,7 +976,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 						clientOutputStarted = true
 					} else {
 						writeStreamHeaders()
-						if _, err := fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE(errType, errMsg)); err == nil {
+						if _, err := fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE(errType, "", errMsg)); err == nil {
 							c.Writer.Flush()
 						}
 					}
@@ -1231,27 +1224,27 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 
 // writeAnthropicError writes an error response in Anthropic Messages API format.
 func writeAnthropicError(c *gin.Context, statusCode int, errType, message string) {
-	c.JSON(statusCode, gin.H{
-		"type": "error",
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
-	})
+	writeAnthropicErrorWithCode(c, statusCode, errType, "", message)
+}
+
+func writeAnthropicErrorWithCode(c *gin.Context, statusCode int, errType, code, message string) {
+	errorBody := gin.H{"type": errType, "message": message}
+	if code = strings.TrimSpace(code); code != "" {
+		errorBody["code"] = code
+	}
+	c.JSON(statusCode, gin.H{"type": "error", "error": errorBody})
 }
 
 // buildAnthropicStreamErrorSSE builds one Anthropic SSE `error` event so a
 // streaming response can terminate with a visible error (e.g. upstream
 // cyber_policy) and programmatic clients stop retrying.
 // Marshal 失败的兜底仅保留固定提示。
-func buildAnthropicStreamErrorSSE(errType, message string) string {
-	payload, err := json.Marshal(gin.H{
-		"type": "error",
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
-	})
+func buildAnthropicStreamErrorSSE(errType, code, message string) string {
+	errorBody := gin.H{"type": errType, "message": message}
+	if code = strings.TrimSpace(code); code != "" {
+		errorBody["code"] = code
+	}
+	payload, err := json.Marshal(gin.H{"type": "error", "error": errorBody})
 	if err != nil {
 		return "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"" + errType + "\",\"message\":\"upstream error\"}}\n\n"
 	}

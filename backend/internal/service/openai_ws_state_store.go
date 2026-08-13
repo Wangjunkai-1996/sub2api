@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -63,6 +64,15 @@ type OpenAIWSStateStore interface {
 	DeleteSessionConn(groupID int64, sessionHash string)
 }
 
+var ErrOpenAIResponseAccountStoreUnavailable = errors.New("openai response account store unavailable")
+
+// openAIWSStrictResponseAccountStore bypasses local-only state for audited
+// continuations. Redis is the cross-process authority for both writes and reads.
+type openAIWSStrictResponseAccountStore interface {
+	BindResponseAccountStrict(ctx context.Context, groupID int64, responseID string, accountID int64, ttl time.Duration) error
+	GetResponseAccountStrict(ctx context.Context, groupID int64, responseID string) (int64, error)
+}
+
 type defaultOpenAIWSStateStore struct {
 	cache GatewayCache
 
@@ -115,6 +125,31 @@ func (s *defaultOpenAIWSStateStore) BindResponseAccount(ctx context.Context, gro
 	return s.cache.SetSessionAccountID(cacheCtx, groupID, cacheKey, accountID, ttl)
 }
 
+func (s *defaultOpenAIWSStateStore) BindResponseAccountStrict(ctx context.Context, groupID int64, responseID string, accountID int64, ttl time.Duration) error {
+	id := normalizeOpenAIWSResponseID(responseID)
+	if id == "" || accountID <= 0 {
+		return ErrOpenAIPreviousResponseAccountUnavailable
+	}
+	if s == nil || s.cache == nil {
+		return ErrOpenAIResponseAccountStoreUnavailable
+	}
+	ttl = normalizeOpenAIWSTTL(ttl)
+	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	defer cancel()
+	if err := s.cache.SetSessionAccountID(cacheCtx, groupID, openAIWSResponseAccountCacheKey(id), accountID, ttl); err != nil {
+		return fmt.Errorf("%w: %w", ErrOpenAIResponseAccountStoreUnavailable, err)
+	}
+
+	s.maybeCleanup()
+	expiresAt := time.Now().Add(ttl)
+	mapKey := openAIWSResponseAccountMapKey(groupID, id)
+	s.responseToAccountMu.Lock()
+	ensureBindingCapacity(s.responseToAccount, mapKey, openAIWSStateStoreMaxEntriesPerMap)
+	s.responseToAccount[mapKey] = openAIWSAccountBinding{accountID: accountID, expiresAt: expiresAt}
+	s.responseToAccountMu.Unlock()
+	return nil
+}
+
 func (s *defaultOpenAIWSStateStore) GetResponseAccount(ctx context.Context, groupID int64, responseID string) (int64, error) {
 	id := normalizeOpenAIWSResponseID(responseID)
 	if id == "" {
@@ -146,6 +181,30 @@ func (s *defaultOpenAIWSStateStore) GetResponseAccount(ctx context.Context, grou
 		// 缓存读取失败不阻断主流程，按未命中降级。
 		return 0, nil
 	}
+	return accountID, nil
+}
+
+func (s *defaultOpenAIWSStateStore) GetResponseAccountStrict(ctx context.Context, groupID int64, responseID string) (int64, error) {
+	id := normalizeOpenAIWSResponseID(responseID)
+	if id == "" {
+		return 0, ErrStickySessionNotFound
+	}
+	if s == nil || s.cache == nil {
+		return 0, ErrOpenAIResponseAccountStoreUnavailable
+	}
+	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	defer cancel()
+	accountID, err := s.cache.GetSessionAccountID(cacheCtx, groupID, openAIWSResponseAccountCacheKey(id))
+	if err != nil {
+		if errors.Is(err, ErrStickySessionNotFound) {
+			return 0, ErrStickySessionNotFound
+		}
+		return 0, fmt.Errorf("%w: %w", ErrOpenAIResponseAccountStoreUnavailable, err)
+	}
+	if accountID <= 0 {
+		return 0, ErrStickySessionNotFound
+	}
+
 	return accountID, nil
 }
 

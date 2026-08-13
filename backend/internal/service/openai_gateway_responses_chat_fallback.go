@@ -136,6 +136,17 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 		return nil, err
 	}
 	responsesResp := apicompat.ChatCompletionsResponseToResponses(ccResp, originalModel, customTools, toolSearch, namespaceTools)
+	terminalEvent := openAIResponsesTerminalEventForStatus(responsesResp.Status)
+	if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+		if err := commitOpenAIStrictLineageFields(c, 1, responsesResp.ID, terminalEvent, nil, false); err != nil {
+			return &OpenAIForwardResult{
+				RequestID: requestID, ResponseID: responsesResp.ID, Usage: usage,
+				Model: originalModel, BillingModel: billingModel, UpstreamModel: upstreamModel,
+				ReasoningEffort: reasoningEffort, ServiceTier: serviceTier, Stream: false,
+				UpstreamTerminalEvent: terminalEvent, Duration: time.Since(startTime),
+			}, err
+		}
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -143,15 +154,17 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	c.JSON(http.StatusOK, responsesResp)
 
 	return &OpenAIForwardResult{
-		RequestID:       requestID,
-		Usage:           usage,
-		Model:           originalModel,
-		BillingModel:    billingModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		ServiceTier:     serviceTier,
-		Stream:          false,
-		Duration:        time.Since(startTime),
+		RequestID:             requestID,
+		ResponseID:            responsesResp.ID,
+		Usage:                 usage,
+		Model:                 originalModel,
+		BillingModel:          billingModel,
+		UpstreamModel:         upstreamModel,
+		ReasoningEffort:       reasoningEffort,
+		ServiceTier:           serviceTier,
+		Stream:                false,
+		UpstreamTerminalEvent: terminalEvent,
+		Duration:              time.Since(startTime),
 	}, nil
 }
 
@@ -210,6 +223,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	if scan.Err != nil {
 		return &OpenAIForwardResult{
 			RequestID:       requestID,
+			ResponseID:      state.ResponseID,
 			Usage:           scan.Usage,
 			Model:           originalModel,
 			BillingModel:    billingModel,
@@ -222,7 +236,24 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		}, fmt.Errorf("stream usage incomplete: %w", scan.Err)
 	}
 
-	writeEvents(apicompat.FinalizeChatCompletionsResponsesStream(state))
+	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
+	terminalEvent := ""
+	for _, event := range finalEvents {
+		if event.Response != nil {
+			terminalEvent = openAIResponsesTerminalEventForStatus(event.Response.Status)
+		}
+	}
+	if terminalEvent == "response.completed" || terminalEvent == "response.done" {
+		if err := commitOpenAIStrictLineageFields(c, 1, state.ResponseID, terminalEvent, nil, false); err != nil {
+			return &OpenAIForwardResult{
+				RequestID: requestID, ResponseID: state.ResponseID, Usage: scan.Usage,
+				Model: originalModel, BillingModel: billingModel, UpstreamModel: upstreamModel,
+				ReasoningEffort: reasoningEffort, ServiceTier: serviceTier, Stream: true,
+				UpstreamTerminalEvent: terminalEvent, Duration: time.Since(startTime), FirstTokenMs: scan.FirstTokenMs,
+			}, err
+		}
+	}
+	writeEvents(finalEvents)
 	if !clientDisconnected {
 		writeStreamHeaders()
 		if _, err := fmt.Fprint(c.Writer, "data: [DONE]\n\n"); err != nil {
@@ -237,17 +268,34 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	return &OpenAIForwardResult{
-		RequestID:       requestID,
-		Usage:           scan.Usage,
-		Model:           originalModel,
-		BillingModel:    billingModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		ServiceTier:     serviceTier,
-		Stream:          true,
-		Duration:        time.Since(startTime),
-		FirstTokenMs:    scan.FirstTokenMs,
+		RequestID:             requestID,
+		ResponseID:            state.ResponseID,
+		Usage:                 scan.Usage,
+		Model:                 originalModel,
+		BillingModel:          billingModel,
+		UpstreamModel:         upstreamModel,
+		ReasoningEffort:       reasoningEffort,
+		ServiceTier:           serviceTier,
+		Stream:                true,
+		UpstreamTerminalEvent: terminalEvent,
+		Duration:              time.Since(startTime),
+		FirstTokenMs:          scan.FirstTokenMs,
 	}, nil
+}
+
+func openAIResponsesTerminalEventForStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "done":
+		return "response.completed"
+	case "incomplete":
+		return "response.incomplete"
+	case "failed":
+		return "response.failed"
+	case "cancelled", "canceled":
+		return "response." + strings.ToLower(strings.TrimSpace(status))
+	default:
+		return ""
+	}
 }
 
 func chatChunkStartsResponsesOutput(chunk *apicompat.ChatCompletionsChunk) bool {

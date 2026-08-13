@@ -48,42 +48,49 @@ func (s *OpenAIGatewayService) cyberSessionBlockStore() CyberSessionBlockStore {
 	return store
 }
 
-// CyberSessionBlockRuntime 返回 (开关, TTL)。开关默认关。
+// CyberSessionBlockRuntime 返回当前会话屏蔽策略。
 // 委托给 SettingService.GetCyberSessionBlockRuntime，进程内缓存避免热路径 DB 往返。
-func (s *OpenAIGatewayService) CyberSessionBlockRuntime(ctx context.Context) (bool, time.Duration) {
+func (s *OpenAIGatewayService) CyberSessionBlockRuntime(ctx context.Context) CyberSessionBlockPolicy {
 	if s == nil || s.settingService == nil {
-		return false, time.Hour
+		return CyberSessionBlockPolicy{}
 	}
 	return s.settingService.GetCyberSessionBlockRuntime(ctx)
 }
 
+// CyberSessionBlockEnabledForGroup 判断本地会话屏蔽是否对当前 API Key 分组生效。
+// 分组范围只用于本地 Redis/连接内屏蔽，不影响真实 cyber_policy 的透传与审计。
+func (s *OpenAIGatewayService) CyberSessionBlockEnabledForGroup(ctx context.Context, groupID *int64) bool {
+	policy := s.CyberSessionBlockRuntime(ctx)
+	return policy.Enabled() && policy.IncludesGroup(groupID)
+}
+
 // MarkCyberSessionBlocked 把会话写入屏蔽表（写入点：cyber 命中后）。
-// 开关关闭、key 为空或存储不可用时静默跳过。
-func (s *OpenAIGatewayService) MarkCyberSessionBlocked(ctx context.Context, key string) {
+// 开关关闭、分组不在范围、key 为空或存储不可用时静默跳过。
+func (s *OpenAIGatewayService) MarkCyberSessionBlocked(ctx context.Context, groupID *int64, key string) {
 	if key == "" {
 		return
 	}
-	enabled, ttl := s.CyberSessionBlockRuntime(ctx)
-	if !enabled {
+	policy := s.CyberSessionBlockRuntime(ctx)
+	if !policy.Enabled() || !policy.IncludesGroup(groupID) {
 		return
 	}
 	store := s.cyberSessionBlockStore()
 	if store == nil {
 		return
 	}
-	if err := store.SetCyberSessionBlocked(ctx, key, ttl); err != nil {
+	if err := store.SetCyberSessionBlocked(ctx, key, policy.TTL()); err != nil {
 		logger.LegacyPrintf("service.openai_gateway", "cyber session block write failed: err=%v", err)
 	}
 }
 
-// IsCyberSessionBlocked 查询会话是否被屏蔽（拦截点）。开关关闭、key 为空、
-// 存储不可用或查询出错时返回 false（fail-open：屏蔽是增强防护，不阻断主链路）。
-func (s *OpenAIGatewayService) IsCyberSessionBlocked(ctx context.Context, key string) bool {
+// IsCyberSessionBlocked 查询会话是否被屏蔽（拦截点）。开关关闭、分组不在范围、
+// key 为空、存储不可用或查询出错时返回 false（fail-open：屏蔽是增强防护，不阻断主链路）。
+func (s *OpenAIGatewayService) IsCyberSessionBlocked(ctx context.Context, groupID *int64, key string) bool {
 	if key == "" {
 		return false
 	}
-	enabled, _ := s.CyberSessionBlockRuntime(ctx)
-	if !enabled {
+	policy := s.CyberSessionBlockRuntime(ctx)
+	if !policy.Enabled() || !policy.IncludesGroup(groupID) {
 		return false
 	}
 	store := s.cyberSessionBlockStore()

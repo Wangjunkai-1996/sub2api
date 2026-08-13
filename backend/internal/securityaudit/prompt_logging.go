@@ -56,6 +56,7 @@ var allowedLogFields = map[string]struct{}{
 	"queue_length": {}, "queue_capacity": {}, "stage": {}, "upstream_dispatched": {},
 	"billing_preconsumed": {}, "worker_id": {}, "reclaimed_total": {}, "attempts": {},
 	"max_attempts": {}, "claim_version": {}, "http_status": {}, "retryable": {},
+	"input_bytes": {}, "text_audit_classification": {},
 }
 
 func LogInfo(event string, fields map[string]any) {
@@ -120,6 +121,7 @@ func snapshotLogFields(snapshot PromptSnapshot) map[string]any {
 		"request_id": snapshot.RequestID, "user_id": snapshot.UserID, "api_key_id": snapshot.APIKeyID,
 		"group_id": pointerLogID(snapshot.GroupID), "provider": snapshot.Provider, "protocol": snapshot.Protocol,
 		"endpoint": snapshot.Endpoint, "model": snapshot.Model, "stage": snapshot.Stage,
+		"input_chars": snapshot.PromptLength, "input_bytes": len(snapshot.ScanText),
 	}
 }
 

@@ -123,6 +123,29 @@ func TestForwardAsRawChatCompletions_ForcesStreamUsageUpstreamAndPassesUsageDown
 	require.Contains(t, rec.Body.String(), "data: [DONE]")
 }
 
+func TestForwardAsRawChatCompletions_UnmarkedRequestStillAppliesFastPolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false,"prompt_cache_key":"client-cache","service_tier":"fast"}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: rawChatCompletionsStreamingResponse("gpt-5.4")}
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+
+	result, err := svc.forwardAsRawChatCompletions(context.Background(), c, rawChatCompletionsTestAccount(), body, "")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "client-cache", gjson.GetBytes(upstream.lastBody, "prompt_cache_key").String())
+	require.Equal(t, OpenAIFastTierPriority, gjson.GetBytes(upstream.lastBody, "service_tier").String())
+}
+
 func TestForwardAsChatCompletions_OpenAICompatibleGrokRawMissingUsageFailsBeforeWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -788,6 +811,20 @@ func rawChatCompletionsTestAccount() *Account {
 			"api_key":  "sk-test",
 			"base_url": "http://upstream.example",
 		},
+	}
+}
+
+func rawChatCompletionsStreamingResponse(model string) *http.Response {
+	body := strings.Join([]string{
+		`data: {"id":"chatcmpl_passthrough","object":"chat.completion.chunk","model":"` + model + `","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
 

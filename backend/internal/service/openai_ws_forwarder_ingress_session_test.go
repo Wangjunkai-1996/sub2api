@@ -145,7 +145,6 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 			"responses_websockets_v2_enabled": true,
 		},
 	}
-
 	serverErrCh := make(chan error, 1)
 	turnTerminalCh := make(chan string, 2)
 	hooks := &OpenAIWSIngressHooks{
@@ -1086,6 +1085,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughModeR
 	select {
 	case result := <-resultCh:
 		require.Equal(t, "resp_passthrough_turn_1", result.RequestID)
+		require.Equal(t, "resp_passthrough_turn_1", result.ResponseID)
 		require.True(t, result.OpenAIWSMode)
 		require.Equal(t, 2, result.Usage.InputTokens)
 		require.Equal(t, 3, result.Usage.OutputTokens)
@@ -1253,15 +1253,22 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
 
 	upstream := &httpUpstreamRecorder{
-		resp: &http.Response{
+		responses: []*http.Response{{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_bridge_1"}},
 			Body: io.NopCloser(strings.NewReader(
 				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
-					"data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_http_bridge_1\",\"output\":[{\"id\":\"ig_bridge_1\",\"type\":\"image_generation_call\",\"status\":\"in_progress\",\"result\":\"final-image\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n" +
+					"data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_http_bridge_1\",\"output\":[{\"id\":\"fc_bridge_1\",\"type\":\"function_call\",\"call_id\":\"call_bridge_1\",\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"},{\"id\":\"ig_bridge_1\",\"type\":\"image_generation_call\",\"status\":\"in_progress\",\"result\":\"final-image\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n" +
 					"data: [DONE]\n\n",
 			)),
-		},
+		}, {
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_bridge_2"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_http_bridge_2\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n" +
+					"data: [DONE]\n\n",
+			)),
+		}},
 	}
 	svc := &OpenAIGatewayService{
 		cfg:              cfg,
@@ -1288,8 +1295,15 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	}
 
 	serverErrCh := make(chan error, 1)
-	resultCh := make(chan *OpenAIForwardResult, 1)
+	resultCh := make(chan *OpenAIForwardResult, 2)
+	var auditedBridgeSecondTurn []byte
 	hooks := &OpenAIWSIngressHooks{
+		BeforeRequest: func(turn int, payload []byte, _ string) error {
+			if turn == 2 {
+				auditedBridgeSecondTurn = cloneOpenAIWSPayloadBytes(payload)
+			}
+			return nil
+		},
 		AfterTurn: func(_ int, result *OpenAIForwardResult, turnErr error) {
 			if turnErr == nil && result != nil {
 				resultCh <- result
@@ -1341,7 +1355,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	}()
 
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
-	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","stream":false}`))
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","stream":false,"input":[{"type":"input_text","text":"call tool"}]}`))
 	cancelWrite()
 	require.NoError(t, err)
 
@@ -1358,7 +1372,18 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	require.NoError(t, readErr2)
 	require.Equal(t, "response.done", gjson.GetBytes(event2, "type").String())
 	require.Equal(t, "resp_http_bridge_1", gjson.GetBytes(event2, "response.id").String())
-	require.Equal(t, "completed", gjson.GetBytes(event2, "response.output.0.status").String())
+	require.Equal(t, "completed", gjson.GetBytes(event2, "response.output.1.status").String())
+
+	writeCtx2, cancelWrite2 := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx2, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_http_bridge_1","input":[{"type":"function_call_output","call_id":"call_bridge_1","output":"ok"}]}`))
+	cancelWrite2()
+	require.NoError(t, err)
+
+	readCtx3, cancelRead3 := context.WithTimeout(context.Background(), 3*time.Second)
+	_, event3, readErr3 := clientConn.Read(readCtx3)
+	cancelRead3()
+	require.NoError(t, readErr3)
+	require.Equal(t, "resp_http_bridge_2", gjson.GetBytes(event3, "response.id").String())
 
 	_ = clientConn.Close(coderws.StatusNormalClosure, "done")
 
@@ -1372,6 +1397,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	select {
 	case result := <-resultCh:
 		require.Equal(t, "resp_http_bridge_1", result.RequestID)
+		require.Equal(t, "resp_http_bridge_1", result.ResponseID)
 		require.True(t, result.OpenAIWSMode)
 		require.Equal(t, 2, result.Usage.InputTokens)
 		require.Equal(t, 1, result.Usage.OutputTokens)
@@ -1382,6 +1408,12 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	}
 
 	require.NotNil(t, upstream.lastReq, "http_bridge 模式应调用 HTTP 上游")
+	require.Len(t, upstream.bodies, 2)
+	require.NotEmpty(t, auditedBridgeSecondTurn)
+	require.JSONEq(t, gjson.GetBytes(auditedBridgeSecondTurn, "input").Raw, gjson.GetBytes(upstream.bodies[1], "input").Raw)
+	require.Equal(t, "function_call", gjson.GetBytes(auditedBridgeSecondTurn, "input.1.type").String())
+	require.Equal(t, "{\"cmd\":\"safe\"}", gjson.GetBytes(auditedBridgeSecondTurn, "input.1.arguments").String())
+	require.Equal(t, "function_call_output", gjson.GetBytes(auditedBridgeSecondTurn, "input.2.type").String())
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ModeOffReturnsPolicyViolation(t *testing.T) {
@@ -2086,6 +2118,23 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledFun
 			"responses_websockets_v2_enabled": true,
 		},
 	}
+	var auditedSecondTurn []byte
+	var secondTurnHookOrder []string
+	hooks := &OpenAIWSIngressHooks{
+		BeforeRequest: func(turn int, payload []byte, _ string) error {
+			if turn == 2 {
+				auditedSecondTurn = cloneOpenAIWSPayloadBytes(payload)
+				secondTurnHookOrder = append(secondTurnHookOrder, "audit")
+			}
+			return nil
+		},
+		BeforeTurn: func(turn int) error {
+			if turn == 2 {
+				secondTurnHookOrder = append(secondTurnHookOrder, "concurrency_and_billing")
+			}
+			return nil
+		},
+	}
 
 	serverErrCh := make(chan error, 1)
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2119,7 +2168,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledFun
 			return
 		}
 
-		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, hooks)
 	}))
 	defer wsServer.Close()
 
@@ -2164,6 +2213,8 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledFun
 	require.Equal(t, 1, captureDialer.DialCount())
 	require.Len(t, captureConn.writes, 2)
 	require.Equal(t, "resp_auto_prev_1", gjson.Get(requestToJSONString(captureConn.writes[1]), "previous_response_id").String(), "function_call_output 缺失 previous_response_id 时应回填上一轮响应 ID")
+	require.Equal(t, "resp_auto_prev_1", gjson.GetBytes(auditedSecondTurn, "previous_response_id").String(), "strict audit must see the inferred lineage anchor")
+	require.Equal(t, []string{"audit", "concurrency_and_billing"}, secondTurnHookOrder)
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledToolSearchOutputAutoAttachesPreviousResponseID(t *testing.T) {
@@ -3059,6 +3110,22 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 			"responses_websockets_v2_enabled": true,
 		},
 	}
+	var auditedSecondTurnPayloads [][]byte
+	beforeTurn2Calls := 0
+	hooks := &OpenAIWSIngressHooks{
+		BeforeRequest: func(turn int, payload []byte, _ string) error {
+			if turn == 2 {
+				auditedSecondTurnPayloads = append(auditedSecondTurnPayloads, cloneOpenAIWSPayloadBytes(payload))
+			}
+			return nil
+		},
+		BeforeTurn: func(turn int) error {
+			if turn == 2 {
+				beforeTurn2Calls++
+			}
+			return nil
+		},
+	}
 
 	serverErrCh := make(chan error, 1)
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3092,7 +3159,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 			return
 		}
 
-		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, hooks)
 	}))
 	defer wsServer.Close()
 
@@ -3149,6 +3216,141 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 	require.Equal(t, "call_replay_1", gjson.Get(secondWrite, "input.1.call_id").String())
 	require.Equal(t, "function_call_output", gjson.Get(secondWrite, "input.2.type").String())
 	require.Equal(t, "call_replay_1", gjson.Get(secondWrite, "input.2.call_id").String())
+	require.Len(t, auditedSecondTurnPayloads, 2, "initial attempt and replay retry must each be audited")
+	require.Equal(t, "resp_turn_ping_replay_ctx_1", gjson.GetBytes(auditedSecondTurnPayloads[0], "previous_response_id").String())
+	require.JSONEq(t, secondWrite, string(auditedSecondTurnPayloads[1]), "retry audit must see the exact replay-enriched payload sent upstream")
+	require.Equal(t, "function_call", gjson.GetBytes(auditedSecondTurnPayloads[1], "input.1.type").String())
+	require.Equal(t, "{}", gjson.GetBytes(auditedSecondTurnPayloads[1], "input.1.arguments").String())
+	require.Equal(t, 1, beforeTurn2Calls, "replay retry must not reacquire per-turn concurrency or rebill")
+}
+
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ReplayAuditBlockStopsRewrittenAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	prevPreflightPingIdle := openAIWSIngressPreflightPingIdle
+	openAIWSIngressPreflightPingIdle = 0
+	defer func() { openAIWSIngressPreflightPingIdle = prevPreflightPingIdle }()
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 2
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 2
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 8
+	cfg.Gateway.OpenAIWS.DialTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
+
+	firstConn := &openAIWSPreflightFailConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_replay_audit_block_1","model":"gpt-5.1","output":[{"type":"function_call","id":"fc_block_1","call_id":"call_block_1","name":"shell","arguments":"{\"cmd\":\"blocked replay\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}}
+	secondConn := &openAIWSCaptureConn{}
+	dialer := &openAIWSQueueDialer{conns: []openAIWSClientConn{firstConn, secondConn}}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(dialer)
+
+	svc := &OpenAIGatewayService{
+		cfg: cfg, httpUpstream: &httpUpstreamRecorder{}, cache: &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg), toolCorrector: NewCodexToolCorrector(), openaiWSPool: pool,
+	}
+	account := &Account{
+		ID: 129, Name: "openai-ingress-replay-audit-block", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+		Status: StatusActive, Schedulable: true, Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-test"},
+		Extra:       map[string]any{"responses_websockets_v2_enabled": true},
+	}
+
+	auditBlockErr := errors.New("strict replay audit blocked")
+	auditTurn2Calls := 0
+	beforeTurn2Calls := 0
+	hooks := &OpenAIWSIngressHooks{
+		BeforeRequest: func(turn int, payload []byte, _ string) error {
+			if turn != 2 {
+				return nil
+			}
+			auditTurn2Calls++
+			for _, item := range gjson.GetBytes(payload, "input").Array() {
+				if item.Get("type").String() == "function_call" && strings.Contains(item.Get("arguments").String(), "blocked replay") {
+					return auditBlockErr
+				}
+			}
+			return nil
+		},
+		BeforeTurn: func(turn int) error {
+			if turn == 2 {
+				beforeTurn2Calls++
+			}
+			return nil
+		},
+	}
+
+	serverErrCh := make(chan error, 1)
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+		ginCtx.Request = r.Clone(r.Context())
+		readCtx, cancelRead := context.WithTimeout(r.Context(), 3*time.Second)
+		msgType, firstMessage, readErr := conn.Read(readCtx)
+		cancelRead()
+		if readErr != nil {
+			serverErrCh <- readErr
+			return
+		}
+		if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
+			serverErrCh <- errors.New("unsupported websocket client message type")
+			return
+		}
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, hooks)
+	}))
+	defer wsServer.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeMessage := func(payload string) {
+		writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancelWrite()
+		require.NoError(t, clientConn.Write(writeCtx, coderws.MessageText, []byte(payload)))
+	}
+	readMessage := func() []byte {
+		readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancelRead()
+		_, message, readErr := clientConn.Read(readCtx)
+		require.NoError(t, readErr)
+		return message
+	}
+
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"input":[{"type":"input_text","text":"call tool"}]}`)
+	require.Equal(t, "resp_replay_audit_block_1", gjson.GetBytes(readMessage(), "response.id").String())
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"previous_response_id":"resp_replay_audit_block_1","input":[{"type":"function_call_output","call_id":"call_block_1","output":"ok"}]}`)
+
+	select {
+	case serverErr := <-serverErrCh:
+		require.ErrorIs(t, serverErr, auditBlockErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待 replay 审计阻断超时")
+	}
+	require.Equal(t, 2, auditTurn2Calls, "original and rewritten attempts must both be audited")
+	require.Equal(t, 1, beforeTurn2Calls, "rewritten retry must not repeat per-turn concurrency or billing")
+	require.Equal(t, 1, dialer.DialCount(), "audit block must happen before dialing a replacement upstream connection")
+	require.Equal(t, 1, firstConn.WriteCount())
+	secondConn.mu.Lock()
+	secondWriteCount := len(secondConn.writes)
+	secondConn.mu.Unlock()
+	require.Zero(t, secondWriteCount, "replay-enriched payload blocked by audit must never be written upstream")
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPreflightPingFailClosesWhenFunctionCallOutputNeedsPreviousResponseID(t *testing.T) {

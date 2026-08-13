@@ -173,6 +173,22 @@ func TestContentModerationRuntimeSnapshotCachesSettings(t *testing.T) {
 	require.Equal(t, 1, getMultiple)
 }
 
+func TestContentModerationStrictPreBlockAppliesFailsClosedOnColdSnapshotError(t *testing.T) {
+	repo := &contentModerationRuntimeSettingRepo{
+		values:         map[string]string{},
+		getMultipleErr: errors.New("database unavailable"),
+	}
+	svc := runtimeCacheTestService(repo, time.Hour)
+	groupID := int64(12)
+
+	applies, err := svc.StrictPreBlockApplies(context.Background(), &groupID)
+	require.Error(t, err)
+	require.False(t, applies)
+	getValue, getMultiple := repo.calls()
+	require.Zero(t, getValue)
+	require.Equal(t, 1, getMultiple)
+}
+
 func TestContentModerationRuntimeSnapshotUpdateConfigIsImmediate(t *testing.T) {
 	repo := &contentModerationRuntimeSettingRepo{values: map[string]string{
 		SettingKeyRiskControlEnabled:      "true",

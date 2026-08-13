@@ -1,0 +1,966 @@
+package auditinput
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
+)
+
+const (
+	ParserVersion = "auditinput/v3"
+
+	MaxTextRunes  = 64 * 1024 * 1024
+	MaxImages     = 4
+	MaxImageBytes = 8 * 1024 * 1024
+
+	ProtocolAnthropicMessages = "anthropic_messages"
+	ProtocolOpenAIResponses   = "openai_responses"
+	ProtocolOpenAIChat        = "openai_chat_completions"
+	ProtocolGemini            = "gemini"
+	ProtocolOpenAIImages      = "openai_images"
+
+	IssueInvalidJSON         = "invalid_json"
+	IssueDuplicateField      = "duplicate_json_field"
+	IssueInvalidRoot         = "invalid_root"
+	IssueUnsupportedProtocol = "unsupported_protocol"
+	IssueEmptyContent        = "empty_content"
+	IssueUnknownType         = "unknown_item_type"
+	IssueUnknownField        = "unknown_field"
+	IssueUnknownRole         = "unknown_role"
+	IssueInvalidShape        = "invalid_shape"
+	IssueRemoteFile          = "remote_file_uninspectable"
+	IssueEncryptedContent    = "encrypted_content_uninspectable"
+	IssueUnsupportedMedia    = "unsupported_media"
+	IssueInvalidMedia        = "invalid_media"
+	IssueTextLimit           = "text_limit_exceeded"
+	IssueImageLimit          = "image_limit_exceeded"
+	IssueImageSize           = "image_size_exceeded"
+)
+
+type TextAuditClassification string
+
+const (
+	// The zero value is deliberately fail-closed. A parser path must explicitly
+	// prove that the current increment contains text or is a known no-text shape.
+	TextAuditIndeterminate TextAuditClassification = ""
+	TextAuditAuditableText TextAuditClassification = "auditable_text"
+	TextAuditKnownNoText   TextAuditClassification = "known_no_text"
+)
+
+type Segment struct {
+	Text       string `json:"-"`
+	Normalized string `json:"normalized"`
+	Folded     string `json:"folded"`
+	Role       string `json:"role,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Path       string `json:"path"`
+}
+
+type Media struct {
+	Kind      string `json:"kind"`
+	MIMEType  string `json:"mime_type"`
+	Source    string `json:"source"`
+	Path      string `json:"path"`
+	Digest    string `json:"digest"`
+	SizeBytes int    `json:"size_bytes"`
+	Value     string `json:"-"`
+}
+
+// OpaqueState records only the digest of provider-generated assistant state.
+// The ciphertext itself must never enter normalized audit text or diagnostics.
+type OpaqueState struct {
+	Kind   string `json:"kind"`
+	Path   string `json:"path"`
+	Digest string `json:"digest"`
+}
+
+type ControlItem struct {
+	Kind string `json:"kind"`
+	Path string `json:"path"`
+}
+
+type Issue struct {
+	Code string `json:"code"`
+	Path string `json:"path,omitempty"`
+}
+
+type Document struct {
+	ParserVersion      string                  `json:"parser_version"`
+	Protocol           string                  `json:"protocol"`
+	Segments           []Segment               `json:"segments"`
+	Media              []Media                 `json:"media"`
+	HasImages          bool                    `json:"has_images,omitempty"`
+	OpaqueStates       []OpaqueState           `json:"opaque_states,omitempty"`
+	ControlItems       []ControlItem           `json:"control_items,omitempty"`
+	Store              *bool                   `json:"store,omitempty"`
+	PreviousResponseID string                  `json:"previous_response_id,omitempty"`
+	NormalizedText     string                  `json:"normalized_text"`
+	FoldedText         string                  `json:"folded_text"`
+	Hash               string                  `json:"hash"`
+	Complete           bool                    `json:"complete"`
+	Truncated          bool                    `json:"truncated"`
+	AuditTextRunes     int                     `json:"-"`
+	TextAuditClass     TextAuditClassification `json:"text_audit_classification,omitempty"`
+	Issues             []Issue                 `json:"issues,omitempty"`
+}
+
+func (d *Document) Clone() *Document {
+	if d == nil {
+		return nil
+	}
+	clone := *d
+	clone.Segments = append([]Segment(nil), d.Segments...)
+	clone.Media = append([]Media(nil), d.Media...)
+	clone.OpaqueStates = append([]OpaqueState(nil), d.OpaqueStates...)
+	clone.ControlItems = append([]ControlItem(nil), d.ControlItems...)
+	if d.Store != nil {
+		store := *d.Store
+		clone.Store = &store
+	}
+	clone.Issues = append([]Issue(nil), d.Issues...)
+	return &clone
+}
+
+func (d *Document) HasIssue(code string) bool {
+	if d == nil {
+		return false
+	}
+	for _, issue := range d.Issues {
+		if issue.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func Parse(protocol string, body []byte) *Document {
+	return parse(protocol, body, false)
+}
+
+// ParseForTextAudit extracts the current auditable increment while treating
+// image payloads as opaque request data. For OpenAI Chat and Responses requests
+// that increment is the latest user turn or its contiguous tool continuation;
+// historical and assistant output remains outside the audit document. Images
+// are validated but never decoded, hashed, counted, size-checked, or retained.
+func ParseForTextAudit(protocol string, body []byte) *Document {
+	return parse(protocol, body, true)
+}
+
+// IsEmptyBase64DataURI matches the empty data URL shape removed by the OpenAI
+// forwarding sanitizer. Text-audit boundary selection uses the same predicate
+// so an item that will disappear before forwarding cannot hide user text.
+func IsEmptyBase64DataURI(raw string) bool {
+	if !strings.HasPrefix(raw, "data:") {
+		return false
+	}
+	rest := strings.TrimPrefix(raw, "data:")
+	semicolonIndex := strings.Index(rest, ";")
+	if semicolonIndex < 0 {
+		return false
+	}
+	rest = rest[semicolonIndex+1:]
+	if !strings.HasPrefix(rest, "base64,") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(rest, "base64,")) == ""
+}
+
+func parse(protocol string, body []byte, ignoreImages bool) *Document {
+	protocol = canonicalProtocol(protocol)
+	b := &builder{doc: Document{ParserVersion: ParserVersion, Protocol: protocol}, ignoreImages: ignoreImages}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		b.issue(IssueEmptyContent, "$")
+		return b.finish()
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		b.issue(IssueInvalidJSON, "$")
+		return b.finish()
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		b.issue(IssueInvalidJSON, "$")
+		return b.finish()
+	}
+	duplicatePath, duplicate := duplicateJSONFieldPath(trimmed)
+	if ignoreImages && (protocol == ProtocolOpenAIResponses || protocol == ProtocolOpenAIChat) {
+		duplicatePath, duplicate = textAuditDuplicateJSONFieldPath(trimmed, protocol, value)
+	}
+	if duplicate {
+		b.issue(IssueDuplicateField, duplicatePath)
+		return b.finish()
+	}
+	root, ok := value.(map[string]any)
+	if !ok {
+		b.issue(IssueInvalidRoot, "$")
+		return b.finish()
+	}
+
+	switch protocol {
+	case ProtocolOpenAIResponses:
+		b.parseResponses(root, "$")
+	case ProtocolOpenAIChat:
+		b.parseChat(root, "$")
+	case ProtocolAnthropicMessages:
+		b.parseAnthropic(root, "$")
+	case ProtocolGemini:
+		b.parseGemini(root, "$")
+	case ProtocolOpenAIImages, "grok_media", "media", "images":
+		b.parseMediaRequest(root, "$")
+	case "openai_embeddings":
+		b.parseEmbedding(root, "$")
+	case "openai_alpha_search":
+		b.parseSearch(root, "$")
+	default:
+		b.issue(IssueUnsupportedProtocol, "$")
+	}
+	return b.finish()
+}
+
+// ParseResponsesOutput parses the complete model-visible output array from a
+// successful Responses terminal event. It intentionally reuses the request
+// item parser so continuation lineage and direct request auditing share the
+// same type, role, media, normalization, and size rules.
+func ParseResponsesOutput(raw []byte) *Document {
+	b := &builder{doc: Document{ParserVersion: ParserVersion, Protocol: ProtocolOpenAIResponses}}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		b.issue(IssueEmptyContent, "$.output")
+		return b.finish()
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		b.issue(IssueInvalidJSON, "$.output")
+		return b.finish()
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		b.issue(IssueInvalidJSON, "$.output")
+		return b.finish()
+	}
+	if duplicatePath, duplicate := duplicateJSONFieldPath(trimmed); duplicate {
+		b.issue(IssueDuplicateField, "$.output"+strings.TrimPrefix(duplicatePath, "$"))
+		return b.finish()
+	}
+	items, ok := value.([]any)
+	if !ok {
+		b.issue(IssueInvalidShape, "$.output")
+		return b.finish()
+	}
+	b.parseResponsesInput(items, "$.output")
+	return b.finish()
+}
+
+func duplicateJSONFieldPath(raw []byte) (string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	path, duplicate, err := scanJSONValueForDuplicateFields(decoder, "$")
+	return path, duplicate && err == nil
+}
+
+// HasDuplicateJSONFields reports whether a syntactically valid JSON value
+// contains the same object member name more than once at any depth. Callers
+// that use a last-key-wins parser must reject such payloads before making a
+// security decision because an upstream parser may select a different value.
+func HasDuplicateJSONFields(raw []byte) bool {
+	_, duplicate := duplicateJSONFieldPath(raw)
+	return duplicate
+}
+
+func scanJSONValueForDuplicateFields(decoder *json.Decoder, path string) (string, bool, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", false, err
+	}
+	delim, structured := token.(json.Delim)
+	if !structured {
+		return "", false, nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return "", false, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return "", false, errors.New("json object key is not a string")
+			}
+			fieldPath := childPath(path, key)
+			if _, exists := seen[key]; exists {
+				return fieldPath, true, nil
+			}
+			seen[key] = struct{}{}
+			if duplicatePath, duplicate, err := scanJSONValueForDuplicateFields(decoder, fieldPath); err != nil || duplicate {
+				return duplicatePath, duplicate, err
+			}
+		}
+		_, err = decoder.Token()
+		return "", false, err
+	case '[':
+		index := 0
+		for decoder.More() {
+			itemPath := indexPath(path, index)
+			if duplicatePath, duplicate, err := scanJSONValueForDuplicateFields(decoder, itemPath); err != nil || duplicate {
+				return duplicatePath, duplicate, err
+			}
+			index++
+		}
+		_, err = decoder.Token()
+		return "", false, err
+	default:
+		return "", false, errors.New("unexpected json delimiter")
+	}
+}
+
+func textAuditDuplicateJSONFieldPath(raw []byte, protocol string, value any) (string, bool) {
+	checkedPaths := map[string]struct{}{"$": {}}
+	selectionFields := make(map[string]map[string]struct{})
+	root, ok := value.(map[string]any)
+	if ok {
+		switch protocol {
+		case ProtocolOpenAIResponses:
+			addResponsesTextAuditDuplicatePaths(checkedPaths, selectionFields, root["input"], "$.input")
+		case ProtocolOpenAIChat:
+			addChatTextAuditDuplicatePaths(checkedPaths, selectionFields, root["messages"], "$.messages")
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	path, duplicate, err := scanJSONValueForDuplicateFieldsAtPaths(decoder, "$", checkedPaths, selectionFields)
+	return path, duplicate && err == nil
+}
+
+func scanJSONValueForDuplicateFieldsAtPaths(decoder *json.Decoder, path string, checkedPaths map[string]struct{}, selectionFields map[string]map[string]struct{}) (string, bool, error) {
+	duplicatePath, duplicate, _, err := scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder, path, checkedPaths, selectionFields)
+	return duplicatePath, duplicate, err
+}
+
+type duplicateSelectionValue struct {
+	normalizedString string
+	isString         bool
+}
+
+func scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder *json.Decoder, path string, checkedPaths map[string]struct{}, selectionFields map[string]map[string]struct{}) (string, bool, duplicateSelectionValue, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", false, duplicateSelectionValue{}, err
+	}
+	delim, structured := token.(json.Delim)
+	if !structured {
+		if value, ok := token.(string); ok {
+			return "", false, duplicateSelectionValue{
+				normalizedString: strings.ToLower(strings.TrimSpace(value)),
+				isString:         true,
+			}, nil
+		}
+		return "", false, duplicateSelectionValue{}, nil
+	}
+	switch delim {
+	case '{':
+		_, checkAllDuplicates := checkedPaths[path]
+		criticalFields := selectionFields[path]
+		var seen map[string]struct{}
+		var selectedValues map[string]duplicateSelectionValue
+		if checkAllDuplicates || len(criticalFields) > 0 {
+			seen = make(map[string]struct{})
+			selectedValues = make(map[string]duplicateSelectionValue)
+		}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return "", false, duplicateSelectionValue{}, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return "", false, duplicateSelectionValue{}, errors.New("json object key is not a string")
+			}
+			fieldPath := childPath(path, key)
+			_, alreadySeen := seen[key]
+			_, critical := criticalFields[key]
+			if seen != nil {
+				if alreadySeen && checkAllDuplicates {
+					return fieldPath, true, duplicateSelectionValue{}, nil
+				}
+			}
+			duplicatePath, duplicate, fieldValue, err := scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder, fieldPath, checkedPaths, selectionFields)
+			if err != nil || duplicate {
+				return duplicatePath, duplicate, duplicateSelectionValue{}, err
+			}
+			if alreadySeen && critical {
+				previousValue := selectedValues[key]
+				if !previousValue.isString || !fieldValue.isString || previousValue.normalizedString != fieldValue.normalizedString {
+					return fieldPath, true, duplicateSelectionValue{}, nil
+				}
+			}
+			if seen != nil {
+				seen[key] = struct{}{}
+				if critical && !alreadySeen {
+					selectedValues[key] = fieldValue
+				}
+			}
+		}
+		_, err = decoder.Token()
+		return "", false, duplicateSelectionValue{}, err
+	case '[':
+		index := 0
+		for decoder.More() {
+			itemPath := indexPath(path, index)
+			if duplicatePath, duplicate, _, err := scanJSONValueForDuplicateFieldsAtPathsWithValue(decoder, itemPath, checkedPaths, selectionFields); err != nil || duplicate {
+				return duplicatePath, duplicate, duplicateSelectionValue{}, err
+			}
+			index++
+		}
+		_, err = decoder.Token()
+		return "", false, duplicateSelectionValue{}, err
+	default:
+		return "", false, duplicateSelectionValue{}, errors.New("unexpected json delimiter")
+	}
+}
+
+func addResponsesTextAuditDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, input any, path string) {
+	switch typed := input.(type) {
+	case map[string]any:
+		addTextAuditSelectionFields(selectionFields, path, "role", "type")
+		if responsesCompactionTriggerCandidate(typed) {
+			addAllObjectDuplicatePaths(paths, typed, path)
+			return
+		}
+		if responsesAuditableToolItem(typed) {
+			addResponsesAuditToolDuplicatePaths(paths, selectionFields, typed, path)
+			return
+		}
+		switch responsesCurrentUserItemClassification(typed) {
+		case responsesCurrentUserExplicit, responsesCurrentUserImplicit, responsesCurrentUserMalformedText:
+			addResponsesCurrentUserDuplicatePaths(paths, selectionFields, typed, path)
+		default:
+			if responsesKnownNoTextTailItem(typed) {
+				addAllObjectDuplicatePaths(paths, typed, path)
+			}
+		}
+	case []any:
+		lastBusinessIndex := -1
+		for index := len(typed) - 1; index >= 0; index-- {
+			if item, ok := typed[index].(map[string]any); ok && responsesCompactionTriggerCandidate(item) {
+				addAllObjectDuplicatePaths(paths, item, indexPath(path, index))
+				continue
+			}
+			if _, transparent := responsesTransparentControl(typed[index]); transparent {
+				if item, ok := typed[index].(map[string]any); ok {
+					addAllObjectDuplicatePaths(paths, item, indexPath(path, index))
+				}
+				continue
+			}
+			lastBusinessIndex = index
+			break
+		}
+		if lastBusinessIndex < 0 {
+			return
+		}
+		if responsesAuditableToolItem(typed[lastBusinessIndex]) {
+			for index := lastBusinessIndex; index >= 0; index-- {
+				itemPath := indexPath(path, index)
+				if _, transparent := responsesTransparentControl(typed[index]); transparent {
+					if item, ok := typed[index].(map[string]any); ok {
+						addAllObjectDuplicatePaths(paths, item, itemPath)
+					}
+					continue
+				}
+				item, ok := typed[index].(map[string]any)
+				if !ok || !responsesAuditableToolItem(item) {
+					break
+				}
+				addResponsesAuditToolDuplicatePaths(paths, selectionFields, item, itemPath)
+			}
+			return
+		}
+		if item, ok := typed[lastBusinessIndex].(map[string]any); ok && responsesKnownNoTextTailItem(item) {
+			addAllObjectDuplicatePaths(paths, item, indexPath(path, lastBusinessIndex))
+			return
+		}
+		if _, ok := typed[lastBusinessIndex].(map[string]any); ok {
+			addTextAuditSelectionFields(selectionFields, indexPath(path, lastBusinessIndex), "role", "type")
+		}
+		switch responsesCurrentUserItemClassification(typed[lastBusinessIndex]) {
+		case responsesCurrentUserExplicit, responsesCurrentUserMalformedText:
+			if item, ok := typed[lastBusinessIndex].(map[string]any); ok {
+				addResponsesCurrentUserDuplicatePaths(paths, selectionFields, item, indexPath(path, lastBusinessIndex))
+			}
+		case responsesCurrentUserImplicit:
+			for index := lastBusinessIndex; index >= 0; index-- {
+				if _, transparent := responsesTransparentControl(typed[index]); transparent {
+					if item, ok := typed[index].(map[string]any); ok {
+						addAllObjectDuplicatePaths(paths, item, indexPath(path, index))
+					}
+					continue
+				}
+				if responsesCurrentUserItemClassification(typed[index]) != responsesCurrentUserImplicit {
+					break
+				}
+				if item, ok := typed[index].(map[string]any); ok {
+					addTextAuditSelectionFields(selectionFields, indexPath(path, index), "role", "type")
+					addResponsesCurrentUserDuplicatePaths(paths, selectionFields, item, indexPath(path, index))
+				}
+			}
+		}
+	}
+}
+
+func addResponsesAuditToolDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, item map[string]any, path string) {
+	paths[path] = struct{}{}
+	addTextAuditSelectionFields(selectionFields, path, "role", "type")
+	typeName, _ := item["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "function_call":
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+	case "custom_tool_call":
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["input"], childPath(path, "input"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+	case "tool_call", "mcp_tool_call":
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["function"], childPath(path, "function"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["args"], childPath(path, "args"))
+	default:
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["input"], childPath(path, "input"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["arguments"], childPath(path, "arguments"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["output"], childPath(path, "output"))
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["content"], childPath(path, "content"))
+	}
+}
+
+func addResponsesCurrentUserDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, item map[string]any, path string) {
+	typeName, _ := item["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "", "message":
+		paths[path] = struct{}{}
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, item["content"], childPath(path, "content"))
+	case "input_text", "text":
+		paths[path] = struct{}{}
+	case "input_image", "image_url", "image":
+		addAllObjectDuplicatePaths(paths, item, path)
+	}
+}
+
+func addAllObjectDuplicatePaths(paths map[string]struct{}, value any, path string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		paths[path] = struct{}{}
+		for field, child := range typed {
+			addAllObjectDuplicatePaths(paths, child, childPath(path, field))
+		}
+	case []any:
+		for index, child := range typed {
+			addAllObjectDuplicatePaths(paths, child, indexPath(path, index))
+		}
+	}
+}
+
+func addChatTextAuditDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, messages any, path string) {
+	items, ok := messages.([]any)
+	if !ok || len(items) == 0 {
+		return
+	}
+	for index := len(items) - 1; index >= 0; index-- {
+		message, ok := items[index].(map[string]any)
+		if !ok {
+			return
+		}
+		messagePath := indexPath(path, index)
+		addTextAuditSelectionFields(selectionFields, messagePath, "role")
+		role, ok := message["role"].(string)
+		if !ok {
+			return
+		}
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role != "user" && role != "tool" && role != "function" {
+			if knownOpenAIChatRole(role) {
+				addAllObjectDuplicatePaths(paths, message, messagePath)
+			}
+			return
+		}
+		paths[messagePath] = struct{}{}
+		addOpenAITextContentDuplicatePaths(paths, selectionFields, message["content"], childPath(messagePath, "content"))
+		if role == "user" {
+			return
+		}
+	}
+}
+
+func addTextAuditSelectionFields(selectionFields map[string]map[string]struct{}, path string, fields ...string) {
+	if len(fields) == 0 {
+		return
+	}
+	selected := selectionFields[path]
+	if selected == nil {
+		selected = make(map[string]struct{}, len(fields))
+		selectionFields[path] = selected
+	}
+	for _, field := range fields {
+		selected[field] = struct{}{}
+	}
+}
+
+func addOpenAITextContentDuplicatePaths(paths map[string]struct{}, selectionFields map[string]map[string]struct{}, value any, path string) {
+	switch typed := value.(type) {
+	case []any:
+		for index, item := range typed {
+			addOpenAITextContentDuplicatePaths(paths, selectionFields, item, indexPath(path, index))
+		}
+	case map[string]any:
+		if selectionFields != nil {
+			addTextAuditSelectionFields(selectionFields, path, "type")
+		}
+		typeName, hasStringType := typed["type"].(string)
+		typeName = strings.ToLower(strings.TrimSpace(typeName))
+		if hasStringType {
+			switch typeName {
+			case "image", "input_image", "image_url", "computer_screenshot":
+				addAllObjectDuplicatePaths(paths, typed, path)
+				return
+			case "", "text", "input_text", "output_text", "refusal", "summary_text", "reasoning_text":
+				paths[path] = struct{}{}
+			default:
+				return
+			}
+		} else {
+			if _, hasText := typed["text"]; !hasText {
+				if _, hasContent := typed["content"]; !hasContent {
+					return
+				}
+			}
+			paths[path] = struct{}{}
+		}
+		if typeName == "" {
+			addOpenAITextContentDuplicatePaths(paths, selectionFields, typed["content"], childPath(path, "content"))
+		}
+	}
+}
+
+type builder struct {
+	doc          Document
+	textRunes    int
+	ignoreImages bool
+}
+
+func (b *builder) markKnownNoText() {
+	if b == nil || !b.ignoreImages || b.doc.TextAuditClass != TextAuditIndeterminate {
+		return
+	}
+	b.doc.TextAuditClass = TextAuditKnownNoText
+}
+
+func (b *builder) addKnownNoTextControl(kind, path string) {
+	b.addControlItem(kind, path)
+	b.markKnownNoText()
+}
+
+func (b *builder) finish() *Document {
+	if len(b.doc.Segments) == 0 && len(b.doc.Media) == 0 && !b.doc.HasImages && len(b.doc.OpaqueStates) == 0 && len(b.doc.ControlItems) == 0 && len(b.doc.Issues) == 0 {
+		b.issue(IssueEmptyContent, "$")
+	}
+	texts := make([]string, 0, len(b.doc.Segments))
+	for _, segment := range b.doc.Segments {
+		texts = append(texts, segment.Normalized)
+	}
+	b.doc.NormalizedText = strings.Join(texts, "\n")
+	b.doc.AuditTextRunes = utf8.RuneCountInString(b.doc.NormalizedText)
+	if b.ignoreImages {
+		switch {
+		case len(b.doc.Issues) > 0 || b.doc.Truncated:
+			b.doc.TextAuditClass = TextAuditIndeterminate
+		case b.doc.AuditTextRunes > 0:
+			b.doc.TextAuditClass = TextAuditAuditableText
+		case b.doc.TextAuditClass != TextAuditKnownNoText:
+			b.doc.TextAuditClass = TextAuditIndeterminate
+		}
+	}
+	b.doc.FoldedText = foldNormalizedForMatching(b.doc.NormalizedText)
+	h := sha256.New()
+	_, _ = h.Write([]byte(ParserVersion))
+	_, _ = h.Write([]byte("\nprotocol:" + b.doc.Protocol + "\ntext:" + b.doc.NormalizedText))
+	for _, media := range b.doc.Media {
+		_, _ = h.Write([]byte("\nmedia:" + media.Digest))
+	}
+	for _, state := range b.doc.OpaqueStates {
+		_, _ = h.Write([]byte("\nopaque:" + state.Kind + ":" + state.Path + ":" + state.Digest))
+	}
+	for _, control := range b.doc.ControlItems {
+		_, _ = h.Write([]byte("\ncontrol:" + control.Kind + ":" + control.Path))
+	}
+	b.doc.Hash = hex.EncodeToString(h.Sum(nil))
+	b.doc.Complete = len(b.doc.Issues) == 0 && !b.doc.Truncated
+	return &b.doc
+}
+
+func (b *builder) issue(code, path string) {
+	for _, issue := range b.doc.Issues {
+		if issue.Code == code && issue.Path == path {
+			return
+		}
+	}
+	b.doc.Issues = append(b.doc.Issues, Issue{Code: code, Path: path})
+}
+
+func (b *builder) addText(value, role, kind, path string) {
+	normalized := NormalizeText(value)
+	if normalized == "" {
+		return
+	}
+	separator := 0
+	if len(b.doc.Segments) > 0 {
+		separator = 1
+	}
+	remaining := MaxTextRunes - b.textRunes - separator
+	if remaining <= 0 {
+		b.doc.Truncated = true
+		b.issue(IssueTextLimit, path)
+		return
+	}
+	runeCount := utf8.RuneCountInString(normalized)
+	if runeCount > remaining {
+		runes := []rune(normalized)
+		runes = runes[:remaining]
+		normalized = string(runes)
+		runeCount = remaining
+		b.doc.Truncated = true
+		b.issue(IssueTextLimit, path)
+	}
+	b.doc.Segments = append(b.doc.Segments, Segment{
+		Normalized: normalized,
+		Role:       strings.ToLower(strings.TrimSpace(role)), Kind: kind, Path: path,
+	})
+	b.textRunes += separator + runeCount
+}
+
+func (b *builder) addJSON(value any, role, kind, path string) {
+	if value == nil {
+		return
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		b.issue(IssueInvalidShape, path)
+		return
+	}
+	if string(raw) == "null" || string(raw) == "{}" || string(raw) == "[]" || string(raw) == `""` {
+		return
+	}
+	b.addText(string(raw), role, kind, path)
+}
+
+func (b *builder) addOpaqueState(kind, value, path string) {
+	digest := sha256.Sum256([]byte(value))
+	b.doc.OpaqueStates = append(b.doc.OpaqueStates, OpaqueState{
+		Kind: strings.ToLower(strings.TrimSpace(kind)), Path: path, Digest: hex.EncodeToString(digest[:]),
+	})
+}
+
+func (b *builder) addControlItem(kind, path string) {
+	b.doc.ControlItems = append(b.doc.ControlItems, ControlItem{
+		Kind: strings.ToLower(strings.TrimSpace(kind)), Path: path,
+	})
+}
+
+func (b *builder) addImage(value, mimeType, path string) {
+	b.doc.HasImages = true
+	if b.ignoreImages {
+		b.markKnownNoText()
+		return
+	}
+	if len(b.doc.Media) >= MaxImages {
+		b.issue(IssueImageLimit, path)
+		return
+	}
+	value = strings.TrimSpace(value)
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	if value == "" {
+		b.issue(IssueInvalidMedia, path)
+		return
+	}
+	media := Media{Kind: "image", MIMEType: mimeType, Path: path, SizeBytes: -1, Value: value}
+	var digest [sha256.Size]byte
+	if strings.HasPrefix(strings.ToLower(value), "data:") {
+		parsedMIME, decoded, ok := decodeDataURL(value)
+		if !ok || !strings.HasPrefix(parsedMIME, "image/") {
+			b.issue(IssueInvalidMedia, path)
+			return
+		}
+		if len(decoded) > MaxImageBytes {
+			b.issue(IssueImageSize, path)
+			return
+		}
+		media.MIMEType, media.Source, media.SizeBytes = parsedMIME, "data_url", len(decoded)
+		digest = sha256.Sum256(decoded)
+	} else if parsed, err := url.Parse(value); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+		// A remote object cannot be size-verified before account selection. Strict
+		// admission therefore treats it like any other opaque remote file.
+		b.issue(IssueRemoteFile, path)
+		return
+	} else {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || !strings.HasPrefix(mimeType, "image/") {
+			b.issue(IssueInvalidMedia, path)
+			return
+		}
+		if len(decoded) > MaxImageBytes {
+			b.issue(IssueImageSize, path)
+			return
+		}
+		media.Source, media.SizeBytes = "base64", len(decoded)
+		media.Value = fmt.Sprintf("data:%s;base64,%s", mimeType, value)
+		digest = sha256.Sum256(decoded)
+	}
+	media.Digest = hex.EncodeToString(digest[:])
+	b.doc.Media = append(b.doc.Media, media)
+}
+
+func (b *builder) addTextFile(value, mimeType, path string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		b.issue(IssueInvalidMedia, path)
+		return
+	}
+	var decoded []byte
+	if strings.HasPrefix(strings.ToLower(value), "data:") {
+		parsedMIME, data, ok := decodeDataURL(value)
+		if !ok {
+			b.issue(IssueInvalidMedia, path)
+			return
+		}
+		mimeType, decoded = parsedMIME, data
+	} else {
+		var err error
+		decoded, err = base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			b.issue(IssueInvalidMedia, path)
+			return
+		}
+	}
+	if len(decoded) > MaxImageBytes {
+		b.issue(IssueImageSize, path)
+		return
+	}
+	if !isTextMIME(mimeType) || !utf8.Valid(decoded) {
+		b.issue(IssueUnsupportedMedia, path)
+		return
+	}
+	b.addText(string(decoded), "user", "text_file", path)
+}
+
+func NormalizeText(value string) string {
+	value = norm.NFKC.String(value)
+	var out strings.Builder
+	out.Grow(len(value))
+	spacePending := false
+	for _, r := range value {
+		if unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Cc, r) {
+			if unicode.IsSpace(r) {
+				spacePending = out.Len() > 0
+			}
+			continue
+		}
+		if unicode.IsSpace(r) {
+			spacePending = out.Len() > 0
+			continue
+		}
+		if spacePending {
+			out.WriteByte(' ')
+			spacePending = false
+		}
+		out.WriteRune(r)
+	}
+	return strings.TrimSpace(out.String())
+}
+
+func FoldForMatching(value string) string {
+	return foldNormalizedForMatching(NormalizeText(value))
+}
+
+func foldNormalizedForMatching(value string) string {
+	var out strings.Builder
+	out.Grow(len(value))
+	for _, r := range value {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
+func canonicalProtocol(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "openai_responses", "responses", "responses_websocket":
+		return ProtocolOpenAIResponses
+	case "openai_chat_completions", "openai_chat", "chat_completions":
+		return ProtocolOpenAIChat
+	case "anthropic_messages", "claude_messages", "messages":
+		return ProtocolAnthropicMessages
+	case "gemini", "gemini_generate_content":
+		return ProtocolGemini
+	case "openai_images":
+		return ProtocolOpenAIImages
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func decodeDataURL(value string) (string, []byte, bool) {
+	comma := strings.IndexByte(value, ',')
+	if comma <= len("data:") {
+		return "", nil, false
+	}
+	header, payload := value[len("data:"):comma], value[comma+1:]
+	parts := strings.Split(header, ";")
+	mimeType := strings.ToLower(strings.TrimSpace(parts[0]))
+	base64Encoded := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(part), "base64") {
+			base64Encoded = true
+		}
+	}
+	if !base64Encoded {
+		decoded, err := url.PathUnescape(payload)
+		return mimeType, []byte(decoded), err == nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	return mimeType, decoded, err == nil
+}
+
+func isTextMIME(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(strings.Split(value, ";")[0]))
+	return strings.HasPrefix(value, "text/") || value == "application/json" || value == "application/xml" ||
+		value == "application/yaml" || value == "application/x-yaml" || value == "application/javascript"
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func childPath(parent, key string) string {
+	if parent == "$" {
+		return "$." + key
+	}
+	return parent + "." + key
+}
+
+func indexPath(parent string, index int) string {
+	return fmt.Sprintf("%s[%d]", parent, index)
+}

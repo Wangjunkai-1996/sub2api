@@ -6,7 +6,7 @@ import "net/http"
 // HTTPStatusToGoogleStatus maps HTTP status codes to Google-style error status strings.
 func HTTPStatusToGoogleStatus(status int) string {
 	switch status {
-	case http.StatusBadRequest:
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		return "INVALID_ARGUMENT"
 	case http.StatusUnauthorized:
 		return "UNAUTHENTICATED"

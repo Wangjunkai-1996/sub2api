@@ -137,17 +137,74 @@ type cachedCodexRestrictionPolicy struct {
 	expiresAt int64 // unix nano
 }
 
-// cachedCyberSessionBlockRuntime cyber 会话屏蔽开关+TTL 进程内缓存（60s TTL）。
+// CyberSessionBlockPolicy 是网关热路径使用的不可变会话屏蔽策略快照。
+// 字段保持私有，避免调用方修改缓存中的分组集合。
+type CyberSessionBlockPolicy struct {
+	enabled         bool
+	ttl             time.Duration
+	allGroups       bool
+	groupIDs        map[int64]struct{}
+	orderedGroupIDs []int64
+}
+
+func newCyberSessionBlockPolicy(enabled bool, ttl time.Duration, allGroups bool, groupIDs []int64) CyberSessionBlockPolicy {
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	normalized := normalizeInt64IDs(groupIDs)
+	groupSet := make(map[int64]struct{}, len(normalized))
+	for _, groupID := range normalized {
+		groupSet[groupID] = struct{}{}
+	}
+	if !allGroups && len(groupSet) == 0 {
+		enabled = false
+	}
+	return CyberSessionBlockPolicy{
+		enabled:         enabled,
+		ttl:             ttl,
+		allGroups:       allGroups,
+		groupIDs:        groupSet,
+		orderedGroupIDs: normalized,
+	}
+}
+
+func failOpenCyberSessionBlockPolicy() CyberSessionBlockPolicy {
+	return newCyberSessionBlockPolicy(false, time.Hour, false, nil)
+}
+
+func (p CyberSessionBlockPolicy) Enabled() bool { return p.enabled }
+
+func (p CyberSessionBlockPolicy) TTL() time.Duration { return p.ttl }
+
+func (p CyberSessionBlockPolicy) AllGroups() bool { return p.allGroups }
+
+func (p CyberSessionBlockPolicy) GroupIDs() []int64 {
+	return append([]int64(nil), p.orderedGroupIDs...)
+}
+
+// IncludesGroup 只判断分组范围；调用方仍需通过 Enabled 检查总开关。
+func (p CyberSessionBlockPolicy) IncludesGroup(groupID *int64) bool {
+	if p.allGroups {
+		return true
+	}
+	if groupID == nil || *groupID <= 0 {
+		return false
+	}
+	_, ok := p.groupIDs[*groupID]
+	return ok
+}
+
+// cachedCyberSessionBlockRuntime cyber 会话屏蔽策略进程内缓存（60s TTL）。
 // GetCyberSessionBlockRuntime 在网关请求热路径上被调用，避免每次访问 DB。
 type cachedCyberSessionBlockRuntime struct {
-	enabled   bool
-	ttl       time.Duration
+	policy    CyberSessionBlockPolicy
 	expiresAt int64 // unix nano
 }
 
 const cyberSessionBlockRuntimeCacheTTL = 60 * time.Second
 const cyberSessionBlockRuntimeErrorTTL = 5 * time.Second
 const cyberSessionBlockRuntimeDBTimeout = 5 * time.Second
+const cyberSessionBlockRuntimeSFKey = "cyber_session_block_runtime"
 
 const openAIQuotaAutoPauseSettingsCacheTTL = 60 * time.Second
 const openAIQuotaAutoPauseSettingsErrorTTL = 5 * time.Second
@@ -155,17 +212,18 @@ const openAIQuotaAutoPauseSettingsDBTimeout = 5 * time.Second
 
 const openAIQuotaAutoPauseSettingsRefreshKey = "openai_quota_auto_pause_settings"
 
-// GetCyberSessionBlockRuntime 返回 (开关, TTL)，进程内缓存 ~60s，
-// 供网关热路径读取时避免 DB 往返。
-// 两个 setting key 在单次 singleflight 里一起读取，减少 DB 往返。
-// 默认值：开关 false，TTL 1h（与粘性会话对齐）。
-func (s *SettingService) GetCyberSessionBlockRuntime(ctx context.Context) (bool, time.Duration) {
+// GetCyberSessionBlockRuntime 返回进程内缓存的策略快照。
+// 老库缺少范围键时默认全分组；读取或解析失败时返回 disabled 策略并短暂缓存。
+func (s *SettingService) GetCyberSessionBlockRuntime(ctx context.Context) CyberSessionBlockPolicy {
+	if s == nil || s.settingRepo == nil {
+		return failOpenCyberSessionBlockPolicy()
+	}
 	if cached, ok := s.cyberSessionBlockRuntimeCache.Load().(*cachedCyberSessionBlockRuntime); ok && cached != nil {
 		if time.Now().UnixNano() < cached.expiresAt {
-			return cached.enabled, cached.ttl
+			return cached.policy
 		}
 	}
-	result, _, _ := s.cyberSessionBlockRuntimeSF.Do("cyber_session_block_runtime", func() (any, error) {
+	result, _, _ := s.cyberSessionBlockRuntimeSF.Do(cyberSessionBlockRuntimeSFKey, func() (any, error) {
 		if cached, ok := s.cyberSessionBlockRuntimeCache.Load().(*cachedCyberSessionBlockRuntime); ok && cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
 				return cached, nil
@@ -174,41 +232,81 @@ func (s *SettingService) GetCyberSessionBlockRuntime(ctx context.Context) (bool,
 		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cyberSessionBlockRuntimeDBTimeout)
 		defer cancel()
 
-		enabledVal, enabledErr := s.settingRepo.GetValue(dbCtx, SettingKeyCyberSessionBlockEnabled)
-		ttlVal, ttlErr := s.settingRepo.GetValue(dbCtx, SettingKeyCyberSessionBlockTTLSeconds)
-
-		if enabledErr != nil && !errors.Is(enabledErr, ErrSettingNotFound) {
-			slog.Warn("failed to get cyber_session_block_enabled setting", "error", enabledErr)
+		values, err := s.settingRepo.GetMultiple(dbCtx, []string{
+			SettingKeyCyberSessionBlockEnabled,
+			SettingKeyCyberSessionBlockTTLSeconds,
+			SettingKeyCyberSessionBlockAllGroups,
+			SettingKeyCyberSessionBlockGroupIDs,
+		})
+		if err != nil {
+			slog.Warn("failed to get cyber session block policy; using fail-open policy", "error", err)
 			entry := &cachedCyberSessionBlockRuntime{
-				enabled:   false,
-				ttl:       time.Hour,
+				policy:    failOpenCyberSessionBlockPolicy(),
 				expiresAt: time.Now().Add(cyberSessionBlockRuntimeErrorTTL).UnixNano(),
 			}
 			s.cyberSessionBlockRuntimeCache.Store(entry)
 			return entry, nil
 		}
 
-		enabled := enabledErr == nil && strings.TrimSpace(enabledVal) == "true"
-
-		ttl := time.Hour
-		if ttlErr == nil {
-			if n, perr := strconv.Atoi(strings.TrimSpace(ttlVal)); perr == nil && n > 0 {
-				ttl = time.Duration(n) * time.Second
+		enabled := false
+		if raw, ok := values[SettingKeyCyberSessionBlockEnabled]; ok {
+			switch strings.TrimSpace(raw) {
+			case "true":
+				enabled = true
+			case "false":
+			default:
+				return s.cacheInvalidCyberSessionBlockPolicy(SettingKeyCyberSessionBlockEnabled), nil
 			}
+		}
+		ttl := time.Hour
+		if raw, ok := values[SettingKeyCyberSessionBlockTTLSeconds]; ok {
+			n, parseErr := strconv.Atoi(strings.TrimSpace(raw))
+			if parseErr != nil || n <= 0 {
+				return s.cacheInvalidCyberSessionBlockPolicy(SettingKeyCyberSessionBlockTTLSeconds), nil
+			}
+			ttl = time.Duration(n) * time.Second
+		}
+		allGroups := true
+		if raw, ok := values[SettingKeyCyberSessionBlockAllGroups]; ok {
+			parsed, parseErr := parseCyberSessionBlockAllGroupsSetting(raw)
+			if parseErr != nil {
+				return s.cacheInvalidCyberSessionBlockPolicy(SettingKeyCyberSessionBlockAllGroups), nil
+			}
+			allGroups = parsed
+		}
+		groupIDs := []int64{}
+		if raw, ok := values[SettingKeyCyberSessionBlockGroupIDs]; ok {
+			parsed, parseErr := parseCyberSessionBlockGroupIDsSetting(raw)
+			if parseErr != nil {
+				return s.cacheInvalidCyberSessionBlockPolicy(SettingKeyCyberSessionBlockGroupIDs), nil
+			}
+			groupIDs = parsed
+		}
+		if !allGroups && len(groupIDs) == 0 {
+			return s.cacheInvalidCyberSessionBlockPolicy("cyber_session_block_scope"), nil
 		}
 
 		entry := &cachedCyberSessionBlockRuntime{
-			enabled:   enabled,
-			ttl:       ttl,
+			policy:    newCyberSessionBlockPolicy(enabled, ttl, allGroups, groupIDs),
 			expiresAt: time.Now().Add(cyberSessionBlockRuntimeCacheTTL).UnixNano(),
 		}
 		s.cyberSessionBlockRuntimeCache.Store(entry)
 		return entry, nil
 	})
 	if entry, ok := result.(*cachedCyberSessionBlockRuntime); ok && entry != nil {
-		return entry.enabled, entry.ttl
+		return entry.policy
 	}
-	return false, time.Hour
+	return failOpenCyberSessionBlockPolicy()
+}
+
+func (s *SettingService) cacheInvalidCyberSessionBlockPolicy(key string) *cachedCyberSessionBlockRuntime {
+	slog.Warn("invalid cyber session block policy setting; using fail-open policy", "setting", key)
+	entry := &cachedCyberSessionBlockRuntime{
+		policy:    failOpenCyberSessionBlockPolicy(),
+		expiresAt: time.Now().Add(cyberSessionBlockRuntimeErrorTTL).UnixNano(),
+	}
+	s.cyberSessionBlockRuntimeCache.Store(entry)
+	return entry
 }
 
 // GetAntigravityUserAgentVersion 返回 Antigravity 上游请求使用的版本号。

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
@@ -1233,13 +1234,23 @@ func buildOpenAIFastPolicyBlockedWSEvent(err *OpenAIFastBlockedError) []byte {
 	return payload
 }
 
-func openAIRequestBodyMayContainImageInput(body []byte) bool {
+// OpenAIRequestBodyMayContainImageInput reports whether the current OpenAI
+// request contains an input image. It inspects structure only and never reads,
+// validates, decodes, or retains the image value.
+func OpenAIRequestBodyMayContainImageInput(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
 	input := gjson.GetBytes(body, "input")
-	messages := gjson.GetBytes(body, "messages.#-1")
+	// Any input image makes the whole request a media request for strict-audit
+	// admission. Scan the full messages array so a multimodal turn cannot be
+	// missed because it is nested under content or not the final array item.
+	messages := gjson.GetBytes(body, "messages")
 	return openAIJSONValueMayContainImageInput(input) || openAIJSONValueMayContainImageInput(messages)
+}
+
+func openAIRequestBodyMayContainImageInput(body []byte) bool {
+	return OpenAIRequestBodyMayContainImageInput(body)
 }
 
 func openAIJSONValueMayContainImageInput(value gjson.Result) bool {
@@ -1411,19 +1422,7 @@ func shouldDropEmptyBase64InputImagePart(part any) bool {
 }
 
 func isEmptyBase64DataURI(raw string) bool {
-	if !strings.HasPrefix(raw, "data:") {
-		return false
-	}
-	rest := strings.TrimPrefix(raw, "data:")
-	semicolonIdx := strings.Index(rest, ";")
-	if semicolonIdx < 0 {
-		return false
-	}
-	rest = rest[semicolonIdx+1:]
-	if !strings.HasPrefix(rest, "base64,") {
-		return false
-	}
-	return strings.TrimSpace(strings.TrimPrefix(rest, "base64,")) == ""
+	return auditinput.IsEmptyBase64DataURI(raw)
 }
 
 func getOpenAIRequestBodyMap(_ *gin.Context, body []byte) (map[string]any, error) {

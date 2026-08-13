@@ -176,6 +176,60 @@ func (s *OpenAIGatewayService) openAIAccountRuntimeBlockLock(accountID int64) *s
 	return mu
 }
 
+// Keep the account out of scheduler candidates while Redis decides whether a
+// real upstream Cyber mark is new. References isolate concurrent decisions;
+// finishing a duplicate removes only its own temporary gate.
+func (s *OpenAIGatewayService) beginOpenAICyberCooldownClassification(accountID int64) func() {
+	if s == nil || accountID <= 0 {
+		return func() {}
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	pending := 0
+	if value, ok := s.openaiCyberCooldownPending.Load(accountID); ok {
+		pending, _ = value.(int)
+	}
+	s.openaiCyberCooldownPending.Store(accountID, pending+1)
+	mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			value, ok := s.openaiCyberCooldownPending.Load(accountID)
+			if !ok {
+				return
+			}
+			count, valid := value.(int)
+			if !valid || count <= 1 {
+				s.openaiCyberCooldownPending.Delete(accountID)
+				return
+			}
+			s.openaiCyberCooldownPending.Store(accountID, count-1)
+		})
+	}
+}
+
+func (s *OpenAIGatewayService) openAICyberCooldownClassificationPendingLocked(accountID int64) bool {
+	value, ok := s.openaiCyberCooldownPending.Load(accountID)
+	if !ok {
+		return false
+	}
+	pending, ok := value.(int)
+	return ok && pending > 0
+}
+
+func (s *OpenAIGatewayService) isOpenAICyberCooldownClassificationPending(accountID int64) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.openAICyberCooldownClassificationPendingLocked(accountID)
+}
+
 func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, _ string) (uint64, bool) {
 	generation := s.openaiAccountRuntimeBlockSequence.Add(1)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)
@@ -229,6 +283,9 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	mu := s.openAIAccountRuntimeBlockLock(account.ID)
 	mu.Lock()
 	defer mu.Unlock()
+	if s.openAICyberCooldownClassificationPendingLocked(account.ID) {
+		return true
+	}
 	value, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
 	if !ok {
 		return false

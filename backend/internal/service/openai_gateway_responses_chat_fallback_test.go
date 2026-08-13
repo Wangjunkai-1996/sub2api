@@ -25,6 +25,7 @@ func TestForwardResponses_ForceChatCompletionsRoutesNonStreamingToChatCompletion
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	EnableOpenAIStrictLineageCapture(c)
 
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
@@ -50,7 +51,9 @@ func TestForwardResponses_ForceChatCompletionsRoutesNonStreamingToChatCompletion
 	require.Equal(t, 3, result.Usage.InputTokens)
 	require.Equal(t, 2, result.Usage.OutputTokens)
 	require.Equal(t, 1, result.Usage.CacheReadInputTokens)
+	require.Equal(t, "chatcmpl_json", result.ResponseID)
 	require.False(t, result.Stream)
+	require.False(t, result.CompletedForLineage(), "chat fallback synthesizes IDs and must not create strict lineage")
 }
 
 func TestForwardResponses_PassthroughFlagWithUnsupportedResponsesUsesAccountMapping(t *testing.T) {
@@ -105,6 +108,7 @@ func TestForwardResponses_ForceChatCompletionsRoutesStreamingToChatCompletions(t
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	EnableOpenAIStrictLineageCapture(c)
 
 	upstreamBody := strings.Join([]string{
 		`data: {"id":"chatcmpl_stream","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
@@ -142,8 +146,10 @@ func TestForwardResponses_ForceChatCompletionsRoutesStreamingToChatCompletions(t
 	require.Contains(t, rec.Body.String(), "data: [DONE]")
 	require.Equal(t, 4, result.Usage.InputTokens)
 	require.Equal(t, 3, result.Usage.OutputTokens)
+	require.Equal(t, "chatcmpl_stream", result.ResponseID)
 	require.True(t, result.Stream)
 	require.NotNil(t, result.FirstTokenMs)
+	require.False(t, result.CompletedForLineage(), "chat fallback must not bind synthesized continuation context")
 }
 
 func TestForwardResponses_DeepSeekReasoningOnlyStreamProducesVisibleText(t *testing.T) {
@@ -179,6 +185,8 @@ func TestForwardResponses_DeepSeekReasoningOnlyStreamProducesVisibleText(t *test
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, result.Stream)
+	require.Equal(t, "response.incomplete", result.UpstreamTerminalEvent)
+	require.False(t, result.CompletedForLineage())
 	require.Contains(t, rec.Body.String(), "event: response.output_text.delta")
 	require.Contains(t, rec.Body.String(), `"delta":"visible fallback"`)
 	require.Contains(t, rec.Body.String(), `"status":"incomplete"`)
@@ -193,6 +201,7 @@ func TestForwardResponses_AutoSupportedAccountStillUsesResponsesEndpoint(t *test
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	EnableOpenAIStrictLineageCapture(c)
 
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
@@ -218,6 +227,10 @@ func TestForwardResponses_AutoSupportedAccountStillUsesResponsesEndpoint(t *test
 	require.True(t, gjson.GetBytes(upstream.lastBody, "input").Exists())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "messages").Exists())
 	require.Equal(t, "ok", gjson.Get(rec.Body.String(), "output.0.content.0.text").String())
+	require.True(t, result.CompletedForLineage())
+	lineageOutput, ok := result.OpenAIResponsesLineageOutput()
+	require.True(t, ok)
+	require.Equal(t, "ok", gjson.GetBytes(lineageOutput, "0.content.0.text").String())
 }
 
 func forceChatResponsesFallbackAccount() *Account {
