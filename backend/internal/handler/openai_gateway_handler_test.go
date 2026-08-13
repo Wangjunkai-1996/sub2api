@@ -2213,6 +2213,7 @@ func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHe
 				nil,
 				cfg,
 			)
+			h.securityAuditCoordinator = securityaudit.NewCoordinator(nil, nil)
 
 			rec := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(rec)
