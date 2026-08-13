@@ -102,6 +102,10 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	if err := s.validateDefaultSubscriptionGroups(ctx, settings.DefaultSubscriptions); err != nil {
 		return nil, err
 	}
+	settings.CyberSessionBlockGroupIDs = normalizeInt64IDs(settings.CyberSessionBlockGroupIDs)
+	if err := normalizeOpenAICyberAccountCooldownSettings(settings); err != nil {
+		return nil, infraerrors.BadRequest("INVALID_OPENAI_CYBER_ACCOUNT_COOLDOWN", err.Error())
+	}
 	normalizedWhitelist, err := NormalizeRegistrationEmailSuffixWhitelist(settings.RegistrationEmailSuffixWhitelist)
 	if err != nil {
 		return nil, infraerrors.BadRequest("INVALID_REGISTRATION_EMAIL_SUFFIX_WHITELIST", err.Error())
@@ -441,11 +445,21 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	// 风控中心功能开关
 	updates[SettingKeyRiskControlEnabled] = strconv.FormatBool(settings.RiskControlEnabled)
 
-	// cyber 会话屏蔽开关 + TTL
+	// cyber 会话屏蔽开关、TTL 与独立分组范围
 	updates[SettingKeyCyberSessionBlockEnabled] = strconv.FormatBool(settings.CyberSessionBlockEnabled)
 	if settings.CyberSessionBlockTTLSeconds > 0 {
 		updates[SettingKeyCyberSessionBlockTTLSeconds] = strconv.Itoa(settings.CyberSessionBlockTTLSeconds)
 	}
+	updates[SettingKeyCyberSessionBlockAllGroups] = strconv.FormatBool(settings.CyberSessionBlockAllGroups)
+	groupIDsJSON, err := json.Marshal(settings.CyberSessionBlockGroupIDs)
+	if err != nil {
+		return nil, fmt.Errorf("marshal cyber session block group IDs: %w", err)
+	}
+	updates[SettingKeyCyberSessionBlockGroupIDs] = string(groupIDsJSON)
+	updates[SettingKeyOpenAICyberAccountCooldownEnabled] = strconv.FormatBool(settings.OpenAICyberAccountCooldownEnabled)
+	updates[SettingKeyOpenAICyberAccountCooldownWindowSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownWindowSeconds)
+	updates[SettingKeyOpenAICyberAccountCooldownFirstSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownFirstSeconds)
+	updates[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownEscalatedSeconds)
 
 	// Claude Code version check
 	updates[SettingKeyMinClaudeCodeVersion] = settings.MinClaudeCodeVersion
@@ -687,6 +701,26 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		min:       settings.MinClaudeCodeVersion,
 		max:       settings.MaxClaudeCodeVersion,
 		expiresAt: time.Now().Add(versionBoundsCacheTTL).UnixNano(),
+	})
+	s.cyberSessionBlockRuntimeSF.Forget(cyberSessionBlockRuntimeSFKey)
+	s.cyberSessionBlockRuntimeCache.Store(&cachedCyberSessionBlockRuntime{
+		policy: newCyberSessionBlockPolicy(
+			settings.CyberSessionBlockEnabled,
+			time.Duration(settings.CyberSessionBlockTTLSeconds)*time.Second,
+			settings.CyberSessionBlockAllGroups,
+			settings.CyberSessionBlockGroupIDs,
+		),
+		expiresAt: time.Now().Add(cyberSessionBlockRuntimeCacheTTL).UnixNano(),
+	})
+	s.openAICyberAccountCooldownRuntimeSF.Forget(openAICyberAccountCooldownRuntimeSFKey)
+	s.openAICyberAccountCooldownRuntimeCache.Store(&cachedOpenAICyberAccountCooldownRuntime{
+		policy: newOpenAICyberAccountCooldownPolicy(
+			settings.OpenAICyberAccountCooldownEnabled,
+			settings.OpenAICyberAccountCooldownWindowSeconds,
+			settings.OpenAICyberAccountCooldownFirstSeconds,
+			settings.OpenAICyberAccountCooldownEscalatedSeconds,
+		),
+		expiresAt: time.Now().Add(openAICyberAccountCooldownRuntimeCacheTTL).UnixNano(),
 	})
 	backendModeSF.Forget("backend_mode")
 	backendModeCache.Store(&cachedBackendMode{

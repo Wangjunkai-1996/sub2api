@@ -365,6 +365,23 @@ func TestOpenAIAgentIdentityTaskInvalidRetriesExactlyOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, registerCalls)
 	require.Len(t, upstream.requests, 6)
+
+	// A strict audited continuation must require the original account's WSv2
+	// transport. If it is unavailable, no HTTP request or task refresh may run.
+	account.Credentials["task_id"] = "task-strict-continuation"
+	upstream.responses = []*http.Response{
+		{StatusCode: http.StatusUnauthorized, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"invalid_task_id"}}`))},
+		{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\ndata: [DONE]\n\n"))},
+	}
+	rec4 := httptest.NewRecorder()
+	c4, _ := gin.CreateTestContext(rec4)
+	c4.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","instructions":"Reply OK","input":[],"stream":false,"previous_response_id":"resp-first"}`))
+	strictCtx := WithOpenAIStrictHTTPContinuation(context.Background())
+	_, err = svc.Forward(strictCtx, c4, account, []byte(`{"model":"gpt-5.4","instructions":"Reply OK","input":[],"stream":false,"previous_response_id":"resp-first"}`))
+	require.Error(t, err)
+	require.Equal(t, 3, registerCalls)
+	require.Len(t, upstream.requests, 6, "strict continuation must not fall back to HTTP")
+	require.Len(t, upstream.responses, 2, "strict continuation must leave both HTTP responses unused")
 }
 
 func TestOpenAIAgentIdentityCompatRoutesRecoverInvalidTaskOnce(t *testing.T) {

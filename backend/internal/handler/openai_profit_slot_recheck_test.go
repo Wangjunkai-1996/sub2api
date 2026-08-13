@@ -27,6 +27,21 @@ type profitCountingConcurrencyCache struct {
 	accountReleases atomic.Int64
 }
 
+type cyberWaitConcurrencyCache struct {
+	fakeConcurrencyCache
+	acquireCalls atomic.Int64
+	releaseCalls atomic.Int64
+}
+
+func (c *cyberWaitConcurrencyCache) AcquireAccountSlot(context.Context, int64, int, string) (bool, error) {
+	return c.acquireCalls.Add(1) >= 3, nil
+}
+
+func (c *cyberWaitConcurrencyCache) ReleaseAccountSlot(context.Context, int64, string) error {
+	c.releaseCalls.Add(1)
+	return nil
+}
+
 func (c *profitCountingConcurrencyCache) ReleaseAccountSlot(context.Context, int64, string) error {
 	c.accountReleases.Add(1)
 	return nil
@@ -139,6 +154,53 @@ func TestAcquireResponsesAccountSlotProfitRecheck(t *testing.T) {
 		require.NotNil(t, release)
 		release()
 	})
+}
+
+func TestAcquireResponsesAccountSlotCyberCooldownRecheckAfterWait(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	settingSvc := service.NewSettingService(&cyberHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAICyberAccountCooldownEnabled:          "true",
+		service.SettingKeyOpenAICyberAccountCooldownWindowSeconds:    "3600",
+		service.SettingKeyOpenAICyberAccountCooldownFirstSeconds:     "3600",
+		service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: "7200",
+	}}, nil)
+	cooldownCache := &cyberHandlerGatewayCache{cooldownDeadline: time.Now().Add(time.Hour)}
+	gw := service.NewOpenAIGatewayService(
+		nil, nil, nil, nil, nil, nil,
+		cooldownCache, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		settingSvc, nil,
+	)
+	concurrencyCache := &cyberWaitConcurrencyCache{}
+	h := &OpenAIGatewayHandler{
+		gatewayService:    gw,
+		concurrencyHelper: NewConcurrencyHelper(service.NewConcurrencyService(concurrencyCache), SSEPingFormatNone, time.Second),
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	streamStarted := false
+	account := profitSlotTestAccount(4, 0.3)
+	account.Type = service.AccountTypeOAuth
+	account.Credentials = map[string]any{"plan_type": "pro"}
+	account.GroupIDs = []int64{12}
+	selection := &service.AccountSelectionResult{
+		Account: account,
+		WaitPlan: &service.AccountWaitPlan{
+			AccountID:      account.ID,
+			MaxConcurrency: account.Concurrency,
+			Timeout:        time.Second,
+			MaxWaiting:     2,
+		},
+	}
+
+	release, result := h.acquireResponsesAccountSlot(c, nil, "", selection, false, &streamStarted, zap.NewNop())
+
+	require.Nil(t, release)
+	require.Equal(t, openAISlotAcquireFailed, result)
+	require.Equal(t, 503, w.Code)
+	require.GreaterOrEqual(t, concurrencyCache.acquireCalls.Load(), int64(3), "test must exercise the waited acquisition branch")
+	require.Equal(t, int64(1), concurrencyCache.releaseCalls.Load(), "cooldown rejection must release the acquired slot")
+	require.Equal(t, 1, cooldownCache.cooldownReadCalls)
 }
 
 // scheduler 跳门条件依赖"CapabilityResponses 仅在显式生图意图时被要求"这一

@@ -56,6 +56,10 @@ var openAIWSLogValueReplacer = strings.NewReplacer(
 
 var openAIWSIngressPreflightPingIdle = 20 * time.Second
 
+// ErrOpenAIWSStrictAuditPassthroughUnsupported marks a local protocol-policy
+// rejection. It must not be reported as an upstream account health failure.
+var ErrOpenAIWSStrictAuditPassthroughUnsupported = errors.New("strict audit does not support websocket passthrough ingress")
+
 // openAIWSFallbackError 表示可安全回退到 HTTP 的 WS 错误（尚未写下游）。
 type openAIWSFallbackError struct {
 	Reason string
@@ -219,12 +223,23 @@ type OpenAIWSIngressHooks struct {
 	MaxReasoningEffort string
 	// ReasoningEffortMappings rewrites explicit effort values for this WS session.
 	ReasoningEffortMappings []ReasoningEffortMapping
-	BeforeTurn              func(turn int) error
-	BeforeRequest           func(turn int, payload []byte, originalModel string) error
+	// StrictAudit identifies a session admitted by the strict security audit.
+	// Continuation turns must not be replayed, redialed, or moved to another
+	// account after this flag is set by the handler.
+	StrictAudit   bool
+	BeforeTurn    func(turn int) error
+	BeforeRequest func(turn int, payload []byte, originalModel string) error
 	// MapRequestModel resolves the current turn's client model to the model
 	// that must be written into the upstream response.create frame.
 	MapRequestModel func(turn int, originalModel string) (string, error)
 	AfterTurn       func(turn int, result *OpenAIForwardResult, turnErr error)
+}
+
+func openAIWSStrictAuditContinuation(hooks *OpenAIWSIngressHooks, turn int, payload []byte) bool {
+	if hooks == nil || !hooks.StrictAudit {
+		return false
+	}
+	return turn > 1 || strings.TrimSpace(openAIWSPayloadStringFromRaw(payload, "previous_response_id")) != ""
 }
 
 func (s *OpenAIGatewayService) getOpenAIWSConnPool() *openAIWSConnPool {

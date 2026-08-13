@@ -7183,6 +7183,169 @@
                 class="input"
               />
             </div>
+
+            <div
+              data-testid="cyber-session-block-scope"
+              class="space-y-4 border-t border-gray-100 pt-5 dark:border-dark-700"
+            >
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t('admin.settings.features.riskControl.cyberSessionBlockScope') }}
+                  </label>
+                  <p
+                    data-testid="cyber-session-block-scope-note"
+                    class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400"
+                  >
+                    {{ t('admin.settings.features.riskControl.cyberSessionBlockScopeHint') }}
+                  </p>
+                </div>
+                <div class="inline-flex shrink-0 rounded-lg bg-gray-100 p-1 dark:bg-dark-700">
+                  <button
+                    type="button"
+                    data-testid="cyber-session-block-all-groups"
+                    :aria-pressed="form.cyber_session_block_all_groups"
+                    class="rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
+                    :class="form.cyber_session_block_all_groups
+                      ? 'bg-white text-gray-900 shadow-sm dark:bg-dark-800 dark:text-white'
+                      : 'text-gray-500 dark:text-gray-400'"
+                    @click="form.cyber_session_block_all_groups = true"
+                  >
+                    {{ t('admin.settings.features.riskControl.cyberSessionBlockAllGroups') }}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="cyber-session-block-specific-groups"
+                    :aria-pressed="!form.cyber_session_block_all_groups"
+                    class="rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
+                    :class="!form.cyber_session_block_all_groups
+                      ? 'bg-white text-gray-900 shadow-sm dark:bg-dark-800 dark:text-white'
+                      : 'text-gray-500 dark:text-gray-400'"
+                    @click="form.cyber_session_block_all_groups = false"
+                  >
+                    {{ t('admin.settings.features.riskControl.cyberSessionBlockSpecificGroups') }}
+                  </button>
+                </div>
+              </div>
+
+              <div v-if="!form.cyber_session_block_all_groups" class="space-y-3">
+                <div class="relative">
+                  <Icon
+                    name="search"
+                    size="sm"
+                    class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  />
+                  <input
+                    v-model.trim="cyberSessionBlockGroupSearch"
+                    type="search"
+                    data-testid="cyber-session-block-group-search"
+                    class="input pl-9"
+                    :placeholder="t('admin.settings.features.riskControl.cyberSessionBlockSearchGroups')"
+                  />
+                </div>
+                <div class="grid max-h-64 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+                  <label
+                    v-for="group in filteredCyberSessionBlockGroups"
+                    :key="group.id"
+                    :data-testid="`cyber-session-block-group-${group.id}`"
+                    class="flex cursor-pointer items-center gap-3 rounded-md border border-gray-100 px-3 py-2.5 transition-colors hover:bg-gray-50 dark:border-dark-700 dark:hover:bg-dark-700/60"
+                  >
+                    <input
+                      type="checkbox"
+                      :value="group.id"
+                      :checked="form.cyber_session_block_group_ids.includes(group.id)"
+                      class="h-4 w-4 shrink-0 rounded border-gray-300 text-primary-500 focus:ring-primary-500 dark:border-dark-500"
+                      @change="toggleCyberSessionBlockGroup(group.id, ($event.target as HTMLInputElement).checked)"
+                    />
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm font-medium text-gray-900 dark:text-white">
+                        {{ group.name }}
+                      </span>
+                      <span class="block truncate text-xs text-gray-500 dark:text-gray-400">
+                        {{ group.platform }} · {{ group.subscription_type }}
+                      </span>
+                    </span>
+                    <span
+                      v-if="group.status !== 'active'"
+                      class="shrink-0 text-xs text-gray-400"
+                    >
+                      {{ t('admin.settings.features.riskControl.cyberSessionBlockDisabledGroup') }}
+                    </span>
+                  </label>
+                  <p
+                    v-if="filteredCyberSessionBlockGroups.length === 0"
+                    class="text-sm text-gray-500 dark:text-gray-400 sm:col-span-2"
+                  >
+                    {{ t('admin.settings.features.riskControl.cyberSessionBlockNoGroups') }}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div
+              data-testid="openai-cyber-account-cooldown"
+              class="space-y-4 border-t border-gray-100 pt-5 dark:border-dark-700"
+            >
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldown') }}
+                  </label>
+                  <p class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownHint') }}
+                  </p>
+                </div>
+                <Toggle
+                  v-model="form.openai_cyber_account_cooldown_enabled"
+                  data-testid="openai-cyber-account-cooldown-toggle"
+                />
+              </div>
+
+              <div
+                v-if="form.openai_cyber_account_cooldown_enabled"
+                class="grid grid-cols-1 gap-4 md:grid-cols-3"
+              >
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownWindow') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_window_seconds"
+                    data-testid="openai-cyber-account-cooldown-window"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownFirst') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_first_seconds"
+                    data-testid="openai-cyber-account-cooldown-first"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.riskControl.cyberAccountCooldownEscalated') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_escalated_seconds"
+                    data-testid="openai-cyber-account-cooldown-escalated"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    class="input"
+                  />
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -8846,6 +9009,20 @@ const adminApiKeyMasked = ref("");
 const adminApiKeyOperating = ref(false);
 const newAdminApiKey = ref("");
 const subscriptionGroups = ref<AdminGroup[]>([]);
+const cyberSessionBlockGroups = ref<AdminGroup[]>([]);
+const cyberSessionBlockGroupSearch = ref("");
+
+const filteredCyberSessionBlockGroups = computed(() => {
+  const query = cyberSessionBlockGroupSearch.value.trim().toLowerCase();
+  if (!query) {
+    return cyberSessionBlockGroups.value;
+  }
+  return cyberSessionBlockGroups.value.filter((group) =>
+    [group.name, group.description, group.platform, group.subscription_type]
+      .filter((value): value is string => typeof value === "string")
+      .some((value) => value.toLowerCase().includes(query)),
+  );
+});
 
 // Upstream billing probe state
 const upstreamBillingProbeLoading = ref(true);
@@ -9461,6 +9638,12 @@ const form = reactive<SettingsForm>({
   risk_control_enabled: false,
   cyber_session_block_enabled: false,
   cyber_session_block_ttl_seconds: 3600,
+  cyber_session_block_all_groups: true,
+  cyber_session_block_group_ids: [],
+  openai_cyber_account_cooldown_enabled: false,
+  openai_cyber_account_cooldown_window_seconds: 86400,
+  openai_cyber_account_cooldown_first_seconds: 3600,
+  openai_cyber_account_cooldown_escalated_seconds: 86400,
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -10705,6 +10888,9 @@ async function loadSettings() {
     form.default_subscriptions = normalizeDefaultSubscriptionSettings(
       settings.default_subscriptions,
     );
+    form.cyber_session_block_group_ids = normalizeCyberSessionBlockGroupIDs(
+      form.cyber_session_block_group_ids,
+    );
     registrationEmailSuffixWhitelistTags.value =
       normalizeRegistrationEmailSuffixDomains(
         settings.registration_email_suffix_whitelist,
@@ -10820,13 +11006,40 @@ async function loadSettings() {
 async function loadSubscriptionGroups() {
   try {
     const groups = await adminAPI.groups.getAll();
+    cyberSessionBlockGroups.value = groups;
     subscriptionGroups.value = groups.filter(
       (group) =>
         group.subscription_type === "subscription" && group.status === "active",
     );
   } catch (_error: unknown) {
+    cyberSessionBlockGroups.value = [];
     subscriptionGroups.value = [];
   }
+}
+
+function normalizeCyberSessionBlockGroupIDs(groupIDs: unknown): number[] {
+  if (!Array.isArray(groupIDs)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      groupIDs.filter(
+        (groupID): groupID is number =>
+          typeof groupID === "number" &&
+          Number.isInteger(groupID) &&
+          groupID > 0,
+      ),
+    ),
+  );
+}
+
+function toggleCyberSessionBlockGroup(groupID: number, checked: boolean): void {
+  const selected = normalizeCyberSessionBlockGroupIDs(
+    form.cyber_session_block_group_ids,
+  );
+  form.cyber_session_block_group_ids = checked
+    ? normalizeCyberSessionBlockGroupIDs([...selected, groupID])
+    : selected.filter((selectedGroupID) => selectedGroupID !== groupID);
 }
 
 function findNextAvailableSubscriptionGroup(
@@ -10961,6 +11174,43 @@ async function saveSettings() {
     form.forwarded_client_ip_headers = normalizeForwardedClientIpHeaders(
       form.forwarded_client_ip_headers,
     );
+
+    form.cyber_session_block_group_ids = normalizeCyberSessionBlockGroupIDs(
+      form.cyber_session_block_group_ids,
+    );
+    if (
+      !form.cyber_session_block_all_groups &&
+      form.cyber_session_block_group_ids.length === 0
+    ) {
+      appStore.showError(
+        t(
+          "admin.settings.features.riskControl.cyberSessionBlockGroupsRequired",
+        ),
+      );
+      return;
+    }
+
+    const cyberAccountCooldownValues = [
+      Number(form.openai_cyber_account_cooldown_window_seconds),
+      Number(form.openai_cyber_account_cooldown_first_seconds),
+      Number(form.openai_cyber_account_cooldown_escalated_seconds),
+    ];
+    if (
+      cyberAccountCooldownValues.some(
+        (value) => !Number.isInteger(value) || value < 60 || value > 604800,
+      )
+    ) {
+      appStore.showError(
+        t("admin.settings.features.riskControl.cyberAccountCooldownRange"),
+      );
+      return;
+    }
+    if (cyberAccountCooldownValues[2] < cyberAccountCooldownValues[1]) {
+      appStore.showError(
+        t("admin.settings.features.riskControl.cyberAccountCooldownOrder"),
+      );
+      return;
+    }
 
     const normalizedDefaultSubscriptions = normalizeDefaultSubscriptionSettings(
       form.default_subscriptions,
@@ -11258,6 +11508,16 @@ async function saveSettings() {
       cyber_session_block_enabled: form.cyber_session_block_enabled,
       cyber_session_block_ttl_seconds:
         Number(form.cyber_session_block_ttl_seconds) || 3600,
+      cyber_session_block_all_groups: form.cyber_session_block_all_groups,
+      cyber_session_block_group_ids: form.cyber_session_block_group_ids,
+      openai_cyber_account_cooldown_enabled:
+        form.openai_cyber_account_cooldown_enabled,
+      openai_cyber_account_cooldown_window_seconds:
+        Number(form.openai_cyber_account_cooldown_window_seconds),
+      openai_cyber_account_cooldown_first_seconds:
+        Number(form.openai_cyber_account_cooldown_first_seconds),
+      openai_cyber_account_cooldown_escalated_seconds:
+        Number(form.openai_cyber_account_cooldown_escalated_seconds),
       payment_min_amount: Number(form.payment_min_amount) || 0,
       payment_max_amount: Number(form.payment_max_amount) || 0,
       payment_daily_limit: Number(form.payment_daily_limit) || 0,

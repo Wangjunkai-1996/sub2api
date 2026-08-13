@@ -3,12 +3,13 @@ package securityaudit
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 )
 
 var (
@@ -30,25 +31,54 @@ type promptSegment struct {
 }
 
 func ExtractPromptSnapshot(req Request) (PromptSnapshot, error) {
-	return extractPromptSnapshot(req, false)
+	return extractPromptSnapshot(req, false, false)
 }
 
-// ExtractBlockingPromptSnapshot builds the narrow, low-latency blocking input
-// when configured. Asynchronous auditing always uses ExtractPromptSnapshot so
-// the complete client-controlled transcript is retained for review.
+// ExtractBlockingPromptSnapshot builds the narrow current-user input used by
+// strict blocking and strict asynchronous auditing.
 func ExtractBlockingPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
-	return extractPromptSnapshot(req, latestTurnOnly)
+	return extractPromptSnapshot(req, true, latestTurnOnly)
 }
 
-func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
-	var document any
-	if err := json.Unmarshal(req.Body, &document); err != nil {
-		return PromptSnapshot{}, errors.New("prompt audit request JSON is invalid")
+func extractPromptSnapshot(req Request, blocking, latestTurnOnly bool) (PromptSnapshot, error) {
+	document := req.Document.Clone()
+	if document == nil {
+		if req.Strict {
+			document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
+		} else {
+			document = auditinput.Parse(req.Protocol, req.Body)
+		}
 	}
-	extracted := extractProtocolSegments(req.Protocol, document)
-	segments := normalizeSegmentsLatestUserFirst(extracted)
-	if latestTurnOnly {
-		segments = blockingSegmentsLatestUserAndPreviousOutput(extracted)
+	if document == nil || (req.Strict && document.TextAuditClass == auditinput.TextAuditIndeterminate) || (!req.Strict && !document.Complete) {
+		if document != nil && document.HasIssue(auditinput.IssueEmptyContent) && len(document.Issues) == 1 {
+			return PromptSnapshot{}, ErrNoPromptText
+		}
+		return PromptSnapshot{}, errors.New("prompt audit input is incomplete")
+	}
+	var segments []string
+	if blocking && req.Strict {
+		// Strict admission already selected the complete current increment. Prompt
+		// Guard must receive all of it, including trailing tool output, without a
+		// local hard limit or silent truncation.
+		if text := strings.TrimSpace(document.NormalizedText); text != "" {
+			segments = []string{text}
+		}
+	} else if req.Strict && strings.TrimSpace(req.AuditContext) != "" {
+		// Strict lineage must be scanned in chronological order as a single
+		// cumulative context. Reordering the current user turn ahead of its parent
+		// would hide cross-turn combinations from semantic guards.
+		segments = []string{strings.TrimSpace(req.AuditContext)}
+	} else {
+		extracted := make([]promptSegment, 0, len(document.Segments))
+		for _, segment := range document.Segments {
+			extracted = append(extracted, promptSegment{
+				text: segment.Normalized, user: segment.Role == "user", role: segment.Role,
+			})
+		}
+		segments = normalizeSegmentsLatestUserFirst(extracted)
+		if latestTurnOnly {
+			segments = blockingSegmentsLatestUserAndPreviousOutput(extracted)
+		}
 	}
 	if len(segments) == 0 {
 		return PromptSnapshot{}, ErrNoPromptText
@@ -561,6 +591,14 @@ func systemPromptSegments(texts []string) []promptSegment {
 }
 
 func RedactPreview(value string, maxRunes int) string {
+	return TrimRunes(RedactContext(value), maxRunes)
+}
+
+// RedactContext masks recognized secrets and direct identifiers without
+// truncating semantic context. Lineage storage uses this form so a later turn
+// can be audited against the complete bounded history without persisting raw
+// normalized prompt text.
+func RedactContext(value string) string {
 	value = bearerPattern.ReplaceAllString(value, "Bearer ***")
 	value = apiKeyPattern.ReplaceAllStringFunc(value, func(match string) string {
 		if index := strings.IndexAny(match, ":= \t"); index >= 0 {
@@ -571,7 +609,7 @@ func RedactPreview(value string, maxRunes int) string {
 	value = canaryPattern.ReplaceAllString(value, "${1}***")
 	value = emailPattern.ReplaceAllString(value, "***@***")
 	value = phonePattern.ReplaceAllString(value, "***PHONE***")
-	return TrimRunes(value, maxRunes)
+	return value
 }
 
 // BuildPromptPreview stores only a short, non-recoverable head of sanitized

@@ -414,6 +414,10 @@
                 <input v-model.number="configForm.timeout_ms" type="number" min="500" max="30000" class="input" />
               </div>
               <div>
+                <label class="input-label">{{ t('admin.riskControl.maxRpm') }}</label>
+                <input v-model.number="configForm.max_rpm" type="number" min="0" max="100000" class="input" />
+              </div>
+              <div>
                 <label class="input-label">{{ t('admin.riskControl.retryCount') }}</label>
                 <input v-model.number="configForm.retry_count" type="number" min="0" max="5" class="input" />
               </div>
@@ -1238,6 +1242,7 @@ const configForm = reactive({
   api_keys_mode: 'append' as APIKeysWriteMode,
   clear_api_key: false,
   timeout_ms: 3000,
+  max_rpm: 0,
   retry_count: 2,
   sample_rate: 100,
   all_groups: true,
@@ -1716,6 +1721,7 @@ function applyConfig(config: ContentModerationConfig) {
   testedApiKeyStatuses.value = []
   apiKeyRowsExpanded.value = false
   configForm.timeout_ms = config.timeout_ms || 3000
+  configForm.max_rpm = config.max_rpm ?? 0
   configForm.retry_count = config.retry_count ?? 2
   configForm.sample_rate = config.sample_rate ?? 100
   configForm.all_groups = config.all_groups
@@ -1801,6 +1807,7 @@ async function saveConfig() {
       // 后端语义：0 清除代理（直连），>0 指定代理
       proxy_id: configForm.proxy_id ?? 0,
       timeout_ms: Number(configForm.timeout_ms) || 3000,
+      max_rpm: Number(configForm.max_rpm) || 0,
       retry_count: Number(configForm.retry_count) || 0,
       sample_rate: Number(configForm.sample_rate) || 0,
       all_groups: configForm.all_groups,

@@ -21,6 +21,7 @@ export interface ContentModerationConfig {
   api_key_masks: string[]
   api_key_statuses: ContentModerationAPIKeyStatus[]
   timeout_ms: number
+  max_rpm: number
   sample_rate: number
   all_groups: boolean
   group_ids: number[]
@@ -101,6 +102,7 @@ export interface UpdateContentModerationConfig {
   delete_api_key_hashes?: string[]
   clear_api_key?: boolean
   timeout_ms?: number
+  max_rpm?: number
   sample_rate?: number
   all_groups?: boolean
   group_ids?: number[]

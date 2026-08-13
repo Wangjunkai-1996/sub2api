@@ -288,6 +288,7 @@ export default {
       clearApiKey: '清除已保存 Key',
       keepApiKey: '保留已保存 Key',
       timeoutMs: 'HTTP 超时 (ms)',
+      maxRpm: '严格审计最大 RPM',
       retryCount: '失败重试次数',
       sampleRate: '采样率',
       proxy: '代理服务器',

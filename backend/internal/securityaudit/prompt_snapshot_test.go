@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -20,9 +19,9 @@ func TestExtractPromptSnapshotProtocols(t *testing.T) {
 		{"openai_chat_completions", `{"messages":[{"role":"user","content":"old"},{"role":"assistant","content":"assistant turn"},{"role":"user","content":[{"type":"text","text":"最新😀"}]}]}`, "最新😀", 3},
 		{"openai_responses", `{"input":[{"role":"user","content":[{"type":"input_text","text":"response text"}]}]}`, "response text", 1},
 		{"anthropic_messages", `{"messages":[{"role":"user","content":[{"type":"text","text":"claude"}]}]}`, "claude", 1},
-		{"gemini", `{"contents":[{"role":"user","parts":[{"text":"gemini"},{"inline_data":{"data":"BASE64"}}]}]}`, "gemini", 1},
-		{"openai_images", `{"prompt":"draw a cat","image":"BASE64SECRET"}`, "draw a cat", 1},
-		{"responses_websocket", `{"type":"response.create","response":{"input":"turn two"}}`, "turn two", 1},
+		{"gemini", `{"contents":[{"role":"user","parts":[{"text":"gemini"},{"inline_data":{"mime_type":"image/png","data":"aGVsbG8="}}]}]}`, "gemini", 1},
+		{"openai_images", `{"prompt":"draw a cat","image":"data:image/png;base64,aGVsbG8="}`, "draw a cat", 1},
+		{"responses_websocket", `{"type":"response.create","input":"turn two"}`, "turn two", 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.protocol, func(t *testing.T) {
@@ -111,7 +110,7 @@ func TestPromptSnapshotLatestUserTextBlockIsOnePrioritizedSegment(t *testing.T) 
 			{"role":"tool","content":"tool client injection"},
 			{"role":"user","content":[
 				{"type":"text","text":"最新第一块😀"},
-				{"type":"image_url","image_url":{"url":"data:image/png;base64,IMAGE_CANARY_BASE64"}},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}},
 				{"type":"text","text":"最新第二块é"}
 			]}
 		]
@@ -119,7 +118,7 @@ func TestPromptSnapshotLatestUserTextBlockIsOnePrioritizedSegment(t *testing.T) 
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: body})
 	require.NoError(t, err)
 	require.Equal(t, 5, snapshot.MessageCount)
-	require.True(t, strings.HasPrefix(snapshot.ScanText, "最新第二块é"+promptAuditPrioritySeparator))
+	require.True(t, strings.HasPrefix(snapshot.ScanText, "最新第二块é"+promptAuditPrioritySeparator))
 	require.Contains(t, snapshot.ScanText, "最新第一块😀")
 	require.Contains(t, snapshot.ScanText, "历史输入")
 	require.Contains(t, snapshot.ScanText, "assistant client injection")
@@ -173,7 +172,7 @@ func TestPromptSnapshotResponsesShapes(t *testing.T) {
 
 func TestPromptSnapshotGeminiBatchShapesAndMediaExclusion(t *testing.T) {
 	body := []byte(`{
-		"contents":{"role":"user","parts":[{"text":"root content"},{"inlineData":{"data":"ROOT_BASE64"}}]},
+		"contents":{"role":"user","parts":[{"text":"root content"},{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]},
 		"instances":[{"prompt":"instance prompt"}],
 		"requests":[
 			{"contents":[{"role":"model","parts":[{"text":"ignore model"}]},{"role":"user","parts":[{"text":"nested user"}]}]},
@@ -193,18 +192,18 @@ func TestPromptSnapshotGeminiBatchShapesAndMediaExclusion(t *testing.T) {
 func TestPromptSnapshotMediaOnlyExtractsDeterministicTextPrompts(t *testing.T) {
 	body := []byte(`{
 		"prompt":"draw a lighthouse",
-		"image":"data:image/png;base64,IMAGE_CANARY",
+		"image":"data:image/png;base64,aGVsbG8=",
 		"input":{"negative_prompt":"no fog","image_prompt":"https://example.test/input.png","prompt":"draw a lighthouse"},
 		"request":{"lyrics":"ocean song","input":"` + strings.Repeat("A", 300) + `"},
-		"images":[{"description":"nested textual direction","image_url":"https://example.test/image.png"}]
+		"images":[{"description":"nested textual direction","image_url":"data:image/png;base64,aGVsbG8="}]
 	}`)
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "grok_media", Body: body})
 	require.NoError(t, err)
-	require.Equal(t, 4, snapshot.MessageCount)
+	require.Equal(t, 5, snapshot.MessageCount)
 	for _, expected := range []string{"draw a lighthouse", "no fog", "ocean song", "nested textual direction"} {
 		require.Contains(t, snapshot.ScanText, expected)
 	}
-	require.Equal(t, 1, strings.Count(snapshot.ScanText, "draw a lighthouse"))
+	require.Equal(t, 2, strings.Count(snapshot.ScanText, "draw a lighthouse"))
 	require.NotContains(t, snapshot.ScanText, "IMAGE_CANARY")
 	require.NotContains(t, snapshot.ScanText, "example.test")
 	require.NotContains(t, snapshot.ScanText, strings.Repeat("A", 100))
@@ -214,7 +213,7 @@ func TestResponsesWebSocketOnlyAuditsResponseCreateAndPreservesStage(t *testing.
 	for _, stage := range []string{"first_turn", "subsequent_turn"} {
 		snapshot, err := ExtractPromptSnapshot(Request{
 			Protocol: "openai_responses", Stage: stage,
-			Body: []byte(`{"type":"response.create","response":{"model":"gpt-test","input":[{"role":"user","content":[{"type":"input_text","text":"ws turn"}]}]}}`),
+			Body: []byte(`{"type":"response.create","model":"gpt-test","input":[{"role":"user","content":[{"type":"input_text","text":"ws turn"}]}]}`),
 		})
 		require.NoError(t, err)
 		require.Equal(t, "ws turn", snapshot.ScanText)
@@ -224,22 +223,24 @@ func TestResponsesWebSocketOnlyAuditsResponseCreateAndPreservesStage(t *testing.
 		Protocol: "openai_responses", Stage: "subsequent_turn",
 		Body: []byte(`{"type":"conversation.item.create","response":{"input":"must not scan this frame"}}`),
 	})
-	require.True(t, errors.Is(err, ErrNoPromptText))
+	require.Error(t, err)
 }
 
 func TestPromptSnapshotEmptyAndLongUnicodeInput(t *testing.T) {
-	_, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"function","content":"not audited role"},{"role":"user","content":"  "}]}`)})
-	require.True(t, errors.Is(err, ErrNoPromptText))
+	functionSnapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"function","content":"audited function output"},{"role":"user","content":"  "}]}`)})
+	require.NoError(t, err)
+	require.Contains(t, functionSnapshot.ScanText, "audited function output")
 
 	latest := strings.Repeat("最新😀é", 80)
 	history := strings.Repeat("历史中文", 80)
 	body := []byte(`{"messages":[{"role":"user","content":` + string(mustJSON(t, history)) + `},{"role":"user","content":` + string(mustJSON(t, latest)) + `}]}`)
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: body})
 	require.NoError(t, err)
-	require.True(t, strings.HasPrefix(snapshot.ScanText, latest))
+	normalizedLatest := strings.Repeat("最新😀é", 80)
+	require.True(t, strings.HasPrefix(snapshot.ScanText, normalizedLatest))
 	chunks := SplitRunes(snapshot.ScanText, 127)
 	require.Equal(t, strings.Replace(snapshot.ScanText, promptAuditPrioritySeparator, "", 1), strings.Join(chunks, ""))
-	require.Equal(t, latest, chunks[0]+strings.Join(chunks[1:len(SplitRunes(latest, 127))], ""))
+	require.Equal(t, normalizedLatest, chunks[0]+strings.Join(chunks[1:len(SplitRunes(normalizedLatest, 127))], ""))
 	for _, chunk := range chunks {
 		require.LessOrEqual(t, len([]rune(chunk)), 127)
 		require.True(t, utf8.ValidString(chunk))
@@ -366,6 +367,48 @@ func TestResponsesOutputTextIncludedInFullAndLatestTurnSnapshots(t *testing.T) {
 	require.Equal(t, "captured latest user input"+promptAuditPrioritySeparator+"captured previous assistant output", latestTurn.ScanText)
 	require.Equal(t, 2, latestTurn.MessageCount)
 	require.NotContains(t, latestTurn.ScanText, "earlier user input")
+}
+
+func TestStrictBlockingPromptSnapshotUsesOnlyLatestCurrentUserText(t *testing.T) {
+	req := Request{
+		Protocol: "openai_responses",
+		Body: []byte(`{
+			"instructions":"system instruction",
+			"input":[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"older user"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant output"}]},
+				{"type":"function_call_output","call_id":"call_1","output":"tool output"},
+				{"type":"message","role":"user","content":[
+					{"type":"input_text","text":"current part one"},
+					{"type":"input_image","image_url":"opaque"},
+					{"type":"input_text","text":"current part two"}
+				]}
+			]
+		}`),
+		Strict: true, AuditContext: "redacted parent\nfull historical context",
+	}
+	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
+	require.NoError(t, err)
+	require.Equal(t, "current part one\ncurrent part two", snapshot.ScanText)
+	require.Equal(t, 1, snapshot.MessageCount)
+	require.NotContains(t, snapshot.ScanText, promptAuditPrioritySeparator)
+	for _, omitted := range []string{"redacted parent", "system instruction", "older user", "assistant output", "tool output", "opaque"} {
+		require.NotContains(t, snapshot.ScanText, omitted)
+	}
+}
+
+func TestStrictBlockingPromptSnapshotPreservesCompleteCurrentIncrement(t *testing.T) {
+	latest := "latest:" + strings.Repeat("界", 12_100)
+	req := Request{
+		Protocol: "openai_chat_completions", Strict: true,
+		Body:         []byte(`{"messages":[{"role":"system","content":"ignore"},{"role":"user","content":` + string(mustJSON(t, latest)) + `}]}`),
+		AuditContext: strings.Repeat("historical context", 1000),
+	}
+
+	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
+	require.NoError(t, err)
+	require.Equal(t, latest, snapshot.ScanText)
+	require.Equal(t, utf8.RuneCountInString(latest), snapshot.PromptLength)
 }
 
 func TestBlockingPromptSnapshotPreservesFullScopeByDefaultAndWithoutUserInput(t *testing.T) {

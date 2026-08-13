@@ -352,6 +352,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	var firstTokenMs *int
 	responseID := ""
 	var finalResponse []byte
+	var lineageOutput []byte
+	lineageComplete := false
+	lineageTerminalCount := 0
+	var lineageAccumulator *openAIResponsesLineageAccumulator
+	if openAIResponsesLineageCaptureEnabled(c) {
+		lineageAccumulator = newOpenAIResponsesLineageAccumulator()
+	}
 	wroteDownstream := false
 	needModelReplace := originalModel != mappedModel
 	var mappedModelBytes []byte
@@ -367,6 +374,29 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
+	buildResult := func() *OpenAIForwardResult {
+		result := &OpenAIForwardResult{
+			RequestID:                     responseID,
+			ResponseID:                    responseID,
+			Usage:                         *usage,
+			Model:                         originalModel,
+			UpstreamModel:                 mappedModel,
+			UpstreamResponseModel:         responseModelObserver.Model(),
+			UpstreamResponseModelConflict: responseModelObserver.Conflict(),
+			ImageCount:                    imageCounter.Count(),
+			ImageOutputSizes:              imageCounter.Sizes(),
+			ServiceTier:                   extractOpenAIServiceTier(reqBody),
+			ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
+			Stream:                        reqStream,
+			OpenAIWSMode:                  true,
+			UpstreamTerminalEvent:         upstreamTerminalEvent,
+			ResponseHeaders:               lease.HandshakeHeaders(),
+			Duration:                      time.Since(startTime),
+			FirstTokenMs:                  firstTokenMs,
+		}
+		result.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
+		return result
+	}
 
 	var flusher http.Flusher
 	if reqStream {
@@ -576,6 +606,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			parseOpenAIWSResponseUsageFromCompletedEvent(message, usage)
 		}
 		imageCounter.AddSSEData(message)
+		if lineageAccumulator != nil {
+			lineageAccumulator.Observe(message)
+		}
 
 		if eventType == "response.failed" {
 			if hit, code, msg := detectOpenAICyberPolicy(message); hit {
@@ -659,6 +692,26 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return nil, fmt.Errorf("openai ws error event: %s", errMsg)
 		}
 
+		if isTerminalEvent {
+			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
+			if openAIResponsesLineageCaptureEnabled(c) {
+				lineageTerminalCount++
+				if lineageTerminalCount == 1 && (eventType == "response.completed" || eventType == "response.done") {
+					lineageOutput, lineageComplete = lineageAccumulator.SuccessTerminalOutput(message, responseID)
+				} else {
+					lineageOutput, lineageComplete = nil, false
+				}
+				if len(pendingJSONDocuments) != 0 {
+					lineageOutput, lineageComplete = nil, false
+				}
+			}
+			if eventType == "response.completed" || eventType == "response.done" {
+				if err := commitOpenAIStrictLineageFields(c, 1, responseID, upstreamTerminalEvent, lineageOutput, lineageComplete); err != nil {
+					return buildResult(), err
+				}
+			}
+		}
+
 		if reqStream {
 			// 在首个 token 前先缓冲事件（如 response.created），
 			// 以便上游早期断连时仍可安全回退到 HTTP，不给下游发送半截流。
@@ -690,11 +743,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 
 		if isTerminalEvent {
-			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
 			// A terminal event must be the final JSON document in its WS message.
 			// Ignore any tail for the completed client turn, but never reuse the
 			// ambiguous upstream connection for another request.
 			cleanExit = len(pendingJSONDocuments) == 0
+			if !cleanExit {
+				lineageOutput, lineageComplete = nil, false
+			}
 			break
 		}
 	}
@@ -761,24 +816,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		clientDisconnected,
 	)
 
-	return &OpenAIForwardResult{
-		RequestID:                     responseID,
-		Usage:                         *usage,
-		Model:                         originalModel,
-		UpstreamModel:                 mappedModel,
-		UpstreamResponseModel:         responseModelObserver.Model(),
-		UpstreamResponseModelConflict: responseModelObserver.Conflict(),
-		ImageCount:                    imageCounter.Count(),
-		ImageOutputSizes:              imageCounter.Sizes(),
-		ServiceTier:                   extractOpenAIServiceTier(reqBody),
-		ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
-		Stream:                        reqStream,
-		OpenAIWSMode:                  true,
-		UpstreamTerminalEvent:         upstreamTerminalEvent,
-		ResponseHeaders:               lease.HandshakeHeaders(),
-		Duration:                      time.Since(startTime),
-		FirstTokenMs:                  firstTokenMs,
-	}, nil
+	result := buildResult()
+	return result, nil
 }
 
 // ProxyResponsesWebSocketFromClient 处理客户端入站 WebSocket（OpenAI Responses WS Mode）并转发到上游。
