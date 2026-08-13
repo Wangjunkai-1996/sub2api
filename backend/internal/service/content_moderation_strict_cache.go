@@ -47,9 +47,10 @@ type strictModerationPool struct {
 }
 
 type strictModerationPoolLease struct {
-	pool  *strictModerationPool
-	probe bool
-	once  sync.Once
+	pool     *strictModerationPool
+	probe    bool
+	trackRPM bool
+	once     sync.Once
 }
 
 func (l *strictModerationPoolLease) release() {
@@ -223,8 +224,8 @@ func (c *strictModerationResultCache) removeLocked(entry *strictModerationResult
 }
 
 func (s *ContentModerationService) acquireStrictModerationPool(ctx context.Context, cfg *ContentModerationConfig) (*strictModerationPoolLease, error) {
-	if s == nil || cfg == nil || cfg.MaxRPM <= 0 {
-		return nil, errors.New("strict moderation rate limiter is not configured")
+	if s == nil || cfg == nil {
+		return nil, errors.New("strict moderation config is unavailable")
 	}
 	pool, err := s.strictModerationPool(cfg)
 	if err != nil {
@@ -242,7 +243,10 @@ func (s *ContentModerationService) acquireStrictModerationPool(ctx context.Conte
 
 		now := pool.currentTime()
 		pool.mu.Lock()
-		pool.pruneRequestsLocked(now)
+		trackRPM := cfg.MaxRPM > 0
+		if trackRPM {
+			pool.pruneRequestsLocked(now)
+		}
 		switch pool.circuit {
 		case strictModerationCircuitOpen:
 			if now.Before(pool.openUntil) {
@@ -266,7 +270,7 @@ func (s *ContentModerationService) acquireStrictModerationPool(ctx context.Conte
 				}
 			}
 		}
-		if len(pool.requestTimes) >= cfg.MaxRPM {
+		if trackRPM && len(pool.requestTimes) >= cfg.MaxRPM {
 			pool.mu.Unlock()
 			<-pool.sem
 			return nil, errStrictModerationRateLimited
@@ -277,12 +281,12 @@ func (s *ContentModerationService) acquireStrictModerationPool(ctx context.Conte
 			pool.probeDone = make(chan struct{})
 		}
 		pool.mu.Unlock()
-		return &strictModerationPoolLease{pool: pool, probe: probe}, nil
+		return &strictModerationPoolLease{pool: pool, probe: probe, trackRPM: trackRPM}, nil
 	}
 }
 
 func (l *strictModerationPoolLease) recordDispatch() {
-	if l == nil || l.pool == nil {
+	if l == nil || l.pool == nil || !l.trackRPM {
 		return
 	}
 	now := l.pool.currentTime()

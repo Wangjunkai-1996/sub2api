@@ -427,6 +427,30 @@ func TestStrictModerationPoolEnforcesRollingMaxRPM(t *testing.T) {
 	require.EqualValues(t, 4, calls.Load())
 }
 
+func TestStrictModerationPoolZeroMaxRPMIsUnlimited(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeStrictModerationCacheTestResponse(w, false, 0.01)
+	}))
+	defer server.Close()
+
+	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
+	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a")
+	cfg.MaxRPM = 0
+
+	for i := 0; i < 3; i++ {
+		result := callStrictModerationCacheTest(context.Background(), svc, cfg, fmt.Sprintf("unlimited-%d", i))
+		require.NoError(t, result.err)
+	}
+	require.EqualValues(t, 3, calls.Load())
+	pool, err := svc.strictModerationPool(cfg)
+	require.NoError(t, err)
+	pool.mu.Lock()
+	require.Empty(t, pool.requestTimes)
+	pool.mu.Unlock()
+}
+
 func TestStrictModerationPoolWaitHonorsContextCancellation(t *testing.T) {
 	svc := strictModerationCacheTestService(http.DefaultClient, nil)
 	cfg := strictModerationCacheTestConfig("https://moderation.example", "omni-moderation-latest", "sk-cache-a")

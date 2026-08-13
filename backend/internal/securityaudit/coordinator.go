@@ -180,6 +180,7 @@ func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, 
 type strictInputIssueLog struct {
 	Code      string
 	PathClass string
+	RootField string
 	Count     int
 }
 
@@ -212,20 +213,42 @@ func summarizeStrictInputIssues(issues []auditinput.Issue) []strictInputIssueLog
 	for _, issue := range issues {
 		code := strings.TrimSpace(issue.Code)
 		pathClass := strictInputPathClass(issue.Path)
-		counts[code+"\x00"+pathClass]++
+		rootField := strictInputRootField(code, issue.Path)
+		counts[code+"\x00"+pathClass+"\x00"+rootField]++
 	}
 	summary := make([]strictInputIssueLog, 0, len(counts))
 	for key, count := range counts {
-		parts := strings.SplitN(key, "\x00", 2)
-		summary = append(summary, strictInputIssueLog{Code: parts[0], PathClass: parts[1], Count: count})
+		parts := strings.SplitN(key, "\x00", 3)
+		summary = append(summary, strictInputIssueLog{Code: parts[0], PathClass: parts[1], RootField: parts[2], Count: count})
 	}
 	sort.Slice(summary, func(i, j int) bool {
 		if summary[i].Code == summary[j].Code {
+			if summary[i].PathClass == summary[j].PathClass {
+				return summary[i].RootField < summary[j].RootField
+			}
 			return summary[i].PathClass < summary[j].PathClass
 		}
 		return summary[i].Code < summary[j].Code
 	})
 	return summary
+}
+
+func strictInputRootField(code, path string) string {
+	if code != auditinput.IssueUnknownField || !strings.HasPrefix(path, "$.") {
+		return ""
+	}
+	field := strings.TrimPrefix(path, "$.")
+	if field == "" || len(field) > 64 || strings.ContainsAny(field, ".[]") {
+		return ""
+	}
+	for index, char := range field {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || char == '_' ||
+			(index > 0 && ((char >= '0' && char <= '9') || char == '-')) {
+			continue
+		}
+		return ""
+	}
+	return field
 }
 
 func strictInputPathClass(path string) string {

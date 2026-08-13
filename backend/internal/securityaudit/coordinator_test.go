@@ -730,15 +730,18 @@ func TestStrictInputIssueSummaryRedactsRawPaths(t *testing.T) {
 		{Code: auditinput.IssueEncryptedContent, Path: "$.input[3].encrypted_content"},
 		{Code: auditinput.IssueEncryptedContent, Path: "$.input[9].signature"},
 		{Code: auditinput.IssueUnknownField, Path: "$.tools[1].secret_schema_key"},
+		{Code: auditinput.IssueUnknownField, Path: "$.codex_output_schema"},
 	})
 
 	require.Equal(t, []strictInputIssueLog{
-		{Code: auditinput.IssueEncryptedContent, PathClass: "responses_input_item", Count: 2},
-		{Code: auditinput.IssueUnknownField, PathClass: "tool_definition", Count: 1},
+		{Code: auditinput.IssueEncryptedContent, PathClass: "responses_input_item", RootField: "", Count: 2},
+		{Code: auditinput.IssueUnknownField, PathClass: "other", RootField: "codex_output_schema", Count: 1},
+		{Code: auditinput.IssueUnknownField, PathClass: "tool_definition", RootField: "", Count: 1},
 	}, summary)
 	require.NotContains(t, fmt.Sprint(summary), "input[3]")
 	require.NotContains(t, fmt.Sprint(summary), "signature")
 	require.NotContains(t, fmt.Sprint(summary), "secret_schema_key")
+	require.Contains(t, fmt.Sprint(summary), "codex_output_schema")
 }
 
 type fakeLineageStore struct {
