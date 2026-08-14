@@ -195,8 +195,26 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 			Credentials: map[string]any{"access_token": "token-2"},
 		},
 	}
+	return newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts, 0)
+}
+
+func newOpenAIFailoverTestHandlerWithAccounts(
+	t *testing.T,
+	upstream service.HTTPUpstream,
+	accounts []service.Account,
+	auditGroupID int64,
+) *OpenAIGatewayHandler {
+	t.Helper()
 	accountRepo := openAIImagesFailoverAccountRepo{accounts: accounts}
 	cfg := &config.Config{RunMode: config.RunModeSimple}
+	var settingService *service.SettingService
+	if auditGroupID > 0 {
+		settingService = service.NewSettingService(&cyberHandlerSettingRepo{values: map[string]string{
+			service.SettingKeyOpenAIAccountAuditGroupIDs:              fmt.Sprintf("[%d]", auditGroupID),
+			service.SettingKeyOpenAIAccountAuditLongTextRuneThreshold: "12000",
+			service.SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled:   "true",
+		}}, cfg)
+	}
 	gatewayService := service.NewOpenAIGatewayService(
 		accountRepo,
 		nil,
@@ -218,7 +236,7 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 		nil,
 		nil,
 		nil,
-		nil,
+		settingService,
 		nil,
 	)
 	billingService := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
@@ -238,6 +256,21 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 	handler.securityAuditCoordinator = securityaudit.NewCoordinator(nil, nil)
 	handler.maxAccountSwitches = 10
 	return handler
+}
+
+func openAIAccountAuditFailoverTestAccount(id int64, priority int, accountType string, groupID int64) service.Account {
+	account := service.Account{
+		ID: id, Name: fmt.Sprintf("audit-failover-account-%d", id),
+		Platform: service.PlatformOpenAI, Type: accountType,
+		Status: service.StatusActive, Schedulable: true, Concurrency: 0, Priority: priority,
+		GroupIDs: []int64{groupID},
+	}
+	if accountType == service.AccountTypeOAuth {
+		account.Credentials = map[string]any{"access_token": fmt.Sprintf("oauth-token-%d", id), "plan_type": "pro"}
+	} else {
+		account.Credentials = map[string]any{"api_key": fmt.Sprintf("sk-test-%d", id)}
+	}
+	return account
 }
 
 func newOpenAIResponsesStrictFailoverTestHandler(t *testing.T, upstream service.HTTPUpstream, groupID int64) *OpenAIGatewayHandler {
@@ -445,6 +478,91 @@ func TestOpenAIGatewayHandlerResponses_FailoverContinuesForConnectedClient(t *te
 	require.Equal(t, []int64{1, 2}, upstream.calls(), "在线客户端应正常切换账号")
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+}
+
+func TestOpenAIChatCompletions_APIKeyFailoversToOAuthAuditsOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(3131)
+	accounts := []service.Account{
+		openAIAccountAuditFailoverTestAccount(1, 0, service.AccountTypeAPIKey, groupID),
+		openAIAccountAuditFailoverTestAccount(2, 1, service.AccountTypeAPIKey, groupID),
+		openAIAccountAuditFailoverTestAccount(3, 2, service.AccountTypeOAuth, groupID),
+	}
+	upstream := &openAIResponsesFailoverCancelUpstream{}
+	handler := newOpenAIFailoverTestHandlerWithAccounts(
+		t,
+		upstream,
+		accounts,
+		groupID,
+	)
+	legacy := &countingAccountAuditLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}}
+	handler.securityAuditCoordinator = securityaudit.NewCoordinator(legacy, nil)
+	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"safe"}]}`,
+	))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ChatCompletions(c)
+
+	require.Equal(t, []int64{1, 2, 3}, upstream.calls())
+	require.Equal(t, int32(1), legacy.calls.Load(), "the first OAuth Pro attempt must audit exactly once")
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+}
+
+func TestOpenAIChatCompletions_AuditFailureDoesNotFailOverToAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tt := range []struct {
+		name       string
+		legacy     *countingAccountAuditLegacyEngine
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "unavailable",
+			legacy: &countingAccountAuditLegacyEngine{
+				err: errors.New("audit unavailable"),
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   securityaudit.ErrorCodeAuditUnavailable,
+		},
+		{
+			name: "blocked",
+			legacy: &countingAccountAuditLegacyEngine{
+				decision: &securityaudit.LegacyDecision{Blocked: true, Flagged: true},
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   securityaudit.ErrorCodePolicyBlocked,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			groupID := int64(3131)
+			accounts := []service.Account{
+				openAIAccountAuditFailoverTestAccount(1, 0, service.AccountTypeOAuth, groupID),
+				openAIAccountAuditFailoverTestAccount(2, 1, service.AccountTypeAPIKey, groupID),
+			}
+			upstream := &openAIResponsesFailoverCancelUpstream{}
+			handler := newOpenAIFailoverTestHandlerWithAccounts(
+				t,
+				upstream,
+				accounts,
+				groupID,
+			)
+			handler.securityAuditCoordinator = securityaudit.NewCoordinator(tt.legacy, nil)
+			c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+				`{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"safe"}]}`,
+			))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			handler.ChatCompletions(c)
+
+			require.Equal(t, int32(1), tt.legacy.calls.Load())
+			require.Empty(t, upstream.calls(), "audit failure must stop before OAuth or backup APIKey forwarding")
+			require.Equal(t, tt.wantStatus, rec.Code)
+			require.Contains(t, rec.Body.String(), tt.wantCode)
+		})
+	}
 }
 
 func TestOpenAIGatewayHandlerResponses_APIKeyContinuationStaysHTTPAndSkipsAudit(t *testing.T) {

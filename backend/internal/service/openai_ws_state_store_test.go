@@ -20,6 +20,41 @@ type openAIWSStrictStateCache struct {
 	getCalls  int
 }
 
+type openAIWSDetachedWriteCache struct {
+	GatewayCache
+	mu            sync.Mutex
+	accountID     int64
+	ctxValue      any
+	hasDeadline   bool
+	deadlineDelta time.Duration
+}
+
+func (c *openAIWSDetachedWriteCache) SetSessionAccountID(ctx context.Context, _ int64, _ string, accountID int64, _ time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.accountID = accountID
+	c.ctxValue = ctx.Value(openAIWSDetachedWriteContextKey{})
+	if deadline, ok := ctx.Deadline(); ok {
+		c.hasDeadline = true
+		c.deadlineDelta = time.Until(deadline)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *openAIWSDetachedWriteCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accountID <= 0 {
+		return 0, ErrStickySessionNotFound
+	}
+	return c.accountID, nil
+}
+
+type openAIWSDetachedWriteContextKey struct{}
+
 func (c *openAIWSStrictStateCache) SetSessionAccountID(context.Context, int64, string, int64, time.Duration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -49,6 +84,25 @@ func TestOpenAIWSStateStore_BindGetDeleteResponseAccount(t *testing.T) {
 	accountID, err = store.GetResponseAccount(ctx, groupID, "resp_abc")
 	require.NoError(t, err)
 	require.Zero(t, accountID)
+}
+
+func TestOpenAIWSStateStore_BindResponseAccountPersistsAfterParentCanceled(t *testing.T) {
+	cache := &openAIWSDetachedWriteCache{}
+	writer := NewOpenAIWSStateStore(cache)
+	parent := context.WithValue(context.Background(), openAIWSDetachedWriteContextKey{}, "request-value")
+	canceled, cancel := context.WithCancel(parent)
+	cancel()
+
+	require.NoError(t, writer.BindResponseAccount(canceled, 12, "resp_after_cancel", 10601, time.Hour))
+
+	reader := NewOpenAIWSStateStore(cache)
+	accountID, err := reader.GetResponseAccount(context.Background(), 12, "resp_after_cancel")
+	require.NoError(t, err)
+	require.Equal(t, int64(10601), accountID, "a fresh process must resolve the persisted response binding")
+	require.Equal(t, "request-value", cache.ctxValue, "detaching cancellation must preserve request context values")
+	require.True(t, cache.hasDeadline)
+	require.Greater(t, cache.deadlineDelta, 2*time.Second)
+	require.LessOrEqual(t, cache.deadlineDelta, openAIWSStateStoreRedisTimeout)
 }
 
 func TestOpenAIWSStateStore_StrictResponseAccountIsRedisAuthoritative(t *testing.T) {
@@ -304,4 +358,10 @@ func TestWithOpenAIWSStateStoreRedisTimeout_WithParentContext(t *testing.T) {
 	require.NotNil(t, ctx)
 	_, ok := ctx.Deadline()
 	require.True(t, ok, "应附加短超时")
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	canceledCtx, cancelCanceledCtx := withOpenAIWSStateStoreRedisTimeout(parent)
+	defer cancelCanceledCtx()
+	require.ErrorIs(t, canceledCtx.Err(), context.Canceled, "读取和删除使用的通用 helper 必须继续继承父取消")
 }
