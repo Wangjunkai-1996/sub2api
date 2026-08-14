@@ -89,9 +89,14 @@ type Request struct {
 	Model      string
 	Body       []byte
 	Stage      string
-	Strict     bool
-	Document   *auditinput.Document
-	PriorAudit *AuditSummary
+	// ForceStrictAdmission is set only after the gateway has verified the final
+	// upstream account against the account-scoped audit policy. It keeps the
+	// client API key group as the lineage namespace while avoiding a second,
+	// request-group based scope decision inside the audit engines.
+	ForceStrictAdmission bool
+	Strict               bool
+	Document             *auditinput.Document
+	PriorAudit           *AuditSummary
 	// AuditContext is the bounded, chronological context consumed by strict
 	// auditors. It is never written back to Body or forwarded upstream.
 	AuditContext string

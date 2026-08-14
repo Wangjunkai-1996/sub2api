@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOpenAIGatewayService_StrictContinuationDBRecheckFailureKeepsBinding(t *testing.T) {
-	ctx := WithOpenAIStrictHTTPContinuation(context.Background())
+func TestOpenAIGatewayService_HardBoundContinuationDBRecheckFailureKeepsBinding(t *testing.T) {
+	ctx := WithOpenAIHardBoundHTTPContinuation(context.Background())
 	groupID := int64(12)
 	account := &Account{
 		ID:          1879,

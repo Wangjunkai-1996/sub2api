@@ -452,7 +452,7 @@ func (s *OpenAIGatewayService) validateStrictContinuationAccount(
 	requireCompact bool,
 	expectedAccountID int64,
 ) error {
-	if s == nil || !openAIStrictHTTPContinuationRequired(ctx) {
+	if s == nil || !openAIHardBoundHTTPContinuationRequired(ctx) {
 		return ErrOpenAIPreviousResponseAccountUnavailable
 	}
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
@@ -612,10 +612,10 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	if s == nil {
 		return 0, nil, "", nil, nil
 	}
-	// Legacy continuations are a WebSocket-v2 contract even when the caller's
-	// broader scheduling transport is Any. Only an audited strict HTTP
-	// continuation may resolve the producing account for HTTP/SSE reuse.
-	if !openAIStrictHTTPContinuationRequired(ctx) {
+	// Legacy movable continuations are a WebSocket-v2 contract. Hard-bound HTTP
+	// continuations keep the caller's base transport; request-local routing adds
+	// audited requirements only when the final account is audit-eligible.
+	if !openAIHardBoundHTTPContinuationRequired(ctx) {
 		requiredTransport = OpenAIUpstreamTransportResponsesWebsocketV2
 	}
 	responseID := strings.TrimSpace(previousResponseID)
@@ -629,7 +629,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 
 	var accountID int64
 	var err error
-	if openAIStrictHTTPContinuationRequired(ctx) {
+	if openAIHardBoundHTTPContinuationRequired(ctx) {
 		strictStore, ok := store.(openAIWSStrictResponseAccountStore)
 		if !ok {
 			return 0, nil, "", nil, ErrOpenAIResponseAccountStoreUnavailable
@@ -639,7 +639,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		accountID, err = store.GetResponseAccount(ctx, derefGroupID(groupID), responseID)
 	}
 	if err != nil {
-		if openAIStrictHTTPContinuationRequired(ctx) && errors.Is(err, ErrStickySessionNotFound) {
+		if openAIHardBoundHTTPContinuationRequired(ctx) && errors.Is(err, ErrStickySessionNotFound) {
 			return 0, nil, "", nil, ErrOpenAIPreviousResponseAccountUnavailable
 		}
 		return 0, nil, "", nil, err
@@ -670,7 +670,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		deleteBinding()
 		return 0, nil, "", nil, nil
 	}
-	if openAIStrictHTTPContinuationRequired(ctx) && !s.openAIAccountMatchesSchedulingGroup(account, groupID) {
+	if openAIHardBoundHTTPContinuationRequired(ctx) && !s.openAIAccountMatchesSchedulingGroup(account, groupID) {
 		deleteBinding()
 		return 0, nil, "", nil, nil
 	}
@@ -724,7 +724,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			deleteBinding()
 			return 0, nil, "", nil, nil
 		}
-		if openAIStrictHTTPContinuationRequired(ctx) && !s.openAIAccountMatchesSchedulingGroup(latest, groupID) {
+		if openAIHardBoundHTTPContinuationRequired(ctx) && !s.openAIAccountMatchesSchedulingGroup(latest, groupID) {
 			deleteBinding()
 			return 0, nil, "", nil, nil
 		}
@@ -733,12 +733,6 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			return 0, nil, "", nil, nil
 		}
 		if requestedModel != "" && !latest.IsModelSupported(requestedModel) {
-			return 0, nil, "", nil, nil
-		}
-		if !latest.SupportsOpenAIEndpointCapability(requiredCapability) {
-			return 0, nil, "", nil, nil
-		}
-		if !s.isOpenAIAccountTransportCompatible(latest, requiredTransport) {
 			return 0, nil, "", nil, nil
 		}
 		if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, latest); paused {
@@ -753,6 +747,9 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			return 0, nil, "", nil, nil
 		}
 		account = latest
+	}
+	if !s.openAIAccountMeetsRoutingRequirements(ctx, account, requiredTransport, requiredCapability) {
+		return 0, nil, "", nil, nil
 	}
 	if requireCompact && openAICompactSupportTier(account) == 0 {
 		deleteBinding()

@@ -121,6 +121,7 @@ func runStrictGateTwoTurnSession(
 func TestOpenAIWSPassthroughRejectsStrictAuditBeforeDial(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := passthroughLifecycleConfig()
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
 	dialer := &strictPassthroughCountingDialer{}
 	svc := &OpenAIGatewayService{
 		cfg:                       cfg,
@@ -131,6 +132,15 @@ func TestOpenAIWSPassthroughRejectsStrictAuditBeforeDial(t *testing.T) {
 		openaiWSPassthroughDialer: dialer,
 	}
 	account := passthroughLifecycleAccount()
+	account.Type = AccountTypeOAuth
+	account.GroupIDs = []int64{12}
+	account.Credentials = map[string]any{
+		"access_token": "oauth-token",
+		"plan_type":    "pro",
+	}
+	account.Extra = map[string]any{
+		"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
+	}
 	serverErrCh := make(chan error, 1)
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
@@ -203,6 +213,7 @@ func TestOpenAIWSHTTPBridgeStrictGateBlocksReplayBeforeTurnAndSecondUpstream(t *
 	cfg.Security.URLAllowlist.Enabled = false
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
 	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
 	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
 	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
@@ -219,10 +230,10 @@ func TestOpenAIWSHTTPBridgeStrictGateBlocksReplayBeforeTurnAndSecondUpstream(t *
 		toolCorrector:    NewCodexToolCorrector(),
 	}
 	account := &Account{
-		ID: 201, Name: "strict-http-bridge", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
-		Status: StatusActive, Schedulable: true, Concurrency: 1,
-		Credentials: map[string]any{"api_key": "sk-test"},
-		Extra:       map[string]any{"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge},
+		ID: 201, Name: "strict-http-bridge", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{12},
+		Credentials: map[string]any{"access_token": "oauth-token", "plan_type": "pro"},
+		Extra:       map[string]any{"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge},
 	}
 
 	var hookMu sync.Mutex
@@ -318,6 +329,7 @@ func TestOpenAIWSIngressStrictGateBlocksSecondTurnBeforeTurnAndUpstreamWrite(t *
 	cfg.Security.URLAllowlist.Enabled = false
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
 	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
 	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
 	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
@@ -341,10 +353,10 @@ func TestOpenAIWSIngressStrictGateBlocksSecondTurnBeforeTurnAndUpstreamWrite(t *
 		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg), toolCorrector: NewCodexToolCorrector(), openaiWSPool: pool,
 	}
 	account := &Account{
-		ID: 202, Name: "strict-ingress", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
-		Status: StatusActive, Schedulable: true, Concurrency: 1,
-		Credentials: map[string]any{"api_key": "sk-test"},
-		Extra:       map[string]any{"responses_websockets_v2_enabled": true},
+		ID: 202, Name: "strict-ingress", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{12},
+		Credentials: map[string]any{"access_token": "oauth-token", "plan_type": "pro"},
+		Extra:       map[string]any{"openai_oauth_responses_websockets_v2_enabled": true},
 	}
 
 	auditBlockErr := errors.New("strict ingress audit blocked")
@@ -452,6 +464,7 @@ func TestOpenAIWSHTTPBridgeRejectsMixedResponseCreateBeforeTurnAndDispatch(t *te
 	cfg.Security.URLAllowlist.Enabled = false
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
 	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
 	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
 	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
@@ -465,10 +478,10 @@ func TestOpenAIWSHTTPBridgeRejectsMixedResponseCreateBeforeTurnAndDispatch(t *te
 		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg), toolCorrector: NewCodexToolCorrector(),
 	}
 	account := &Account{
-		ID: 204, Name: "strict-http-bridge-mixed", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
-		Status: StatusActive, Schedulable: true, Concurrency: 1,
-		Credentials: map[string]any{"api_key": "sk-test"},
-		Extra:       map[string]any{"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge},
+		ID: 204, Name: "strict-http-bridge-mixed", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{12},
+		Credentials: map[string]any{"access_token": "oauth-token", "plan_type": "pro"},
+		Extra:       map[string]any{"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge},
 	}
 
 	var hookMu sync.Mutex
@@ -522,6 +535,7 @@ func TestOpenAIWSIngressRejectsMixedResponseCreateBeforeTurnAndUpstreamWrite(t *
 	cfg.Security.URLAllowlist.Enabled = false
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
 	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
 	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
 	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
@@ -544,10 +558,10 @@ func TestOpenAIWSIngressRejectsMixedResponseCreateBeforeTurnAndUpstreamWrite(t *
 		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg), toolCorrector: NewCodexToolCorrector(), openaiWSPool: pool,
 	}
 	account := &Account{
-		ID: 205, Name: "strict-ingress-mixed", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
-		Status: StatusActive, Schedulable: true, Concurrency: 1,
-		Credentials: map[string]any{"api_key": "sk-test"},
-		Extra:       map[string]any{"responses_websockets_v2_enabled": true},
+		ID: 205, Name: "strict-ingress-mixed", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{12},
+		Credentials: map[string]any{"access_token": "oauth-token", "plan_type": "pro"},
+		Extra:       map[string]any{"openai_oauth_responses_websockets_v2_enabled": true},
 	}
 
 	var hookMu sync.Mutex

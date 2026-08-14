@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -23,6 +25,177 @@ type securityAuditWSDedupeEntry struct {
 	turn     int
 	bodyHash [sha256.Size]byte
 	decision securityaudit.Decision
+}
+
+type openAIAccountAuditState struct {
+	mu       sync.Mutex
+	protocol string
+	model    string
+	body     []byte
+	stage    string
+	document *auditinput.Document
+	policy   service.OpenAIAccountAuditRoutingPolicy
+	passed   bool
+	terminal bool
+	decision securityaudit.Decision
+	summary  *securityaudit.AuditSummary
+}
+
+func newOpenAIAccountAuditState(
+	protocol string,
+	model string,
+	body []byte,
+	stage string,
+	policy service.OpenAIAccountAuditRoutingPolicy,
+) *openAIAccountAuditState {
+	if strings.TrimSpace(stage) == "" {
+		stage = "http"
+	}
+	return &openAIAccountAuditState{
+		protocol: strings.TrimSpace(protocol),
+		model:    strings.TrimSpace(model),
+		body:     append([]byte(nil), body...),
+		stage:    strings.TrimSpace(stage),
+		document: auditinput.ParseForTextAudit(protocol, body),
+		policy:   policy,
+	}
+}
+
+func (s *openAIAccountAuditState) auditTextRunes() int {
+	if s == nil || s.document == nil {
+		return 0
+	}
+	return s.document.AuditTextRunes
+}
+
+func (s *openAIAccountAuditState) preferAPIKey() bool {
+	return s != nil && s.policy.PreferAPIKeyEnabled() &&
+		s.auditTextRunes() > s.policy.LongTextRuneThreshold()
+}
+
+func (s *openAIAccountAuditState) routingOptions(
+	auditTransport service.OpenAIUpstreamTransport,
+	auditCapability service.OpenAIEndpointCapability,
+) service.OpenAIAccountRoutingOptions {
+	if s == nil {
+		return service.OpenAIAccountRoutingOptions{}
+	}
+	return service.OpenAIAccountRoutingOptions{
+		PreferAPIKey:                    s.preferAPIKey(),
+		AuditPolicy:                     s.policy,
+		AuditRequiredTransport:          auditTransport,
+		AuditRequiredEndpointCapability: auditCapability,
+	}
+}
+
+func (s *openAIAccountAuditState) summaryClone() *securityaudit.AuditSummary {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.summary == nil {
+		return nil
+	}
+	cloned := s.summary.Clone()
+	return &cloned
+}
+
+func auditUnavailableForAccountPolicy() *securityaudit.Decision {
+	return &securityaudit.Decision{
+		Kind: securityaudit.DecisionUnavailable, HTTPStatus: http.StatusServiceUnavailable,
+		ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
+		ClientMessage: "安全审计暂时不可用，请稍后重试",
+	}
+}
+
+func (h *OpenAIGatewayHandler) ensureSecurityAuditForAccount(
+	c *gin.Context,
+	reqLog *zap.Logger,
+	apiKey *service.APIKey,
+	subject middleware2.AuthSubject,
+	account *service.Account,
+	state *openAIAccountAuditState,
+) (*securityaudit.Decision, service.OpenAIAccountAuditEligibility) {
+	if state == nil {
+		eligibility := service.OpenAIAccountAuditEligibility{Indeterminate: true, Reason: service.OpenAIAccountAuditPolicyUnavailable}
+		return auditUnavailableForAccountPolicy(), eligibility
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	eligibility := service.ClassifyOpenAIAccountAuditEligibility(account, state.policy)
+	if state.terminal {
+		decision := state.decision
+		return &decision, eligibility
+	}
+	if reqLog != nil {
+		fields := []zap.Field{
+			zap.Int("audit_text_runes", state.auditTextRunes()),
+			zap.Bool("prefer_apikey", state.preferAPIKey()),
+			zap.Bool("audit_required", eligibility.Eligible || eligibility.Indeterminate),
+			zap.String("audit_eligibility_reason", string(eligibility.Reason)),
+			zap.Int64("audit_account_group_id", eligibility.MatchedGroupID),
+		}
+		if account != nil {
+			fields = append(fields, zap.Int64("account_id", account.ID), zap.String("account_type", account.Type))
+		}
+		reqLog.Info("security_audit.account_admission", fields...)
+	}
+	if !eligibility.Eligible {
+		if eligibility.Indeterminate {
+			decision := auditUnavailableForAccountPolicy()
+			state.terminal = true
+			state.decision = *decision
+			return decision, eligibility
+		}
+		return nil, eligibility
+	}
+	if state.passed {
+		decision := state.decision
+		if reqLog != nil {
+			reqLog.Info("security_audit.account_check_reused",
+				zap.Int64("account_id", account.ID),
+				zap.String("account_type", account.Type),
+				zap.Int("audit_text_runes", state.auditTextRunes()),
+			)
+		}
+		return &decision, eligibility
+	}
+	if h == nil || h.securityAuditCoordinator == nil || c == nil || c.Request == nil {
+		decision := auditUnavailableForAccountPolicy()
+		state.terminal = true
+		state.decision = *decision
+		return decision, eligibility
+	}
+	if !strictAuditProtocolApplies(c, apiKey, state.protocol) ||
+		strictAuditRequestBypassesTextAudit(c, state.protocol, state.model, state.body) {
+		return nil, eligibility
+	}
+
+	request := buildSecurityAuditRequest(c, apiKey, subject, state.protocol, state.model, state.body, state.stage)
+	request.Document = state.document.Clone()
+	request.ForceStrictAdmission = true
+	logSecurityAuditStart(reqLog, request, len(state.body), false)
+	decision := h.securityAuditCoordinator.Check(c.Request.Context(), request)
+	logSecurityAuditDone(reqLog, request, decision, false)
+	if !decision.AllowNextStage {
+		state.terminal = true
+		state.decision = decision
+		return &decision, eligibility
+	}
+	if decision.Audit == nil {
+		unavailable := auditUnavailableForAccountPolicy()
+		state.terminal = true
+		state.decision = *unavailable
+		return unavailable, eligibility
+	}
+	service.MarkOpenAIStrictAuditRequest(c)
+	state.passed = true
+	state.decision = decision
+	cloned := decision.Audit.Clone()
+	state.summary = &cloned
+	return &decision, eligibility
 }
 
 // cachesSecurityAuditCompletion reports whether a successful audit may be

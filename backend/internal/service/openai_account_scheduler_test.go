@@ -2150,11 +2150,11 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseSticky(
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationKeepsProducingAccount(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_HardBoundHTTPContinuationKeepsProducingAccount(t *testing.T) {
 	for _, advancedScheduler := range []string{"false", "true"} {
 		advancedScheduler := advancedScheduler
 		t.Run("advanced_scheduler_"+advancedScheduler, func(t *testing.T) {
-			ctx := WithOpenAIStrictHTTPContinuation(context.Background())
+			ctx := WithOpenAIHardBoundHTTPContinuation(context.Background())
 			groupID := int64(12)
 			producingAccount := Account{
 				ID:          1879,
@@ -2194,12 +2194,12 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationK
 			}
 
 			store := svc.getOpenAIWSStateStore()
-			require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_http_strict", producingAccount.ID, time.Hour))
+			require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_http_hard_bound", producingAccount.ID, time.Hour))
 
 			selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
 				ctx,
 				&groupID,
-				"resp_http_strict",
+				"resp_http_hard_bound",
 				"",
 				"gpt-5.4",
 				nil,
@@ -2223,14 +2223,14 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationK
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationFailureNeverUsesBackup(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_HardBoundHTTPContinuationFailureNeverUsesBackup(t *testing.T) {
 	for _, advancedScheduler := range []string{"false", "true"} {
 		advancedScheduler := advancedScheduler
 		t.Run("advanced_scheduler_"+advancedScheduler, func(t *testing.T) {
 			for _, failure := range []string{"missing", "excluded", "responses_unsupported", "wrong_group"} {
 				failure := failure
 				t.Run(failure, func(t *testing.T) {
-					ctx := WithOpenAIStrictHTTPContinuation(context.Background())
+					ctx := WithOpenAIHardBoundHTTPContinuation(context.Background())
 					groupID := int64(12)
 					producingAccount := Account{
 						ID:          1879,
@@ -2275,7 +2275,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationF
 						}),
 					}
 					if failure != "missing" {
-						require.NoError(t, svc.getOpenAIWSStateStore().BindResponseAccount(ctx, groupID, "resp_http_strict", producingAccount.ID, time.Hour))
+						require.NoError(t, svc.getOpenAIWSStateStore().BindResponseAccount(ctx, groupID, "resp_http_hard_bound", producingAccount.ID, time.Hour))
 					}
 					excludedIDs := map[int64]struct{}(nil)
 					if failure == "excluded" {
@@ -2285,7 +2285,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationF
 					selection, _, err := svc.SelectAccountWithSchedulerForCapability(
 						ctx,
 						&groupID,
-						"resp_http_strict",
+						"resp_http_hard_bound",
 						"",
 						"gpt-5.4",
 						excludedIDs,
@@ -2297,38 +2297,11 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StrictHTTPContinuationF
 					)
 					require.ErrorIs(t, err, ErrOpenAIPreviousResponseAccountUnavailable)
 					require.Nil(t, selection)
-					require.Empty(t, acquiredIDs, "strict failure must not acquire the producing or backup account")
+					require.Empty(t, acquiredIDs, "hard-bound failure must not acquire the producing or backup account")
 				})
 			}
 		})
 	}
-}
-
-func TestOpenAIGatewayService_ValidateStrictHTTPContinuationAccountDoesNotDeleteBindingOnLookupFailure(t *testing.T) {
-	ctx := WithOpenAIStrictHTTPContinuation(context.Background())
-	groupID := int64(12)
-	cache := &schedulerTestGatewayCache{}
-	svc := &OpenAIGatewayService{
-		accountRepo: schedulerLookupErrorOpenAIAccountRepo{err: errors.New("database unavailable")},
-		cache:       cache,
-		cfg:         newSchedulerTestOpenAIWSV2Config(),
-	}
-	store := svc.getOpenAIWSStateStore()
-	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_read_only_preflight", 1879, time.Hour))
-
-	err := svc.ValidateStrictHTTPContinuationAccount(
-		ctx,
-		&groupID,
-		"resp_read_only_preflight",
-		"gpt-5.4",
-		false,
-	)
-	require.ErrorIs(t, err, ErrOpenAIResponseAccountStoreUnavailable)
-
-	accountID, getErr := store.GetResponseAccount(ctx, groupID, "resp_read_only_preflight")
-	require.NoError(t, getErr)
-	require.Equal(t, int64(1879), accountID)
-	require.Empty(t, cache.deletedSessions)
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_NonStrictContinuationMissKeepsLegacyFallback(t *testing.T) {
@@ -3949,20 +3922,19 @@ func TestDefaultOpenAIAccountScheduler_IsAccountTransportCompatible_Branches(t *
 	require.False(t, scheduler.isAccountTransportCompatible(account, OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress))
 }
 
-func TestOpenAIGatewayService_StrictContinuationTransportContracts(t *testing.T) {
+func TestOpenAIGatewayService_StrictWSContinuationTransportContractsForAuditedOAuth(t *testing.T) {
 	groupID := int64(12)
 	tests := []struct {
-		name      string
-		mode      string
-		httpValid bool
-		wsValid   bool
+		name    string
+		mode    string
+		wsValid bool
 	}{
-		{name: "ctx_pool", mode: OpenAIWSIngressModeCtxPool, httpValid: true, wsValid: true},
-		{name: "shared", mode: OpenAIWSIngressModeShared, httpValid: true, wsValid: true},
-		{name: "dedicated", mode: OpenAIWSIngressModeDedicated, httpValid: true, wsValid: true},
-		{name: "http_bridge", mode: OpenAIWSIngressModeHTTPBridge, httpValid: false, wsValid: true},
-		{name: "passthrough", mode: OpenAIWSIngressModePassthrough, httpValid: false, wsValid: false},
-		{name: "off", mode: OpenAIWSIngressModeOff, httpValid: false, wsValid: false},
+		{name: "ctx_pool", mode: OpenAIWSIngressModeCtxPool, wsValid: true},
+		{name: "shared", mode: OpenAIWSIngressModeShared, wsValid: true},
+		{name: "dedicated", mode: OpenAIWSIngressModeDedicated, wsValid: true},
+		{name: "http_bridge", mode: OpenAIWSIngressModeHTTPBridge, wsValid: true},
+		{name: "passthrough", mode: OpenAIWSIngressModePassthrough, wsValid: false},
+		{name: "off", mode: OpenAIWSIngressModeOff, wsValid: false},
 	}
 
 	for index, tt := range tests {
@@ -3970,14 +3942,15 @@ func TestOpenAIGatewayService_StrictContinuationTransportContracts(t *testing.T)
 			account := Account{
 				ID:          int64(8900 + index),
 				Platform:    PlatformOpenAI,
-				Type:        AccountTypeAPIKey,
+				Type:        AccountTypeOAuth,
 				Status:      StatusActive,
 				Schedulable: true,
 				Concurrency: 1,
 				GroupIDs:    []int64{groupID},
+				Credentials: map[string]any{"plan_type": "pro"},
 				Extra: map[string]any{
-					"openai_responses_supported":                 true,
-					"openai_apikey_responses_websockets_v2_mode": tt.mode,
+					"openai_responses_supported":                true,
+					"openai_oauth_responses_websockets_v2_mode": tt.mode,
 				},
 			}
 			cfg := newSchedulerTestOpenAIWSV2Config()
@@ -3993,13 +3966,6 @@ func TestOpenAIGatewayService_StrictContinuationTransportContracts(t *testing.T)
 			responseID := fmt.Sprintf("resp_strict_transport_%d", index)
 			store := svc.getOpenAIWSStateStore()
 			require.NoError(t, store.BindResponseAccount(ctx, groupID, responseID, account.ID, time.Hour))
-
-			httpErr := svc.ValidateStrictHTTPContinuationAccount(ctx, &groupID, responseID, "gpt-5.4", false)
-			if tt.httpValid {
-				require.NoError(t, httpErr)
-			} else {
-				require.ErrorIs(t, httpErr, ErrOpenAIPreviousResponseAccountUnavailable)
-			}
 
 			wsErr := svc.ValidateStrictWSContinuationAccount(ctx, &groupID, responseID, "gpt-5.4", 0)
 			if tt.wsValid {
@@ -4023,29 +3989,31 @@ func TestOpenAIGatewayService_LegacySchedulerAuditedIngressSkipsPassthroughBefor
 	passthrough := Account{
 		ID:          8951,
 		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
+		Type:        AccountTypeOAuth,
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
 		Priority:    0,
 		GroupIDs:    []int64{groupID},
+		Credentials: map[string]any{"plan_type": "pro"},
 		Extra: map[string]any{
-			"openai_responses_supported":                 true,
-			"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
+			"openai_responses_supported":                true,
+			"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
 		},
 	}
 	ctxPool := Account{
 		ID:          8952,
 		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
+		Type:        AccountTypeOAuth,
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
 		Priority:    10,
 		GroupIDs:    []int64{groupID},
+		Credentials: map[string]any{"plan_type": "pro"},
 		Extra: map[string]any{
-			"openai_responses_supported":                 true,
-			"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModeCtxPool,
+			"openai_responses_supported":                true,
+			"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeCtxPool,
 		},
 	}
 	cfg := newSchedulerTestOpenAIWSV2Config()

@@ -52,6 +52,16 @@ func SetOpenAIStrictLineageCommitter(c *gin.Context, committer OpenAIStrictLinea
 	}
 }
 
+// ClearOpenAIStrictLineage removes request-attempt state before an ineligible
+// account (notably APIKey) is forwarded after an audited OAuth attempt failed.
+func ClearOpenAIStrictLineage(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(openAIResponsesLineageCaptureContextKey, false)
+	c.Set(openAIResponsesLineageCommitContextKey, nil)
+}
+
 func openAIStrictLineageCommitRequired(c *gin.Context) bool {
 	if c == nil {
 		return false
@@ -70,6 +80,9 @@ func commitOpenAIStrictLineageBeforeSuccess(c *gin.Context, turn int, result *Op
 	}
 	value, exists := c.Get(openAIResponsesLineageCommitContextKey)
 	if !exists {
+		return nil
+	}
+	if value == nil {
 		return nil
 	}
 	committer, ok := value.(OpenAIStrictLineageCommitter)

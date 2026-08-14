@@ -30,7 +30,8 @@ func (a *LegacyModerationAdapter) Check(ctx context.Context, req Request) (*Lega
 		RequestID: req.RequestID, UserID: req.UserID, UserEmail: req.UserEmail,
 		APIKeyID: req.APIKeyID, APIKeyName: req.APIKeyName, GroupID: cloneInt64Ptr(req.GroupID),
 		GroupName: req.GroupName, Endpoint: req.Endpoint, Provider: req.Provider,
-		Model: req.Model, Protocol: req.Protocol, Body: req.Body, Strict: req.Strict, Document: req.Document.Clone(),
+		Model: req.Model, Protocol: req.Protocol, Body: req.Body, Strict: req.Strict,
+		StrictScopeVerified: req.ForceStrictAdmission, Document: req.Document.Clone(),
 		AuditContext: req.AuditContext,
 	})
 	if err != nil || decision == nil {

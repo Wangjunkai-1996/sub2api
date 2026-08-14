@@ -317,21 +317,25 @@ type ContentModerationModelFilter struct {
 }
 
 type ContentModerationCheckInput struct {
-	RequestID    string
-	UserID       int64
-	UserEmail    string
-	APIKeyID     int64
-	APIKeyName   string
-	GroupID      *int64
-	GroupName    string
-	Endpoint     string
-	Provider     string
-	Model        string
-	Protocol     string
-	Body         []byte
-	Strict       bool
-	Document     *auditinput.Document
-	AuditContext string
+	RequestID  string
+	UserID     int64
+	UserEmail  string
+	APIKeyID   int64
+	APIKeyName string
+	GroupID    *int64
+	GroupName  string
+	Endpoint   string
+	Provider   string
+	Model      string
+	Protocol   string
+	Body       []byte
+	Strict     bool
+	// StrictScopeVerified means the gateway already verified the final upstream
+	// account against the account-scoped audit policy. GroupID remains the client
+	// API key group for logs and lineage and must not be reused as that policy.
+	StrictScopeVerified bool
+	Document            *auditinput.Document
+	AuditContext        string
 }
 
 type ContentModerationInput struct {
@@ -1114,7 +1118,7 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 		return nil, fmt.Errorf("load strict content moderation config: %w", err)
 	}
 	cfg := runtimeSnapshot.config
-	if !contentModerationStrictPreBlockApplies(runtimeSnapshot, input.GroupID) ||
+	if (!input.StrictScopeVerified && !contentModerationStrictPreBlockApplies(runtimeSnapshot, input.GroupID)) ||
 		cfg.SampleRate != 100 || cfg.KeywordBlockingMode != ContentModerationKeywordModeKeywordAndAPI {
 		return nil, errors.New("strict content moderation is not fully configured for request")
 	}

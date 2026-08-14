@@ -215,7 +215,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 
 	agentTaskRecoveryTried := false
-	allowInternalReplay := !openAIStrictHTTPContinuationRequired(ctx)
+	allowInternalReplay := !openAIHardBoundHTTPContinuationRequired(ctx)
 	var resp *http.Response
 	for {
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
