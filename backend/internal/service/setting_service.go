@@ -137,6 +137,8 @@ type SettingService struct {
 	cyberSessionBlockRuntimeSF             singleflight.Group
 	openAICyberAccountCooldownRuntimeCache atomic.Value // *cachedOpenAICyberAccountCooldownRuntime
 	openAICyberAccountCooldownRuntimeSF    singleflight.Group
+	openAIAccountAuditRoutingRuntimeCache  atomic.Value // *cachedOpenAIAccountAuditRoutingRuntime
+	openAIAccountAuditRoutingRuntimeSF     singleflight.Group
 
 	// panelRateLimitCache 面板 API 限流配置进程内缓存（*cachedPanelRateLimitSettings）。
 	// 面板每个认证请求都会读取，禁止在热路径上直接访问 DB。

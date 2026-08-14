@@ -136,11 +136,11 @@ func TestOpenAICyberAccountCooldownEligibility(t *testing.T) {
 		want    bool
 	}{
 		{name: "pro oauth in pro pool via group ids", account: openAICyberCooldownEligibleAccount(), want: true},
-		{name: "chatgptpro alias via account groups", account: &Account{
+		{name: "chatgptpro alias is not exact pro", account: &Account{
 			ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
 			Credentials:   map[string]any{"plan_type": " ChatGPTPro "},
 			AccountGroups: []AccountGroup{{GroupID: openAICyberAccountCooldownProGroupID}},
-		}, want: true},
+		}},
 		{name: "plus oauth in pro pool", account: &Account{
 			ID: 2, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
 			Credentials: map[string]any{"plan_type": "plus"}, GroupIDs: []int64{openAICyberAccountCooldownProGroupID},
@@ -356,16 +356,19 @@ func TestOpenAICyberAccountCooldownPendingGateBlocksSchedulingDuringDedup(t *tes
 func TestOpenAICyberAccountCooldownPendingGateCoversPolicyLookup(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var blockOnce sync.Once
 	settingRepo := &openAICyberCooldownSettingRepo{
 		values: map[string]string{
 			SettingKeyOpenAICyberAccountCooldownEnabled: "false",
 		},
 		onGetMultiple: func(ctx context.Context) {
-			close(entered)
-			select {
-			case <-release:
-			case <-ctx.Done():
-			}
+			blockOnce.Do(func() {
+				close(entered)
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			})
 		},
 	}
 	cache := &openAICyberCooldownCache{strike: OpenAICyberAccountCooldownStrike{Strikes: 1}}

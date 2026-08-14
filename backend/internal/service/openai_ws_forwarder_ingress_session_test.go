@@ -1282,15 +1282,17 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 		ID:          552,
 		Name:        "openai-ingress-http-bridge",
 		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
+		Type:        AccountTypeOAuth,
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		GroupIDs:    []int64{12},
 		Credentials: map[string]any{
-			"api_key": "sk-test",
+			"access_token": "oauth-token",
+			"plan_type":    "pro",
 		},
 		Extra: map[string]any{
-			"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge,
+			"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge,
 		},
 	}
 
@@ -2107,15 +2109,17 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledFun
 		ID:          143,
 		Name:        "openai-ingress-fco-auto-prev",
 		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
+		Type:        AccountTypeOAuth,
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		GroupIDs:    []int64{12},
 		Credentials: map[string]any{
-			"api_key": "sk-test",
+			"access_token": "oauth-token",
+			"plan_type":    "pro",
 		},
 		Extra: map[string]any{
-			"responses_websockets_v2_enabled": true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
 		},
 	}
 	var auditedSecondTurn []byte
@@ -3099,23 +3103,25 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 		ID:          128,
 		Name:        "openai-ingress-preflight-replay-function-output-with-context",
 		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
+		Type:        AccountTypeOAuth,
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		GroupIDs:    []int64{12},
 		Credentials: map[string]any{
-			"api_key": "sk-test",
+			"access_token": "oauth-token",
+			"plan_type":    "pro",
 		},
 		Extra: map[string]any{
-			"responses_websockets_v2_enabled": true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
 		},
 	}
-	var auditedSecondTurnPayloads [][]byte
+	var admittedSecondTurnPayloads [][]byte
 	beforeTurn2Calls := 0
 	hooks := &OpenAIWSIngressHooks{
 		BeforeRequest: func(turn int, payload []byte, _ string) error {
 			if turn == 2 {
-				auditedSecondTurnPayloads = append(auditedSecondTurnPayloads, cloneOpenAIWSPayloadBytes(payload))
+				admittedSecondTurnPayloads = append(admittedSecondTurnPayloads, cloneOpenAIWSPayloadBytes(payload))
 			}
 			return nil
 		},
@@ -3216,15 +3222,15 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 	require.Equal(t, "call_replay_1", gjson.Get(secondWrite, "input.1.call_id").String())
 	require.Equal(t, "function_call_output", gjson.Get(secondWrite, "input.2.type").String())
 	require.Equal(t, "call_replay_1", gjson.Get(secondWrite, "input.2.call_id").String())
-	require.Len(t, auditedSecondTurnPayloads, 2, "initial attempt and replay retry must each be audited")
-	require.Equal(t, "resp_turn_ping_replay_ctx_1", gjson.GetBytes(auditedSecondTurnPayloads[0], "previous_response_id").String())
-	require.JSONEq(t, secondWrite, string(auditedSecondTurnPayloads[1]), "retry audit must see the exact replay-enriched payload sent upstream")
-	require.Equal(t, "function_call", gjson.GetBytes(auditedSecondTurnPayloads[1], "input.1.type").String())
-	require.Equal(t, "{}", gjson.GetBytes(auditedSecondTurnPayloads[1], "input.1.arguments").String())
+	require.Len(t, admittedSecondTurnPayloads, 2, "initial attempt and replay retry must each pass through request admission")
+	require.Equal(t, "resp_turn_ping_replay_ctx_1", gjson.GetBytes(admittedSecondTurnPayloads[0], "previous_response_id").String())
+	require.JSONEq(t, secondWrite, string(admittedSecondTurnPayloads[1]), "retry admission must see the exact replay-enriched payload sent upstream")
+	require.Equal(t, "function_call", gjson.GetBytes(admittedSecondTurnPayloads[1], "input.1.type").String())
+	require.Equal(t, "{}", gjson.GetBytes(admittedSecondTurnPayloads[1], "input.1.arguments").String())
 	require.Equal(t, 1, beforeTurn2Calls, "replay retry must not reacquire per-turn concurrency or rebill")
 }
 
-func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ReplayAuditBlockStopsRewrittenAttempt(t *testing.T) {
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ReplayAdmissionBlockStopsRewrittenAttempt(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	prevPreflightPingIdle := openAIWSIngressPreflightPingIdle
 	openAIWSIngressPreflightPingIdle = 0
@@ -3258,24 +3264,24 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ReplayAuditBlock
 		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg), toolCorrector: NewCodexToolCorrector(), openaiWSPool: pool,
 	}
 	account := &Account{
-		ID: 129, Name: "openai-ingress-replay-audit-block", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
-		Status: StatusActive, Schedulable: true, Concurrency: 1,
-		Credentials: map[string]any{"api_key": "sk-test"},
-		Extra:       map[string]any{"responses_websockets_v2_enabled": true},
+		ID: 129, Name: "openai-ingress-replay-audit-block", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{12},
+		Credentials: map[string]any{"access_token": "oauth-token", "plan_type": "pro"},
+		Extra:       map[string]any{"openai_oauth_responses_websockets_v2_enabled": true},
 	}
 
-	auditBlockErr := errors.New("strict replay audit blocked")
-	auditTurn2Calls := 0
+	admissionBlockErr := errors.New("replay admission blocked")
+	beforeRequestTurn2Calls := 0
 	beforeTurn2Calls := 0
 	hooks := &OpenAIWSIngressHooks{
 		BeforeRequest: func(turn int, payload []byte, _ string) error {
 			if turn != 2 {
 				return nil
 			}
-			auditTurn2Calls++
+			beforeRequestTurn2Calls++
 			for _, item := range gjson.GetBytes(payload, "input").Array() {
 				if item.Get("type").String() == "function_call" && strings.Contains(item.Get("arguments").String(), "blocked replay") {
-					return auditBlockErr
+					return admissionBlockErr
 				}
 			}
 			return nil
@@ -3339,18 +3345,18 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ReplayAuditBlock
 
 	select {
 	case serverErr := <-serverErrCh:
-		require.ErrorIs(t, serverErr, auditBlockErr)
+		require.ErrorIs(t, serverErr, admissionBlockErr)
 	case <-time.After(5 * time.Second):
-		t.Fatal("等待 replay 审计阻断超时")
+		t.Fatal("等待 replay 准入阻断超时")
 	}
-	require.Equal(t, 2, auditTurn2Calls, "original and rewritten attempts must both be audited")
+	require.Equal(t, 2, beforeRequestTurn2Calls, "original and rewritten attempts must both pass through request admission")
 	require.Equal(t, 1, beforeTurn2Calls, "rewritten retry must not repeat per-turn concurrency or billing")
-	require.Equal(t, 1, dialer.DialCount(), "audit block must happen before dialing a replacement upstream connection")
+	require.Equal(t, 1, dialer.DialCount(), "admission block must happen before dialing a replacement upstream connection")
 	require.Equal(t, 1, firstConn.WriteCount())
 	secondConn.mu.Lock()
 	secondWriteCount := len(secondConn.writes)
 	secondConn.mu.Unlock()
-	require.Zero(t, secondWriteCount, "replay-enriched payload blocked by audit must never be written upstream")
+	require.Zero(t, secondWriteCount, "replay-enriched payload blocked by admission must never be written upstream")
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPreflightPingFailClosesWhenFunctionCallOutputNeedsPreviousResponseID(t *testing.T) {

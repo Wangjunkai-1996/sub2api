@@ -113,6 +113,32 @@ func TestCoordinatorNilReceiverFailsClosed(t *testing.T) {
 	require.Equal(t, ErrorCodeAuditUnavailable, decision.ErrorCode)
 }
 
+func TestCoordinatorForcedAccountScopeUsesPreparedDocument(t *testing.T) {
+	groupID := int64(13)
+	document := auditinput.ParseForTextAudit(
+		auditinput.ProtocolOpenAIResponses,
+		[]byte(`{"input":"prepared current text"}`),
+	)
+	legacy := &fakeLegacyEngine{strict: false, check: func(_ context.Context, req Request) (*LegacyDecision, error) {
+		require.True(t, req.Strict)
+		require.True(t, req.ForceStrictAdmission)
+		require.Equal(t, "prepared current text", req.Document.NormalizedText)
+		return &LegacyDecision{Allowed: true}, nil
+	}}
+
+	decision := NewCoordinator(legacy, &fakePromptEngine{mode: ModeOff}).Check(context.Background(), Request{
+		APIKeyID: 7, GroupID: &groupID, Protocol: auditinput.ProtocolOpenAIResponses,
+		Body: []byte(`{"input":"body must not be reparsed"}`), Document: document,
+		ForceStrictAdmission: true,
+	})
+
+	require.True(t, decision.AllowNextStage)
+	require.Equal(t, DecisionAllow, decision.Kind)
+	require.NotNil(t, decision.Audit)
+	require.Equal(t, int64(0), legacy.scopes.Load(), "account-scoped admission must not re-check the client group")
+	require.Equal(t, int64(1), legacy.calls.Load())
+}
+
 func TestCoordinatorContentModerationStrictGateDoesNotRequirePromptAudit(t *testing.T) {
 	groupID := int64(12)
 

@@ -120,7 +120,7 @@ func (s *PromptService) BlockingApplies(req Request) bool {
 		// configured protected groups during transient reload failures.
 		return false
 	}
-	return cfg.EffectiveMode() == ModeBlocking && cfg.IncludesGroup(req.GroupID)
+	return cfg.EffectiveMode() == ModeBlocking && (req.ForceStrictAdmission || cfg.IncludesGroup(req.GroupID))
 }
 
 func (s *PromptService) Enqueue(_ context.Context, req Request) error {
@@ -181,7 +181,7 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 		}
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	if cfg.EffectiveMode() != ModeBlocking || !cfg.IncludesGroup(req.GroupID) {
+	if cfg.EffectiveMode() != ModeBlocking || (!req.ForceStrictAdmission && !cfg.IncludesGroup(req.GroupID)) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
 	// Strict blocking scans the complete current increment. Lineage remains a

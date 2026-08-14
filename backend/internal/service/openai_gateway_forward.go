@@ -70,9 +70,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			body = liteBody
 		}
 	}
-	strictContinuation := openAIStrictHTTPContinuationRequired(ctx)
+	auditedStrictContinuation := openAIStrictHTTPContinuationRequired(ctx)
+	hardBoundContinuation := openAIHardBoundHTTPContinuationRequired(ctx)
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
-	if strictContinuation {
+	if auditedStrictContinuation {
 		// Audited continuations intentionally bridge HTTP ingress to the producing
 		// account's native Responses WSv2 transport. The HTTP endpoint used by some
 		// compatible accounts rejects previous_response_id outright.
@@ -171,7 +172,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		return nil, errors.New("openai ws v1 is temporarily unsupported; use ws v2")
 	}
-	if passthroughEnabled && !strictContinuation {
+	if passthroughEnabled && !auditedStrictContinuation {
 		attemptImageIntentInvalidated := false
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			strippedBody, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(body)
@@ -603,14 +604,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			hasPreviousResponseID,
 		)
 		maxAttempts := openAIWSReconnectRetryLimit + 1
-		if strictContinuation {
+		if hardBoundContinuation {
 			maxAttempts = 1
 		}
 		wsAttempts := 0
 		var wsResult *OpenAIForwardResult
 		var wsErr error
 		wsLastFailureReason := ""
-		agentTaskRecoveryTried := strictContinuation
+		agentTaskRecoveryTried := hardBoundContinuation
 		wsPrevResponseRecoveryTried := false
 		wsInvalidEncryptedContentRecoveryTried := false
 		recoverPrevResponseNotFound := func(attempt int) bool {
@@ -718,10 +719,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			// previous_response_not_found 说明续链锚点不可用：
 			// 对非 function_call_output 场景，允许一次“去掉 previous_response_id 后重放”。
-			if !strictContinuation && reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
+			if !hardBoundContinuation && reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
 				continue
 			}
-			if !strictContinuation && reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
+			if !hardBoundContinuation && reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
 				continue
 			}
 			if retryable && attempt < maxAttempts {
@@ -846,7 +847,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	httpInvalidEncryptedContentRetryTried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
-	allowInternalReplay := !openAIStrictHTTPContinuationRequired(ctx)
+	allowInternalReplay := !hardBoundContinuation
 	for {
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)

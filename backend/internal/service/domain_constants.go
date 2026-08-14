@@ -540,17 +540,23 @@ const (
 	SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled = "openai_advanced_scheduler_sticky_weighted_enabled"
 	// SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled OpenAI 高级调度下是否优先使用订阅账号池。
 	SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled = "openai_advanced_scheduler_subscription_priority_enabled"
-	SettingKeyOpenAIAdvancedSchedulerLBTopK                      = "openai_advanced_scheduler_lb_top_k"
-	SettingKeyOpenAIAdvancedSchedulerWeightPriority              = "openai_advanced_scheduler_weight_priority"
-	SettingKeyOpenAIAdvancedSchedulerWeightLoad                  = "openai_advanced_scheduler_weight_load"
-	SettingKeyOpenAIAdvancedSchedulerWeightQueue                 = "openai_advanced_scheduler_weight_queue"
-	SettingKeyOpenAIAdvancedSchedulerWeightErrorRate             = "openai_advanced_scheduler_weight_error_rate"
-	SettingKeyOpenAIAdvancedSchedulerWeightTTFT                  = "openai_advanced_scheduler_weight_ttft"
-	SettingKeyOpenAIAdvancedSchedulerWeightReset                 = "openai_advanced_scheduler_weight_reset"
-	SettingKeyOpenAIAdvancedSchedulerWeightQuotaHeadroom         = "openai_advanced_scheduler_weight_quota_headroom"
-	SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost          = "openai_advanced_scheduler_weight_upstream_cost"
-	SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse      = "openai_advanced_scheduler_weight_previous_response"
-	SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky         = "openai_advanced_scheduler_weight_session_sticky"
+	// SettingKeyOpenAIAccountAuditGroupIDs stores the account groups eligible for local OpenAI audit.
+	SettingKeyOpenAIAccountAuditGroupIDs = "openai_account_audit_group_ids"
+	// SettingKeyOpenAIAccountAuditLongTextRuneThreshold stores the normalized rune threshold for APIKey preference.
+	SettingKeyOpenAIAccountAuditLongTextRuneThreshold = "openai_account_audit_long_text_rune_threshold"
+	// SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled controls long-text APIKey preference.
+	SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled         = "openai_account_audit_prefer_apikey_enabled"
+	SettingKeyOpenAIAdvancedSchedulerLBTopK                 = "openai_advanced_scheduler_lb_top_k"
+	SettingKeyOpenAIAdvancedSchedulerWeightPriority         = "openai_advanced_scheduler_weight_priority"
+	SettingKeyOpenAIAdvancedSchedulerWeightLoad             = "openai_advanced_scheduler_weight_load"
+	SettingKeyOpenAIAdvancedSchedulerWeightQueue            = "openai_advanced_scheduler_weight_queue"
+	SettingKeyOpenAIAdvancedSchedulerWeightErrorRate        = "openai_advanced_scheduler_weight_error_rate"
+	SettingKeyOpenAIAdvancedSchedulerWeightTTFT             = "openai_advanced_scheduler_weight_ttft"
+	SettingKeyOpenAIAdvancedSchedulerWeightReset            = "openai_advanced_scheduler_weight_reset"
+	SettingKeyOpenAIAdvancedSchedulerWeightQuotaHeadroom    = "openai_advanced_scheduler_weight_quota_headroom"
+	SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost     = "openai_advanced_scheduler_weight_upstream_cost"
+	SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse = "openai_advanced_scheduler_weight_previous_response"
+	SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky    = "openai_advanced_scheduler_weight_session_sticky"
 
 	// SettingKeyBackendModeEnabled Backend 模式：禁用用户注册和自助服务，仅管理员可登录
 	SettingKeyBackendModeEnabled = "backend_mode_enabled"

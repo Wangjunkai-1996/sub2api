@@ -8,6 +8,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClearOpenAIStrictLineageDisablesCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(nil)
+	commits := 0
+	EnableOpenAIStrictLineageCapture(c)
+	SetOpenAIStrictLineageCommitter(c, func(int, *OpenAIForwardResult) error {
+		commits++
+		return nil
+	})
+
+	ClearOpenAIStrictLineage(c)
+
+	require.False(t, openAIResponsesLineageCaptureEnabled(c))
+	require.False(t, openAIStrictLineageCommitRequired(c))
+	require.NoError(t, commitOpenAIStrictLineageBeforeSuccess(c, 1, &OpenAIForwardResult{}))
+	require.Zero(t, commits)
+}
+
 func TestOpenAIResponsesLineageOutputRequiresStrictCompleteTerminal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(nil)

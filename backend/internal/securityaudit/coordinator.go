@@ -51,9 +51,13 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 	if c.prompt != nil {
 		mode = c.prompt.EffectiveMode()
 	}
-	strict, err := c.legacyBlockingApplies(ctx, req)
-	if err != nil {
-		return auditUnavailableDecision(nil, nil)
+	strict := req.ForceStrictAdmission
+	if !strict {
+		var err error
+		strict, err = c.legacyBlockingApplies(ctx, req)
+		if err != nil {
+			return auditUnavailableDecision(nil, nil)
+		}
 	}
 	if strict {
 		prepared, rejected := c.prepareStrict(ctx, req)
@@ -119,10 +123,10 @@ func (c *Coordinator) promptBlockingApplies(req Request) bool {
 
 func (c *Coordinator) prepareStrict(ctx context.Context, req Request) (Request, *Decision) {
 	var document *auditinput.Document
-	if len(req.Body) > 0 {
-		document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
-	} else {
+	if req.Document != nil {
 		document = req.Document.Clone()
+	} else if len(req.Body) > 0 {
+		document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
 	}
 	if document == nil || document.TextAuditClass == auditinput.TextAuditIndeterminate {
 		logStrictInputIncomplete(req, document)

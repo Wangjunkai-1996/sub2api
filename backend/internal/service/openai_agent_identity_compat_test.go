@@ -300,12 +300,14 @@ func TestOpenAIAgentIdentityTaskInvalidRetriesExactlyOnce(t *testing.T) {
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		GroupIDs:    []int64{12},
 		Credentials: map[string]any{
 			"auth_mode":          OpenAIAuthModeAgentIdentity,
 			"agent_runtime_id":   key.runtimeID,
 			"agent_private_key":  privateKey,
 			"task_id":            "task-old",
 			"chatgpt_account_id": "account-agent-retry",
+			"plan_type":          "pro",
 		},
 	}
 	repo := &agentIdentityForwardRepo{account: account}
