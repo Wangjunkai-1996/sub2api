@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -121,13 +122,17 @@ func TestRunSecurityAuditOutOfScopeGroupSkipsBeforeCoordinator(t *testing.T) {
 }
 
 type countingAccountAuditLegacyEngine struct {
-	calls    atomic.Int32
-	decision *securityaudit.LegacyDecision
-	err      error
+	calls        atomic.Int32
+	lastDocument atomic.Pointer[auditinput.Document]
+	decision     *securityaudit.LegacyDecision
+	err          error
 }
 
-func (e *countingAccountAuditLegacyEngine) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
+func (e *countingAccountAuditLegacyEngine) Check(_ context.Context, request securityaudit.Request) (*securityaudit.LegacyDecision, error) {
 	e.calls.Add(1)
+	if request.Document != nil {
+		e.lastDocument.Store(request.Document.Clone())
+	}
 	return e.decision, e.err
 }
 
@@ -144,7 +149,7 @@ func TestEnsureSecurityAuditForAccountFailoverState(t *testing.T) {
 	state := newOpenAIAccountAuditState(
 		service.ContentModerationProtocolOpenAIResponses,
 		"gpt-5.4",
-		[]byte(`{"model":"gpt-5.4","input":"safe"}`),
+		[]byte(`{"model":"gpt-5.4","instructions":"tenant safety policy","input":"safe"}`),
 		"http",
 		service.DefaultOpenAIAccountAuditRoutingPolicy(),
 	)
@@ -165,6 +170,7 @@ func TestEnsureSecurityAuditForAccountFailoverState(t *testing.T) {
 	require.True(t, decision.AllowNextStage)
 	require.True(t, eligibility.Eligible)
 	require.Equal(t, int32(1), legacy.calls.Load())
+	require.Equal(t, "tenant safety policy\nsafe", legacy.lastDocument.Load().NormalizedText)
 
 	decision, eligibility = h.ensureSecurityAuditForAccount(c, nil, apiKey, subject, account(3, service.AccountTypeOAuth), state)
 	require.NotNil(t, decision)
@@ -217,23 +223,97 @@ func TestEnsureSecurityAuditForAccountTerminalFailureCannotBeBypassed(t *testing
 
 func TestOpenAIAccountAuditStateLongTextUsesCanonicalRuneCount(t *testing.T) {
 	policy := service.DefaultOpenAIAccountAuditRoutingPolicy()
-	build := func(text string) *openAIAccountAuditState {
+	build := func(protocol string, payload any) *openAIAccountAuditState {
+		body, err := json.Marshal(payload)
+		require.NoError(t, err)
 		return newOpenAIAccountAuditState(
-			service.ContentModerationProtocolOpenAIResponses,
+			protocol,
 			"gpt-5.4",
-			[]byte(`{"model":"gpt-5.4","input":"`+text+`"}`),
+			body,
 			"http",
 			policy,
 		)
 	}
 
-	atLimit := build(strings.Repeat("界", service.DefaultOpenAIAccountAuditLongTextRuneThreshold))
+	atLimit := build(service.ContentModerationProtocolOpenAIResponses, map[string]any{
+		"model": "gpt-5.4", "input": strings.Repeat("界", service.DefaultOpenAIAccountAuditLongTextRuneThreshold),
+	})
 	require.Equal(t, service.DefaultOpenAIAccountAuditLongTextRuneThreshold, atLimit.auditTextRunes())
 	require.False(t, atLimit.preferAPIKey(), "exactly 12k runes stays on normal scheduling")
+	require.True(t, atLimit.auditContextReliable())
+	require.Equal(t, "normal", atLimit.auditRoutingReason())
 
-	overLimit := build(strings.Repeat("界", service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1))
-	require.Equal(t, service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1, overLimit.auditTextRunes())
-	require.True(t, overLimit.preferAPIKey(), "12k+1 canonical runes enables APIKey preference")
+	responsesOverLimit := build(service.ContentModerationProtocolOpenAIResponses, map[string]any{
+		"model":        "gpt-5.4",
+		"instructions": strings.Repeat("界", service.DefaultOpenAIAccountAuditLongTextRuneThreshold),
+		"input":        "😀",
+	})
+	require.Equal(t, service.DefaultOpenAIAccountAuditLongTextRuneThreshold+2, responsesOverLimit.auditTextRunes())
+	require.True(t, responsesOverLimit.preferAPIKey(), "Responses instructions must participate in routing")
+	require.Equal(t, "long_text", responsesOverLimit.auditRoutingReason())
+	require.Contains(t, responsesOverLimit.document.NormalizedText, "😀")
+
+	chatOverLimit := build(service.ContentModerationProtocolOpenAIChat, map[string]any{
+		"model": "gpt-5.4",
+		"messages": []map[string]any{
+			{"role": "system", "content": strings.Repeat("甲", 6000)},
+			{"role": "developer", "content": strings.Repeat("乙", 5999)},
+			{"role": "user", "content": "界"},
+		},
+	})
+	require.Equal(t, service.DefaultOpenAIAccountAuditLongTextRuneThreshold+2, chatOverLimit.auditTextRunes())
+	require.True(t, chatOverLimit.preferAPIKey(), "Chat system and developer text must participate in routing")
+
+	unreliable := build(service.ContentModerationProtocolOpenAIResponses, map[string]any{
+		"model": "gpt-5.4", "instructions": 42, "input": "safe",
+	})
+	require.False(t, unreliable.auditContextReliable())
+	require.True(t, unreliable.preferAPIKey(), "unreliable extraction must prefer APIKey")
+	require.Equal(t, "context_unreliable", unreliable.auditRoutingReason())
+	require.Equal(t, auditinput.IssueInvalidShape, unreliable.auditContextIssue())
+
+	knownNoText := build(service.ContentModerationProtocolOpenAIResponses, map[string]any{
+		"model": "gpt-5.4", "input": []any{},
+	})
+	require.True(t, knownNoText.auditContextReliable())
+	require.Zero(t, knownNoText.auditTextRunes())
+	require.False(t, knownNoText.preferAPIKey())
+}
+
+func TestEnsureSecurityAuditForAccountUnreliableContextPrefersAPIKeyAndFailsClosedOnOAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	groupID := int64(12)
+	clientKey := &service.APIKey{ID: 9, GroupID: &groupID, Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI}}
+	legacy := &countingAccountAuditLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, nil)}
+	state := newOpenAIAccountAuditState(
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-5.4",
+		[]byte(`{"model":"gpt-5.4","instructions":42,"input":"safe"}`),
+		"http",
+		service.DefaultOpenAIAccountAuditRoutingPolicy(),
+	)
+	apiKeyAccount := &service.Account{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey}
+	oauthPro := &service.Account{
+		ID: 2, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "pro"}, GroupIDs: []int64{groupID},
+	}
+
+	require.True(t, state.preferAPIKey())
+	decision, eligibility := h.ensureSecurityAuditForAccount(c, nil, clientKey, middleware2.AuthSubject{UserID: 7}, apiKeyAccount, state)
+	require.Nil(t, decision)
+	require.False(t, eligibility.Eligible)
+	require.Zero(t, legacy.calls.Load(), "APIKey must not call any audit engine")
+
+	decision, eligibility = h.ensureSecurityAuditForAccount(c, nil, clientKey, middleware2.AuthSubject{UserID: 7}, oauthPro, state)
+	require.True(t, eligibility.Eligible)
+	require.NotNil(t, decision)
+	require.False(t, decision.AllowNextStage)
+	require.Equal(t, securityaudit.ErrorCodeContextIncomplete, decision.ErrorCode)
+	require.Zero(t, legacy.calls.Load(), "incomplete context must fail closed before invoking an audit model")
 }
 
 func TestRunSecurityAuditDoesNotSkipSubsequentWebSocketTurns(t *testing.T) {

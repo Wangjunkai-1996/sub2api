@@ -517,10 +517,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
 	requiredTransport := service.OpenAIUpstreamTransportAny
-	routingCtx := service.WithOpenAIAccountRoutingOptions(c.Request.Context(), auditState.routingOptions(
+	routingOptions := auditState.routingOptions(
 		service.OpenAIUpstreamTransportResponsesWebsocketV2Audited,
 		service.OpenAIEndpointCapabilityResponses,
-	))
+	)
+	routingOptions.PreferAPIKey = routingOptions.PreferAPIKey && requestPlatform == service.PlatformOpenAI
+	routingCtx := service.WithOpenAIAccountRoutingOptions(c.Request.Context(), routingOptions)
 	c.Request = c.Request.WithContext(routingCtx)
 
 	// 分组利润控制：请求级装配定价上下文——pricingAt 固定本请求的
@@ -1941,7 +1943,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	turnAuditTracker := newOpenAIWSAccountAuditTracker()
 	var turnAuditMu sync.Mutex
 	turnRequestPayloadHashes := make(map[int]string)
-	preferAPIKeyForLongText := firstTurnAccountAuditState.preferAPIKey()
+	preferAPIKeyForAuditContext := firstTurnAccountAuditState.preferAPIKey()
 	var strictWSContinuation bool
 
 	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
@@ -2117,12 +2119,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// 建连时刻只用于选号/准入，不作为任何 turn 的计费定价时刻。
 	wsPricingCtx, _ := h.gatewayService.WithOpenAIRequestPricingContext(ctx, apiKey.GroupID)
 	ctx = wsPricingCtx
-	preferAPIKeyForLongText = preferAPIKeyForLongText && requestPlatform == service.PlatformOpenAI
+	preferAPIKeyForAuditContext = preferAPIKeyForAuditContext && requestPlatform == service.PlatformOpenAI
 	routingOptions := firstTurnAccountAuditState.routingOptions(
 		service.OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress,
 		service.OpenAIEndpointCapabilityResponses,
 	)
-	routingOptions.PreferAPIKey = preferAPIKeyForLongText
+	routingOptions.PreferAPIKey = preferAPIKeyForAuditContext
 	ctx = service.WithOpenAIAccountRoutingOptions(ctx, routingOptions)
 
 	for {
@@ -2365,7 +2367,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			zap.Bool("audit_required", firstTurnAuditResult.Required),
 			zap.Bool("audit_passed", firstTurnAuditResult.Passed),
 			zap.Int("audit_text_runes", openAIWSAuditTextRunes(firstTurnAuditDocument)),
-			zap.Bool("long_text_prefer_api_key", preferAPIKeyForLongText),
+			zap.Bool("audit_context_prefer_api_key", preferAPIKeyForAuditContext),
+			zap.String("audit_routing_reason", firstTurnAccountAuditState.auditRoutingReason()),
+			zap.Bool("audit_context_reliable", firstTurnAccountAuditState.auditContextReliable()),
+			zap.String("audit_context_issue", firstTurnAccountAuditState.auditContextIssue()),
 		)
 
 		maxReasoningEffort, reasoningEffortMappings, _ := openAIReasoningEffortPolicyForRequest(c, apiKey)

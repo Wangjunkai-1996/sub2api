@@ -28,17 +28,18 @@ type securityAuditWSDedupeEntry struct {
 }
 
 type openAIAccountAuditState struct {
-	mu       sync.Mutex
-	protocol string
-	model    string
-	body     []byte
-	stage    string
-	document *auditinput.Document
-	policy   service.OpenAIAccountAuditRoutingPolicy
-	passed   bool
-	terminal bool
-	decision securityaudit.Decision
-	summary  *securityaudit.AuditSummary
+	mu             sync.Mutex
+	protocol       string
+	model          string
+	body           []byte
+	stage          string
+	routingContext *auditinput.SecurityRoutingContext
+	document       *auditinput.Document
+	policy         service.OpenAIAccountAuditRoutingPolicy
+	passed         bool
+	terminal       bool
+	decision       securityaudit.Decision
+	summary        *securityaudit.AuditSummary
 }
 
 func newOpenAIAccountAuditState(
@@ -51,18 +52,30 @@ func newOpenAIAccountAuditState(
 	if strings.TrimSpace(stage) == "" {
 		stage = "http"
 	}
+	routingContext := auditinput.ParseSecurityRoutingContext(protocol, body)
+	var document *auditinput.Document
+	if routingContext != nil {
+		document = routingContext.Document
+	}
 	return &openAIAccountAuditState{
-		protocol: strings.TrimSpace(protocol),
-		model:    strings.TrimSpace(model),
-		body:     append([]byte(nil), body...),
-		stage:    strings.TrimSpace(stage),
-		document: auditinput.ParseForTextAudit(protocol, body),
-		policy:   policy,
+		protocol:       strings.TrimSpace(protocol),
+		model:          strings.TrimSpace(model),
+		body:           append([]byte(nil), body...),
+		stage:          strings.TrimSpace(stage),
+		routingContext: routingContext,
+		document:       document,
+		policy:         policy,
 	}
 }
 
 func (s *openAIAccountAuditState) auditTextRunes() int {
-	if s == nil || s.document == nil {
+	if s == nil {
+		return 0
+	}
+	if s.routingContext != nil {
+		return s.routingContext.AuditTextRunes
+	}
+	if s.document == nil {
 		return 0
 	}
 	return s.document.AuditTextRunes
@@ -70,7 +83,34 @@ func (s *openAIAccountAuditState) auditTextRunes() int {
 
 func (s *openAIAccountAuditState) preferAPIKey() bool {
 	return s != nil && s.policy.PreferAPIKeyEnabled() &&
-		s.auditTextRunes() > s.policy.LongTextRuneThreshold()
+		(!s.auditContextReliable() || s.auditTextRunes() > s.policy.LongTextRuneThreshold())
+}
+
+func (s *openAIAccountAuditState) auditContextReliable() bool {
+	return s != nil && s.routingContext != nil && s.routingContext.Reliable
+}
+
+func (s *openAIAccountAuditState) auditRoutingReason() string {
+	if s == nil {
+		return "state_unavailable"
+	}
+	if !s.policy.PreferAPIKeyEnabled() {
+		return "preference_disabled"
+	}
+	if !s.auditContextReliable() {
+		return "context_unreliable"
+	}
+	if s.auditTextRunes() > s.policy.LongTextRuneThreshold() {
+		return "long_text"
+	}
+	return "normal"
+}
+
+func (s *openAIAccountAuditState) auditContextIssue() string {
+	if s == nil || s.routingContext == nil {
+		return auditinput.SecurityRoutingReasonIncomplete
+	}
+	return strings.TrimSpace(s.routingContext.UnreliableReason)
 }
 
 func (s *openAIAccountAuditState) routingOptions(
@@ -133,6 +173,9 @@ func (h *OpenAIGatewayHandler) ensureSecurityAuditForAccount(
 		fields := []zap.Field{
 			zap.Int("audit_text_runes", state.auditTextRunes()),
 			zap.Bool("prefer_apikey", state.preferAPIKey()),
+			zap.String("audit_routing_reason", state.auditRoutingReason()),
+			zap.Bool("audit_context_reliable", state.auditContextReliable()),
+			zap.String("audit_context_issue", state.auditContextIssue()),
 			zap.Bool("audit_required", eligibility.Eligible || eligibility.Indeterminate),
 			zap.String("audit_eligibility_reason", string(eligibility.Reason)),
 			zap.Int64("audit_account_group_id", eligibility.MatchedGroupID),
