@@ -37,6 +37,19 @@ func TestOpenAIFirstOutputFailoverStopsAfterOneAccountSwitch(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+func TestOpenAIFirstOutputFailoverDoesNotBoundRequestScopedTransient(t *testing.T) {
+	failoverErr := &service.UpstreamFailoverError{
+		SafeToFailoverAfterWrite: true,
+		RequestScopedTransient:   true,
+	}
+	count := 0
+
+	for range 3 {
+		require.False(t, openAIFirstOutputFailoverExhausted(failoverErr, &count))
+	}
+	require.Zero(t, count)
+}
+
 func TestOpenAIRequestAllowsFailoverReplayStopsCanceledClient(t *testing.T) {
 	require.False(t, openAIRequestAllowsFailoverReplay(nil))
 

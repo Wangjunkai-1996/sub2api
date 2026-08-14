@@ -36,6 +36,46 @@ type openAIResponsesFailoverCancelUpstream struct {
 	onFirstDo  func()
 }
 
+type openAIResponsesCapacityFailoverUpstream struct {
+	service.HTTPUpstream
+	mu         sync.Mutex
+	accountIDs []int64
+}
+
+func (u *openAIResponsesCapacityFailoverUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+	u.mu.Lock()
+	u.accountIDs = append(u.accountIDs, accountID)
+	u.mu.Unlock()
+
+	body := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_capacity","instructions":"` + strings.Repeat("p", 8*1024) + `"}}`,
+		"",
+		`data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"overloaded"}}`,
+		"",
+		`data: {"type":"response.failed","response":{"id":"resp_capacity","status":"failed","error":{"code":"server_is_overloaded","message":"overloaded"}}}`,
+		"",
+	}, "\n")
+	if accountID == 3 {
+		body = strings.Join([]string{
+			`data: {"type":"response.output_text.delta","delta":"ok"}`,
+			"",
+			`data: {"type":"response.completed","response":{"id":"resp_capacity_ok","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+			"",
+		}, "\n")
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, nil
+}
+
+func (u *openAIResponsesCapacityFailoverUpstream) calls() []int64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]int64(nil), u.accountIDs...)
+}
+
 type openAIResponsesStrictStickyCache struct {
 	service.GatewayCache
 	mu                   sync.Mutex
@@ -478,6 +518,42 @@ func TestOpenAIGatewayHandlerResponses_FailoverContinuesForConnectedClient(t *te
 	require.Equal(t, []int64{1, 2}, upstream.calls(), "在线客户端应正常切换账号")
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+}
+
+func TestOpenAIGatewayHandlerResponses_CapacityRetryThenUsesNormalAccountSwitchBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	newCapacityAccount := func(id int64, priority, retryCount int) service.Account {
+		return service.Account{
+			ID: id, Name: fmt.Sprintf("capacity-account-%d", id),
+			Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+			Status: service.StatusActive, Schedulable: true, Priority: priority,
+			Credentials: map[string]any{
+				"api_key": "sk-test", "base_url": "https://api.example.test",
+				"pool_mode": true, "pool_mode_retry_count": float64(retryCount),
+			},
+			Extra: map[string]any{"openai_passthrough": false},
+		}
+	}
+	accounts := []service.Account{
+		newCapacityAccount(1, 0, 1),
+		newCapacityAccount(2, 1, 0),
+		newCapacityAccount(3, 2, 0),
+	}
+
+	upstream := &openAIResponsesCapacityFailoverUpstream{}
+	handler := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts, 0)
+	handler.cfg.Gateway.OpenAIFirstOutputTimeoutSeconds = 30
+	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(
+		`{"model":"gpt-5.1","stream":true,"input":"hello"}`,
+	))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Responses(c)
+
+	require.Equal(t, []int64{1, 1, 2, 3}, upstream.calls(), "status=%d body=%s", rec.Code, rec.Body.String())
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"delta":"ok"`)
 }
 
 func TestOpenAIChatCompletions_APIKeyFailoversToOAuthAuditsOnce(t *testing.T) {
