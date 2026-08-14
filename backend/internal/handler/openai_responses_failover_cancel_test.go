@@ -556,13 +556,13 @@ func TestOpenAIGatewayHandlerResponses_CapacityRetryThenUsesNormalAccountSwitchB
 	require.Contains(t, rec.Body.String(), `"delta":"ok"`)
 }
 
-func TestOpenAIChatCompletions_APIKeyFailoversToOAuthAuditsOnce(t *testing.T) {
+func TestOpenAIChatCompletions_LongSecurityContextTriesAPIKeyPoolBeforeAuditedOAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	groupID := int64(3131)
 	accounts := []service.Account{
-		openAIAccountAuditFailoverTestAccount(1, 0, service.AccountTypeAPIKey, groupID),
-		openAIAccountAuditFailoverTestAccount(2, 1, service.AccountTypeAPIKey, groupID),
-		openAIAccountAuditFailoverTestAccount(3, 2, service.AccountTypeOAuth, groupID),
+		openAIAccountAuditFailoverTestAccount(1, 10, service.AccountTypeAPIKey, groupID),
+		openAIAccountAuditFailoverTestAccount(2, 20, service.AccountTypeAPIKey, groupID),
+		openAIAccountAuditFailoverTestAccount(3, 0, service.AccountTypeOAuth, groupID),
 	}
 	upstream := &openAIResponsesFailoverCancelUpstream{}
 	handler := newOpenAIFailoverTestHandlerWithAccounts(
@@ -574,8 +574,9 @@ func TestOpenAIChatCompletions_APIKeyFailoversToOAuthAuditsOnce(t *testing.T) {
 	legacy := &countingAccountAuditLegacyEngine{decision: &securityaudit.LegacyDecision{Allowed: true}}
 	handler.securityAuditCoordinator = securityaudit.NewCoordinator(legacy, nil)
 	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+	longSystemPrompt := strings.Repeat("s", service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
-		`{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"safe"}]}`,
+		fmt.Sprintf(`{"model":"gpt-5.1","stream":false,"messages":[{"role":"system","content":%q},{"role":"user","content":"safe"}]}`, longSystemPrompt),
 	))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -583,6 +584,8 @@ func TestOpenAIChatCompletions_APIKeyFailoversToOAuthAuditsOnce(t *testing.T) {
 
 	require.Equal(t, []int64{1, 2, 3}, upstream.calls())
 	require.Equal(t, int32(1), legacy.calls.Load(), "the first OAuth Pro attempt must audit exactly once")
+	require.Greater(t, legacy.lastDocument.Load().AuditTextRunes, service.DefaultOpenAIAccountAuditLongTextRuneThreshold)
+	require.Contains(t, legacy.lastDocument.Load().NormalizedText, "safe")
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
@@ -658,8 +661,9 @@ func TestOpenAIGatewayHandlerResponses_APIKeyContinuationStaysHTTPAndSkipsAudit(
 	}
 	handler.securityAuditCoordinator = securityaudit.NewCoordinator(legacy, prompt)
 	c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+	longInstructions := strings.Repeat("i", service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(
-		`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_api_key_parent","input":"continue"}`,
+		fmt.Sprintf(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_api_key_parent","instructions":%q,"input":"continue"}`, longInstructions),
 	))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -726,9 +730,13 @@ func TestOpenAIResponsesWebSocket_AuditDependsOnFinalAccount(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var moderationCalls atomic.Int32
+			var moderationPayload atomic.Value
 			moderationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				moderationCalls.Add(1)
 				require.Equal(t, "/v1/moderations", r.URL.Path)
+				payload, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				moderationPayload.Store(string(payload))
 				_, _ = w.Write([]byte(`{"results":[{"flagged":true,"category_scores":{"harassment":0.01,"harassment/threatening":0.01,"hate":0.01,"hate/threatening":0.01,"illicit":0.01,"illicit/violent":0.01,"self-harm":0.01,"self-harm/intent":0.01,"self-harm/instructions":0.01,"sexual":0.9,"sexual/minors":0.01,"violence":0.01,"violence/graphic":0.01}}]}`))
 			}))
 			defer moderationServer.Close()
@@ -801,8 +809,9 @@ func TestOpenAIResponsesWebSocket_AuditDependsOnFinalAccount(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = client.CloseNow() }()
 			writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+			longInstructions := "ws-instruction-marker " + strings.Repeat("w", service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1)
 			require.NoError(t, client.Write(writeCtx, coderws.MessageText, []byte(
-				`{"type":"response.create","model":"gpt-5.1","input":"bad prompt"}`,
+				fmt.Sprintf(`{"type":"response.create","model":"gpt-5.1","instructions":%q,"input":"bad prompt"}`, longInstructions),
 			)))
 			cancelWrite()
 
@@ -828,6 +837,11 @@ func TestOpenAIResponsesWebSocket_AuditDependsOnFinalAccount(t *testing.T) {
 				return moderationCalls.Load() == tt.wantModerationCalls
 			}, time.Second, 10*time.Millisecond)
 			require.Equal(t, tt.wantUpstreamCalls, upstreamCalls.Load())
+			if tt.wantModerationCalls > 0 {
+				captured, ok := moderationPayload.Load().(string)
+				require.True(t, ok)
+				require.Contains(t, captured, "ws-instruction-marker")
+			}
 		})
 	}
 }
