@@ -573,7 +573,7 @@ func StripEmptyTextBlocks(body []byte) []byte {
 // 策略 (anthropic-strict only)：
 //   - 当 thinking.type 不是 "enabled"/"adaptive"：移除所有 thinking 相关块
 //   - 当 thinking.type 是 "enabled"/"adaptive"：仅移除缺失/无效 signature 的 thinking 块（避免 400）
-//     (blocks with missing/empty/dummy signatures that would cause 400 errors)
+//   - redacted_thinking 使用 opaque data 而非 signature，必须在 assistant 消息中原样保留
 func FilterThinkingBlocks(body []byte, mappedModel string) []byte {
 	if !ShouldPreFilterThinkingBlocks(mappedModel) {
 		return body
@@ -1137,7 +1137,7 @@ func FilterSignatureSensitiveBlocksForRetry(body []byte, mappedModel string) []b
 // filterThinkingBlocksInternal removes invalid thinking blocks from request
 // 策略：
 //   - 当 thinking.type 不是 "enabled"/"adaptive"：移除所有 thinking 相关块
-//   - 当 thinking.type 是 "enabled"/"adaptive"：仅移除缺失/无效 signature 的 thinking 块
+//   - 当 thinking.type 是 "enabled"/"adaptive"：校验 thinking.signature，原样保留 redacted_thinking
 func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 	// Fast path: if body doesn't contain "thinking", skip parsing
 	if !bytes.Contains(body, []byte(`"type":"thinking"`)) &&
@@ -1192,9 +1192,21 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 
 			blockType, _ := blockMap["type"].(string)
 
-			if blockType == "thinking" || blockType == "redacted_thinking" {
+			if blockType == "redacted_thinking" {
+				// Redacted blocks contain opaque data instead of a signature. Anthropic
+				// requires these assistant blocks to round-trip without modification.
+				if thinkingEnabled && role == "assistant" {
+					newContent = append(newContent, block)
+					continue
+				}
+				filtered = true
+				filteredThisMessage = true
+				continue
+			}
+
+			if blockType == "thinking" {
 				// When thinking is enabled and this is an assistant message,
-				// only keep thinking blocks with valid signatures
+				// only keep thinking blocks with valid signatures.
 				if thinkingEnabled && role == "assistant" {
 					signature, _ := blockMap["signature"].(string)
 					if signature != "" && signature != antigravity.DummyThoughtSignature {

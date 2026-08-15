@@ -267,6 +267,11 @@ func TestFilterThinkingBlocks(t *testing.T) {
 			shouldFilter: false,
 		},
 		{
+			name:         "does not filter redacted thinking blocks without signature when thinking enabled",
+			input:        `{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"encrypted_payload"},{"type":"text","text":"B"}]}]}`,
+			shouldFilter: false,
+		},
+		{
 			name:         "filters unsigned thinking blocks when thinking adaptive",
 			input:        `{"thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"internal","signature":""},{"type":"text","text":"B"}]}]}`,
 			shouldFilter: true,
@@ -332,6 +337,19 @@ func TestFilterThinkingBlocks(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestFilterThinkingBlocksPreservesRedactedThinkingWhileFilteringUnsignedThinking(t *testing.T) {
+	input := []byte(`{"thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"encrypted_payload"},{"type":"thinking","thinking":"unsigned"},{"type":"text","text":"B"}]}]}`)
+
+	result := FilterThinkingBlocks(input, "claude-opus-5")
+
+	content := gjson.GetBytes(result, "messages.0.content").Array()
+	require.Len(t, content, 2)
+	require.Equal(t, "redacted_thinking", content[0].Get("type").String())
+	require.Equal(t, "encrypted_payload", content[0].Get("data").String())
+	require.Equal(t, "text", content[1].Get("type").String())
+	require.Equal(t, "B", content[1].Get("text").String())
 }
 
 func TestFilterThinkingBlocksForRetry_DisablesThinkingAndPreservesAsText(t *testing.T) {
