@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -339,17 +340,60 @@ func TestFilterThinkingBlocks(t *testing.T) {
 	}
 }
 
-func TestFilterThinkingBlocksPreservesRedactedThinkingWhileFilteringUnsignedThinking(t *testing.T) {
+func TestFilterThinkingBlocksPreservesLatestRedactedThinkingWithoutTopLevelThinking(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"data":"encrypted_payload","type":"redacted_thinking"},{"text":"B","type":"text"}]}]}`)
+
+	result := FilterThinkingBlocks(input, "claude-opus-5")
+
+	require.Equal(t, input, result)
+}
+
+func TestFilterThinkingBlocksPreservesEntireLatestContentWithRedactedThinking(t *testing.T) {
 	input := []byte(`{"thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"encrypted_payload"},{"type":"thinking","thinking":"unsigned"},{"type":"text","text":"B"}]}]}`)
 
 	result := FilterThinkingBlocks(input, "claude-opus-5")
 
+	require.Equal(t, input, result)
 	content := gjson.GetBytes(result, "messages.0.content").Array()
-	require.Len(t, content, 2)
+	require.Len(t, content, 3)
 	require.Equal(t, "redacted_thinking", content[0].Get("type").String())
 	require.Equal(t, "encrypted_payload", content[0].Get("data").String())
-	require.Equal(t, "text", content[1].Get("type").String())
-	require.Equal(t, "B", content[1].Get("text").String())
+	require.Equal(t, "thinking", content[1].Get("type").String())
+	require.Empty(t, content[1].Get("signature").String())
+	require.Equal(t, "text", content[2].Get("type").String())
+	require.Equal(t, "B", content[2].Get("text").String())
+}
+
+func TestFilterThinkingBlocksDoesNotProtectDummySignedLatestThinking(t *testing.T) {
+	input := []byte(fmt.Sprintf(`{"thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"dummy","signature":%q},{"type":"text","text":"B"}]}]}`, antigravity.DummyThoughtSignature))
+
+	result := FilterThinkingBlocks(input, "claude-opus-5")
+
+	content := gjson.GetBytes(result, "messages.0.content").Array()
+	require.Len(t, content, 1)
+	require.Equal(t, "B", content[0].Get("text").String())
+}
+
+func TestFilterThinkingBlocksDoesNotProtectEarlierSignedAssistant(t *testing.T) {
+	input := []byte(`{"thinking":{"type":"adaptive"},"messages":[` +
+		`{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"trusted old","signature":"sig_real_123"},` +
+		`{"type":"thinking","thinking":"unsigned old"},` +
+		`{"type":"text","text":"old answer"}]},` +
+		`{"role":"user","content":"next"},` +
+		`{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"unsigned latest"},` +
+		`{"type":"text","text":"latest answer"}]}]}`)
+
+	result := FilterThinkingBlocks(input, "claude-opus-5")
+
+	earlier := gjson.GetBytes(result, "messages.0.content").Array()
+	require.Len(t, earlier, 2)
+	require.Equal(t, "trusted old", earlier[0].Get("thinking").String())
+	require.Equal(t, "old answer", earlier[1].Get("text").String())
+	latest := gjson.GetBytes(result, "messages.2.content").Array()
+	require.Len(t, latest, 1)
+	require.Equal(t, "latest answer", latest[0].Get("text").String())
 }
 
 func TestFilterThinkingBlocksForRetry_DisablesThinkingAndPreservesAsText(t *testing.T) {
@@ -843,6 +887,91 @@ func TestFilterSignatureSensitiveBlocksForRetry_RemovesClearThinkingStrategy(t *
 			require.NotEqual(t, "clear_thinking_20251015", em["type"], "clear_thinking_20251015 应被移除")
 		}
 	}
+}
+
+func TestInitialMessageFiltersPreserveTrustedLatestAssistantContentBytes(t *testing.T) {
+	input := []byte(`{"model":"claude-sonnet-4-5","messages":[` +
+		`{"role":"assistant","content":[` +
+		`{"type":"text","text":""},` +
+		`{"type":"server_tool_use","id":"srvtoolu_ws_old","name":"web_search","input":{}},` +
+		`{"type":"thinking","thinking":"old unsigned"},` +
+		`{"type":"text","text":"keep history"}]},` +
+		`{"role":"user","content":[{"type":"text","text":"next"}]},` +
+		`{"role":"assistant","content":[` +
+		`{"meta":{"z":1.0,"escaped":"\u4f60\u597d","literal":"你好"},"data":"opaque","type":"redacted_thinking"},` +
+		`{"thinking":"unsigned sibling","type":"thinking"},` +
+		`{"text":"","type":"text"},` +
+		`{"input":{"limit":2.00},"name":"web_search","id":"srvtoolu_ws_latest","type":"server_tool_use"},` +
+		`{"rank":3.0,"text":"答案","type":"text"}]},` +
+		`{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
+
+	wantLatestRaw := gjson.GetBytes(input, "messages.2.content").Raw
+	require.NotEmpty(t, wantLatestRaw)
+
+	filters := []struct {
+		name  string
+		apply func([]byte) []byte
+	}{
+		{name: "strip empty text", apply: StripEmptyTextBlocks},
+		{name: "strip web search history", apply: func(body []byte) []byte {
+			return FilterWebSearchHistoryBlocks(body, "claude-sonnet-4-5")
+		}},
+		{name: "filter thinking", apply: func(body []byte) []byte {
+			return FilterThinkingBlocks(body, "claude-sonnet-4-5")
+		}},
+	}
+	for _, filter := range filters {
+		t.Run(filter.name, func(t *testing.T) {
+			out := filter.apply(input)
+			require.Equal(t, wantLatestRaw, gjson.GetBytes(out, "messages.2.content").Raw)
+		})
+	}
+
+	out := StripEmptyTextBlocks(input)
+	out = FilterWebSearchHistoryBlocks(out, "claude-sonnet-4-5")
+	out = FilterThinkingBlocks(out, "claude-sonnet-4-5")
+
+	require.Equal(t, wantLatestRaw, gjson.GetBytes(out, "messages.2.content").Raw)
+	history := gjson.GetBytes(out, "messages.0.content").Array()
+	require.Len(t, history, 1)
+	require.Equal(t, "keep history", history[0].Get("text").String())
+	require.Len(t, gjson.GetBytes(out, "messages.2.content").Array(), 5, "protected siblings must remain untouched")
+}
+
+func TestInitialMessageFiltersPreserveSignedLatestAssistantContentBytes(t *testing.T) {
+	input := []byte(`{"messages":[` +
+		`{"role":"assistant","content":[{"type":"text","text":""},{"type":"thinking","thinking":"old"}]},` +
+		`{"role":"assistant","content":[{"signature":"sig_real_123","thinking":"\u4f60好","type":"thinking","meta":{"scale":1.0}},{"text":"answer","type":"text"}]},` +
+		`{"role":"user","content":"continue"}]}`)
+	wantLatestRaw := gjson.GetBytes(input, "messages.1.content").Raw
+
+	out := StripEmptyTextBlocks(input)
+	out = FilterWebSearchHistoryBlocks(out, "claude-sonnet-4-5")
+	out = FilterThinkingBlocks(out, "claude-sonnet-4-5")
+
+	require.Equal(t, wantLatestRaw, gjson.GetBytes(out, "messages.1.content").Raw)
+	require.Empty(t, gjson.GetBytes(out, "messages.0.content").Array())
+}
+
+func TestInitialMessageFiltersReplaceMultipleHistoricalMessages(t *testing.T) {
+	input := []byte(`{"messages":[` +
+		`{"role":"assistant","content":[{"type":"text","text":""},{"type":"thinking","thinking":"old one"},{"type":"text","text":"keep one"}]},` +
+		`{"role":"assistant","content":[{"type":"server_tool_use","id":"srvtoolu_ws_old","name":"web_search","input":{}},{"type":"thinking","thinking":"old two"},{"type":"text","text":"keep two"}]},` +
+		`{"role":"assistant","content":[{"data":"opaque","type":"redacted_thinking"},{"text":"latest","type":"text"}]},` +
+		`{"role":"user","content":"continue"}]}`)
+	wantLatestRaw := gjson.GetBytes(input, "messages.2.content").Raw
+
+	out := StripEmptyTextBlocks(input)
+	out = FilterWebSearchHistoryBlocks(out, "claude-sonnet-4-5")
+	out = FilterThinkingBlocks(out, "claude-sonnet-4-5")
+
+	require.Equal(t, wantLatestRaw, gjson.GetBytes(out, "messages.2.content").Raw)
+	first := gjson.GetBytes(out, "messages.0.content").Array()
+	require.Len(t, first, 1)
+	require.Equal(t, "keep one", first[0].Get("text").String())
+	second := gjson.GetBytes(out, "messages.1.content").Array()
+	require.Len(t, second, 1)
+	require.Equal(t, "keep two", second[0].Get("text").String())
 }
 
 func TestFilterSignatureSensitiveBlocksForRetry_PreservesNonThinkingStrategies(t *testing.T) {

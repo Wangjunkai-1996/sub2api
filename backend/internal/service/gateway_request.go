@@ -448,6 +448,57 @@ func sliceRawFromBody(body []byte, r gjson.Result) []byte {
 	return []byte(r.Raw)
 }
 
+// latestAssistantContentToPreserve returns the message index whose content is
+// covered by Anthropic's latest-assistant immutability contract. Only the most
+// recent assistant message is eligible: an earlier signed turn must not stop
+// the normal history cleanup when a newer assistant turn has no trusted block.
+//
+// A redacted_thinking block is opaque and trusted by definition. A thinking
+// block is trusted only when it carries a non-empty, non-dummy signature.
+func latestAssistantContentToPreserve(messages gjson.Result) int {
+	if !messages.IsArray() {
+		return -1
+	}
+
+	items := messages.Array()
+	for i := len(items) - 1; i >= 0; i-- {
+		message := items[i]
+		if message.Get("role").String() != "assistant" {
+			continue
+		}
+
+		content := message.Get("content")
+		if !content.IsArray() {
+			return -1
+		}
+		for _, block := range content.Array() {
+			switch block.Get("type").String() {
+			case "redacted_thinking":
+				return i
+			case "thinking":
+				signature := block.Get("signature")
+				signatureValue := signature.String()
+				if signature.Type == gjson.String && signatureValue != "" && signatureValue != antigravity.DummyThoughtSignature {
+					return i
+				}
+			}
+		}
+		return -1
+	}
+	return -1
+}
+
+// replaceMessageContent rewrites one content subtree while leaving all other
+// message bytes untouched. In particular, this avoids re-marshalling a signed
+// latest assistant message when an unrelated historical message is filtered.
+func replaceMessageContent(body []byte, messageIndex int, content []any) ([]byte, error) {
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, fmt.Sprintf("messages.%d.content", messageIndex), raw)
+}
+
 // stripEmptyTextBlocksFromSlice removes empty text blocks from a content slice (including nested tool_result content).
 // Returns (cleaned slice, true) if any blocks were removed, or (original, false) if unchanged.
 func stripEmptyTextBlocksFromSlice(blocks []any) ([]any, bool) {
@@ -507,6 +558,7 @@ func stripEmptyTextBlocksFromSlice(blocks []any) ([]any, bool) {
 
 // StripEmptyTextBlocks removes empty text blocks from the request body (including nested tool_result content).
 // This is a lightweight pre-filter for the initial request path to prevent upstream 400 errors.
+// The latest assistant content is immutable when it contains trusted thinking.
 // Returns the original body unchanged if no empty text blocks are found.
 func StripEmptyTextBlocks(body []byte) []byte {
 	// Fast path: check if body contains empty text patterns
@@ -524,38 +576,28 @@ func StripEmptyTextBlocks(body []byte) []byte {
 		return body
 	}
 
-	var messages []any
-	if err := json.Unmarshal(sliceRawFromBody(body, msgsRes), &messages); err != nil {
-		return body
-	}
-
-	modified := false
-	for _, msg := range messages {
-		msgMap, ok := msg.(map[string]any)
-		if !ok {
+	messages := msgsRes.Array()
+	protectedIndex := latestAssistantContentToPreserve(msgsRes)
+	out := body
+	for i, message := range messages {
+		if i == protectedIndex {
 			continue
 		}
-		content, ok := msgMap["content"].([]any)
-		if !ok {
+		contentResult := message.Get("content")
+		if !contentResult.IsArray() {
 			continue
+		}
+		var content []any
+		if err := json.Unmarshal([]byte(contentResult.Raw), &content); err != nil {
+			return body
 		}
 		if cleaned, changed := stripEmptyTextBlocksFromSlice(content); changed {
-			modified = true
-			msgMap["content"] = cleaned
+			var err error
+			out, err = replaceMessageContent(out, i, cleaned)
+			if err != nil {
+				return body
+			}
 		}
-	}
-
-	if !modified {
-		return body
-	}
-
-	msgsBytes, err := json.Marshal(messages)
-	if err != nil {
-		return body
-	}
-	out, err := sjson.SetRawBytes(body, "messages", msgsBytes)
-	if err != nil {
-		return body
 	}
 	return out
 }
@@ -574,6 +616,7 @@ func StripEmptyTextBlocks(body []byte) []byte {
 //   - 当 thinking.type 不是 "enabled"/"adaptive"：移除所有 thinking 相关块
 //   - 当 thinking.type 是 "enabled"/"adaptive"：仅移除缺失/无效 signature 的 thinking 块（避免 400）
 //   - redacted_thinking 使用 opaque data 而非 signature，必须在 assistant 消息中原样保留
+//   - 最近一条 assistant 含可信 thinking 时，整段 content 必须原样保留，不受上述过滤影响
 func FilterThinkingBlocks(body []byte, mappedModel string) []byte {
 	if !ShouldPreFilterThinkingBlocks(mappedModel) {
 		return body
@@ -1149,35 +1192,31 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 		return body
 	}
 
-	var req map[string]any
-	if err := json.Unmarshal(body, &req); err != nil {
-		return body
-	}
-
 	// Check if thinking is enabled
-	thinkingEnabled := false
-	if thinking, ok := req["thinking"].(map[string]any); ok {
-		if thinkType, ok := thinking["type"].(string); ok && (thinkType == "enabled" || thinkType == "adaptive") {
-			thinkingEnabled = true
-		}
-	}
+	jsonStr := *(*string)(unsafe.Pointer(&body))
+	thinkingType := gjson.Get(jsonStr, "thinking.type").String()
+	thinkingEnabled := thinkingType == "enabled" || thinkingType == "adaptive"
 
-	messages, ok := req["messages"].([]any)
-	if !ok {
+	messagesResult := gjson.Get(jsonStr, "messages")
+	if !messagesResult.IsArray() {
 		return body
 	}
 
-	filtered := false
-	for _, msg := range messages {
-		msgMap, ok := msg.(map[string]any)
-		if !ok {
+	protectedIndex := latestAssistantContentToPreserve(messagesResult)
+	out := body
+	for messageIndex, message := range messagesResult.Array() {
+		if messageIndex == protectedIndex {
 			continue
 		}
 
-		role, _ := msgMap["role"].(string)
-		content, ok := msgMap["content"].([]any)
-		if !ok {
+		role := message.Get("role").String()
+		contentResult := message.Get("content")
+		if !contentResult.IsArray() {
 			continue
+		}
+		var content []any
+		if err := json.Unmarshal([]byte(contentResult.Raw), &content); err != nil {
+			return body
 		}
 
 		newContent := make([]any, 0, len(content))
@@ -1199,7 +1238,6 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 					newContent = append(newContent, block)
 					continue
 				}
-				filtered = true
 				filteredThisMessage = true
 				continue
 			}
@@ -1214,7 +1252,6 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 						continue
 					}
 				}
-				filtered = true
 				filteredThisMessage = true
 				continue
 			}
@@ -1222,7 +1259,6 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 			// Handle blocks without type discriminator but with "thinking" key
 			if blockType == "" {
 				if _, hasThinking := blockMap["thinking"]; hasThinking {
-					filtered = true
 					filteredThisMessage = true
 					continue
 				}
@@ -1232,19 +1268,14 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 		}
 
 		if filteredThisMessage {
-			msgMap["content"] = newContent
+			var err error
+			out, err = replaceMessageContent(out, messageIndex, newContent)
+			if err != nil {
+				return body
+			}
 		}
 	}
-
-	if !filtered {
-		return body
-	}
-
-	newBody, err := json.Marshal(req)
-	if err != nil {
-		return body
-	}
-	return newBody
+	return out
 }
 
 // NormalizeClaudeOutputEffort normalizes Claude's output_config.effort value.
