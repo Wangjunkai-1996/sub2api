@@ -76,7 +76,11 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 		for _, filename := range files {
 			source, readErr := os.ReadFile(filepath.Join("..", "..", "handler", filename))
 			require.NoError(t, readErr)
-			require.Containsf(t, string(source), "checkSecurityAudit", "%s route handler %s bypasses Coordinator", route, filename)
+			sourceText := string(source)
+			hasDirectAudit := strings.Contains(sourceText, "checkSecurityAudit")
+			hasSelectedAccountAudit := strings.Contains(sourceText, "newOpenAIAccountAuditState") &&
+				strings.Contains(sourceText, "ensureSecurityAuditForAccount")
+			require.Truef(t, hasDirectAudit || hasSelectedAccountAudit, "%s route handler %s bypasses Coordinator", route, filename)
 		}
 	}
 
@@ -93,16 +97,28 @@ func TestResponsesWebSocketHasFirstAndSubsequentTurnPromptGates(t *testing.T) {
 	require.GreaterOrEqual(t, strings.Count(string(routeSource), `.GET("/responses"`), 2)
 	handlerSource, err := os.ReadFile(filepath.Join("..", "..", "handler", "openai_gateway_handler.go"))
 	require.NoError(t, err)
-	require.Contains(t, string(handlerSource), `checkSecurityAuditStage`)
+	require.Contains(t, string(handlerSource), `newOpenAIAccountAuditState`)
+	require.Contains(t, string(handlerSource), `ensureSecurityAuditForAccount`)
 	require.Contains(t, string(handlerSource), `"first_turn"`)
 	require.Contains(t, string(handlerSource), `"subsequent_turn"`)
 	wsStart := strings.Index(string(handlerSource), `func (h *OpenAIGatewayHandler) ResponsesWebSocket`)
 	require.NotEqual(t, -1, wsStart)
 	wsSource := string(handlerSource)[wsStart:]
+	firstTurnState := strings.Index(wsSource, `"first_turn"`)
+	firstUserSlot := strings.Index(wsSource, `TryAcquireUserSlotForAPIKey`)
+	firstAccountAudit := strings.Index(wsSource, `ensureSecurityAuditForAccount`)
+	require.NotEqual(t, -1, firstTurnState)
+	require.NotEqual(t, -1, firstUserSlot)
+	require.NotEqual(t, -1, firstAccountAudit)
 	require.Less(t,
-		strings.Index(wsSource, `"first_turn"`),
-		strings.Index(wsSource, `TryAcquireUserSlotForAPIKey`),
-		"the first response.create gate must precede per-request user/account slots",
+		firstTurnState,
+		firstUserSlot,
+		"the first response.create audit state must be prepared before per-request slots",
+	)
+	require.Greater(t,
+		firstAccountAudit,
+		firstUserSlot,
+		"the first response.create audit must run after the final account is selected",
 	)
 }
 

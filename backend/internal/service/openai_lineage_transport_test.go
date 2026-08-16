@@ -246,7 +246,7 @@ func TestOpenAISSEToJSONTransportsRejectMismatchedCreatedAndTerminalLineageIDs(t
 		svc := &OpenAIGatewayService{cfg: &config.Config{}}
 		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}}
 
-		result, err := svc.handleSSEToJSON(resp, c, body, "gpt-5.4", "gpt-5.4")
+		result, err := svc.handleSSEToJSON(resp, c, nil, body, "gpt-5.4", "gpt-5.4")
 		require.NoError(t, err)
 		require.NotNil(t, result)
 		require.False(t, result.lineageComplete)
@@ -278,7 +278,7 @@ func TestOpenAISSEToJSONTransportsCaptureReconstructedLineageOutput(t *testing.T
 		{
 			name: "native",
 			run: func(svc *OpenAIGatewayService, c *gin.Context, resp *http.Response) ([]byte, bool, error) {
-				result, err := svc.handleSSEToJSON(resp, c, body, "gpt-5.6-terra", "gpt-5.6-terra")
+				result, err := svc.handleSSEToJSON(resp, c, nil, body, "gpt-5.6-terra", "gpt-5.6-terra")
 				if result == nil {
 					return nil, false, err
 				}
@@ -441,7 +441,7 @@ func TestOpenAISSEToJSONTransportsRejectMalformedContributingLineage(t *testing.
 		{
 			name: "native",
 			run: func(svc *OpenAIGatewayService, c *gin.Context, resp *http.Response) ([]byte, bool, error) {
-				result, err := svc.handleSSEToJSON(resp, c, body, "gpt-5.6-terra", "gpt-5.6-terra")
+				result, err := svc.handleSSEToJSON(resp, c, nil, body, "gpt-5.6-terra", "gpt-5.6-terra")
 				if result == nil {
 					return nil, false, err
 				}

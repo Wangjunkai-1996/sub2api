@@ -260,8 +260,11 @@ func TestRecordCyberPolicyEvent_RuntimeSnapshotRefreshFailureKeepsStaleScope(t *
 		SettingKeyRiskControlEnabled:      "true",
 		SettingKeyContentModerationConfig: `{"all_groups":true,"model_filter":{"type":"include","models":["gpt-5"]}}`,
 	}}
-	svc := NewContentModerationService(settingRepo, repo, nil, nil, nil, nil, nil, nil)
+	// This path is synchronous, so avoid starting queue workers before the test
+	// installs its short runtime-cache TTL.
+	svc := NewContentModerationService(settingRepo, nil, nil, nil, nil, nil, nil, nil)
 	svc.runtimeCacheTTL = time.Minute
+	svc.repo = repo
 
 	_, err := svc.loadRuntimeSnapshot(context.Background())
 	require.NoError(t, err)
