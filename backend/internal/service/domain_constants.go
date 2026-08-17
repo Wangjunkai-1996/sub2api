@@ -442,6 +442,10 @@ const (
 	// Grok accounts without an explicit credentials.base_url.
 	SettingKeyGrokDefaultBaseURLMode = "grok_default_base_url_mode"
 
+	// SettingKeyOpenAIOAuthDefaultProxyID identifies the proxy inherited by new
+	// OpenAI OAuth accounts and OAuth bootstrap flows when no proxy was supplied.
+	SettingKeyOpenAIOAuthDefaultProxyID = "openai_oauth_default_proxy_id"
+
 	// SettingKeyAvailableChannelsEnabled is a DB-backed soft switch for the "Available Channels"
 	// user-facing aggregate view. When false: user endpoint returns an empty list and the
 	// sidebar entry is hidden. Defaults to false (opt-in feature).

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -83,9 +85,93 @@ func (s *SettingService) ResolveGrokBaseURL(ctx context.Context, account *Accoun
 	return account.GetGrokBaseURLOr(def)
 }
 
+// ResolveOpenAIOAuthDefaultProxy resolves the optional proxy inherited by
+// OpenAI OAuth bootstrap flows. An absent setting is intentionally a no-op;
+// once configured, however, a malformed, missing, or inactive proxy is an
+// explicit configuration error rather than an invitation to fall back to a
+// direct connection.
+func (s *SettingService) ResolveOpenAIOAuthDefaultProxy(ctx context.Context) (*Proxy, error) {
+	if s == nil || s.settingRepo == nil {
+		return nil, nil
+	}
+
+	baseCtx := context.Background()
+	if ctx != nil {
+		baseCtx = context.WithoutCancel(ctx)
+	}
+	dbCtx, cancel := context.WithTimeout(baseCtx, gatewayForwardingDBTimeout)
+	defer cancel()
+
+	raw, err := s.settingRepo.GetValue(dbCtx, SettingKeyOpenAIOAuthDefaultProxyID)
+	if errors.Is(err, ErrSettingNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, infraerrors.Newf(
+			http.StatusInternalServerError,
+			"OPENAI_OAUTH_DEFAULT_PROXY_READ_FAILED",
+			"failed to read OpenAI OAuth default proxy setting: %v",
+			err,
+		)
+	}
+
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	proxyID, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || proxyID <= 0 {
+		return nil, ErrOpenAIOAuthDefaultProxyInvalid.WithCause(
+			fmt.Errorf("setting %q is not a positive proxy ID", raw),
+		)
+	}
+	if s.proxyRepo == nil {
+		return nil, ErrOpenAIOAuthDefaultProxyNotFound.WithCause(
+			fmt.Errorf("proxy repository is unavailable for proxy ID %d", proxyID),
+		)
+	}
+
+	proxy, err := s.proxyRepo.GetByID(dbCtx, proxyID)
+	if err != nil {
+		if errors.Is(err, ErrProxyNotFound) {
+			return nil, ErrOpenAIOAuthDefaultProxyNotFound.WithCause(err)
+		}
+		return nil, infraerrors.Newf(
+			http.StatusInternalServerError,
+			"OPENAI_OAUTH_DEFAULT_PROXY_READ_FAILED",
+			"failed to load OpenAI OAuth default proxy %d: %v",
+			proxyID,
+			err,
+		)
+	}
+	if proxy == nil {
+		return nil, ErrOpenAIOAuthDefaultProxyNotFound.WithCause(
+			fmt.Errorf("proxy %d was not returned", proxyID),
+		)
+	}
+	if !proxy.IsActive() {
+		return nil, ErrOpenAIOAuthDefaultProxyInactive.WithCause(
+			fmt.Errorf("proxy %d has status %q", proxy.ID, proxy.Status),
+		)
+	}
+	return proxy, nil
+}
+
 var (
-	ErrRegistrationDisabled   = infraerrors.Forbidden("REGISTRATION_DISABLED", "registration is currently disabled")
-	ErrSettingNotFound        = infraerrors.NotFound("SETTING_NOT_FOUND", "setting not found")
+	ErrRegistrationDisabled           = infraerrors.Forbidden("REGISTRATION_DISABLED", "registration is currently disabled")
+	ErrSettingNotFound                = infraerrors.NotFound("SETTING_NOT_FOUND", "setting not found")
+	ErrOpenAIOAuthDefaultProxyInvalid = infraerrors.BadRequest(
+		"OPENAI_OAUTH_DEFAULT_PROXY_INVALID",
+		"OpenAI OAuth default proxy setting must be a positive proxy ID",
+	)
+	ErrOpenAIOAuthDefaultProxyNotFound = infraerrors.BadRequest(
+		"OPENAI_OAUTH_DEFAULT_PROXY_NOT_FOUND",
+		"OpenAI OAuth default proxy does not exist",
+	)
+	ErrOpenAIOAuthDefaultProxyInactive = infraerrors.BadRequest(
+		"OPENAI_OAUTH_DEFAULT_PROXY_INACTIVE",
+		"OpenAI OAuth default proxy is not active",
+	)
 	ErrDefaultSubGroupInvalid = infraerrors.BadRequest(
 		"DEFAULT_SUBSCRIPTION_GROUP_INVALID",
 		"default subscription group must exist and be subscription type",

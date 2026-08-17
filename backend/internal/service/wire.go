@@ -110,9 +110,11 @@ func ProvideBatchImageCleanupService(repo BatchImageRepository, accountRepo Acco
 func ProvideOpenAIOAuthService(
 	proxyRepo ProxyRepository,
 	oauthClient OpenAIOAuthClient,
+	settingService *SettingService,
 	privacyClientFactory PrivacyClientFactory,
 ) *OpenAIOAuthService {
 	svc := NewOpenAIOAuthService(proxyRepo, oauthClient)
+	svc.SetSettingService(settingService)
 	svc.SetPrivacyClientFactory(privacyClientFactory)
 	return svc
 }
