@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -28,18 +29,20 @@ type securityAuditWSDedupeEntry struct {
 }
 
 type openAIAccountAuditState struct {
-	mu             sync.Mutex
-	protocol       string
-	model          string
-	body           []byte
-	stage          string
-	routingContext *auditinput.SecurityRoutingContext
-	document       *auditinput.Document
-	policy         service.OpenAIAccountAuditRoutingPolicy
-	passed         bool
-	terminal       bool
-	decision       securityaudit.Decision
-	summary        *securityaudit.AuditSummary
+	mu              sync.Mutex
+	protocol        string
+	model           string
+	body            []byte
+	stage           string
+	routingContext  *auditinput.SecurityRoutingContext
+	document        *auditinput.Document
+	policy          service.OpenAIAccountAuditRoutingPolicy
+	routePreference service.OpenAIAccountRoutingPreference
+	routeResolved   bool
+	passed          bool
+	terminal        bool
+	decision        securityaudit.Decision
+	summary         *securityaudit.AuditSummary
 }
 
 func newOpenAIAccountAuditState(
@@ -82,28 +85,76 @@ func (s *openAIAccountAuditState) auditTextRunes() int {
 }
 
 func (s *openAIAccountAuditState) preferAPIKey() bool {
-	return s != nil && s.policy.PreferAPIKeyEnabled() &&
-		(!s.auditContextReliable() || s.auditTextRunes() > s.policy.LongTextRuneThreshold())
+	if s == nil {
+		return false
+	}
+	return s.effectiveRoutingPreference() == service.OpenAIAccountRoutingPreferenceAPIKey
+}
+
+func (s *openAIAccountAuditState) effectiveRoutingPreference() service.OpenAIAccountRoutingPreference {
+	if s == nil {
+		return service.OpenAIAccountRoutingPreferenceNone
+	}
+	if s.routeResolved {
+		return s.routePreference
+	}
+	return s.routingPreference("")
+}
+
+func (s *openAIAccountAuditState) setRoutingPreference(preference service.OpenAIAccountRoutingPreference) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.routePreference = preference
+	s.routeResolved = true
+	s.mu.Unlock()
 }
 
 func (s *openAIAccountAuditState) auditContextReliable() bool {
 	return s != nil && s.routingContext != nil && s.routingContext.Reliable
 }
 
-func (s *openAIAccountAuditState) auditRoutingReason() string {
+func (s *openAIAccountAuditState) auditRoutingReason() service.OpenAIAccountAuditRoutingReason {
 	if s == nil {
-		return "state_unavailable"
-	}
-	if !s.policy.PreferAPIKeyEnabled() {
-		return "preference_disabled"
+		return service.OpenAIAccountAuditRoutingStateUnavailable
 	}
 	if !s.auditContextReliable() {
-		return "context_unreliable"
+		return service.OpenAIAccountAuditRoutingContextUnreliable
 	}
-	if s.auditTextRunes() > s.policy.LongTextRuneThreshold() {
-		return "long_text"
+	textRunes := s.auditTextRunes()
+	if textRunes > s.policy.LongTextRuneThreshold() || !service.StrictContentModerationSupportsTextRunes(textRunes) {
+		return service.OpenAIAccountAuditRoutingLongText
 	}
-	return "normal"
+	return service.OpenAIAccountAuditRoutingNormal
+}
+
+func (s *openAIAccountAuditState) routingPreference(stableKey string) service.OpenAIAccountRoutingPreference {
+	if s == nil {
+		return service.OpenAIAccountRoutingPreferenceNone
+	}
+	switch s.auditRoutingReason() {
+	case service.OpenAIAccountAuditRoutingContextUnreliable:
+		return service.OpenAIAccountRoutingPreferenceAPIKey
+	case service.OpenAIAccountAuditRoutingLongText:
+		if !service.StrictContentModerationSupportsTextRunes(s.auditTextRunes()) {
+			return service.OpenAIAccountRoutingPreferenceAPIKey
+		}
+		if !s.policy.PreferAPIKeyEnabled() {
+			return service.OpenAIAccountRoutingPreferenceNone
+		}
+		stableKey = strings.TrimSpace(stableKey)
+		if stableKey == "" {
+			digest := sha256.Sum256(s.body)
+			stableKey = fmt.Sprintf("body:%x", digest[:])
+		}
+		if s.policy.LongTextOAuthRolloutSelected(stableKey) {
+			return service.OpenAIAccountRoutingPreferenceAuditedOAuth
+		}
+		return service.OpenAIAccountRoutingPreferenceAPIKey
+	default:
+		return service.OpenAIAccountRoutingPreferenceNone
+	}
 }
 
 func (s *openAIAccountAuditState) auditContextIssue() string {
@@ -116,16 +167,75 @@ func (s *openAIAccountAuditState) auditContextIssue() string {
 func (s *openAIAccountAuditState) routingOptions(
 	auditTransport service.OpenAIUpstreamTransport,
 	auditCapability service.OpenAIEndpointCapability,
+	stableKey ...string,
 ) service.OpenAIAccountRoutingOptions {
 	if s == nil {
 		return service.OpenAIAccountRoutingOptions{}
 	}
+	key := ""
+	if len(stableKey) > 0 {
+		key = stableKey[0]
+	}
+	preference := s.routingPreference(key)
+	s.setRoutingPreference(preference)
 	return service.OpenAIAccountRoutingOptions{
-		PreferAPIKey:                    s.preferAPIKey(),
+		Preference:                      preference,
+		AuditRoutingReason:              s.auditRoutingReason(),
 		AuditPolicy:                     s.policy,
 		AuditRequiredTransport:          auditTransport,
 		AuditRequiredEndpointCapability: auditCapability,
 	}
+}
+
+func openAIAccountRoutingPreferenceLogValue(preference service.OpenAIAccountRoutingPreference) string {
+	if preference == service.OpenAIAccountRoutingPreferenceNone {
+		return "none"
+	}
+	return string(preference)
+}
+
+// finalizeOpenAIAccountAuditRoutingDecision records the scheduler contract
+// after any platform override. The stable cohort key is intentionally omitted.
+func finalizeOpenAIAccountAuditRoutingDecision(
+	reqLog *zap.Logger,
+	state *openAIAccountAuditState,
+	options service.OpenAIAccountRoutingOptions,
+) {
+	if state != nil {
+		state.setRoutingPreference(options.Preference)
+	}
+	if reqLog == nil {
+		return
+	}
+	reason := options.AuditRoutingReason
+	if reason == "" && state != nil {
+		reason = state.auditRoutingReason()
+	}
+	reqLog.Info("security_audit.routing_decision",
+		zap.String("audit_routing_reason", string(reason)),
+		zap.String("audit_routing_preference", openAIAccountRoutingPreferenceLogValue(options.Preference)),
+		zap.Int("audit_text_runes", state.auditTextRunes()),
+		zap.Bool("audit_context_reliable", state.auditContextReliable()),
+		zap.Int("long_text_oauth_rollout_percent", options.AuditPolicy.LongTextOAuthRolloutPercent()),
+		zap.Bool("long_text_oauth_rollout_selected", options.Preference == service.OpenAIAccountRoutingPreferenceAuditedOAuth),
+	)
+}
+
+func openAIAccountAuditStableRoutingKey(c *gin.Context, sessionHash string) string {
+	if sessionHash = strings.TrimSpace(sessionHash); sessionHash != "" {
+		return "session:" + sessionHash
+	}
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	ctx := c.Request.Context()
+	if clientRequestID, _ := ctx.Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(clientRequestID) != "" {
+		return "client_request:" + strings.TrimSpace(clientRequestID)
+	}
+	if requestID := contentModerationRequestID(ctx); requestID != "" {
+		return "request:" + requestID
+	}
+	return ""
 }
 
 func (s *openAIAccountAuditState) summaryClone() *securityaudit.AuditSummary {
@@ -173,7 +283,10 @@ func (h *OpenAIGatewayHandler) ensureSecurityAuditForAccount(
 		fields := []zap.Field{
 			zap.Int("audit_text_runes", state.auditTextRunes()),
 			zap.Bool("prefer_apikey", state.preferAPIKey()),
-			zap.String("audit_routing_reason", state.auditRoutingReason()),
+			zap.String("audit_routing_reason", string(state.auditRoutingReason())),
+			zap.String("audit_routing_preference", openAIAccountRoutingPreferenceLogValue(state.effectiveRoutingPreference())),
+			zap.Int("long_text_oauth_rollout_percent", state.policy.LongTextOAuthRolloutPercent()),
+			zap.Bool("long_text_oauth_rollout_selected", state.effectiveRoutingPreference() == service.OpenAIAccountRoutingPreferenceAuditedOAuth),
 			zap.Bool("audit_context_reliable", state.auditContextReliable()),
 			zap.String("audit_context_issue", state.auditContextIssue()),
 			zap.Bool("audit_required", eligibility.Eligible || eligibility.Indeterminate),

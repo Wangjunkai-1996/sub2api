@@ -737,7 +737,16 @@ func TestOpenAIResponsesWebSocket_AuditDependsOnFinalAccount(t *testing.T) {
 				payload, err := io.ReadAll(r.Body)
 				require.NoError(t, err)
 				moderationPayload.Store(string(payload))
-				_, _ = w.Write([]byte(`{"results":[{"flagged":true,"category_scores":{"harassment":0.01,"harassment/threatening":0.01,"hate":0.01,"hate/threatening":0.01,"illicit":0.01,"illicit/violent":0.01,"self-harm":0.01,"self-harm/intent":0.01,"self-harm/instructions":0.01,"sexual":0.9,"sexual/minors":0.01,"violence":0.01,"violence/graphic":0.01}}]}`))
+				resultCount := int(gjson.GetBytes(payload, "input.#").Int())
+				if resultCount == 0 {
+					resultCount = 1
+				}
+				result := json.RawMessage(`{"flagged":true,"category_scores":{"harassment":0.01,"harassment/threatening":0.01,"hate":0.01,"hate/threatening":0.01,"illicit":0.01,"illicit/violent":0.01,"self-harm":0.01,"self-harm/intent":0.01,"self-harm/instructions":0.01,"sexual":0.9,"sexual/minors":0.01,"violence":0.01,"violence/graphic":0.01}}`)
+				results := make([]json.RawMessage, resultCount)
+				for index := range results {
+					results[index] = result
+				}
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
 			}))
 			defer moderationServer.Close()
 

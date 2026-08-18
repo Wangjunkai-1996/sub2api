@@ -703,6 +703,7 @@ func TestAPIContracts(t *testing.T) {
 					"openai_advanced_scheduler_enabled":                                  "true",
 					service.SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled:       "false",
 					service.SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled: "false",
+					service.SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent:      "25",
 				})
 			},
 			method:     http.MethodGet,
@@ -924,6 +925,7 @@ func TestAPIContracts(t *testing.T) {
 					"openai_advanced_scheduler_enabled": true,
 					"openai_advanced_scheduler_sticky_weighted_enabled": false,
 					"openai_advanced_scheduler_subscription_priority_enabled": false,
+					"openai_account_audit_long_text_oauth_rollout_percent": 25,
 					"openai_advanced_scheduler_lb_top_k": "",
 					"openai_advanced_scheduler_weight_priority": "",
 					"openai_advanced_scheduler_weight_load": "",
@@ -1242,6 +1244,7 @@ func TestAPIContracts(t *testing.T) {
 					"openai_advanced_scheduler_enabled": false,
 					"openai_advanced_scheduler_sticky_weighted_enabled": false,
 					"openai_advanced_scheduler_subscription_priority_enabled": false,
+					"openai_account_audit_long_text_oauth_rollout_percent": 0,
 					"openai_advanced_scheduler_lb_top_k": "",
 					"openai_advanced_scheduler_weight_priority": "",
 					"openai_advanced_scheduler_weight_load": "",

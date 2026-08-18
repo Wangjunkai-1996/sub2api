@@ -1289,6 +1289,8 @@ export default {
         stickyWeightedDescription: '开启后 previous_response_id 和 session_hash 粘性进入高级调度打分；关闭时仍按旧逻辑硬命中粘性账号。',
         subscriptionPriorityTitle: '订阅优先',
         subscriptionPriorityDescription: '开启后先在 ChatGPT 订阅账号池中按权值选取；订阅池拿不到席位时再回退到非订阅账号池。',
+        longTextOAuthRolloutTitle: '长文本 OAuth 灰度比例',
+        longTextOAuthRolloutDescription: '对超过审计阈值且可完整审计的长文本按稳定哈希分流：0 表示仍优先 API Key；1–100 表示相应比例优先审计合格的 Pro OAuth，再回退 API Key。',
         weightsTitle: '调度权值覆盖',
         weightsDescription: '留空时使用配置/环境变量值；配置未设置时使用内置默认值。页面非空设置优先。',
         defaultPlaceholder: '配置/默认：{value}',

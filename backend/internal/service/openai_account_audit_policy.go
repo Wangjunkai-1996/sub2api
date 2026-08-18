@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -23,25 +25,45 @@ const (
 var defaultOpenAIAccountAuditGroupIDs = []int64{12}
 
 type OpenAIAccountAuditRoutingSettings struct {
-	AccountGroupIDs       []int64
-	LongTextRuneThreshold int
-	PreferAPIKeyEnabled   bool
+	AccountGroupIDs             []int64
+	LongTextRuneThreshold       int
+	PreferAPIKeyEnabled         bool
+	LongTextOAuthRolloutPercent int
 }
 
 type OpenAIAccountAuditRoutingPolicy struct {
-	groupIDs              map[int64]struct{}
-	orderedGroupIDs       []int64
-	longTextRuneThreshold int
-	preferAPIKeyEnabled   bool
-	available             bool
+	groupIDs                    map[int64]struct{}
+	orderedGroupIDs             []int64
+	longTextRuneThreshold       int
+	preferAPIKeyEnabled         bool
+	longTextOAuthRolloutPercent int
+	available                   bool
 }
+
+type OpenAIAccountAuditRoutingReason string
+
+const (
+	OpenAIAccountAuditRoutingNormal            OpenAIAccountAuditRoutingReason = "normal"
+	OpenAIAccountAuditRoutingContextUnreliable OpenAIAccountAuditRoutingReason = "context_unreliable"
+	OpenAIAccountAuditRoutingLongText          OpenAIAccountAuditRoutingReason = "long_text"
+	OpenAIAccountAuditRoutingStateUnavailable  OpenAIAccountAuditRoutingReason = "state_unavailable"
+)
+
+type OpenAIAccountRoutingPreference string
+
+const (
+	OpenAIAccountRoutingPreferenceNone         OpenAIAccountRoutingPreference = ""
+	OpenAIAccountRoutingPreferenceAPIKey       OpenAIAccountRoutingPreference = "api_key"
+	OpenAIAccountRoutingPreferenceAuditedOAuth OpenAIAccountRoutingPreference = "audited_oauth"
+)
 
 // OpenAIAccountRoutingOptions is a request-local scheduler contract. The
 // preference only affects unbound load-balanced selection. Conditional
 // requirements are applied to accounts that are eligible, or may be eligible,
 // for local audit after their fresh database state is loaded.
 type OpenAIAccountRoutingOptions struct {
-	PreferAPIKey                    bool
+	Preference                      OpenAIAccountRoutingPreference
+	AuditRoutingReason              OpenAIAccountAuditRoutingReason
 	AuditPolicy                     OpenAIAccountAuditRoutingPolicy
 	AuditRequiredTransport          OpenAIUpstreamTransport
 	AuditRequiredEndpointCapability OpenAIEndpointCapability
@@ -54,28 +76,69 @@ type openAIAccountRoutingTypeTier uint8
 const (
 	openAIAccountRoutingTypeAny openAIAccountRoutingTypeTier = iota
 	openAIAccountRoutingTypeAPIKey
-	openAIAccountRoutingTypeFallback
+	openAIAccountRoutingTypeAuditedOAuth
+	openAIAccountRoutingTypeNonAPIKey
+	openAIAccountRoutingTypeNonAuditedOAuth
 )
 
-func openAIAccountRoutingTypeTiers(preferAPIKey bool) []openAIAccountRoutingTypeTier {
-	if !preferAPIKey {
-		return []openAIAccountRoutingTypeTier{openAIAccountRoutingTypeAny}
+func (o OpenAIAccountRoutingOptions) effectivePreference() OpenAIAccountRoutingPreference {
+	switch o.Preference {
+	case OpenAIAccountRoutingPreferenceAPIKey, OpenAIAccountRoutingPreferenceAuditedOAuth:
+		return o.Preference
+	default:
+		return OpenAIAccountRoutingPreferenceNone
 	}
-	return []openAIAccountRoutingTypeTier{openAIAccountRoutingTypeAPIKey, openAIAccountRoutingTypeFallback}
 }
 
-func openAIAccountMatchesRoutingTypeTier(account *Account, tier openAIAccountRoutingTypeTier) bool {
+func (o OpenAIAccountRoutingOptions) PrefersAPIKey() bool {
+	return o.effectivePreference() == OpenAIAccountRoutingPreferenceAPIKey
+}
+
+func (o OpenAIAccountRoutingOptions) PrefersAuditedOAuth() bool {
+	return o.effectivePreference() == OpenAIAccountRoutingPreferenceAuditedOAuth
+}
+
+func openAIAccountRoutingTypeTiers(options OpenAIAccountRoutingOptions) []openAIAccountRoutingTypeTier {
+	switch options.effectivePreference() {
+	case OpenAIAccountRoutingPreferenceAPIKey:
+		return []openAIAccountRoutingTypeTier{openAIAccountRoutingTypeAPIKey, openAIAccountRoutingTypeNonAPIKey}
+	case OpenAIAccountRoutingPreferenceAuditedOAuth:
+		return []openAIAccountRoutingTypeTier{
+			openAIAccountRoutingTypeAuditedOAuth,
+			openAIAccountRoutingTypeAPIKey,
+			openAIAccountRoutingTypeNonAuditedOAuth,
+		}
+	default:
+		return []openAIAccountRoutingTypeTier{openAIAccountRoutingTypeAny}
+	}
+}
+
+func openAIAccountMatchesRoutingTypeTier(account *Account, tier openAIAccountRoutingTypeTier, options OpenAIAccountRoutingOptions) bool {
 	if account == nil {
 		return false
 	}
 	switch tier {
 	case openAIAccountRoutingTypeAPIKey:
 		return account.Type == AccountTypeAPIKey
-	case openAIAccountRoutingTypeFallback:
+	case openAIAccountRoutingTypeAuditedOAuth:
+		return ClassifyOpenAIAccountAuditEligibility(account, options.AuditPolicy).Eligible
+	case openAIAccountRoutingTypeNonAPIKey:
 		return account.Type != AccountTypeAPIKey
+	case openAIAccountRoutingTypeNonAuditedOAuth:
+		return account.Type != AccountTypeAPIKey &&
+			!ClassifyOpenAIAccountAuditEligibility(account, options.AuditPolicy).Eligible
 	default:
 		return true
 	}
+}
+
+func openAIAccountRoutingTypeTierForAccount(account *Account, options OpenAIAccountRoutingOptions) (openAIAccountRoutingTypeTier, int, bool) {
+	for index, tier := range openAIAccountRoutingTypeTiers(options) {
+		if openAIAccountMatchesRoutingTypeTier(account, tier, options) {
+			return tier, index, true
+		}
+	}
+	return openAIAccountRoutingTypeAny, 0, false
 }
 
 func WithOpenAIAccountRoutingOptions(ctx context.Context, options OpenAIAccountRoutingOptions) context.Context {
@@ -147,19 +210,29 @@ func newOpenAIAccountAuditRoutingPolicy(settings OpenAIAccountAuditRoutingSettin
 		groupSet[groupID] = struct{}{}
 	}
 	return OpenAIAccountAuditRoutingPolicy{
-		groupIDs:              groupSet,
-		orderedGroupIDs:       groupIDs,
-		longTextRuneThreshold: threshold,
-		preferAPIKeyEnabled:   settings.PreferAPIKeyEnabled,
-		available:             available,
+		groupIDs:                    groupSet,
+		orderedGroupIDs:             groupIDs,
+		longTextRuneThreshold:       threshold,
+		preferAPIKeyEnabled:         settings.PreferAPIKeyEnabled,
+		longTextOAuthRolloutPercent: settings.LongTextOAuthRolloutPercent,
+		available:                   available,
 	}
+}
+
+func NewOpenAIAccountAuditRoutingPolicy(settings OpenAIAccountAuditRoutingSettings) (OpenAIAccountAuditRoutingPolicy, error) {
+	settings.AccountGroupIDs = normalizeOpenAIAccountAuditGroupIDs(settings.AccountGroupIDs)
+	if err := ValidateOpenAIAccountAuditRoutingSettings(settings); err != nil {
+		return OpenAIAccountAuditRoutingPolicy{}, err
+	}
+	return newOpenAIAccountAuditRoutingPolicy(settings, true), nil
 }
 
 func DefaultOpenAIAccountAuditRoutingPolicy() OpenAIAccountAuditRoutingPolicy {
 	return newOpenAIAccountAuditRoutingPolicy(OpenAIAccountAuditRoutingSettings{
-		AccountGroupIDs:       defaultOpenAIAccountAuditGroupIDs,
-		LongTextRuneThreshold: DefaultOpenAIAccountAuditLongTextRuneThreshold,
-		PreferAPIKeyEnabled:   true,
+		AccountGroupIDs:             defaultOpenAIAccountAuditGroupIDs,
+		LongTextRuneThreshold:       DefaultOpenAIAccountAuditLongTextRuneThreshold,
+		PreferAPIKeyEnabled:         true,
+		LongTextOAuthRolloutPercent: 0,
 	}, true)
 }
 
@@ -176,6 +249,30 @@ func (p OpenAIAccountAuditRoutingPolicy) LongTextRuneThreshold() int {
 
 func (p OpenAIAccountAuditRoutingPolicy) PreferAPIKeyEnabled() bool {
 	return p.preferAPIKeyEnabled
+}
+
+func (p OpenAIAccountAuditRoutingPolicy) LongTextOAuthRolloutPercent() int {
+	if p.longTextOAuthRolloutPercent < 0 || p.longTextOAuthRolloutPercent > 100 {
+		return 0
+	}
+	return p.longTextOAuthRolloutPercent
+}
+
+func (p OpenAIAccountAuditRoutingPolicy) LongTextOAuthRolloutSelected(stableKey string) bool {
+	percent := p.LongTextOAuthRolloutPercent()
+	if percent <= 0 {
+		return false
+	}
+	if percent >= 100 {
+		return true
+	}
+	stableKey = strings.TrimSpace(stableKey)
+	if stableKey == "" {
+		return false
+	}
+	digest := sha256.Sum256([]byte(stableKey))
+	bucket := binary.BigEndian.Uint64(digest[:8]) % 100
+	return bucket < uint64(percent)
 }
 
 func (p OpenAIAccountAuditRoutingPolicy) Available() bool {
@@ -249,6 +346,9 @@ func ValidateOpenAIAccountAuditRoutingSettings(settings OpenAIAccountAuditRoutin
 	if settings.LongTextRuneThreshold <= 0 {
 		return fmt.Errorf("%s must be greater than zero", SettingKeyOpenAIAccountAuditLongTextRuneThreshold)
 	}
+	if settings.LongTextOAuthRolloutPercent < 0 || settings.LongTextOAuthRolloutPercent > 100 {
+		return fmt.Errorf("%s must be between 0 and 100", SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent)
+	}
 	return nil
 }
 
@@ -265,19 +365,80 @@ func (s *SettingService) UpdateOpenAIAccountAuditRoutingSettings(ctx context.Con
 		return fmt.Errorf("marshal OpenAI account audit group IDs: %w", err)
 	}
 	if err := s.settingRepo.SetMultiple(ctx, map[string]string{
-		SettingKeyOpenAIAccountAuditGroupIDs:              string(groupIDsJSON),
-		SettingKeyOpenAIAccountAuditLongTextRuneThreshold: strconv.Itoa(settings.LongTextRuneThreshold),
-		SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled:   strconv.FormatBool(settings.PreferAPIKeyEnabled),
+		SettingKeyOpenAIAccountAuditGroupIDs:                    string(groupIDsJSON),
+		SettingKeyOpenAIAccountAuditLongTextRuneThreshold:       strconv.Itoa(settings.LongTextRuneThreshold),
+		SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled:         strconv.FormatBool(settings.PreferAPIKeyEnabled),
+		SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent: strconv.Itoa(settings.LongTextOAuthRolloutPercent),
 	}); err != nil {
 		return err
 	}
 	policy := newOpenAIAccountAuditRoutingPolicy(settings, true)
-	s.openAIAccountAuditRoutingRuntimeSF.Forget(openAIAccountAuditRoutingRuntimeSFKey)
-	s.openAIAccountAuditRoutingRuntimeCache.Store(&cachedOpenAIAccountAuditRoutingRuntime{
+	s.replaceOpenAIAccountAuditRoutingRuntime(&cachedOpenAIAccountAuditRoutingRuntime{
 		policy:    policy,
 		expiresAt: time.Now().Add(openAIAccountAuditRoutingRuntimeCacheTTL).UnixNano(),
 	})
 	return nil
+}
+
+func (s *SettingService) replaceOpenAIAccountAuditRoutingRuntime(entry *cachedOpenAIAccountAuditRoutingRuntime) {
+	if s == nil || entry == nil {
+		return
+	}
+	s.openAIAccountAuditRoutingRuntimeMu.Lock()
+	defer s.openAIAccountAuditRoutingRuntimeMu.Unlock()
+	s.openAIAccountAuditRoutingGeneration++
+	s.openAIAccountAuditRoutingRuntimeSF.Forget(openAIAccountAuditRoutingRuntimeSFKey)
+	s.openAIAccountAuditRoutingRuntimeCache.Store(entry)
+}
+
+func (s *SettingService) openAIAccountAuditRoutingLoadGeneration() uint64 {
+	s.openAIAccountAuditRoutingRuntimeMu.Lock()
+	defer s.openAIAccountAuditRoutingRuntimeMu.Unlock()
+	return s.openAIAccountAuditRoutingGeneration
+}
+
+func (s *SettingService) storeOpenAIAccountAuditRoutingRuntimeForGeneration(
+	generation uint64,
+	entry *cachedOpenAIAccountAuditRoutingRuntime,
+) *cachedOpenAIAccountAuditRoutingRuntime {
+	s.openAIAccountAuditRoutingRuntimeMu.Lock()
+	defer s.openAIAccountAuditRoutingRuntimeMu.Unlock()
+	if generation != s.openAIAccountAuditRoutingGeneration {
+		if current, ok := s.openAIAccountAuditRoutingRuntimeCache.Load().(*cachedOpenAIAccountAuditRoutingRuntime); ok && current != nil {
+			return current
+		}
+		return entry
+	}
+	s.openAIAccountAuditRoutingRuntimeCache.Store(entry)
+	return entry
+}
+
+// refreshOpenAIAccountAuditLongTextOAuthRolloutPercent keeps the hot-path
+// policy cache aligned with a generic SystemSettings write. Other audit policy
+// fields are preserved; if no policy has been loaded yet, the expired sentinel
+// makes the first request load the complete policy from storage.
+func (s *SettingService) refreshOpenAIAccountAuditLongTextOAuthRolloutPercent(percent int) {
+	if s == nil || percent < 0 || percent > 100 {
+		return
+	}
+	s.openAIAccountAuditRoutingRuntimeMu.Lock()
+	defer s.openAIAccountAuditRoutingRuntimeMu.Unlock()
+	s.openAIAccountAuditRoutingGeneration++
+	s.openAIAccountAuditRoutingRuntimeSF.Forget(openAIAccountAuditRoutingRuntimeSFKey)
+	policy := DefaultOpenAIAccountAuditRoutingPolicy()
+	policy.available = false
+	expiresAt := int64(0)
+	if cached, ok := s.openAIAccountAuditRoutingRuntimeCache.Load().(*cachedOpenAIAccountAuditRoutingRuntime); ok && cached != nil {
+		policy = cached.policy
+		if policy.Available() {
+			expiresAt = time.Now().Add(openAIAccountAuditRoutingRuntimeCacheTTL).UnixNano()
+		}
+	}
+	policy.longTextOAuthRolloutPercent = percent
+	s.openAIAccountAuditRoutingRuntimeCache.Store(&cachedOpenAIAccountAuditRoutingRuntime{
+		policy:    policy,
+		expiresAt: expiresAt,
+	})
 }
 
 func (s *SettingService) GetOpenAIAccountAuditRoutingRuntime(ctx context.Context) OpenAIAccountAuditRoutingPolicy {
@@ -294,12 +455,14 @@ func (s *SettingService) GetOpenAIAccountAuditRoutingRuntime(ctx context.Context
 		if cached, ok := s.openAIAccountAuditRoutingRuntimeCache.Load().(*cachedOpenAIAccountAuditRoutingRuntime); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
 			return cached, nil
 		}
+		generation := s.openAIAccountAuditRoutingLoadGeneration()
 		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIAccountAuditRoutingRuntimeDBTimeout)
 		defer cancel()
 		values, err := s.settingRepo.GetMultiple(dbCtx, []string{
 			SettingKeyOpenAIAccountAuditGroupIDs,
 			SettingKeyOpenAIAccountAuditLongTextRuneThreshold,
 			SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled,
+			SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent,
 		})
 		if err != nil {
 			policy := defaultPolicy
@@ -312,14 +475,14 @@ func (s *SettingService) GetOpenAIAccountAuditRoutingRuntime(ctx context.Context
 				policy:    policy,
 				expiresAt: time.Now().Add(openAIAccountAuditRoutingRuntimeErrorTTL).UnixNano(),
 			}
-			s.openAIAccountAuditRoutingRuntimeCache.Store(entry)
-			return entry, nil
+			return s.storeOpenAIAccountAuditRoutingRuntimeForGeneration(generation, entry), nil
 		}
 
 		settings := OpenAIAccountAuditRoutingSettings{
-			AccountGroupIDs:       defaultOpenAIAccountAuditGroupIDs,
-			LongTextRuneThreshold: DefaultOpenAIAccountAuditLongTextRuneThreshold,
-			PreferAPIKeyEnabled:   true,
+			AccountGroupIDs:             defaultOpenAIAccountAuditGroupIDs,
+			LongTextRuneThreshold:       DefaultOpenAIAccountAuditLongTextRuneThreshold,
+			PreferAPIKeyEnabled:         true,
+			LongTextOAuthRolloutPercent: 0,
 		}
 		available := true
 		if raw, ok := values[SettingKeyOpenAIAccountAuditGroupIDs]; ok && strings.TrimSpace(raw) != "" {
@@ -348,12 +511,18 @@ func (s *SettingService) GetOpenAIAccountAuditRoutingRuntime(ctx context.Context
 				available = false
 			}
 		}
+		if raw, ok := values[SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent]; ok {
+			if percent, parseErr := strconv.Atoi(strings.TrimSpace(raw)); parseErr == nil && percent >= 0 && percent <= 100 {
+				settings.LongTextOAuthRolloutPercent = percent
+			} else {
+				available = false
+			}
+		}
 		entry := &cachedOpenAIAccountAuditRoutingRuntime{
 			policy:    newOpenAIAccountAuditRoutingPolicy(settings, available),
 			expiresAt: time.Now().Add(openAIAccountAuditRoutingRuntimeCacheTTL).UnixNano(),
 		}
-		s.openAIAccountAuditRoutingRuntimeCache.Store(entry)
-		return entry, nil
+		return s.storeOpenAIAccountAuditRoutingRuntimeForGeneration(generation, entry), nil
 	})
 	if entry, ok := result.(*cachedOpenAIAccountAuditRoutingRuntime); ok && entry != nil {
 		return entry.policy
@@ -389,18 +558,17 @@ func (s *OpenAIGatewayService) openAIAccountMeetsRoutingRequirements(
 		s.isOpenAIAccountTransportCompatible(account, requiredTransport)
 }
 
-func prioritizeOpenAIAPIKeyAccounts(accounts []*Account, enabled bool) []*Account {
-	if !enabled || len(accounts) < 2 {
+func prioritizeOpenAIAccountsForRouting(accounts []*Account, options OpenAIAccountRoutingOptions) []*Account {
+	if options.effectivePreference() == OpenAIAccountRoutingPreferenceNone || len(accounts) < 2 {
 		return accounts
 	}
-	preferred := make([]*Account, 0, len(accounts))
-	fallback := make([]*Account, 0, len(accounts))
-	for _, account := range accounts {
-		if account != nil && account.Type == AccountTypeAPIKey {
-			preferred = append(preferred, account)
-			continue
+	ordered := make([]*Account, 0, len(accounts))
+	for _, tier := range openAIAccountRoutingTypeTiers(options) {
+		for _, account := range accounts {
+			if openAIAccountMatchesRoutingTypeTier(account, tier, options) {
+				ordered = append(ordered, account)
+			}
 		}
-		fallback = append(fallback, account)
 	}
-	return append(preferred, fallback...)
+	return ordered
 }

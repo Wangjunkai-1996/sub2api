@@ -942,7 +942,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		}
 		return s.isBetterAccount(a, b)
 	})
-	eligible = prioritizeOpenAIAPIKeyAccounts(eligible, openAIAccountRoutingOptionsFromContext(ctx).PreferAPIKey)
+	eligible = prioritizeOpenAIAccountsForRouting(eligible, openAIAccountRoutingOptionsFromContext(ctx))
 	return eligible[0], compactBlocked, filterStats
 }
 
@@ -1244,7 +1244,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if !routingCompatible(fresh) {
 				continue
 			}
-			if !openAIAccountMatchesRoutingTypeTier(fresh, routingTier) {
+			if !openAIAccountMatchesRoutingTypeTier(fresh, routingTier, routingOptions) {
 				continue
 			}
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
@@ -1274,7 +1274,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if requireCompact {
 			ordered = prioritizeOpenAICompactAccounts(ordered)
 		}
-		for _, routingTier := range openAIAccountRoutingTypeTiers(routingOptions.PreferAPIKey) {
+		for _, routingTier := range openAIAccountRoutingTypeTiers(routingOptions) {
 			for _, acc := range ordered {
 				fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, acc, platform, requestedModel, false, requiredCapability)
 				if fresh == nil {
@@ -1287,7 +1287,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				if !routingCompatible(fresh) {
 					continue
 				}
-				if !openAIAccountMatchesRoutingTypeTier(fresh, routingTier) {
+				if !openAIAccountMatchesRoutingTypeTier(fresh, routingTier, routingOptions) {
 					continue
 				}
 				if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
@@ -1306,7 +1306,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	} else {
 		var freshLoadMap map[int64]*AccountLoadInfo
 		var freshLoadMapLoaded bool
-		for _, routingTier := range openAIAccountRoutingTypeTiers(routingOptions.PreferAPIKey) {
+		for _, routingTier := range openAIAccountRoutingTypeTiers(routingOptions) {
 			if selection, attempted, selectErr := tryAcquireFromLoadMap(loadMap, routingTier); selectErr != nil {
 				return nil, selectErr
 			} else if selection != nil {
@@ -1339,7 +1339,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	if requireCompact {
 		candidates = prioritizeOpenAICompactAccounts(candidates)
 	}
-	for _, routingTier := range openAIAccountRoutingTypeTiers(routingOptions.PreferAPIKey) {
+	for _, routingTier := range openAIAccountRoutingTypeTiers(routingOptions) {
 		for _, acc := range candidates {
 			fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, acc, platform, requestedModel, false, requiredCapability)
 			if fresh == nil {
@@ -1352,7 +1352,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if !routingCompatible(fresh) {
 				continue
 			}
-			if !openAIAccountMatchesRoutingTypeTier(fresh, routingTier) {
+			if !openAIAccountMatchesRoutingTypeTier(fresh, routingTier, routingOptions) {
 				continue
 			}
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {

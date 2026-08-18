@@ -1295,6 +1295,8 @@ export default {
         stickyWeightedDescription: 'When enabled, previous_response_id and session_hash affinity are scored by the advanced scheduler. When disabled, sticky accounts keep the legacy hard-hit behavior.',
         subscriptionPriorityTitle: 'Subscription priority',
         subscriptionPriorityDescription: 'When enabled, the scheduler scores ChatGPT subscription accounts first and falls back to non-subscription accounts only if no subscription slot can be acquired.',
+        longTextOAuthRolloutTitle: 'Long-text OAuth rollout',
+        longTextOAuthRolloutDescription: 'Stably hashes auditable requests above the threshold: 0 keeps API Key preference; 1–100 sends that percentage to audit-eligible Pro OAuth first, then falls back to API Key.',
         weightsTitle: 'Scheduler weight overrides',
         weightsDescription: 'Blank values use config/environment values; when config is not set, built-in defaults apply. Non-blank page settings take priority.',
         defaultPlaceholder: 'config/default: {value}',

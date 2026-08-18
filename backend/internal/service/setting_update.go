@@ -130,6 +130,12 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	if err := s.normalizeOpenAIAdvancedSchedulerOverrides(settings); err != nil {
 		return nil, err
 	}
+	if settings.OpenAIAccountAuditLongTextOAuthRolloutPercent < 0 || settings.OpenAIAccountAuditLongTextOAuthRolloutPercent > 100 {
+		return nil, infraerrors.BadRequest(
+			"INVALID_OPENAI_ACCOUNT_AUDIT_LONG_TEXT_OAUTH_ROLLOUT_PERCENT",
+			"OpenAI account audit long-text OAuth rollout percent must be between 0 and 100",
+		)
+	}
 	settings.PaymentVisibleMethodAlipaySource = alipaySource
 	settings.PaymentVisibleMethodWxpaySource = wxpaySource
 	settings.WeChatConnectAppID = strings.TrimSpace(settings.WeChatConnectAppID)
@@ -506,6 +512,7 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[openAIAdvancedSchedulerSettingKey] = strconv.FormatBool(settings.OpenAIAdvancedSchedulerEnabled)
 	updates[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled] = strconv.FormatBool(settings.OpenAIAdvancedSchedulerStickyWeightedEnabled)
 	updates[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled] = strconv.FormatBool(settings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled)
+	updates[SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent] = strconv.Itoa(settings.OpenAIAccountAuditLongTextOAuthRolloutPercent)
 	updates[SettingKeyOpenAIAdvancedSchedulerLBTopK] = settings.OpenAIAdvancedSchedulerLBTopK
 	updates[SettingKeyOpenAIAdvancedSchedulerWeightPriority] = settings.OpenAIAdvancedSchedulerWeightPriority
 	updates[SettingKeyOpenAIAdvancedSchedulerWeightLoad] = settings.OpenAIAdvancedSchedulerWeightLoad
@@ -783,6 +790,7 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		}),
 		expiresAt: time.Now().Add(openAIAdvancedSchedulerSettingCacheTTL).UnixNano(),
 	})
+	s.refreshOpenAIAccountAuditLongTextOAuthRolloutPercent(settings.OpenAIAccountAuditLongTextOAuthRolloutPercent)
 	// Invalidate the quota auto-pause cache and let the next read trigger a fresh load.
 	// We can't know from here whether ops_advanced_settings was also touched, so be
 	// defensive: store an expired entry — GetOpenAIQuotaAutoPauseSettings will serve

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -241,7 +242,7 @@ func TestOpenAIAccountAuditStateLongTextUsesCanonicalRuneCount(t *testing.T) {
 	require.Equal(t, service.DefaultOpenAIAccountAuditLongTextRuneThreshold, atLimit.auditTextRunes())
 	require.False(t, atLimit.preferAPIKey(), "exactly 12k runes stays on normal scheduling")
 	require.True(t, atLimit.auditContextReliable())
-	require.Equal(t, "normal", atLimit.auditRoutingReason())
+	require.Equal(t, service.OpenAIAccountAuditRoutingNormal, atLimit.auditRoutingReason())
 
 	responsesOverLimit := build(service.ContentModerationProtocolOpenAIResponses, map[string]any{
 		"model":        "gpt-5.4",
@@ -250,7 +251,7 @@ func TestOpenAIAccountAuditStateLongTextUsesCanonicalRuneCount(t *testing.T) {
 	})
 	require.Equal(t, service.DefaultOpenAIAccountAuditLongTextRuneThreshold+2, responsesOverLimit.auditTextRunes())
 	require.True(t, responsesOverLimit.preferAPIKey(), "Responses instructions must participate in routing")
-	require.Equal(t, "long_text", responsesOverLimit.auditRoutingReason())
+	require.Equal(t, service.OpenAIAccountAuditRoutingLongText, responsesOverLimit.auditRoutingReason())
 	require.Contains(t, responsesOverLimit.document.NormalizedText, "😀")
 
 	chatOverLimit := build(service.ContentModerationProtocolOpenAIChat, map[string]any{
@@ -269,7 +270,7 @@ func TestOpenAIAccountAuditStateLongTextUsesCanonicalRuneCount(t *testing.T) {
 	})
 	require.False(t, unreliable.auditContextReliable())
 	require.True(t, unreliable.preferAPIKey(), "unreliable extraction must prefer APIKey")
-	require.Equal(t, "context_unreliable", unreliable.auditRoutingReason())
+	require.Equal(t, service.OpenAIAccountAuditRoutingContextUnreliable, unreliable.auditRoutingReason())
 	require.Equal(t, auditinput.IssueInvalidShape, unreliable.auditContextIssue())
 
 	knownNoText := build(service.ContentModerationProtocolOpenAIResponses, map[string]any{
@@ -278,6 +279,110 @@ func TestOpenAIAccountAuditStateLongTextUsesCanonicalRuneCount(t *testing.T) {
 	require.True(t, knownNoText.auditContextReliable())
 	require.Zero(t, knownNoText.auditTextRunes())
 	require.False(t, knownNoText.preferAPIKey())
+}
+
+func TestOpenAIAccountAuditStateRoutingPreference(t *testing.T) {
+	build := func(policy service.OpenAIAccountAuditRoutingPolicy, input any) *openAIAccountAuditState {
+		body, err := json.Marshal(map[string]any{"model": "gpt-5.4", "input": input})
+		require.NoError(t, err)
+		return newOpenAIAccountAuditState(
+			service.ContentModerationProtocolOpenAIResponses,
+			"gpt-5.4",
+			body,
+			"http",
+			policy,
+		)
+	}
+	policyWithRollout := func(percent int, enabled bool) service.OpenAIAccountAuditRoutingPolicy {
+		policy, err := service.NewOpenAIAccountAuditRoutingPolicy(service.OpenAIAccountAuditRoutingSettings{
+			AccountGroupIDs: []int64{12}, LongTextRuneThreshold: 12000,
+			PreferAPIKeyEnabled: enabled, LongTextOAuthRolloutPercent: percent,
+		})
+		require.NoError(t, err)
+		return policy
+	}
+
+	normal := build(policyWithRollout(100, true), "short")
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceNone, normal.routingPreference("session:normal"))
+
+	longText := strings.Repeat("x", service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1)
+	defaultLong := build(policyWithRollout(0, true), longText)
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceAPIKey, defaultLong.routingPreference("session:long"))
+	require.Equal(t, service.OpenAIAccountAuditRoutingLongText, defaultLong.routingOptions("", "", "session:long").AuditRoutingReason)
+
+	fullRollout := build(policyWithRollout(100, true), longText)
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceAuditedOAuth, fullRollout.routingPreference("session:long"))
+	require.False(t, fullRollout.preferAPIKey())
+
+	disabled := build(policyWithRollout(100, false), longText)
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceNone, disabled.routingPreference("session:long"))
+
+	unreliable := newOpenAIAccountAuditState(
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-5.4",
+		[]byte(`{"model":"gpt-5.4","instructions":42,"input":"safe"}`),
+		"http",
+		policyWithRollout(100, false),
+	)
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceAPIKey, unreliable.routingPreference("session:unreliable"),
+		"unreliable context must remain hard APIKey even when long-text preference is disabled")
+
+	oversized := build(policyWithRollout(100, true), strings.Repeat("x", service.StrictContentModerationMaxTextRunes+1))
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceAPIKey, oversized.routingPreference("session:oversized"))
+}
+
+func TestOpenAIAccountAuditStableRoutingKeyPrefersSessionThenRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	ctx := context.WithValue(context.Background(), ctxkey.RequestID, "server-request")
+	ctx = context.WithValue(ctx, ctxkey.ClientRequestID, "client-request")
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+
+	require.Equal(t, "session:session-hash", openAIAccountAuditStableRoutingKey(c, "session-hash"))
+	require.Equal(t, "client_request:client-request", openAIAccountAuditStableRoutingKey(c, ""))
+	c.Request = c.Request.WithContext(context.WithValue(context.Background(), ctxkey.RequestID, "server-request"))
+	require.Equal(t, "request:server-request", openAIAccountAuditStableRoutingKey(c, ""))
+}
+
+func TestFinalizeOpenAIAccountAuditRoutingDecisionLogsFinalPreference(t *testing.T) {
+	policy, err := service.NewOpenAIAccountAuditRoutingPolicy(service.OpenAIAccountAuditRoutingSettings{
+		AccountGroupIDs: []int64{12}, LongTextRuneThreshold: 12000,
+		PreferAPIKeyEnabled: true, LongTextOAuthRolloutPercent: 100,
+	})
+	require.NoError(t, err)
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-5.4",
+		"input": strings.Repeat("x", service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1),
+	})
+	require.NoError(t, err)
+	state := newOpenAIAccountAuditState(
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-5.4",
+		body,
+		"http",
+		policy,
+	)
+	options := state.routingOptions("", "", "session:must-not-be-logged")
+	require.True(t, options.PrefersAuditedOAuth())
+	// Simulate the non-OpenAI platform override performed by each entrypoint.
+	options.Preference = service.OpenAIAccountRoutingPreferenceNone
+
+	core, logs := observer.New(zap.InfoLevel)
+	finalizeOpenAIAccountAuditRoutingDecision(zap.New(core), state, options)
+
+	entries := logs.FilterMessage("security_audit.routing_decision").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	require.Equal(t, "long_text", fields["audit_routing_reason"])
+	require.Equal(t, "none", fields["audit_routing_preference"])
+	require.Equal(t, int64(service.DefaultOpenAIAccountAuditLongTextRuneThreshold+1), fields["audit_text_runes"])
+	require.Equal(t, true, fields["audit_context_reliable"])
+	require.Equal(t, int64(100), fields["long_text_oauth_rollout_percent"])
+	require.Equal(t, false, fields["long_text_oauth_rollout_selected"])
+	require.Equal(t, service.OpenAIAccountRoutingPreferenceNone, state.effectiveRoutingPreference())
+	require.NotContains(t, fields, "stable_key")
+	require.NotContains(t, fields, "routing_key")
 }
 
 func TestEnsureSecurityAuditForAccountUnreliableContextPrefersAPIKeyAndFailsClosedOnOAuth(t *testing.T) {

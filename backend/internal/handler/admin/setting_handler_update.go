@@ -277,6 +277,7 @@ type UpdateSettingsRequest struct {
 	OpenAIAdvancedSchedulerEnabled                     *bool    `json:"openai_advanced_scheduler_enabled"`
 	OpenAIAdvancedSchedulerStickyWeightedEnabled       *bool    `json:"openai_advanced_scheduler_sticky_weighted_enabled"`
 	OpenAIAdvancedSchedulerSubscriptionPriorityEnabled *bool    `json:"openai_advanced_scheduler_subscription_priority_enabled"`
+	OpenAIAccountAuditLongTextOAuthRolloutPercent      *int     `json:"openai_account_audit_long_text_oauth_rollout_percent"`
 	OpenAIAdvancedSchedulerLBTopK                      *string  `json:"openai_advanced_scheduler_lb_top_k"`
 	OpenAIAdvancedSchedulerWeightPriority              *string  `json:"openai_advanced_scheduler_weight_priority"`
 	OpenAIAdvancedSchedulerWeightLoad                  *string  `json:"openai_advanced_scheduler_weight_load"`
@@ -1865,6 +1866,12 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled
 		}(),
+		OpenAIAccountAuditLongTextOAuthRolloutPercent: func() int {
+			if req.OpenAIAccountAuditLongTextOAuthRolloutPercent != nil {
+				return *req.OpenAIAccountAuditLongTextOAuthRolloutPercent
+			}
+			return previousSettings.OpenAIAccountAuditLongTextOAuthRolloutPercent
+		}(),
 		OpenAIAdvancedSchedulerLBTopK:                 stringSetting(req.OpenAIAdvancedSchedulerLBTopK, previousSettings.OpenAIAdvancedSchedulerLBTopK),
 		OpenAIAdvancedSchedulerWeightPriority:         stringSetting(req.OpenAIAdvancedSchedulerWeightPriority, previousSettings.OpenAIAdvancedSchedulerWeightPriority),
 		OpenAIAdvancedSchedulerWeightLoad:             stringSetting(req.OpenAIAdvancedSchedulerWeightLoad, previousSettings.OpenAIAdvancedSchedulerWeightLoad),
@@ -2344,6 +2351,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAIAdvancedSchedulerEnabled:                         updatedSettings.OpenAIAdvancedSchedulerEnabled,
 		OpenAIAdvancedSchedulerStickyWeightedEnabled:           updatedSettings.OpenAIAdvancedSchedulerStickyWeightedEnabled,
 		OpenAIAdvancedSchedulerSubscriptionPriorityEnabled:     updatedSettings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled,
+		OpenAIAccountAuditLongTextOAuthRolloutPercent:          updatedSettings.OpenAIAccountAuditLongTextOAuthRolloutPercent,
 		OpenAIAdvancedSchedulerLBTopK:                          updatedSettings.OpenAIAdvancedSchedulerLBTopK,
 		OpenAIAdvancedSchedulerWeightPriority:                  updatedSettings.OpenAIAdvancedSchedulerWeightPriority,
 		OpenAIAdvancedSchedulerWeightLoad:                      updatedSettings.OpenAIAdvancedSchedulerWeightLoad,

@@ -239,6 +239,7 @@ type SystemSettings struct {
 	OpenAIAdvancedSchedulerEnabled                         bool    `json:"openai_advanced_scheduler_enabled"`
 	OpenAIAdvancedSchedulerStickyWeightedEnabled           bool    `json:"openai_advanced_scheduler_sticky_weighted_enabled"`
 	OpenAIAdvancedSchedulerSubscriptionPriorityEnabled     bool    `json:"openai_advanced_scheduler_subscription_priority_enabled"`
+	OpenAIAccountAuditLongTextOAuthRolloutPercent          int     `json:"openai_account_audit_long_text_oauth_rollout_percent"`
 	OpenAIAdvancedSchedulerLBTopK                          string  `json:"openai_advanced_scheduler_lb_top_k"`
 	OpenAIAdvancedSchedulerWeightPriority                  string  `json:"openai_advanced_scheduler_weight_priority"`
 	OpenAIAdvancedSchedulerWeightLoad                      string  `json:"openai_advanced_scheduler_weight_load"`

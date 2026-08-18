@@ -112,8 +112,8 @@ func strictModerationResultCacheKey(cfg *ContentModerationConfig, batch strictMo
 	if state.clientAPIKeyID <= 0 || !state.groupIDPresent || strings.TrimSpace(state.requestEndpoint) == "" {
 		return zero, false
 	}
-	text, ok := batch.input.(string)
-	if !ok || strings.TrimSpace(text) == "" {
+	texts, ok := strictModerationBatchTextInputs(batch.input)
+	if !ok {
 		return zero, false
 	}
 	endpoint, err := url.JoinPath(strings.TrimRight(cfg.BaseURL, "/"), "/v1/moderations")
@@ -121,9 +121,21 @@ func strictModerationResultCacheKey(cfg *ContentModerationConfig, batch strictMo
 		return zero, false
 	}
 
-	textHash := sha256.Sum256([]byte(normalizeContentModerationText(text)))
+	version := "strict-moderation-result-v4"
+	var textHash []byte
+	if _, singleText := batch.input.(string); singleText {
+		legacyTextHash := sha256.Sum256([]byte(normalizeContentModerationText(texts[0])))
+		version = "strict-moderation-result-v3"
+		textHash = legacyTextHash[:]
+	} else {
+		textHasher := sha256.New()
+		for _, text := range texts {
+			writeStrictModerationCacheHashField(textHasher, normalizeContentModerationText(text))
+		}
+		textHash = textHasher.Sum(nil)
+	}
 	hasher := sha256.New()
-	writeStrictModerationCacheHashField(hasher, "strict-moderation-result-v3")
+	writeStrictModerationCacheHashField(hasher, version)
 	writeStrictModerationCacheHashField(hasher, "api-key-id:"+strconv.FormatInt(state.clientAPIKeyID, 10))
 	writeStrictModerationCacheHashField(hasher, "group-id:"+strconv.FormatInt(state.groupID, 10))
 	writeStrictModerationCacheHashField(hasher, "request-endpoint:"+strings.TrimSpace(state.requestEndpoint))
@@ -135,7 +147,7 @@ func strictModerationResultCacheKey(cfg *ContentModerationConfig, batch strictMo
 		writeStrictModerationCacheHashField(hasher, "proxy:"+strconv.FormatInt(*cfg.ProxyID, 10))
 	}
 	writeStrictModerationCacheHashField(hasher, strconv.Itoa(batch.expectedResults))
-	writeStrictModerationCacheHashBytes(hasher, textHash[:])
+	writeStrictModerationCacheHashBytes(hasher, textHash)
 
 	credentialHasher := sha256.New()
 	for _, apiKey := range cfg.apiKeys() {

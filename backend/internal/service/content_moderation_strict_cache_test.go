@@ -359,6 +359,19 @@ func TestStrictModerationResultCacheKeySeparatesRoutingAndCredentialSet(t *testi
 	}
 }
 
+func TestStrictModerationResultCacheKeyPreservesChunkOrder(t *testing.T) {
+	cfg := strictModerationCacheTestConfig("https://moderation.example", "moderation-a", "sk-cache-a")
+	identity := strictModerationCacheTestIdentity()
+	forward := strictModerationBatch{input: []string{"first", "second"}, expectedResults: 2}
+	reversed := strictModerationBatch{input: []string{"second", "first"}, expectedResults: 2}
+
+	forwardKey, ok := strictModerationResultCacheKey(cfg, forward, newStrictModerationKeyState(cfg, identity))
+	require.True(t, ok)
+	reversedKey, ok := strictModerationResultCacheKey(cfg, reversed, newStrictModerationKeyState(cfg, identity))
+	require.True(t, ok)
+	require.NotEqual(t, forwardKey, reversedKey)
+}
+
 func TestStrictModerationResultCacheCredentialOrderChangesKey(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

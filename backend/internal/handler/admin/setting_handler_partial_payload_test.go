@@ -39,6 +39,16 @@ func TestUpdateSettingsPartialPayloadKeepsUnsentKeys(t *testing.T) {
 	require.Equal(t, "true", repo.values[service.SettingKeyTurnstileEnabled])
 }
 
+func TestUpdateSettingsPartialPayloadKeepsOpenAIAccountAuditLongTextOAuthRollout(t *testing.T) {
+	h, repo := newStepUpSwitchTestHandler(t, map[string]string{
+		service.SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent: "20",
+	})
+
+	rec := doUpdateSettings(t, h, map[string]any{"risk_control_enabled": true}, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "20", repo.values[service.SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent])
+}
+
 // A full payload keeps whole-document semantics: fields explicitly set to their
 // zero value are still cleared.
 func TestUpdateSettingsFullPayloadStillClearsSentEmptyFields(t *testing.T) {

@@ -516,6 +516,9 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if before.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled != after.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled {
 		changed = append(changed, "openai_advanced_scheduler_subscription_priority_enabled")
 	}
+	if before.OpenAIAccountAuditLongTextOAuthRolloutPercent != after.OpenAIAccountAuditLongTextOAuthRolloutPercent {
+		changed = append(changed, "openai_account_audit_long_text_oauth_rollout_percent")
+	}
 	if before.OpenAIAdvancedSchedulerLBTopK != after.OpenAIAdvancedSchedulerLBTopK {
 		changed = append(changed, "openai_advanced_scheduler_lb_top_k")
 	}

@@ -520,8 +520,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	routingOptions := auditState.routingOptions(
 		service.OpenAIUpstreamTransportResponsesWebsocketV2Audited,
 		service.OpenAIEndpointCapabilityResponses,
+		openAIAccountAuditStableRoutingKey(c, sessionHash),
 	)
-	routingOptions.PreferAPIKey = routingOptions.PreferAPIKey && requestPlatform == service.PlatformOpenAI
+	if requestPlatform != service.PlatformOpenAI {
+		routingOptions.Preference = service.OpenAIAccountRoutingPreferenceNone
+	}
+	finalizeOpenAIAccountAuditRoutingDecision(reqLog, auditState, routingOptions)
 	routingCtx := service.WithOpenAIAccountRoutingOptions(c.Request.Context(), routingOptions)
 	c.Request = c.Request.WithContext(routingCtx)
 
@@ -1943,7 +1947,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	turnAuditTracker := newOpenAIWSAccountAuditTracker()
 	var turnAuditMu sync.Mutex
 	turnRequestPayloadHashes := make(map[int]string)
-	preferAPIKeyForAuditContext := firstTurnAccountAuditState.preferAPIKey()
 	var strictWSContinuation bool
 
 	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
@@ -2119,12 +2122,16 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// 建连时刻只用于选号/准入，不作为任何 turn 的计费定价时刻。
 	wsPricingCtx, _ := h.gatewayService.WithOpenAIRequestPricingContext(ctx, apiKey.GroupID)
 	ctx = wsPricingCtx
-	preferAPIKeyForAuditContext = preferAPIKeyForAuditContext && requestPlatform == service.PlatformOpenAI
 	routingOptions := firstTurnAccountAuditState.routingOptions(
 		service.OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress,
 		service.OpenAIEndpointCapabilityResponses,
+		openAIAccountAuditStableRoutingKey(c, sessionHash),
 	)
-	routingOptions.PreferAPIKey = preferAPIKeyForAuditContext
+	if requestPlatform != service.PlatformOpenAI {
+		routingOptions.Preference = service.OpenAIAccountRoutingPreferenceNone
+	}
+	finalizeOpenAIAccountAuditRoutingDecision(reqLog, firstTurnAccountAuditState, routingOptions)
+	preferAPIKeyForAuditContext := routingOptions.PrefersAPIKey()
 	ctx = service.WithOpenAIAccountRoutingOptions(ctx, routingOptions)
 
 	for {
@@ -2368,7 +2375,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			zap.Bool("audit_passed", firstTurnAuditResult.Passed),
 			zap.Int("audit_text_runes", openAIWSAuditTextRunes(firstTurnAuditDocument)),
 			zap.Bool("audit_context_prefer_api_key", preferAPIKeyForAuditContext),
-			zap.String("audit_routing_reason", firstTurnAccountAuditState.auditRoutingReason()),
+			zap.String("audit_routing_reason", string(firstTurnAccountAuditState.auditRoutingReason())),
+			zap.String("audit_routing_preference", openAIAccountRoutingPreferenceLogValue(routingOptions.Preference)),
+			zap.Int("long_text_oauth_rollout_percent", routingOptions.AuditPolicy.LongTextOAuthRolloutPercent()),
+			zap.Bool("long_text_oauth_rollout_selected", routingOptions.PrefersAuditedOAuth()),
 			zap.Bool("audit_context_reliable", firstTurnAccountAuditState.auditContextReliable()),
 			zap.String("audit_context_issue", firstTurnAccountAuditState.auditContextIssue()),
 		)

@@ -68,7 +68,13 @@ const (
 	maxContentModerationTimeoutMS     = 30000
 	maxModerationInputRunes           = 12000
 	maxModerationExcerptRunes         = 240
+	strictModerationMaxTextChunks     = 8
+	strictModerationBoundaryLookback  = 512
 	defaultStrictModerationMaxRPM     = 0 // zero means unlimited
+
+	// StrictContentModerationMaxTextRunes is the largest canonical audit text
+	// that strict moderation can fully inspect in one bounded upstream request.
+	StrictContentModerationMaxTextRunes = maxModerationInputRunes * strictModerationMaxTextChunks
 
 	defaultContentModerationWorkerCount          = 4
 	maxContentModerationWorkerCount              = 32
@@ -103,6 +109,10 @@ const (
 	contentModerationRuntimeCacheTTL       = time.Second
 	contentModerationRuntimeRefreshTimeout = 5 * time.Second
 )
+
+// ErrStrictContentModerationTextTooLong identifies strict audit inputs that
+// exceed the bounded full-text moderation contract.
+var ErrStrictContentModerationTextTooLong = errors.New("strict content moderation text exceeds maximum auditable length")
 
 var contentModerationCategoryOrder = []string{
 	"harassment",
@@ -858,6 +868,12 @@ func contentModerationStrictPreBlockApplies(runtimeSnapshot *contentModerationRu
 	return cfg.Enabled && cfg.Mode == ContentModerationModePreBlock && cfg.includesGroup(groupID)
 }
 
+// StrictContentModerationSupportsTextRunes reports whether canonical audit
+// text can be fully inspected by the bounded strict moderation batch.
+func StrictContentModerationSupportsTextRunes(textRunes int) bool {
+	return textRunes >= 0 && textRunes <= StrictContentModerationMaxTextRunes
+}
+
 func (s *ContentModerationService) Check(ctx context.Context, input ContentModerationCheckInput) (*ContentModerationDecision, error) {
 	if input.Strict {
 		return s.checkStrict(ctx, input)
@@ -1226,7 +1242,115 @@ func strictModerationBatches(document *auditinput.Document) ([]strictModerationB
 	if text == "" {
 		return nil, errors.New("strict content moderation produced no auditable text batch")
 	}
-	return []strictModerationBatch{{input: text, expectedResults: 1}}, nil
+	textRunes := utf8.RuneCountInString(text)
+	if !StrictContentModerationSupportsTextRunes(textRunes) {
+		return nil, fmt.Errorf("%w: got %d runes, max %d", ErrStrictContentModerationTextTooLong, textRunes, StrictContentModerationMaxTextRunes)
+	}
+	if textRunes <= maxModerationInputRunes {
+		return []strictModerationBatch{{input: text, expectedResults: 1}}, nil
+	}
+
+	chunks := strictModerationTextChunks(text, maxModerationInputRunes, strictModerationMaxTextChunks)
+	if len(chunks) == 0 || len(chunks) > strictModerationMaxTextChunks {
+		return nil, fmt.Errorf("%w: requires %d chunks, max %d", ErrStrictContentModerationTextTooLong, len(chunks), strictModerationMaxTextChunks)
+	}
+	return []strictModerationBatch{{input: chunks, expectedResults: len(chunks)}}, nil
+}
+
+func strictModerationTextChunks(text string, maxRunes, maxChunks int) []string {
+	if maxRunes <= 0 || maxChunks <= 0 || text == "" {
+		return nil
+	}
+	runes := []rune(text)
+	if len(runes) > maxRunes*maxChunks {
+		return nil
+	}
+	if len(runes) <= maxRunes {
+		return []string{text}
+	}
+
+	chunks := make([]string, 0, (len(runes)+maxRunes-1)/maxRunes)
+	for start := 0; start < len(runes); {
+		end := start + maxRunes
+		if end >= len(runes) {
+			end = len(runes)
+		} else {
+			safeEnd := strictModerationSafeChunkEnd(runes, start, end)
+			remainingChunks := maxChunks - len(chunks) - 1
+			minimumEnd := len(runes) - remainingChunks*maxRunes
+			if safeEnd >= minimumEnd {
+				end = safeEnd
+			}
+		}
+		chunks = append(chunks, string(runes[start:end]))
+		start = end
+	}
+	return chunks
+}
+
+func strictModerationSafeChunkEnd(runes []rune, start, hardEnd int) int {
+	if hardEnd >= len(runes) || hardEnd <= start {
+		return hardEnd
+	}
+	scanStart := hardEnd - strictModerationBoundaryLookback
+	if scanStart <= start {
+		scanStart = start + 1
+	}
+	for index := hardEnd - 1; index >= scanStart; index-- {
+		if unicode.IsSpace(runes[index]) || strictModerationSentenceBoundary(runes[index]) {
+			return index + 1
+		}
+	}
+	return hardEnd
+}
+
+func strictModerationSentenceBoundary(r rune) bool {
+	switch r {
+	case '.', '!', '?', ';', ':', ',', '\u3002', '\uff01', '\uff1f', '\uff1b', '\uff1a', '\uff0c', '\u3001':
+		return true
+	default:
+		return false
+	}
+}
+
+func strictModerationBatchTextInputs(input any) ([]string, bool) {
+	switch value := input.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" || utf8.RuneCountInString(value) > maxModerationInputRunes {
+			return nil, false
+		}
+		return []string{value}, true
+	case []string:
+		if len(value) == 0 || len(value) > strictModerationMaxTextChunks {
+			return nil, false
+		}
+		totalRunes := 0
+		for _, text := range value {
+			textRunes := utf8.RuneCountInString(text)
+			if strings.TrimSpace(text) == "" || textRunes > maxModerationInputRunes {
+				return nil, false
+			}
+			totalRunes += textRunes
+		}
+		if !StrictContentModerationSupportsTextRunes(totalRunes) {
+			return nil, false
+		}
+		return value, true
+	default:
+		return nil, false
+	}
+}
+
+func strictModerationBatchTextSize(input any) (runes int, bytes int, items int) {
+	texts, ok := strictModerationBatchTextInputs(input)
+	if !ok {
+		return 0, 0, 0
+	}
+	for _, text := range texts {
+		runes += utf8.RuneCountInString(text)
+		bytes += len(text)
+	}
+	return runes, bytes, len(texts)
 }
 
 func strictModerationEmptyTurn(document *auditinput.Document) bool {
@@ -2053,7 +2177,7 @@ func (state *strictModerationKeyState) markFailed(key string) {
 }
 
 func (s *ContentModerationService) callModerationStrictBatch(ctx context.Context, cfg *ContentModerationConfig, batch strictModerationBatch, state *strictModerationKeyState, trackKeyLoad ...bool) ([]moderationAPIResult, error) {
-	if _, ok := batch.input.(string); !ok {
+	if _, ok := strictModerationBatchTextInputs(batch.input); !ok {
 		return nil, errors.New("strict moderation batch input must be text")
 	}
 	if state == nil {
@@ -2138,9 +2262,10 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 	}
 	latency := int(time.Since(start).Milliseconds())
 	lease.recordResult(err)
+	textRunes, textBytes, textItems := strictModerationBatchTextSize(batch.input)
 	if err == nil {
 		fields := moderationAPISuccessLogFields(responseDiagnostics)
-		fields = append(fields, "audit_text_runes", utf8.RuneCountInString(batch.input.(string)), "audit_text_bytes", len(batch.input.(string)))
+		fields = append(fields, "audit_text_runes", textRunes, "audit_text_bytes", textBytes, "audit_text_items", textItems)
 		slog.Info("content_moderation.strict_upstream_success", fields...)
 		if trackLoad {
 			s.finishModerationAPIKeyCall(key, latency, true)
@@ -2153,7 +2278,7 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 	}
 	s.markAPIKeyError(key, err.Error(), latency, httpStatus, moderationRetryAfter(err))
 	state.markFailed(key)
-	failureFields := []any{"audit_text_runes", utf8.RuneCountInString(batch.input.(string)), "audit_text_bytes", len(batch.input.(string)), "error", err}
+	failureFields := []any{"audit_text_runes", textRunes, "audit_text_bytes", textBytes, "audit_text_items", textItems, "error", err}
 	failureFields = append(failureFields, moderationAPIErrorLogFields(err)...)
 	slog.Warn("content_moderation.strict_upstream_failed", failureFields...)
 	return nil, err

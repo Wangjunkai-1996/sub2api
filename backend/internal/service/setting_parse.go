@@ -252,6 +252,7 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		openAIAdvancedSchedulerSettingKey:                            "false",
 		SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled:       "false",
 		SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled: "false",
+		SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent:      "0",
 		SettingKeyOpenAIAdvancedSchedulerLBTopK:                      "",
 		SettingKeyOpenAIAdvancedSchedulerWeightPriority:              "",
 		SettingKeyOpenAIAdvancedSchedulerWeightLoad:                  "",
@@ -969,6 +970,9 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	result.OpenAIAdvancedSchedulerEnabled = settings[openAIAdvancedSchedulerSettingKey] == "true"
 	result.OpenAIAdvancedSchedulerStickyWeightedEnabled = settings[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled] == "true"
 	result.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled = settings[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled] == "true"
+	if value, err := strconv.Atoi(strings.TrimSpace(settings[SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent])); err == nil && value >= 0 && value <= 100 {
+		result.OpenAIAccountAuditLongTextOAuthRolloutPercent = value
+	}
 	result.OpenAIAdvancedSchedulerLBTopK = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerLBTopK])
 	result.OpenAIAdvancedSchedulerWeightPriority = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerWeightPriority])
 	result.OpenAIAdvancedSchedulerWeightLoad = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerWeightLoad])

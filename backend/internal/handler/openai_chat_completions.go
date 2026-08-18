@@ -152,8 +152,12 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	routingOptions := auditState.routingOptions(
 		service.OpenAIUpstreamTransportAny,
 		"",
+		openAIAccountAuditStableRoutingKey(c, sessionHash),
 	)
-	routingOptions.PreferAPIKey = routingOptions.PreferAPIKey && requestPlatform == service.PlatformOpenAI
+	if requestPlatform != service.PlatformOpenAI {
+		routingOptions.Preference = service.OpenAIAccountRoutingPreferenceNone
+	}
+	finalizeOpenAIAccountAuditRoutingDecision(reqLog, auditState, routingOptions)
 	routingCtx := service.WithOpenAIAccountRoutingOptions(c.Request.Context(), routingOptions)
 	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(routingCtx, apiKey.GroupID)
 	c.Request = c.Request.WithContext(ccPricingCtx)

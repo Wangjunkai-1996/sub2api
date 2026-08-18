@@ -207,6 +207,8 @@ vi.mock("vue-i18n", async () => {
     "admin.settings.openaiExperimentalScheduler.stickyWeightedDescription": "开启后 previous_response_id 和 session_hash 粘性进入高级调度打分；关闭时仍按旧逻辑硬命中粘性账号。",
     "admin.settings.openaiExperimentalScheduler.subscriptionPriorityTitle": "订阅优先",
     "admin.settings.openaiExperimentalScheduler.subscriptionPriorityDescription": "开启后先在 ChatGPT 订阅账号池中按权值选取；订阅池拿不到席位时再回退到非订阅账号池。",
+    "admin.settings.openaiExperimentalScheduler.longTextOAuthRolloutTitle": "长文本 OAuth 灰度比例",
+    "admin.settings.openaiExperimentalScheduler.longTextOAuthRolloutDescription": "对超过审计阈值且可完整审计的长文本按稳定哈希分流：0 表示仍优先 API Key；1–100 表示相应比例优先审计合格的 Pro OAuth，再回退 API Key。",
     "admin.settings.openaiExperimentalScheduler.weightsTitle": "调度权值覆盖",
     "admin.settings.openaiExperimentalScheduler.weightsDescription": "留空时使用配置/环境变量值；配置未设置时使用内置默认值。页面非空设置优先。",
     "admin.settings.openaiExperimentalScheduler.defaultPlaceholder": "配置/默认：{value}",
@@ -517,6 +519,7 @@ const baseSettingsResponse = {
   openai_advanced_scheduler_enabled: false,
   openai_advanced_scheduler_sticky_weighted_enabled: false,
   openai_advanced_scheduler_subscription_priority_enabled: false,
+  openai_account_audit_long_text_oauth_rollout_percent: 0,
   openai_advanced_scheduler_lb_top_k: "",
   openai_advanced_scheduler_weight_priority: "",
   openai_advanced_scheduler_weight_load: "",
@@ -1526,6 +1529,13 @@ describe("admin SettingsView payment visible method controls", () => {
     expect(
       wrapper.find('[data-testid="openai-oauth-scheduling-rate-multiplier"]').exists(),
     ).toBe(false);
+    const longTextOAuthRolloutInput = wrapper.get(
+      '[data-testid="openai-account-audit-long-text-oauth-rollout-percent"]',
+    );
+    expect((longTextOAuthRolloutInput.element as HTMLInputElement).value).toBe("0");
+    expect(wrapper.text()).toContain(
+      "0 表示仍优先 API Key；1–100 表示相应比例优先审计合格的 Pro OAuth",
+    );
 
     const lowRateToggle = wrapper.get('[data-testid="openai-low-rate-priority-toggle"]');
     await lowRateToggle.setValue(true);
@@ -1544,6 +1554,7 @@ describe("admin SettingsView payment visible method controls", () => {
       '[data-testid="openai-oauth-scheduling-rate-multiplier"]',
     );
     await oauthRateInput.setValue("0.05");
+    await longTextOAuthRolloutInput.setValue("20");
     await wrapper.find("form").trigger("submit.prevent");
     await flushPromises();
 
@@ -1551,6 +1562,7 @@ describe("admin SettingsView payment visible method controls", () => {
       expect.objectContaining({
         openai_low_upstream_rate_priority_enabled: true,
         openai_oauth_scheduling_rate_multiplier: 0.05,
+        openai_account_audit_long_text_oauth_rollout_percent: 20,
       }),
     );
 

@@ -549,7 +549,9 @@ const (
 	// SettingKeyOpenAIAccountAuditLongTextRuneThreshold stores the normalized rune threshold for APIKey preference.
 	SettingKeyOpenAIAccountAuditLongTextRuneThreshold = "openai_account_audit_long_text_rune_threshold"
 	// SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled controls long-text APIKey preference.
-	SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled         = "openai_account_audit_prefer_apikey_enabled"
+	SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled = "openai_account_audit_prefer_apikey_enabled"
+	// SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent controls the stable long-text audited OAuth rollout.
+	SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent = "openai_account_audit_long_text_oauth_rollout_percent"
 	SettingKeyOpenAIAdvancedSchedulerLBTopK                 = "openai_advanced_scheduler_lb_top_k"
 	SettingKeyOpenAIAdvancedSchedulerWeightPriority         = "openai_advanced_scheduler_weight_priority"
 	SettingKeyOpenAIAdvancedSchedulerWeightLoad             = "openai_advanced_scheduler_weight_load"

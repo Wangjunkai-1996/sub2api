@@ -5072,6 +5072,38 @@
               </div>
 
               <div
+                class="flex flex-col items-stretch gap-3 border-t border-gray-100 pt-5 sm:flex-row sm:items-start sm:justify-between sm:gap-6 dark:border-dark-700"
+              >
+                <div class="min-w-0">
+                  <label
+                    class="text-sm font-medium text-gray-700 dark:text-gray-300"
+                    for="openai-account-audit-long-text-oauth-rollout-percent"
+                  >
+                    {{ t("admin.settings.openaiExperimentalScheduler.longTextOAuthRolloutTitle") }}
+                  </label>
+                  <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                    {{ t("admin.settings.openaiExperimentalScheduler.longTextOAuthRolloutDescription") }}
+                  </p>
+                </div>
+                <div class="relative w-full shrink-0 sm:w-32">
+                  <input
+                    id="openai-account-audit-long-text-oauth-rollout-percent"
+                    v-model.number="form.openai_account_audit_long_text_oauth_rollout_percent"
+                    class="input pr-8"
+                    data-testid="openai-account-audit-long-text-oauth-rollout-percent"
+                    max="100"
+                    min="0"
+                    required
+                    step="1"
+                    type="number"
+                  />
+                  <span
+                    class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-gray-400"
+                  >%</span>
+                </div>
+              </div>
+
+              <div
                 v-if="form.openai_advanced_scheduler_enabled"
                 class="flex flex-col items-stretch gap-3 border-t border-gray-100 pt-5 sm:flex-row sm:items-start sm:justify-between sm:gap-6 dark:border-dark-700"
               >
@@ -9573,6 +9605,7 @@ type SettingsForm = Omit<
   openai_advanced_scheduler_enabled: boolean;
   openai_advanced_scheduler_sticky_weighted_enabled: boolean;
   openai_advanced_scheduler_subscription_priority_enabled: boolean;
+  openai_account_audit_long_text_oauth_rollout_percent: number;
   openai_advanced_scheduler_lb_top_k: string;
   openai_advanced_scheduler_weight_priority: string;
   openai_advanced_scheduler_weight_load: string;
@@ -9821,6 +9854,7 @@ const form = reactive<SettingsForm>({
   openai_advanced_scheduler_enabled: false,
   openai_advanced_scheduler_sticky_weighted_enabled: false,
   openai_advanced_scheduler_subscription_priority_enabled: false,
+  openai_account_audit_long_text_oauth_rollout_percent: 0,
   openai_advanced_scheduler_lb_top_k: "",
   openai_advanced_scheduler_weight_priority: "",
   openai_advanced_scheduler_weight_load: "",
@@ -11556,6 +11590,8 @@ async function saveSettings() {
         form.openai_advanced_scheduler_sticky_weighted_enabled,
       openai_advanced_scheduler_subscription_priority_enabled:
         form.openai_advanced_scheduler_subscription_priority_enabled,
+      openai_account_audit_long_text_oauth_rollout_percent:
+        Number(form.openai_account_audit_long_text_oauth_rollout_percent),
       openai_advanced_scheduler_lb_top_k:
         form.openai_advanced_scheduler_lb_top_k.trim(),
       openai_advanced_scheduler_weight_priority:

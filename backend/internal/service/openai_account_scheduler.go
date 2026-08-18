@@ -338,14 +338,18 @@ type defaultOpenAIAccountScheduler struct {
 }
 
 type openAISelectionProbeBudget struct {
-	acquires  int
-	rechecks  int
-	attempted map[int64]struct{}
-	limited   bool
+	acquires     int
+	rechecks     int
+	attempted    map[int64]struct{}
+	routingTiers map[int64]openAIAccountRoutingTypeTier
+	limited      bool
 }
 
 func newOpenAISelectionProbeBudget() *openAISelectionProbeBudget {
-	return &openAISelectionProbeBudget{attempted: make(map[int64]struct{})}
+	return &openAISelectionProbeBudget{
+		attempted:    make(map[int64]struct{}),
+		routingTiers: make(map[int64]openAIAccountRoutingTypeTier),
+	}
 }
 
 func (b *openAISelectionProbeBudget) enableLimit() {
@@ -354,14 +358,15 @@ func (b *openAISelectionProbeBudget) enableLimit() {
 	}
 }
 
-func (b *openAISelectionProbeBudget) recordAcquire(accountID int64) bool {
+func (b *openAISelectionProbeBudget) recordAcquire(accountID int64, reservedFallbackProbes int) bool {
 	if b == nil {
 		return false
 	}
 	if !b.limited {
 		return true
 	}
-	if b.acquires >= openAIAccountSelectionProbeLimit {
+	limit := openAIAccountSelectionProbeLimit - max(reservedFallbackProbes, 0)
+	if b.acquires >= limit {
 		return false
 	}
 	if b.attempted == nil {
@@ -372,14 +377,15 @@ func (b *openAISelectionProbeBudget) recordAcquire(accountID int64) bool {
 	return true
 }
 
-func (b *openAISelectionProbeBudget) recordRecheck() bool {
+func (b *openAISelectionProbeBudget) recordRecheck(reservedFallbackProbes int) bool {
 	if b == nil {
 		return false
 	}
 	if !b.limited {
 		return true
 	}
-	if b.rechecks >= openAIAccountSelectionProbeLimit {
+	limit := openAIAccountSelectionProbeLimit - max(reservedFallbackProbes, 0)
+	if b.rechecks >= limit {
 		return false
 	}
 	b.rechecks++
@@ -396,6 +402,24 @@ func (b *openAISelectionProbeBudget) wasAttempted(accountID int64) bool {
 	}
 	_, ok := b.attempted[accountID]
 	return ok
+}
+
+func (b *openAISelectionProbeBudget) routingTier(accountID int64) (openAIAccountRoutingTypeTier, bool) {
+	if b == nil {
+		return openAIAccountRoutingTypeAny, false
+	}
+	tier, ok := b.routingTiers[accountID]
+	return tier, ok
+}
+
+func (b *openAISelectionProbeBudget) rememberRoutingTier(accountID int64, tier openAIAccountRoutingTypeTier) {
+	if b == nil {
+		return
+	}
+	if b.routingTiers == nil {
+		b.routingTiers = make(map[int64]openAIAccountRoutingTypeTier)
+	}
+	b.routingTiers[accountID] = tier
 }
 
 type openAIStickyEscapeConfig struct {
@@ -1109,20 +1133,20 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		return append(primary, overflow...)
 	}
 	buildSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
-		if !req.Routing.PreferAPIKey {
+		if req.Routing.effectivePreference() == OpenAIAccountRoutingPreferenceNone {
 			return buildScoredSelectionOrder(pool)
 		}
-		apiKeyPool := make([]openAIAccountCandidateScore, 0, len(pool))
-		fallbackPool := make([]openAIAccountCandidateScore, 0, len(pool))
-		for _, candidate := range pool {
-			if candidate.account != nil && candidate.account.Type == AccountTypeAPIKey {
-				apiKeyPool = append(apiKeyPool, candidate)
-				continue
+		selectionOrder := make([]openAIAccountCandidateScore, 0, len(pool))
+		for _, tier := range openAIAccountRoutingTypeTiers(req.Routing) {
+			tierPool := make([]openAIAccountCandidateScore, 0, len(pool))
+			for _, candidate := range pool {
+				if openAIAccountMatchesRoutingTypeTier(candidate.account, tier, req.Routing) {
+					tierPool = append(tierPool, candidate)
+				}
 			}
-			fallbackPool = append(fallbackPool, candidate)
+			selectionOrder = append(selectionOrder, buildScoredSelectionOrder(tierPool)...)
 		}
-		selectionOrder := buildScoredSelectionOrder(apiKeyPool)
-		return append(selectionOrder, buildScoredSelectionOrder(fallbackPool)...)
+		return selectionOrder
 	}
 
 	if req.RequireCompact {
@@ -1195,8 +1219,12 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 	budget *openAISelectionProbeBudget,
 ) (*AccountSelectionResult, bool, error) {
 	compactBlocked := false
-	for _, tier := range openAIAccountRoutingTypeTiers(req.Routing.PreferAPIKey) {
-		result, tierCompactBlocked, err := s.tryAcquireOpenAISelectionOrderWithBudgetForType(ctx, req, selectionOrder, budget, tier)
+	tiers := openAIAccountRoutingTypeTiers(req.Routing)
+	for tierIndex, tier := range tiers {
+		reservedFallbackProbes := len(tiers) - tierIndex - 1
+		result, tierCompactBlocked, err := s.tryAcquireOpenAISelectionOrderWithBudgetForType(
+			ctx, req, selectionOrder, budget, tier, tierIndex, reservedFallbackProbes,
+		)
 		compactBlocked = compactBlocked || tierCompactBlocked
 		if err != nil || result != nil {
 			return result, compactBlocked, err
@@ -1211,6 +1239,8 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 	selectionOrder []openAIAccountCandidateScore,
 	budget *openAISelectionProbeBudget,
 	tier openAIAccountRoutingTypeTier,
+	tierIndex int,
+	reservedFallbackProbes int,
 ) (*AccountSelectionResult, bool, error) {
 	compactBlocked := false
 	release := func(result *AcquireResult) {
@@ -1223,12 +1253,23 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		if candidate.account == nil {
 			continue
 		}
+		if budget != nil && budget.limited {
+			if rememberedTier, ok := budget.routingTier(candidate.account.ID); ok {
+				if rememberedTier != tier {
+					continue
+				}
+			} else if !openAIAccountMatchesRoutingTypeTier(candidate.account, tier, req.Routing) {
+				continue
+			}
+		}
 		if candidate.loadKnown && candidate.account.Concurrency > 0 &&
 			candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency {
 			continue
 		}
 
-		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, candidate.account.ID, candidate.account.Concurrency, budget)
+		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(
+			ctx, candidate.account.ID, candidate.account.Concurrency, budget, reservedFallbackProbes,
+		)
 		if !attempted {
 			break
 		}
@@ -1244,7 +1285,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			continue
 		}
-		if !s.consumeOpenAISelectionDBRecheck(budget) {
+		if !s.consumeOpenAISelectionDBRecheck(budget, reservedFallbackProbes) {
 			release(result)
 			break
 		}
@@ -1253,7 +1294,11 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			continue
 		}
-		if !openAIAccountMatchesRoutingTypeTier(fresh, tier) {
+		freshTier, freshTierIndex, matchesRoutingTier := openAIAccountRoutingTypeTierForAccount(fresh, req.Routing)
+		if matchesRoutingTier {
+			budget.rememberRoutingTier(fresh.ID, freshTier)
+		}
+		if !matchesRoutingTier || freshTierIndex > tierIndex {
 			release(result)
 			continue
 		}
@@ -1265,7 +1310,9 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 
 		if fresh.Concurrency != candidate.account.Concurrency {
 			release(result)
-			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh.ID, fresh.Concurrency, budget)
+			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(
+				ctx, fresh.ID, fresh.Concurrency, budget, reservedFallbackProbes,
+			)
 			if !attempted {
 				continue
 			}
@@ -1293,19 +1340,20 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAIAccountSlot(
 	accountID int64,
 	maxConcurrency int,
 	budget *openAISelectionProbeBudget,
+	reservedFallbackProbes int,
 ) (*AcquireResult, bool, error) {
-	if s.service.concurrencyService != nil && maxConcurrency > 0 && !budget.recordAcquire(accountID) {
+	if s.service.concurrencyService != nil && maxConcurrency > 0 && !budget.recordAcquire(accountID, reservedFallbackProbes) {
 		return nil, false, nil
 	}
 	result, err := s.service.tryAcquireAccountSlot(ctx, accountID, maxConcurrency)
 	return result, true, err
 }
 
-func (s *defaultOpenAIAccountScheduler) consumeOpenAISelectionDBRecheck(budget *openAISelectionProbeBudget) bool {
+func (s *defaultOpenAIAccountScheduler) consumeOpenAISelectionDBRecheck(budget *openAISelectionProbeBudget, reservedFallbackProbes int) bool {
 	if s.service.schedulerSnapshot == nil || s.service.accountRepo == nil {
 		return true
 	}
-	return budget.recordRecheck()
+	return budget.recordRecheck(reservedFallbackProbes)
 }
 
 func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
@@ -1536,7 +1584,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		}
 	}
 
-	if req.SubscriptionPriority && !req.Routing.PreferAPIKey {
+	if req.SubscriptionPriority && req.Routing.effectivePreference() == OpenAIAccountRoutingPreferenceNone {
 		subscriptionAccounts, regularAccounts := partitionOpenAIChatGPTSubscriptionAccounts(filtered)
 		if len(subscriptionAccounts) > 0 {
 			attempt := s.trySelectByLoadBalancePool(ctx, req, subscriptionAccounts, loadMap, budget)
@@ -1661,8 +1709,12 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 		return freshPlan
 	}
 
-	for _, tier := range openAIAccountRoutingTypeTiers(req.Routing.PreferAPIKey) {
-		result, compactBlocked, acquireErr := s.tryAcquireOpenAISelectionOrderWithBudgetForType(ctx, req, plan.selectionOrder, budget, tier)
+	tiers := openAIAccountRoutingTypeTiers(req.Routing)
+	for tierIndex, tier := range tiers {
+		reservedFallbackProbes := len(tiers) - tierIndex - 1
+		result, compactBlocked, acquireErr := s.tryAcquireOpenAISelectionOrderWithBudgetForType(
+			ctx, req, plan.selectionOrder, budget, tier, tierIndex, reservedFallbackProbes,
+		)
 		attempt.compactBlocked = attempt.compactBlocked || compactBlocked
 		if acquireErr != nil {
 			attempt.err = acquireErr
@@ -1674,7 +1726,9 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 		}
 
 		if currentFreshPlan := loadFreshPlan(); currentFreshPlan != nil {
-			freshResult, freshCompactBlocked, freshAcquireErr := s.tryAcquireOpenAISelectionOrderWithBudgetForType(ctx, req, currentFreshPlan.selectionOrder, budget, tier)
+			freshResult, freshCompactBlocked, freshAcquireErr := s.tryAcquireOpenAISelectionOrderWithBudgetForType(
+				ctx, req, currentFreshPlan.selectionOrder, budget, tier, tierIndex, reservedFallbackProbes,
+			)
 			attempt.compactBlocked = attempt.compactBlocked || freshCompactBlocked
 			if freshAcquireErr != nil {
 				attempt.err = freshAcquireErr
@@ -1751,13 +1805,25 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 	if budget != nil && budget.limited {
 		passes = 4
 	}
-	for _, tier := range openAIAccountRoutingTypeTiers(req.Routing.PreferAPIKey) {
+	tiers := openAIAccountRoutingTypeTiers(req.Routing)
+routingTierLoop:
+	for tierIndex, tier := range tiers {
+		reservedFallbackProbes := len(tiers) - tierIndex - 1
 		for pass := 0; pass < passes; pass++ {
 			wantAttempted := pass == 1 || pass == 3
 			wantKnownFull := pass >= 2
 			for _, candidate := range attempt.selectionOrder {
 				if candidate.account == nil {
 					continue
+				}
+				if budget != nil && budget.limited {
+					if rememberedTier, ok := budget.routingTier(candidate.account.ID); ok {
+						if rememberedTier != tier {
+							continue
+						}
+					} else if !openAIAccountMatchesRoutingTypeTier(candidate.account, tier, req.Routing) {
+						continue
+					}
 				}
 				if budget != nil && budget.limited {
 					knownFull := candidate.loadKnown && candidate.account.Concurrency > 0 &&
@@ -1770,14 +1836,18 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountSnapshotRequestCompatible(ctx, fresh, req) {
 					continue
 				}
-				if !s.consumeOpenAISelectionDBRecheck(budget) {
-					return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
+				if !s.consumeOpenAISelectionDBRecheck(budget, reservedFallbackProbes) {
+					continue routingTierLoop
 				}
 				fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
 				if fresh == nil || !s.isAccountTransportCompatibleForRequest(fresh, req) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 					continue
 				}
-				if !openAIAccountMatchesRoutingTypeTier(fresh, tier) {
+				freshTier, freshTierIndex, matchesRoutingTier := openAIAccountRoutingTypeTierForAccount(fresh, req.Routing)
+				if matchesRoutingTier {
+					budget.rememberRoutingTier(fresh.ID, freshTier)
+				}
+				if !matchesRoutingTier || freshTierIndex > tierIndex {
 					continue
 				}
 				if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {

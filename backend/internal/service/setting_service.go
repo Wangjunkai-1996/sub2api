@@ -8,13 +8,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"golang.org/x/sync/singleflight"
-	"sync"
 )
 
 const (
@@ -225,6 +225,8 @@ type SettingService struct {
 	openAICyberAccountCooldownRuntimeSF    singleflight.Group
 	openAIAccountAuditRoutingRuntimeCache  atomic.Value // *cachedOpenAIAccountAuditRoutingRuntime
 	openAIAccountAuditRoutingRuntimeSF     singleflight.Group
+	openAIAccountAuditRoutingRuntimeMu     sync.Mutex
+	openAIAccountAuditRoutingGeneration    uint64
 
 	// panelRateLimitCache 面板 API 限流配置进程内缓存（*cachedPanelRateLimitSettings）。
 	// 面板每个认证请求都会读取，禁止在热路径上直接访问 DB。

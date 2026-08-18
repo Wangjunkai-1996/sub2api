@@ -1176,8 +1176,9 @@ func TestStrictModerationBatchesUsesOneTextInputAndIgnoresImages(t *testing.T) {
 	require.Equal(t, 1, batches[0].expectedResults)
 }
 
-func TestStrictModerationBatchesKeepsFullUnnormalizedText(t *testing.T) {
-	want := strings.Repeat("界", 12_000) + "尾"
+func TestStrictModerationBatchesChunksLongTextWithoutLoss(t *testing.T) {
+	prefix := strings.Repeat("界", maxModerationInputRunes-20) + "。 "
+	want := prefix + strings.Repeat("尾", 40)
 	document := &auditinput.Document{
 		NormalizedText: want,
 	}
@@ -1186,11 +1187,49 @@ func TestStrictModerationBatchesKeepsFullUnnormalizedText(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
-	textInput, ok := batches[0].input.(string)
+	textInputs, ok := batches[0].input.([]string)
 	require.True(t, ok)
-	require.Equal(t, want, textInput)
-	require.Equal(t, 12_001, len([]rune(textInput)))
-	require.Equal(t, 1, batches[0].expectedResults)
+	require.Len(t, textInputs, 2)
+	require.Equal(t, prefix, textInputs[0], "the chunker should prefer a nearby sentence boundary")
+	require.Equal(t, want, strings.Join(textInputs, ""))
+	for _, text := range textInputs {
+		require.LessOrEqual(t, len([]rune(text)), maxModerationInputRunes)
+	}
+	require.Equal(t, len(textInputs), batches[0].expectedResults)
+}
+
+func TestStrictModerationBatchesHardSplitsUnicodeAtRuneBoundary(t *testing.T) {
+	want := strings.Repeat("界", maxModerationInputRunes) + "尾"
+
+	batches, err := strictModerationBatches(&auditinput.Document{NormalizedText: want})
+
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+	textInputs, ok := batches[0].input.([]string)
+	require.True(t, ok)
+	require.Equal(t, []string{strings.Repeat("界", maxModerationInputRunes), "尾"}, textInputs)
+	require.Equal(t, want, strings.Join(textInputs, ""))
+}
+
+func TestStrictModerationBatchesEnforcesBoundedFullTextLimit(t *testing.T) {
+	require.False(t, StrictContentModerationSupportsTextRunes(-1))
+	require.True(t, StrictContentModerationSupportsTextRunes(0))
+	require.True(t, StrictContentModerationSupportsTextRunes(StrictContentModerationMaxTextRunes))
+	require.False(t, StrictContentModerationSupportsTextRunes(StrictContentModerationMaxTextRunes+1))
+
+	atLimit := strings.Repeat("界", StrictContentModerationMaxTextRunes)
+	batches, err := strictModerationBatches(&auditinput.Document{NormalizedText: atLimit})
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+	textInputs, ok := batches[0].input.([]string)
+	require.True(t, ok)
+	require.Len(t, textInputs, strictModerationMaxTextChunks)
+	require.Equal(t, atLimit, strings.Join(textInputs, ""))
+
+	_, err = strictModerationBatches(&auditinput.Document{
+		NormalizedText: strings.Repeat("界", StrictContentModerationMaxTextRunes+1),
+	})
+	require.ErrorIs(t, err, ErrStrictContentModerationTextTooLong)
 }
 
 func TestBuildModerationTestInputRejectsMultipleImages(t *testing.T) {
@@ -1868,23 +1907,32 @@ func TestContentModerationCheck_StrictSendsFullCurrentUserTextBeyondFormerLimit(
 	body, err := json.Marshal(map[string]any{
 		"input": []any{map[string]any{
 			"type": "message", "role": "user",
-			"content": []any{map[string]any{
-				"type": "input_text", "text": want,
-			}},
+			"content": []any{
+				map[string]any{"type": "input_text", "text": want},
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64,aWdub3JlZA=="},
+			},
 		}},
 	})
 	require.NoError(t, err)
 
 	requestCount := 0
-	var gotInput any
+	var gotInputs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
 		var request moderationAPIRequest
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-		gotInput = request.Input
-		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
-			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
-		}}}))
+		items, ok := request.Input.([]any)
+		require.True(t, ok, "long strict text must use one batched text request")
+		results := make([]moderationAPIResult, len(items))
+		for index, item := range items {
+			text, ok := item.(string)
+			require.True(t, ok, "strict text batches must not repeat image inputs")
+			gotInputs = append(gotInputs, text)
+			results[index] = moderationAPIResult{
+				Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+			}
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: results}))
 	}))
 	defer server.Close()
 
@@ -1919,8 +1967,11 @@ func TestContentModerationCheck_StrictSendsFullCurrentUserTextBeyondFormerLimit(
 	require.NotNil(t, decision)
 	require.True(t, decision.Allowed)
 	require.Equal(t, 1, requestCount)
-	require.Equal(t, want, gotInput)
-	require.Equal(t, 12_017, len([]rune(gotInput.(string))))
+	require.Len(t, gotInputs, 2)
+	require.Equal(t, want, strings.Join(gotInputs, ""))
+	for _, text := range gotInputs {
+		require.LessOrEqual(t, len([]rune(text)), maxModerationInputRunes)
+	}
 
 	blockedBody, err := json.Marshal(map[string]any{
 		"input": want + " blocked-after-former-limit",
@@ -2423,6 +2474,136 @@ func TestContentModerationCheck_StrictBlocksFlaggedSingleResult(t *testing.T) {
 	require.Equal(t, "violence", decision.HighestCategory)
 	require.Equal(t, 0.99, decision.HighestScore)
 	require.Equal(t, 1, requestCount)
+}
+
+func TestContentModerationCheck_StrictLongTextBatchAggregatesAndFailsClosed(t *testing.T) {
+	groupID := int64(12)
+	longText := strings.Repeat("甲", maxModerationInputRunes) + strings.Repeat("乙", 17)
+	body, err := json.Marshal(map[string]any{"input": longText})
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name        string
+		response    string
+		wantBlocked bool
+		wantError   bool
+	}{
+		{name: "later chunk is blocked", response: "flagged", wantBlocked: true},
+		{name: "partial batch result fails closed", response: "partial", wantError: true},
+		{name: "upstream unavailable fails closed", response: "unavailable", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requestCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestCount++
+				var request moderationAPIRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				inputs, ok := request.Input.([]any)
+				require.True(t, ok)
+				require.Len(t, inputs, 2)
+				if test.response == "unavailable" {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+
+				results := []moderationAPIResult{
+					{Flagged: false, CategoryScores: completeModerationCategoryScores(0.01)},
+					{Flagged: false, CategoryScores: completeModerationCategoryScores(0.01)},
+				}
+				switch test.response {
+				case "flagged":
+					results[1].Flagged = true
+					results[1].CategoryScores["violence"] = 0.99
+				case "partial":
+					results = results[:1]
+				}
+				require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: results}))
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.Mode = ContentModerationModePreBlock
+			cfg.AllGroups = false
+			cfg.GroupIDs = []int64{groupID}
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = []string{"sk-test"}
+			cfg.MaxRPM = 100000
+			cfg.RetryCount = 0
+			rawCfg, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			svc := &ContentModerationService{
+				settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+					SettingKeyRiskControlEnabled:      "true",
+					SettingKeyContentModerationConfig: string(rawCfg),
+				}},
+				repo:       &contentModerationTestRepo{},
+				httpClient: server.Client(),
+				asyncQueue: make(chan contentModerationTask, 1),
+				keyHealth:  make(map[string]*contentModerationKeyHealth),
+			}
+
+			decision, checkErr := svc.Check(context.Background(), ContentModerationCheckInput{
+				Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
+				Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+			})
+
+			require.Equal(t, 1, requestCount, "all chunks must be sent in one bounded upstream request")
+			if test.wantError {
+				require.Error(t, checkErr)
+				require.Nil(t, decision)
+				return
+			}
+			require.NoError(t, checkErr)
+			require.NotNil(t, decision)
+			require.Equal(t, test.wantBlocked, decision.Blocked)
+			require.Equal(t, test.wantBlocked, decision.Flagged)
+		})
+	}
+}
+
+func TestContentModerationCheck_StrictTextBeyondBatchLimitFailsClosedBeforeUpstream(t *testing.T) {
+	groupID := int64(12)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		require.Fail(t, "over-limit strict audit must not call the moderation upstream")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.AllGroups = false
+	cfg.GroupIDs = []int64{groupID}
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-test"}
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	svc := &ContentModerationService{
+		settingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+		repo:       &contentModerationTestRepo{},
+		httpClient: server.Client(),
+		asyncQueue: make(chan contentModerationTask, 1),
+		keyHealth:  make(map[string]*contentModerationKeyHealth),
+	}
+	body, err := json.Marshal(map[string]any{
+		"input": strings.Repeat("界", StrictContentModerationMaxTextRunes+1),
+	})
+	require.NoError(t, err)
+
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Strict: true, APIKeyID: 7, GroupID: &groupID, Model: "gpt-test",
+		Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
+	})
+
+	require.ErrorIs(t, err, ErrStrictContentModerationTextTooLong)
+	require.Nil(t, decision)
+	require.Zero(t, requestCount)
 }
 
 func TestContentModerationCheck_StrictMalformedImageRequestIsRejectedWithoutModerationCall(t *testing.T) {
