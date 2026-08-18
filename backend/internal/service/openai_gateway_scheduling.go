@@ -943,6 +943,9 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		return s.isBetterAccount(a, b)
 	})
 	eligible = prioritizeOpenAIAccountsForRouting(eligible, openAIAccountRoutingOptionsFromContext(ctx))
+	if len(eligible) == 0 {
+		return nil, compactBlocked, filterStats
+	}
 	return eligible[0], compactBlocked, filterStats
 }
 

@@ -138,6 +138,160 @@ func TestOpenAIAccountRoutingPreferAPIKeyFallsBackToOAuthAdvancedAndLegacy(t *te
 	}
 }
 
+func TestOpenAIAccountRoutingPreferAPIKeyDoesNotFallBackToAuditedOAuthAdvancedAndLegacy(t *testing.T) {
+	for _, advanced := range []bool{false, true} {
+		name := "legacy"
+		if advanced {
+			name = "advanced"
+		}
+		t.Run(name, func(t *testing.T) {
+			groupID := int64(51015)
+			pro := Account{
+				ID: 51151, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+				Concurrency: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"},
+			}
+			svc := newOpenAIAccountAuditRoutingSchedulerTestService(
+				t, advanced, groupID, []*Account{&pro}, []Account{pro}, nil, schedulerTestConcurrencyCache{}, nil,
+			)
+			ctx := WithOpenAIAccountRoutingOptions(context.Background(), OpenAIAccountRoutingOptions{
+				Preference:  OpenAIAccountRoutingPreferenceAPIKey,
+				AuditPolicy: openAIAccountAuditRoutingTestPolicy(),
+			})
+
+			selection, _, err := svc.SelectAccountWithScheduler(
+				ctx, &groupID, "", "", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false,
+			)
+			require.ErrorIs(t, err, ErrNoAvailableAccounts)
+			require.Nil(t, selection)
+		})
+	}
+}
+
+func TestOpenAIAccountRoutingPreferAPIKeySimpleSelectionDoesNotFallBackToAuditedOAuth(t *testing.T) {
+	groupID := int64(51018)
+	pro := Account{
+		ID: 51181, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+		Concurrency: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"},
+	}
+	svc := newOpenAIAccountAuditRoutingSchedulerTestService(
+		t, false, groupID, []*Account{&pro}, []Account{pro}, nil, schedulerTestConcurrencyCache{}, nil,
+	)
+	ctx := WithOpenAIAccountRoutingOptions(context.Background(), OpenAIAccountRoutingOptions{
+		Preference:  OpenAIAccountRoutingPreferenceAPIKey,
+		AuditPolicy: openAIAccountAuditRoutingTestPolicy(),
+	})
+
+	selected, err := svc.selectAccountForModelWithExclusions(
+		ctx, &groupID, PlatformOpenAI, "", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false, 0, "", false,
+	)
+	require.ErrorIs(t, err, ErrNoAvailableAccounts)
+	require.Nil(t, selected)
+}
+
+func TestOpenAIAccountRoutingPreferAPIKeyFallsBackOnlyToNonAuditedOAuthAdvancedAndLegacy(t *testing.T) {
+	for _, advanced := range []bool{false, true} {
+		name := "legacy"
+		if advanced {
+			name = "advanced"
+		}
+		t.Run(name, func(t *testing.T) {
+			groupID := int64(51016)
+			pro := Account{
+				ID: 51161, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+				Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"},
+			}
+			plus := Account{
+				ID: 51162, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+				Concurrency: 1, Priority: 150, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "plus"},
+			}
+			svc := newOpenAIAccountAuditRoutingSchedulerTestService(
+				t, advanced, groupID, []*Account{&pro, &plus}, []Account{pro, plus}, nil, schedulerTestConcurrencyCache{}, nil,
+			)
+			ctx := WithOpenAIAccountRoutingOptions(context.Background(), OpenAIAccountRoutingOptions{
+				Preference:  OpenAIAccountRoutingPreferenceAPIKey,
+				AuditPolicy: openAIAccountAuditRoutingTestPolicy(),
+			})
+
+			selection, _, err := svc.SelectAccountWithScheduler(
+				ctx, &groupID, "", "", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, selection)
+			require.Equal(t, plus.ID, selection.Account.ID)
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+		})
+	}
+}
+
+func TestOpenAIAccountRoutingPreferAPIKeyAdvancedTopKDoesNotLetAuditedOAuthCrowdOutFallback(t *testing.T) {
+	groupID := int64(51019)
+	pro1 := Account{
+		ID: 51191, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+		Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"},
+	}
+	pro2 := Account{
+		ID: 51192, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+		Concurrency: 1, Priority: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"},
+	}
+	plus := Account{
+		ID: 51193, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+		Concurrency: 1, Priority: 150, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "plus"},
+	}
+	svc := newOpenAIAccountAuditRoutingSchedulerTestService(
+		t, true, groupID, []*Account{&pro1, &pro2, &plus}, []Account{pro1, pro2, plus},
+		nil, schedulerTestConcurrencyCache{}, func(cfg *config.Config) {
+			cfg.Gateway.OpenAIWS.LBTopK = 1
+		},
+	)
+	ctx := WithOpenAIAccountRoutingOptions(context.Background(), OpenAIAccountRoutingOptions{
+		Preference:  OpenAIAccountRoutingPreferenceAPIKey,
+		AuditPolicy: openAIAccountAuditRoutingTestPolicy(),
+	})
+
+	selection, _, err := svc.SelectAccountWithScheduler(
+		ctx, &groupID, "", "", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, plus.ID, selection.Account.ID)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAIAccountRoutingPreferAPIKeyFreshAuditEligibilityRecheckAdvancedAndLegacy(t *testing.T) {
+	for _, advanced := range []bool{false, true} {
+		name := "legacy"
+		if advanced {
+			name = "advanced"
+		}
+		t.Run(name, func(t *testing.T) {
+			groupID := int64(51017)
+			stalePlus := Account{
+				ID: 51171, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true,
+				Concurrency: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "plus"},
+			}
+			freshPro := stalePlus
+			freshPro.Credentials = map[string]any{"plan_type": "pro"}
+			svc := newOpenAIAccountAuditRoutingSchedulerTestService(
+				t, advanced, groupID, []*Account{&stalePlus}, []Account{freshPro}, nil, schedulerTestConcurrencyCache{}, nil,
+			)
+			ctx := WithOpenAIAccountRoutingOptions(context.Background(), OpenAIAccountRoutingOptions{
+				Preference:  OpenAIAccountRoutingPreferenceAPIKey,
+				AuditPolicy: openAIAccountAuditRoutingTestPolicy(),
+			})
+
+			selection, _, err := svc.SelectAccountWithScheduler(
+				ctx, &groupID, "", "", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false,
+			)
+			require.ErrorIs(t, err, ErrNoAvailableAccounts)
+			require.Nil(t, selection)
+		})
+	}
+}
+
 func auditedOAuthRoutingOptions() OpenAIAccountRoutingOptions {
 	return OpenAIAccountRoutingOptions{
 		Preference:         OpenAIAccountRoutingPreferenceAuditedOAuth,

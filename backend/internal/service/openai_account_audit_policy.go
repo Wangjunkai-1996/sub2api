@@ -77,7 +77,6 @@ const (
 	openAIAccountRoutingTypeAny openAIAccountRoutingTypeTier = iota
 	openAIAccountRoutingTypeAPIKey
 	openAIAccountRoutingTypeAuditedOAuth
-	openAIAccountRoutingTypeNonAPIKey
 	openAIAccountRoutingTypeNonAuditedOAuth
 )
 
@@ -101,7 +100,7 @@ func (o OpenAIAccountRoutingOptions) PrefersAuditedOAuth() bool {
 func openAIAccountRoutingTypeTiers(options OpenAIAccountRoutingOptions) []openAIAccountRoutingTypeTier {
 	switch options.effectivePreference() {
 	case OpenAIAccountRoutingPreferenceAPIKey:
-		return []openAIAccountRoutingTypeTier{openAIAccountRoutingTypeAPIKey, openAIAccountRoutingTypeNonAPIKey}
+		return []openAIAccountRoutingTypeTier{openAIAccountRoutingTypeAPIKey, openAIAccountRoutingTypeNonAuditedOAuth}
 	case OpenAIAccountRoutingPreferenceAuditedOAuth:
 		return []openAIAccountRoutingTypeTier{
 			openAIAccountRoutingTypeAuditedOAuth,
@@ -122,14 +121,24 @@ func openAIAccountMatchesRoutingTypeTier(account *Account, tier openAIAccountRou
 		return account.Type == AccountTypeAPIKey
 	case openAIAccountRoutingTypeAuditedOAuth:
 		return ClassifyOpenAIAccountAuditEligibility(account, options.AuditPolicy).Eligible
-	case openAIAccountRoutingTypeNonAPIKey:
-		return account.Type != AccountTypeAPIKey
 	case openAIAccountRoutingTypeNonAuditedOAuth:
 		return account.Type != AccountTypeAPIKey &&
 			!ClassifyOpenAIAccountAuditEligibility(account, options.AuditPolicy).Eligible
 	default:
 		return true
 	}
+}
+
+// Snapshot state may lag behind the database. An audited OAuth snapshot can be
+// probed in the non-audited OAuth fallback tier, but fresh database state must
+// still pass the strict routing-tier check before selection.
+func openAIAccountMayMatchRoutingTypeTierAfterRefresh(account *Account, tier openAIAccountRoutingTypeTier, options OpenAIAccountRoutingOptions) bool {
+	if openAIAccountMatchesRoutingTypeTier(account, tier, options) {
+		return true
+	}
+	return options.PrefersAPIKey() &&
+		tier == openAIAccountRoutingTypeNonAuditedOAuth &&
+		ClassifyOpenAIAccountAuditEligibility(account, options.AuditPolicy).Eligible
 }
 
 func openAIAccountRoutingTypeTierForAccount(account *Account, options OpenAIAccountRoutingOptions) (openAIAccountRoutingTypeTier, int, bool) {
@@ -559,7 +568,7 @@ func (s *OpenAIGatewayService) openAIAccountMeetsRoutingRequirements(
 }
 
 func prioritizeOpenAIAccountsForRouting(accounts []*Account, options OpenAIAccountRoutingOptions) []*Account {
-	if options.effectivePreference() == OpenAIAccountRoutingPreferenceNone || len(accounts) < 2 {
+	if options.effectivePreference() == OpenAIAccountRoutingPreferenceNone || len(accounts) == 0 {
 		return accounts
 	}
 	ordered := make([]*Account, 0, len(accounts))

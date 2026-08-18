@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/stretchr/testify/require"
 )
 
@@ -198,6 +199,43 @@ func TestStrictModerationResultCacheDoesNotCacheErrors(t *testing.T) {
 	require.NoError(t, third.err)
 	require.True(t, strictModerationCacheHit(third.state))
 	require.EqualValues(t, 2, calls.Load())
+}
+
+func TestStrictModerationLongBatchesReuseSuccessfulChunkAfterLaterFailure(t *testing.T) {
+	var calls atomic.Int32
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		if calls.Add(1) == 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeStrictModerationCacheTestResponse(w, false, 0.01)
+	}))
+	defer server.Close()
+
+	batches, err := strictModerationBatches(&auditinput.Document{
+		NormalizedText: strings.Repeat("甲", maxModerationInputRunes) + strings.Repeat("乙", 17),
+	})
+	require.NoError(t, err)
+	require.Len(t, batches, 2)
+
+	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
+	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	identity := strictModerationCacheTestIdentity()
+	firstState := newStrictModerationKeyState(cfg, identity)
+	_, err = svc.callModerationStrictBatches(context.Background(), cfg, batches, firstState)
+	require.Error(t, err)
+	require.Equal(t, 2, strictModerationCallCount(firstState))
+
+	secondState := newStrictModerationKeyState(cfg, identity)
+	result, err := svc.callModerationStrictBatches(context.Background(), cfg, batches, secondState)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, strictModerationCacheHit(secondState))
+	require.Equal(t, 1, strictModerationCallCount(secondState))
+	require.EqualValues(t, 3, calls.Load())
+	require.Equal(t, []string{"Bearer sk-cache-a", "Bearer sk-cache-a", "Bearer sk-cache-b"}, authorizations)
 }
 
 func TestStrictModerationResultCacheExpiresWithDeterministicClock(t *testing.T) {
@@ -513,6 +551,7 @@ func TestStrictModerationPool429FailsOverWithoutOpeningSharedCircuit(t *testing.
 
 	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
 	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	cfg.RetryCount = 1
 	startedAt := time.Now()
 	first := callStrictModerationCacheTest(context.Background(), svc, cfg, "fail over")
 	require.NoError(t, first.err)
@@ -534,6 +573,74 @@ func TestStrictModerationPool429FailsOverWithoutOpeningSharedCircuit(t *testing.
 	pool.mu.Unlock()
 }
 
+func TestStrictModerationTokenBudgetPersistsAcrossRequestsUntilReset(t *testing.T) {
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		authorizations = append(authorizations, authorization)
+		w.Header().Set("x-ratelimit-remaining-tokens", "100000")
+		w.Header().Set("x-ratelimit-reset-tokens", "1m")
+		if authorization == "Bearer sk-cache-a" {
+			w.Header().Set("x-ratelimit-remaining-project-tokens", "0")
+		} else {
+			w.Header().Set("x-ratelimit-remaining-project-tokens", "100000")
+		}
+		w.Header().Set("x-ratelimit-reset-project-tokens", "1m")
+		writeStrictModerationCacheTestResponse(w, false, 0.01)
+	}))
+	defer server.Close()
+
+	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
+	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	for _, text := range []string{"budget-a", "budget-b", "budget-skips-a"} {
+		result := callStrictModerationCacheTest(context.Background(), svc, cfg, text)
+		require.NoError(t, result.err)
+		require.Equal(t, 1, strictModerationCallCount(result.state))
+	}
+	require.Equal(t, []string{"Bearer sk-cache-a", "Bearer sk-cache-b", "Bearer sk-cache-b"}, authorizations)
+
+	hash := moderationAPIKeyHash("sk-cache-a")
+	svc.keyHealthMu.Lock()
+	state := svc.keyHealth[hash]
+	require.NotNil(t, state)
+	require.True(t, state.ProjectTokenRemainingKnown)
+	state.ProjectTokenResetAt = time.Now().Add(-time.Second)
+	svc.keyHealthMu.Unlock()
+
+	afterReset := callStrictModerationCacheTest(context.Background(), svc, cfg, "budget-a-after-reset")
+	require.NoError(t, afterReset.err)
+	require.Equal(t, 1, strictModerationCallCount(afterReset.state))
+	require.Equal(t, "Bearer sk-cache-a", authorizations[len(authorizations)-1])
+}
+
+func TestNonStrictModerationBudgetPreventsLaterStrictDispatch(t *testing.T) {
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		authorizations = append(authorizations, authorization)
+		if authorization == "Bearer sk-cache-a" {
+			w.Header().Set("x-ratelimit-remaining-tokens", "0")
+		} else {
+			w.Header().Set("x-ratelimit-remaining-tokens", "100000")
+		}
+		w.Header().Set("x-ratelimit-reset-tokens", "1m")
+		writeStrictModerationCacheTestResponse(w, false, 0.01)
+	}))
+	defer server.Close()
+
+	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
+	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	_, err := svc.callModeration(context.Background(), cfg, "ordinary moderation consumes key a")
+	require.NoError(t, err)
+	require.Equal(t, []string{"Bearer sk-cache-a"}, authorizations)
+
+	svc.apiKeyCursor.Store(0)
+	strict := callStrictModerationCacheTest(context.Background(), svc, cfg, "strict must skip depleted key a")
+	require.NoError(t, strict.err)
+	require.Equal(t, 1, strictModerationCallCount(strict.state))
+	require.Equal(t, []string{"Bearer sk-cache-a", "Bearer sk-cache-b"}, authorizations)
+}
+
 func TestStrictModeration429FailoverReacquiresRPMGate(t *testing.T) {
 	var authorizations []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -545,6 +652,7 @@ func TestStrictModeration429FailoverReacquiresRPMGate(t *testing.T) {
 
 	svc := strictModerationCacheTestService(server.Client(), newStrictModerationResultCache(time.Minute, 8))
 	cfg := strictModerationCacheTestConfig(server.URL, "omni-moderation-latest", "sk-cache-a", "sk-cache-b")
+	cfg.RetryCount = 1
 	cfg.MaxRPM = 1
 	result := callStrictModerationCacheTest(context.Background(), svc, cfg, "respect rpm on failover")
 

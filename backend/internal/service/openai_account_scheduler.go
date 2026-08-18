@@ -1138,13 +1138,17 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		}
 		selectionOrder := make([]openAIAccountCandidateScore, 0, len(pool))
 		for _, tier := range openAIAccountRoutingTypeTiers(req.Routing) {
-			tierPool := make([]openAIAccountCandidateScore, 0, len(pool))
+			strictPool := make([]openAIAccountCandidateScore, 0, len(pool))
+			refreshProbePool := make([]openAIAccountCandidateScore, 0, len(pool))
 			for _, candidate := range pool {
 				if openAIAccountMatchesRoutingTypeTier(candidate.account, tier, req.Routing) {
-					tierPool = append(tierPool, candidate)
+					strictPool = append(strictPool, candidate)
+				} else if openAIAccountMayMatchRoutingTypeTierAfterRefresh(candidate.account, tier, req.Routing) {
+					refreshProbePool = append(refreshProbePool, candidate)
 				}
 			}
-			selectionOrder = append(selectionOrder, buildScoredSelectionOrder(tierPool)...)
+			selectionOrder = append(selectionOrder, buildScoredSelectionOrder(strictPool)...)
+			selectionOrder = append(selectionOrder, buildScoredSelectionOrder(refreshProbePool)...)
 		}
 		return selectionOrder
 	}
@@ -1258,7 +1262,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 				if rememberedTier != tier {
 					continue
 				}
-			} else if !openAIAccountMatchesRoutingTypeTier(candidate.account, tier, req.Routing) {
+			} else if !openAIAccountMayMatchRoutingTypeTierAfterRefresh(candidate.account, tier, req.Routing) {
 				continue
 			}
 		}
@@ -1821,7 +1825,7 @@ routingTierLoop:
 						if rememberedTier != tier {
 							continue
 						}
-					} else if !openAIAccountMatchesRoutingTypeTier(candidate.account, tier, req.Routing) {
+					} else if !openAIAccountMayMatchRoutingTypeTierAfterRefresh(candidate.account, tier, req.Routing) {
 						continue
 					}
 				}

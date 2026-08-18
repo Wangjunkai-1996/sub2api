@@ -69,11 +69,12 @@ const (
 	maxModerationInputRunes           = 12000
 	maxModerationExcerptRunes         = 240
 	strictModerationMaxTextChunks     = 8
+	strictModerationMaxInputTokens    = 16000 // Leave headroom below the observed 20k TPM ceiling.
 	strictModerationBoundaryLookback  = 512
 	defaultStrictModerationMaxRPM     = 0 // zero means unlimited
 
 	// StrictContentModerationMaxTextRunes is the largest canonical audit text
-	// that strict moderation can fully inspect in one bounded upstream request.
+	// that strict moderation can fully inspect in a bounded series of requests.
 	StrictContentModerationMaxTextRunes = maxModerationInputRunes * strictModerationMaxTextChunks
 
 	defaultContentModerationWorkerCount          = 4
@@ -584,21 +585,27 @@ type contentModerationTask struct {
 }
 
 type contentModerationKeyHealth struct {
-	Hash           string
-	Masked         string
-	FailureCount   int
-	SuccessCount   int64
-	LastError      string
-	LastCheckedAt  time.Time
-	FrozenUntil    time.Time
-	LastLatencyMS  int
-	LastHTTPStatus int
-	LastTested     bool
-	SyncActive     int64
-	SyncTotal      int64
-	SyncSuccess    int64
-	SyncErrors     int64
-	SyncLatencyMS  int64
+	Hash                       string
+	Masked                     string
+	FailureCount               int
+	SuccessCount               int64
+	LastError                  string
+	LastCheckedAt              time.Time
+	FrozenUntil                time.Time
+	LastLatencyMS              int
+	LastHTTPStatus             int
+	LastTested                 bool
+	SyncActive                 int64
+	SyncTotal                  int64
+	SyncSuccess                int64
+	SyncErrors                 int64
+	SyncLatencyMS              int64
+	TokenRemaining             int64
+	TokenRemainingKnown        bool
+	TokenResetAt               time.Time
+	ProjectTokenRemaining      int64
+	ProjectTokenRemainingKnown bool
+	ProjectTokenResetAt        time.Time
 }
 
 func NewContentModerationService(
@@ -1181,7 +1188,7 @@ func (s *ContentModerationService) checkStrict(ctx context.Context, input Conten
 	if len(cfg.apiKeys()) == 0 {
 		return nil, errors.New("strict content moderation has no audit API key")
 	}
-	batches, err := strictModerationBatches(moderationDocument)
+	batches, err := strictModerationBatches(moderationDocument, cfg.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -1232,9 +1239,19 @@ func strictBlockedKeyword(document *auditinput.Document, keywords []string) (str
 type strictModerationBatch struct {
 	input           any
 	expectedResults int
+	tokenCount      int
 }
 
-func strictModerationBatches(document *auditinput.Document) ([]strictModerationBatch, error) {
+type strictModerationTokenCounter interface {
+	Count(string) (int, error)
+}
+
+type strictModerationTextChunk struct {
+	text   string
+	tokens int
+}
+
+func strictModerationBatches(document *auditinput.Document, models ...string) ([]strictModerationBatch, error) {
 	if document == nil {
 		return nil, errors.New("strict content moderation document is unavailable")
 	}
@@ -1246,15 +1263,86 @@ func strictModerationBatches(document *auditinput.Document) ([]strictModerationB
 	if !StrictContentModerationSupportsTextRunes(textRunes) {
 		return nil, fmt.Errorf("%w: got %d runes, max %d", ErrStrictContentModerationTextTooLong, textRunes, StrictContentModerationMaxTextRunes)
 	}
-	if textRunes <= maxModerationInputRunes {
-		return []strictModerationBatch{{input: text, expectedResults: 1}}, nil
+	model := defaultContentModerationModel
+	if len(models) > 0 && strings.TrimSpace(models[0]) != "" {
+		model = models[0]
 	}
+	counter, err := openAIInputTokensCodecForModel(model)
+	if err != nil {
+		return nil, fmt.Errorf("strict moderation tokenizer: %w", err)
+	}
+	runeChunks := strictModerationTextChunks(text, maxModerationInputRunes, strictModerationMaxTextChunks)
+	if len(runeChunks) == 0 || len(runeChunks) > strictModerationMaxTextChunks {
+		return nil, fmt.Errorf("%w: requires %d rune chunks, max %d", ErrStrictContentModerationTextTooLong, len(runeChunks), strictModerationMaxTextChunks)
+	}
+	batches := make([]strictModerationBatch, 0, len(runeChunks))
+	for _, runeChunk := range runeChunks {
+		tokenChunks, chunkErr := strictModerationTokenChunks(runeChunk, counter, strictModerationMaxInputTokens)
+		if chunkErr != nil {
+			return nil, chunkErr
+		}
+		if len(batches)+len(tokenChunks) > strictModerationMaxTextChunks {
+			return nil, fmt.Errorf("%w: requires more than %d token-bounded chunks", ErrStrictContentModerationTextTooLong, strictModerationMaxTextChunks)
+		}
+		for _, chunk := range tokenChunks {
+			batches = append(batches, strictModerationBatch{
+				input: chunk.text, expectedResults: 1, tokenCount: chunk.tokens,
+			})
+		}
+	}
+	return batches, nil
+}
 
-	chunks := strictModerationTextChunks(text, maxModerationInputRunes, strictModerationMaxTextChunks)
-	if len(chunks) == 0 || len(chunks) > strictModerationMaxTextChunks {
-		return nil, fmt.Errorf("%w: requires %d chunks, max %d", ErrStrictContentModerationTextTooLong, len(chunks), strictModerationMaxTextChunks)
+func strictModerationTokenChunks(text string, counter strictModerationTokenCounter, maxTokens int) ([]strictModerationTextChunk, error) {
+	if strings.TrimSpace(text) == "" || counter == nil || maxTokens <= 0 {
+		return nil, errors.New("strict moderation token chunk input is invalid")
 	}
-	return []strictModerationBatch{{input: chunks, expectedResults: len(chunks)}}, nil
+	runes := []rune(text)
+	chunks := make([]strictModerationTextChunk, 0, 1)
+	for start := 0; start < len(runes); {
+		end := len(runes)
+		tokens, err := counter.Count(string(runes[start:end]))
+		if err != nil {
+			return nil, fmt.Errorf("strict moderation token count: %w", err)
+		}
+		if tokens > maxTokens {
+			bestEnd := start
+			bestTokens := 0
+			for low, high := start+1, end; low <= high; {
+				middle := low + (high-low)/2
+				candidateTokens, countErr := counter.Count(string(runes[start:middle]))
+				if countErr != nil {
+					return nil, fmt.Errorf("strict moderation token count: %w", countErr)
+				}
+				if candidateTokens <= maxTokens {
+					bestEnd = middle
+					bestTokens = candidateTokens
+					low = middle + 1
+				} else {
+					high = middle - 1
+				}
+			}
+			if bestEnd <= start {
+				return nil, fmt.Errorf("%w: one rune exceeds the %d-token batch limit", ErrStrictContentModerationTextTooLong, maxTokens)
+			}
+			end = bestEnd
+			tokens = bestTokens
+		}
+
+		if safeEnd := strictModerationSafeChunkEnd(runes, start, end); safeEnd < end {
+			safeTokens, err := counter.Count(string(runes[start:safeEnd]))
+			if err != nil {
+				return nil, fmt.Errorf("strict moderation token count: %w", err)
+			}
+			if safeTokens <= maxTokens {
+				end = safeEnd
+				tokens = safeTokens
+			}
+		}
+		chunks = append(chunks, strictModerationTextChunk{text: string(runes[start:end]), tokens: tokens})
+		start = end
+	}
+	return chunks, nil
 }
 
 func strictModerationTextChunks(text string, maxRunes, maxChunks int) []string {
@@ -1351,6 +1439,32 @@ func strictModerationBatchTextSize(input any) (runes int, bytes int, items int) 
 		bytes += len(text)
 	}
 	return runes, bytes, len(texts)
+}
+
+func prepareStrictModerationBatch(cfg *ContentModerationConfig, batch strictModerationBatch) (strictModerationBatch, error) {
+	texts, ok := strictModerationBatchTextInputs(batch.input)
+	if !ok || len(texts) != 1 || batch.expectedResults != 1 {
+		return strictModerationBatch{}, errors.New("strict moderation batch input must be text and contain exactly one item")
+	}
+	if batch.tokenCount <= 0 {
+		model := defaultContentModerationModel
+		if cfg != nil && strings.TrimSpace(cfg.Model) != "" {
+			model = cfg.Model
+		}
+		counter, err := openAIInputTokensCodecForModel(model)
+		if err != nil {
+			return strictModerationBatch{}, fmt.Errorf("strict moderation tokenizer: %w", err)
+		}
+		tokens, err := counter.Count(texts[0])
+		if err != nil {
+			return strictModerationBatch{}, fmt.Errorf("strict moderation token count: %w", err)
+		}
+		batch.tokenCount = tokens
+	}
+	if batch.tokenCount > strictModerationMaxInputTokens {
+		return strictModerationBatch{}, fmt.Errorf("%w: batch has %d tokens, max %d", ErrStrictContentModerationTextTooLong, batch.tokenCount, strictModerationMaxInputTokens)
+	}
+	return batch, nil
 }
 
 func strictModerationEmptyTurn(document *auditinput.Document) bool {
@@ -2083,7 +2197,11 @@ func (s *ContentModerationService) callModeration(ctx context.Context, cfg *Cont
 		}
 		start := time.Now()
 		httpStatus := 0
-		result, err := s.callModerationOnceWithInput(ctx, cfg, key, input, &httpStatus)
+		var responseDiagnostics moderationAPIResponseDiagnostics
+		result, err := s.callModerationOnceWithInput(ctx, cfg, key, input, &httpStatus, &responseDiagnostics)
+		if !moderationAPIRequestTooLarge(err) {
+			s.recordStrictModerationTokenBudget(key, responseDiagnostics, time.Now())
+		}
 		latency := int(time.Since(start).Milliseconds())
 		if err == nil {
 			if trackLoad {
@@ -2148,26 +2266,34 @@ func newStrictModerationKeyState(cfg *ContentModerationConfig, inputs ...Content
 	return state
 }
 
-func (s *ContentModerationService) nextStrictModerationAPIKey(cfg *ContentModerationConfig, state *strictModerationKeyState) (string, bool) {
+func (s *ContentModerationService) nextStrictModerationAPIKey(cfg *ContentModerationConfig, state *strictModerationKeyState, requiredTokens ...int) (string, bool) {
 	if state == nil {
 		return "", false
 	}
+	required := 0
+	if len(requiredTokens) > 0 && requiredTokens[0] > 0 {
+		required = requiredTokens[0]
+	}
+	now := time.Now()
 	if state.currentKey != "" {
-		if !s.isAPIKeyFrozen(state.currentKey, time.Now()) {
+		if !s.isAPIKeyFrozen(state.currentKey, now) && s.strictModerationAPIKeyHasBudget(state.currentKey, required, now) {
 			return state.currentKey, true
 		}
 		state.currentKey = ""
 	}
-	if len(state.selectedKeys) >= state.maxKeys {
-		return "", false
+	for len(state.selectedKeys) < state.maxKeys {
+		key, ok := s.nextUsableAPIKeyExcluding(cfg, state.selectedKeys)
+		if !ok {
+			return "", false
+		}
+		state.selectedKeys[key] = struct{}{}
+		if !s.strictModerationAPIKeyHasBudget(key, required, now) {
+			continue
+		}
+		state.currentKey = key
+		return key, true
 	}
-	key, ok := s.nextUsableAPIKeyExcluding(cfg, state.selectedKeys)
-	if !ok {
-		return "", false
-	}
-	state.selectedKeys[key] = struct{}{}
-	state.currentKey = key
-	return key, true
+	return "", false
 }
 
 func (state *strictModerationKeyState) markFailed(key string) {
@@ -2177,8 +2303,10 @@ func (state *strictModerationKeyState) markFailed(key string) {
 }
 
 func (s *ContentModerationService) callModerationStrictBatch(ctx context.Context, cfg *ContentModerationConfig, batch strictModerationBatch, state *strictModerationKeyState, trackKeyLoad ...bool) ([]moderationAPIResult, error) {
-	if _, ok := strictModerationBatchTextInputs(batch.input); !ok {
-		return nil, errors.New("strict moderation batch input must be text")
+	var err error
+	batch, err = prepareStrictModerationBatch(cfg, batch)
+	if err != nil {
+		return nil, err
 	}
 	if state == nil {
 		state = newStrictModerationKeyState(cfg)
@@ -2192,6 +2320,8 @@ func (s *ContentModerationService) callModerationStrictBatch(ctx context.Context
 		}
 	}
 	var lastRateLimitErr error
+	rateLimitAttempts := 0
+	maxAttempts := strictModerationMaxAttempts(cfg)
 	for {
 		lease, err := s.acquireStrictModerationPool(ctx, cfg)
 		if err != nil {
@@ -2214,14 +2344,32 @@ func (s *ContentModerationService) callModerationStrictBatch(ctx context.Context
 			return results, nil
 		}
 		var apiErr *moderationAPIError
-		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests {
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.RequestTooLarge {
 			return nil, err
 		}
 		lastRateLimitErr = err
-		if _, ok := s.nextStrictModerationAPIKey(cfg, state); !ok {
+		rateLimitAttempts++
+		if rateLimitAttempts >= maxAttempts {
+			return nil, lastRateLimitErr
+		}
+		if _, ok := s.nextStrictModerationAPIKey(cfg, state, batch.tokenCount); !ok {
 			return nil, lastRateLimitErr
 		}
 	}
+}
+
+func strictModerationMaxAttempts(cfg *ContentModerationConfig) int {
+	attempts := 1
+	if cfg != nil {
+		attempts = cfg.RetryCount + 1
+	}
+	if attempts < 1 {
+		return 1
+	}
+	if attempts > maxContentModerationRetryCount+1 {
+		return maxContentModerationRetryCount + 1
+	}
+	return attempts
 }
 
 func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context.Context, cfg *ContentModerationConfig, batch strictModerationBatch, state *strictModerationKeyState, lease *strictModerationPoolLease, trackKeyLoad ...bool) ([]moderationAPIResult, error) {
@@ -2235,7 +2383,7 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 	if int(state.calls.Load()) >= state.maxCalls {
 		return nil, errors.New("strict moderation API call limit reached")
 	}
-	key, ok := s.nextStrictModerationAPIKey(cfg, state)
+	key, ok := s.nextStrictModerationAPIKey(cfg, state, batch.tokenCount)
 	if !ok {
 		return nil, errors.New("no distinct moderation api key available")
 	}
@@ -2248,6 +2396,9 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 	state.calls.Add(1)
 	lease.recordDispatch()
 	results, err := s.callModerationOnceWithInputResults(ctx, cfg, key, batch.input, &httpStatus, &responseDiagnostics)
+	if !moderationAPIRequestTooLarge(err) {
+		s.recordStrictModerationTokenBudget(key, responseDiagnostics, time.Now())
+	}
 	if err == nil {
 		if len(results) != batch.expectedResults {
 			err = fmt.Errorf("moderation api returned %d results, expected %d", len(results), batch.expectedResults)
@@ -2265,7 +2416,7 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 	textRunes, textBytes, textItems := strictModerationBatchTextSize(batch.input)
 	if err == nil {
 		fields := moderationAPISuccessLogFields(responseDiagnostics)
-		fields = append(fields, "audit_text_runes", textRunes, "audit_text_bytes", textBytes, "audit_text_items", textItems)
+		fields = append(fields, "audit_text_runes", textRunes, "audit_text_bytes", textBytes, "audit_text_items", textItems, "audit_text_tokens", batch.tokenCount)
 		slog.Info("content_moderation.strict_upstream_success", fields...)
 		if trackLoad {
 			s.finishModerationAPIKeyCall(key, latency, true)
@@ -2276,9 +2427,13 @@ func (s *ContentModerationService) callModerationStrictBatchUncached(ctx context
 	if trackLoad {
 		s.finishModerationAPIKeyCall(key, latency, false)
 	}
-	s.markAPIKeyError(key, err.Error(), latency, httpStatus, moderationRetryAfter(err))
-	state.markFailed(key)
-	failureFields := []any{"audit_text_runes", textRunes, "audit_text_bytes", textBytes, "audit_text_items", textItems, "error", err}
+	if moderationAPIRequestTooLarge(err) {
+		s.markAPIKeyErrorWithoutFreeze(key, err.Error(), latency, httpStatus)
+	} else {
+		s.markAPIKeyError(key, err.Error(), latency, httpStatus, moderationRetryAfterForRequiredTokens(err, batch.tokenCount, time.Now()))
+		state.markFailed(key)
+	}
+	failureFields := []any{"audit_text_runes", textRunes, "audit_text_bytes", textBytes, "audit_text_items", textItems, "audit_text_tokens", batch.tokenCount, "error", err}
 	failureFields = append(failureFields, moderationAPIErrorLogFields(err)...)
 	slog.Warn("content_moderation.strict_upstream_failed", failureFields...)
 	return nil, err
@@ -2315,8 +2470,8 @@ func (s *ContentModerationService) callModerationStrictBatches(ctx context.Conte
 	return aggregate, nil
 }
 
-func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Context, cfg *ContentModerationConfig, apiKey string, input any, httpStatus *int) (*moderationAPIResult, error) {
-	results, err := s.callModerationOnceWithInputResults(ctx, cfg, apiKey, input, httpStatus)
+func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Context, cfg *ContentModerationConfig, apiKey string, input any, httpStatus *int, responseDiagnostics ...*moderationAPIResponseDiagnostics) (*moderationAPIResult, error) {
+	results, err := s.callModerationOnceWithInputResults(ctx, cfg, apiKey, input, httpStatus, responseDiagnostics...)
 	if err != nil {
 		return nil, err
 	}
@@ -2955,6 +3110,18 @@ func (s *ContentModerationService) markAPIKeySuccess(key string, latencyMS int, 
 }
 
 func (s *ContentModerationService) markAPIKeyError(key string, errText string, latencyMS int, httpStatus int, retryAfter ...time.Duration) {
+	freezeDuration := contentModerationFreezeDurationForHTTPStatus(httpStatus)
+	if httpStatus == http.StatusTooManyRequests && len(retryAfter) > 0 && retryAfter[0] > 0 {
+		freezeDuration = retryAfter[0]
+	}
+	s.recordAPIKeyError(key, errText, latencyMS, httpStatus, freezeDuration)
+}
+
+func (s *ContentModerationService) markAPIKeyErrorWithoutFreeze(key string, errText string, latencyMS int, httpStatus int) {
+	s.recordAPIKeyError(key, errText, latencyMS, httpStatus, 0)
+}
+
+func (s *ContentModerationService) recordAPIKeyError(key string, errText string, latencyMS int, httpStatus int, freezeDuration time.Duration) {
 	hash := moderationAPIKeyHash(key)
 	if hash == "" || s == nil {
 		return
@@ -2962,10 +3129,6 @@ func (s *ContentModerationService) markAPIKeyError(key string, errText string, l
 	s.keyHealthMu.Lock()
 	defer s.keyHealthMu.Unlock()
 	state := s.ensureAPIKeyHealthLocked(hash, maskSecretTail(key))
-	freezeDuration := contentModerationFreezeDurationForHTTPStatus(httpStatus)
-	if httpStatus == http.StatusTooManyRequests && len(retryAfter) > 0 && retryAfter[0] > 0 {
-		freezeDuration = retryAfter[0]
-	}
 	if freezeDuration > 0 {
 		state.FailureCount++
 	}
@@ -3305,6 +3468,7 @@ type moderationAPIError struct {
 	LimitProjectTokens     string
 	RemainingProjectTokens string
 	ResetProjectTokens     string
+	RequestTooLarge        bool
 	retryAfterDuration     time.Duration
 }
 
@@ -3339,18 +3503,90 @@ func newModerationAPIError(resp *http.Response, body []byte, apiKey string) *mod
 	err.LimitProjectTokens = safeModerationHeader(resp.Header.Get("x-ratelimit-limit-project-tokens"))
 	err.RemainingProjectTokens = safeModerationHeader(resp.Header.Get("x-ratelimit-remaining-project-tokens"))
 	err.ResetProjectTokens = safeModerationHeader(resp.Header.Get("x-ratelimit-reset-project-tokens"))
-	err.retryAfterDuration = parseModerationRetryAfter(err.RetryAfter, time.Now())
+	now := time.Now()
+	err.retryAfterDuration = parseModerationRetryAfter(err.RetryAfter, now)
+	if err.StatusCode == http.StatusTooManyRequests && err.retryAfterDuration <= 0 {
+		err.retryAfterDuration = moderationExhaustedResetDuration(err, now)
+	}
 	var envelope struct {
 		Error struct {
-			Type string `json:"type"`
-			Code string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &envelope) == nil {
 		err.ErrorType = safeModerationIdentifier(envelope.Error.Type)
 		err.ErrorCode = safeModerationIdentifier(envelope.Error.Code)
+		err.RequestTooLarge = moderationAPIResponseIndicatesRequestTooLarge(resp.StatusCode, envelope.Error.Message)
 	}
 	return err
+}
+
+func moderationExhaustedResetDuration(apiErr *moderationAPIError, now time.Time, requiredTokens ...int) time.Duration {
+	if apiErr == nil {
+		return 0
+	}
+	required := int64(0)
+	if len(requiredTokens) > 0 && requiredTokens[0] > 0 {
+		required = int64(requiredTokens[0])
+	}
+	dimensions := []struct {
+		remaining string
+		reset     string
+		tokens    bool
+	}{
+		{remaining: apiErr.RemainingRequests, reset: apiErr.ResetRequests},
+		{remaining: apiErr.RemainingTokens, reset: apiErr.ResetTokens, tokens: true},
+		{remaining: apiErr.RemainingProjectTokens, reset: apiErr.ResetProjectTokens, tokens: true},
+	}
+	var retryAfter time.Duration
+	for _, dimension := range dimensions {
+		remaining, err := strconv.ParseInt(strings.TrimSpace(dimension.remaining), 10, 64)
+		if err != nil || remaining < 0 {
+			continue
+		}
+		exhausted := remaining == 0
+		if dimension.tokens && required > 0 && remaining < required {
+			exhausted = true
+		}
+		if !exhausted {
+			continue
+		}
+		resetAt := strictModerationHeaderResetAt(dimension.reset, now)
+		if resetAt.IsZero() {
+			continue
+		}
+		if duration := resetAt.Sub(now); duration > retryAfter {
+			retryAfter = duration
+		}
+	}
+	return retryAfter
+}
+
+func moderationRetryAfterForRequiredTokens(err error, requiredTokens int, now time.Time) time.Duration {
+	if retryAfter := moderationRetryAfter(err); retryAfter > 0 {
+		return retryAfter
+	}
+	var apiErr *moderationAPIError
+	if !errors.As(err, &apiErr) || apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests {
+		return 0
+	}
+	return moderationExhaustedResetDuration(apiErr, now, requiredTokens)
+}
+
+func moderationAPIResponseIndicatesRequestTooLarge(statusCode int, message string) bool {
+	if statusCode != http.StatusTooManyRequests {
+		return false
+	}
+	message = strings.ToLower(message)
+	return strings.Contains(message, "request too large") ||
+		strings.Contains(message, "input or output tokens must be reduced")
+}
+
+func moderationAPIRequestTooLarge(err error) bool {
+	var apiErr *moderationAPIError
+	return errors.As(err, &apiErr) && apiErr != nil && apiErr.RequestTooLarge
 }
 
 func safeModerationHeader(value string) string {
@@ -3432,6 +3668,9 @@ func moderationAPIErrorLogFields(err error) []any {
 	appendField("ratelimit_limit_project_tokens", apiErr.LimitProjectTokens)
 	appendField("ratelimit_remaining_project_tokens", apiErr.RemainingProjectTokens)
 	appendField("ratelimit_reset_project_tokens", apiErr.ResetProjectTokens)
+	if apiErr.RequestTooLarge {
+		fields = append(fields, "moderation_request_too_large", true)
+	}
 	return fields
 }
 

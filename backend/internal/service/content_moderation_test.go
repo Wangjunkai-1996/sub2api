@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
@@ -1186,16 +1187,17 @@ func TestStrictModerationBatchesChunksLongTextWithoutLoss(t *testing.T) {
 	batches, err := strictModerationBatches(document)
 
 	require.NoError(t, err)
-	require.Len(t, batches, 1)
-	textInputs, ok := batches[0].input.([]string)
-	require.True(t, ok)
-	require.Len(t, textInputs, 2)
-	require.Equal(t, prefix, textInputs[0], "the chunker should prefer a nearby sentence boundary")
-	require.Equal(t, want, strings.Join(textInputs, ""))
-	for _, text := range textInputs {
+	require.Len(t, batches, 2)
+	textInputs := make([]string, 0, len(batches))
+	for _, batch := range batches {
+		text, ok := batch.input.(string)
+		require.True(t, ok)
+		require.Equal(t, 1, batch.expectedResults)
+		textInputs = append(textInputs, text)
 		require.LessOrEqual(t, len([]rune(text)), maxModerationInputRunes)
 	}
-	require.Equal(t, len(textInputs), batches[0].expectedResults)
+	require.Equal(t, prefix, textInputs[0], "the chunker should prefer a nearby sentence boundary")
+	require.Equal(t, want, strings.Join(textInputs, ""))
 }
 
 func TestStrictModerationBatchesHardSplitsUnicodeAtRuneBoundary(t *testing.T) {
@@ -1204,11 +1206,44 @@ func TestStrictModerationBatchesHardSplitsUnicodeAtRuneBoundary(t *testing.T) {
 	batches, err := strictModerationBatches(&auditinput.Document{NormalizedText: want})
 
 	require.NoError(t, err)
-	require.Len(t, batches, 1)
-	textInputs, ok := batches[0].input.([]string)
-	require.True(t, ok)
+	require.Len(t, batches, 2)
+	textInputs := make([]string, 0, len(batches))
+	for _, batch := range batches {
+		text, ok := batch.input.(string)
+		require.True(t, ok)
+		require.Equal(t, 1, batch.expectedResults)
+		textInputs = append(textInputs, text)
+	}
 	require.Equal(t, []string{strings.Repeat("界", maxModerationInputRunes), "尾"}, textInputs)
 	require.Equal(t, want, strings.Join(textInputs, ""))
+}
+
+func TestStrictModerationBatchesEnforcesPerRequestTokenLimit(t *testing.T) {
+	want := strings.Repeat("\U0010FFFF", maxModerationInputRunes)
+
+	batches, err := strictModerationBatches(&auditinput.Document{NormalizedText: want})
+
+	require.NoError(t, err)
+	require.Greater(t, len(batches), 1, "high token-density text must be split below the upstream token ceiling")
+	require.LessOrEqual(t, len(batches), strictModerationMaxTextChunks)
+	texts := make([]string, 0, len(batches))
+	for _, batch := range batches {
+		text, ok := batch.input.(string)
+		require.True(t, ok)
+		require.Equal(t, 1, batch.expectedResults)
+		require.Positive(t, batch.tokenCount)
+		require.LessOrEqual(t, batch.tokenCount, strictModerationMaxInputTokens)
+		texts = append(texts, text)
+	}
+	require.Equal(t, want, strings.Join(texts, ""))
+}
+
+func TestStrictModerationBatchesFailsClosedWhenTokenBoundRequiresTooManyCalls(t *testing.T) {
+	_, err := strictModerationBatches(&auditinput.Document{
+		NormalizedText: strings.Repeat("\U0010FFFF", StrictContentModerationMaxTextRunes),
+	})
+
+	require.ErrorIs(t, err, ErrStrictContentModerationTextTooLong)
 }
 
 func TestStrictModerationBatchesEnforcesBoundedFullTextLimit(t *testing.T) {
@@ -1220,10 +1255,14 @@ func TestStrictModerationBatchesEnforcesBoundedFullTextLimit(t *testing.T) {
 	atLimit := strings.Repeat("界", StrictContentModerationMaxTextRunes)
 	batches, err := strictModerationBatches(&auditinput.Document{NormalizedText: atLimit})
 	require.NoError(t, err)
-	require.Len(t, batches, 1)
-	textInputs, ok := batches[0].input.([]string)
-	require.True(t, ok)
-	require.Len(t, textInputs, strictModerationMaxTextChunks)
+	require.Len(t, batches, strictModerationMaxTextChunks)
+	textInputs := make([]string, 0, len(batches))
+	for _, batch := range batches {
+		text, ok := batch.input.(string)
+		require.True(t, ok)
+		require.Equal(t, 1, batch.expectedResults)
+		textInputs = append(textInputs, text)
+	}
 	require.Equal(t, atLimit, strings.Join(textInputs, ""))
 
 	_, err = strictModerationBatches(&auditinput.Document{
@@ -1921,18 +1960,12 @@ func TestContentModerationCheck_StrictSendsFullCurrentUserTextBeyondFormerLimit(
 		requestCount++
 		var request moderationAPIRequest
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-		items, ok := request.Input.([]any)
-		require.True(t, ok, "long strict text must use one batched text request")
-		results := make([]moderationAPIResult, len(items))
-		for index, item := range items {
-			text, ok := item.(string)
-			require.True(t, ok, "strict text batches must not repeat image inputs")
-			gotInputs = append(gotInputs, text)
-			results[index] = moderationAPIResult{
-				Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
-			}
-		}
-		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: results}))
+		text, ok := request.Input.(string)
+		require.True(t, ok, "each strict text chunk must use its own text-only request")
+		gotInputs = append(gotInputs, text)
+		require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
+			Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+		}}}))
 	}))
 	defer server.Close()
 
@@ -1966,7 +1999,7 @@ func TestContentModerationCheck_StrictSendsFullCurrentUserTextBeyondFormerLimit(
 	require.NoError(t, err)
 	require.NotNil(t, decision)
 	require.True(t, decision.Allowed)
-	require.Equal(t, 1, requestCount)
+	require.Equal(t, 2, requestCount)
 	require.Len(t, gotInputs, 2)
 	require.Equal(t, want, strings.Join(gotInputs, ""))
 	for _, text := range gotInputs {
@@ -1984,7 +2017,7 @@ func TestContentModerationCheck_StrictSendsFullCurrentUserTextBeyondFormerLimit(
 	require.NoError(t, err)
 	require.True(t, blocked.Blocked, "local keyword checks must cover text beyond the remote limit")
 	require.Equal(t, ContentModerationActionKeywordBlock, blocked.Action)
-	require.Equal(t, 1, requestCount, "local keyword blocks must not consume another Moderations call")
+	require.Equal(t, 2, requestCount, "local keyword blocks must not consume another Moderations call")
 }
 
 func TestContentModerationStatusTracksPreBlockSyncMetrics(t *testing.T) {
@@ -2489,33 +2522,38 @@ func TestContentModerationCheck_StrictLongTextBatchAggregatesAndFailsClosed(t *t
 		wantError   bool
 	}{
 		{name: "later chunk is blocked", response: "flagged", wantBlocked: true},
-		{name: "partial batch result fails closed", response: "partial", wantError: true},
+		{name: "invalid second result count fails closed", response: "invalid_count", wantError: true},
 		{name: "upstream unavailable fails closed", response: "unavailable", wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requestCount := 0
+			var auditedTexts []string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requestCount++
 				var request moderationAPIRequest
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-				inputs, ok := request.Input.([]any)
+				text, ok := request.Input.(string)
 				require.True(t, ok)
-				require.Len(t, inputs, 2)
-				if test.response == "unavailable" {
+				require.LessOrEqual(t, utf8.RuneCountInString(text), maxModerationInputRunes)
+				auditedTexts = append(auditedTexts, text)
+				if requestCount == 2 && test.response == "unavailable" {
 					w.WriteHeader(http.StatusServiceUnavailable)
 					return
 				}
 
-				results := []moderationAPIResult{
-					{Flagged: false, CategoryScores: completeModerationCategoryScores(0.01)},
-					{Flagged: false, CategoryScores: completeModerationCategoryScores(0.01)},
-				}
-				switch test.response {
-				case "flagged":
-					results[1].Flagged = true
-					results[1].CategoryScores["violence"] = 0.99
-				case "partial":
-					results = results[:1]
+				results := []moderationAPIResult{{
+					Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+				}}
+				if requestCount == 2 {
+					switch test.response {
+					case "flagged":
+						results[0].Flagged = true
+						results[0].CategoryScores["violence"] = 0.99
+					case "invalid_count":
+						results = append(results, moderationAPIResult{
+							Flagged: false, CategoryScores: completeModerationCategoryScores(0.01),
+						})
+					}
 				}
 				require.NoError(t, json.NewEncoder(w).Encode(moderationAPIResponse{Results: results}))
 			}))
@@ -2548,7 +2586,8 @@ func TestContentModerationCheck_StrictLongTextBatchAggregatesAndFailsClosed(t *t
 				Protocol: ContentModerationProtocolOpenAIResponses, Body: body,
 			})
 
-			require.Equal(t, 1, requestCount, "all chunks must be sent in one bounded upstream request")
+			require.Equal(t, 2, requestCount, "each bounded chunk must use a separate upstream request")
+			require.Equal(t, longText, strings.Join(auditedTexts, ""))
 			if test.wantError {
 				require.Error(t, checkErr)
 				require.Nil(t, decision)
@@ -2917,6 +2956,85 @@ func TestContentModerationStrictAllKeys429ReturnsLast429(t *testing.T) {
 	require.Equal(t, []string{"Bearer sk-primary", "Bearer sk-backup"}, authorizations)
 }
 
+func TestContentModerationStrict429RespectsRetryCount(t *testing.T) {
+	apiKeys := []string{"sk-1", "sk-2", "sk-3", "sk-4", "sk-5", "sk-6"}
+	for _, test := range []struct {
+		name         string
+		retryCount   int
+		wantAttempts int
+	}{
+		{name: "default retry count", retryCount: defaultContentModerationRetryCount, wantAttempts: defaultContentModerationRetryCount + 1},
+		{name: "retry disabled", retryCount: 0, wantAttempts: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var authorizations []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorizations = append(authorizations, r.Header.Get("Authorization"))
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = append([]string(nil), apiKeys...)
+			cfg.MaxRPM = 100000
+			cfg.RetryCount = test.retryCount
+			svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+			state := newStrictModerationKeyState(cfg)
+
+			_, err := svc.callModerationStrictBatches(context.Background(), cfg, []strictModerationBatch{{
+				input: "current user text", expectedResults: 1,
+			}}, state)
+
+			require.Error(t, err)
+			require.Len(t, authorizations, test.wantAttempts)
+			for index := range authorizations {
+				require.Equal(t, "Bearer "+apiKeys[index], authorizations[index])
+			}
+			require.Equal(t, test.wantAttempts, strictModerationCallCount(state))
+		})
+	}
+}
+
+func TestContentModerationStrictOversized429DoesNotFailOverOrFreezeKeys(t *testing.T) {
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"Request too large for omni-moderation-latest on tokens per min (TPM): Limit 20000, Requested 65000. The input or output tokens must be reduced in order to run successfully.","type":"tokens","code":"rate_limit_exceeded"}}`))
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-primary", "sk-backup", "sk-third"}
+	cfg.MaxRPM = 100000
+	cfg.RetryCount = 2
+	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+	state := newStrictModerationKeyState(cfg)
+
+	_, err := svc.callModerationStrictBatches(context.Background(), cfg, []strictModerationBatch{{
+		input: "bounded current user text", expectedResults: 1,
+	}}, state)
+
+	require.Error(t, err)
+	var apiErr *moderationAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.True(t, apiErr.RequestTooLarge)
+	require.Equal(t, []string{"Bearer sk-primary"}, authorizations)
+	require.Equal(t, 1, strictModerationCallCount(state))
+	status := svc.apiKeyStatusForHash(0, moderationAPIKeyHash("sk-primary"), maskSecretTail("sk-primary"), true)
+	require.Nil(t, status.FrozenUntil)
+	require.Zero(t, status.FailureCount)
+	require.Equal(t, http.StatusTooManyRequests, status.LastHTTPStatus)
+	svc.keyHealthMu.Lock()
+	require.Len(t, svc.keyHealth, 1)
+	svc.keyHealthMu.Unlock()
+}
+
 func TestContentModerationCheck_Strict59ToolScreenshotsAreNotModeratedUnderConcurrency(t *testing.T) {
 	const workers = 16
 	groupID := int64(12)
@@ -3152,6 +3270,71 @@ func TestParseModerationRetryAfter(t *testing.T) {
 	}
 }
 
+func TestContentModerationCallModeration_429UsesLongestExhaustedResetWithoutRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-ratelimit-remaining-requests", "0")
+		w.Header().Set("x-ratelimit-reset-requests", "1s")
+		w.Header().Set("x-ratelimit-remaining-tokens", "0")
+		w.Header().Set("x-ratelimit-reset-tokens", "2s")
+		w.Header().Set("x-ratelimit-remaining-project-tokens", "0")
+		w.Header().Set("x-ratelimit-reset-project-tokens", "3s")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-reset-test"}
+	cfg.RetryCount = 0
+	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+	startedAt := time.Now()
+
+	_, err := svc.callModeration(context.Background(), cfg, "current user text")
+
+	require.Error(t, err)
+	var apiErr *moderationAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Empty(t, apiErr.RetryAfter)
+	require.Equal(t, 3*time.Second, apiErr.retryAfterDuration)
+	status := svc.apiKeyStatusForHash(0, moderationAPIKeyHash("sk-reset-test"), maskSecretTail("sk-reset-test"), true)
+	require.NotNil(t, status.FrozenUntil)
+	require.False(t, status.FrozenUntil.Before(startedAt.Add(3*time.Second)))
+	require.True(t, status.FrozenUntil.Before(time.Now().Add(4*time.Second)))
+}
+
+func TestContentModerationStrict429UsesResetWhenRemainingCannotFitBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-ratelimit-remaining-tokens", "15814")
+		w.Header().Set("x-ratelimit-reset-tokens", "2s")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"sk-strict-reset-test"}
+	cfg.MaxRPM = 100000
+	cfg.RetryCount = 0
+	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+	state := newStrictModerationKeyState(cfg)
+	startedAt := time.Now()
+
+	_, err := svc.callModerationStrictBatches(context.Background(), cfg, []strictModerationBatch{{
+		input: "bounded strict text", expectedResults: 1, tokenCount: strictModerationMaxInputTokens,
+	}}, state)
+
+	require.Error(t, err)
+	var apiErr *moderationAPIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Zero(t, apiErr.retryAfterDuration, "ordinary zero-only retry derivation must remain unchanged")
+	status := svc.apiKeyStatusForHash(0, moderationAPIKeyHash("sk-strict-reset-test"), maskSecretTail("sk-strict-reset-test"), true)
+	require.NotNil(t, status.FrozenUntil)
+	require.False(t, status.FrozenUntil.Before(startedAt.Add(2*time.Second)))
+	require.True(t, status.FrozenUntil.Before(time.Now().Add(3*time.Second)))
+}
+
 func TestContentModerationCallModeration_429PreservesDiagnosticsWithoutLeakingBody(t *testing.T) {
 	const upstreamMessage = "customer prompt must never appear in diagnostics"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -3185,6 +3368,7 @@ func TestContentModerationCallModeration_429PreservesDiagnosticsWithoutLeakingBo
 	require.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
 	require.Equal(t, "rate_limit_error", apiErr.ErrorType)
 	require.Equal(t, "rate_limit_exceeded", apiErr.ErrorCode)
+	require.False(t, apiErr.RequestTooLarge)
 	require.Equal(t, moderationAPIKeyHash("sk-diagnostic-test"), apiErr.KeyHash)
 	require.Equal(t, "120", apiErr.RetryAfter)
 	require.Equal(t, 2*time.Minute, apiErr.retryAfterDuration)

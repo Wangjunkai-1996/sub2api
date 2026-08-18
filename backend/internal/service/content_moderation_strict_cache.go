@@ -425,6 +425,94 @@ type moderationAPIResponseDiagnostics struct {
 	ResetProjectTokens     string
 }
 
+func (s *ContentModerationService) recordStrictModerationTokenBudget(key string, diagnostics moderationAPIResponseDiagnostics, now time.Time) {
+	if s == nil {
+		return
+	}
+	hash := moderationAPIKeyHash(key)
+	if hash == "" {
+		return
+	}
+	remaining, resetAt, known := strictModerationHeaderTokenBudget(diagnostics.RemainingTokens, diagnostics.ResetTokens, now)
+	projectRemaining, projectResetAt, projectKnown := strictModerationHeaderTokenBudget(diagnostics.RemainingProjectTokens, diagnostics.ResetProjectTokens, now)
+	if !known && !projectKnown {
+		return
+	}
+
+	s.keyHealthMu.Lock()
+	defer s.keyHealthMu.Unlock()
+	state := s.ensureAPIKeyHealthLocked(hash, maskSecretTail(key))
+	if known {
+		state.TokenRemaining = remaining
+		state.TokenRemainingKnown = true
+		state.TokenResetAt = resetAt
+	}
+	if projectKnown {
+		state.ProjectTokenRemaining = projectRemaining
+		state.ProjectTokenRemainingKnown = true
+		state.ProjectTokenResetAt = projectResetAt
+	}
+}
+
+func (s *ContentModerationService) strictModerationAPIKeyHasBudget(key string, requiredTokens int, now time.Time) bool {
+	if s == nil || requiredTokens <= 0 {
+		return true
+	}
+	hash := moderationAPIKeyHash(key)
+	if hash == "" {
+		return true
+	}
+	s.keyHealthMu.Lock()
+	defer s.keyHealthMu.Unlock()
+	state := s.keyHealth[hash]
+	if state == nil {
+		return true
+	}
+	if state.TokenRemainingKnown && !now.Before(state.TokenResetAt) {
+		state.TokenRemainingKnown = false
+	}
+	if state.ProjectTokenRemainingKnown && !now.Before(state.ProjectTokenResetAt) {
+		state.ProjectTokenRemainingKnown = false
+	}
+	if state.TokenRemainingKnown && state.TokenRemaining < int64(requiredTokens) {
+		return false
+	}
+	return !state.ProjectTokenRemainingKnown || state.ProjectTokenRemaining >= int64(requiredTokens)
+}
+
+func strictModerationHeaderTokenBudget(remainingHeader, resetHeader string, now time.Time) (int64, time.Time, bool) {
+	remaining, err := strconv.ParseInt(strings.TrimSpace(remainingHeader), 10, 64)
+	if err != nil || remaining < 0 {
+		return 0, time.Time{}, false
+	}
+	resetAt := strictModerationHeaderResetAt(resetHeader, now)
+	if resetAt.IsZero() {
+		resetAt = now.Add(contentModerationKeyRateLimitFreezeDuration)
+	}
+	return remaining, resetAt, true
+}
+
+func strictModerationHeaderResetAt(value string, now time.Time) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	const maxReset = 24 * time.Hour
+	if duration, err := time.ParseDuration(value); err == nil && duration > 0 {
+		if duration > maxReset {
+			duration = maxReset
+		}
+		return now.Add(duration)
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		if at.Sub(now) > maxReset {
+			return now.Add(maxReset)
+		}
+		return at
+	}
+	return time.Time{}
+}
+
 func captureModerationAPIResponseDiagnostics(resp *http.Response, apiKey string) moderationAPIResponseDiagnostics {
 	diagnostics := moderationAPIResponseDiagnostics{KeyHash: moderationAPIKeyHash(apiKey)}
 	if resp == nil {
