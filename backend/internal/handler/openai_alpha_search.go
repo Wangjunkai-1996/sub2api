@@ -78,11 +78,6 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 	reqLog = reqLog.With(zap.String("model", requestedModel))
 	setOpsRequestContext(c, requestedModel, false)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeSync))
-	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, "openai_alpha_search", requestedModel, body); decision != nil && !decision.AllowNextStage {
-		h.openAISecurityAuditError(c, decision)
-		return
-	}
-
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, requestedModel)
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)

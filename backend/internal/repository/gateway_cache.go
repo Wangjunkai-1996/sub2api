@@ -127,26 +127,7 @@ func (c *gatewayCache) ReleaseGrokVideoBilled(ctx context.Context, key string) e
 	return c.rdb.Del(ctx, grokVideoBilledPrefix+key).Err()
 }
 
-// Compile-time assertion: gatewayCache must implement CyberSessionBlockStore.
-var _ service.CyberSessionBlockStore = (*gatewayCache)(nil)
 var _ service.LiveCallStore = (*gatewayCache)(nil)
-
-const cyberSessionBlockPrefix = "cyber_session_block:"
-
-// SetCyberSessionBlocked 把被 cyber_policy 命中的会话写入屏蔽表（TTL 自动过期）。
-// 存储值 "1" 作为存在标记（IsCyberSessionBlocked 只检查 key 是否存在，不读值）。
-func (c *gatewayCache) SetCyberSessionBlocked(ctx context.Context, key string, ttl time.Duration) error {
-	return c.rdb.Set(ctx, cyberSessionBlockPrefix+key, "1", ttl).Err()
-}
-
-// IsCyberSessionBlocked 查询会话是否在屏蔽表中。
-func (c *gatewayCache) IsCyberSessionBlocked(ctx context.Context, key string) (bool, error) {
-	n, err := c.rdb.Exists(ctx, cyberSessionBlockPrefix+key).Result()
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
-}
 
 var claimLiveControllerScript = redis.NewScript(`
 	local key = KEYS[1]

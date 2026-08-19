@@ -24,15 +24,7 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 		{file: "gateway_handler_chat_completions.go", function: "ChatCompletions", auditToken: "checkSecurityAudit"},
 		{file: "gateway_handler_responses.go", function: "Responses", auditToken: "checkSecurityAudit"},
 		{file: "gemini_v1beta_handler.go", function: "GeminiV1BetaModels", auditToken: "checkSecurityAudit"},
-		{file: "openai_gateway_handler.go", function: "Responses", auditToken: "checkSecurityAudit"},
-		{file: "openai_gateway_handler.go", function: "Messages", auditToken: "checkSecurityAudit"},
-		{file: "openai_chat_completions.go", function: "ChatCompletions", auditToken: "checkSecurityAudit"},
-		{file: "openai_images.go", function: "Images", auditToken: "checkSecurityAudit"},
 		{file: "grok_media.go", function: "handleGrokMedia", auditToken: "checkSecurityAudit"},
-		{file: "openai_embeddings.go", function: "Embeddings", auditToken: "checkSecurityAudit"},
-		{file: "openai_alpha_search.go", function: "AlphaSearch", auditToken: "checkSecurityAudit"},
-		{file: "image_task_handler.go", function: "Submit", auditToken: "checkSecurityAuditBeforeSubmit"},
-		{file: "batch_image_handler.go", function: "Submit", auditToken: "checkSecurityAuditBeforeSubmit"},
 	}
 	sideEffectTokens := []string{
 		"CheckBillingEligibility(", "SelectAccount", ".Forward", "acquireResponsesUserSlot(",
@@ -54,6 +46,30 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 				require.Lessf(t, auditIndex, index, "%s must run before %s", tt.auditToken, sideEffect)
 			}
 			require.True(t, foundSideEffect, "coverage case must contain a downstream side effect")
+		})
+	}
+}
+
+func TestOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
+	tests := []struct {
+		file     string
+		function string
+	}{
+		{file: "openai_gateway_handler.go", function: "Responses"},
+		{file: "openai_gateway_handler.go", function: "Messages"},
+		{file: "openai_chat_completions.go", function: "ChatCompletions"},
+		{file: "openai_images.go", function: "Images"},
+		{file: "openai_embeddings.go", function: "Embeddings"},
+		{file: "openai_alpha_search.go", function: "AlphaSearch"},
+		{file: "image_task_handler.go", function: "Submit"},
+		{file: "batch_image_handler.go", function: "Submit"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file+"/"+tt.function, func(t *testing.T) {
+			source := stripGoComments(goFunctionSource(t, tt.file, tt.function))
+			for _, forbidden := range []string{"checkSecurityAudit", "ensureSecurityAuditForAccount", "newOpenAIAccountAuditState"} {
+				require.NotContains(t, source, forbidden)
+			}
 		})
 	}
 }

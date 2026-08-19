@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -240,7 +241,31 @@ func (s *OpenAIGatewayService) SelectAccountForModel(ctx context.Context, groupI
 // SelectAccountForModelWithExclusions selects an account supporting the requested model while excluding specified accounts.
 // SelectAccountForModelWithExclusions 选择支持指定模型的账号，同时排除指定的账号。
 func (s *OpenAIGatewayService) SelectAccountForModelWithExclusions(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*Account, error) {
-	return s.selectAccountForModelWithExclusions(s.withOpenAIQuotaAutoPauseContext(ctx), groupID, PlatformOpenAI, sessionHash, requestedModel, excludedIDs, false, 0, "", false)
+	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
+	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
+	for {
+		account, err := s.selectAccountForModelWithExclusions(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, effectiveExcludedIDs, false, 0, "", false)
+		if err != nil || account == nil {
+			return account, err
+		}
+		cooldownErr := s.RecheckOpenAICyberAccountCooldown(ctx, account)
+		if cooldownErr == nil {
+			return account, nil
+		}
+		if errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownStateUnavailable) {
+			return nil, cooldownErr
+		}
+		if !errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownBlocked) {
+			return nil, cooldownErr
+		}
+		if effectiveExcludedIDs == nil {
+			effectiveExcludedIDs = make(map[int64]struct{})
+		}
+		if _, exists := effectiveExcludedIDs[account.ID]; exists {
+			return nil, ErrNoAvailableAccounts
+		}
+		effectiveExcludedIDs[account.ID] = struct{}{}
+	}
 }
 
 // NormalizeOpenAICompatiblePlatform 保留 grok 与国产 OpenAI 兼容供应商（kimi/zhipu/

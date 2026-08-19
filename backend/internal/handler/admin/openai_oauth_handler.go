@@ -209,12 +209,10 @@ func (h *OpenAIOAuthHandler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	var proxyURL string
-	if req.ProxyID != nil {
-		proxy, err := h.adminService.GetProxy(c.Request.Context(), *req.ProxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
-		}
+	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthProxyURL(c.Request.Context(), req.ProxyID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
 	}
 
 	// 未指定 client_id 时，根据请求路径平台自动设置默认值，避免 repository 层盲猜
@@ -392,16 +390,10 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		return
 	}
 
-	var proxyURL string
-	if req.ProxyID != nil {
-		proxy, err := h.adminService.GetProxy(c.Request.Context(), *req.ProxyID)
-		if err != nil {
-			response.ErrorFrom(c, err)
-			return
-		}
-		if proxy != nil {
-			proxyURL = proxy.URL()
-		}
+	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthProxyURL(c.Request.Context(), req.ProxyID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
 	}
 
 	tokenInfo, err := h.openaiOAuthService.ValidateCodexPersonalAccessToken(c.Request.Context(), req.AccessToken, proxyURL)
