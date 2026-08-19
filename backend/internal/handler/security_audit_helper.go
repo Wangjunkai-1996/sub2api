@@ -58,6 +58,22 @@ func (h *OpenAIGatewayHandler) checkSecurityAudit(c *gin.Context, reqLog *zap.Lo
 	return runSecurityAudit(c, reqLog, h.securityAuditCoordinator, h.contentModerationService, apiKey, subject, protocol, model, body, "http")
 }
 
+func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIProAccount(
+	c *gin.Context,
+	reqLog *zap.Logger,
+	apiKey *service.APIKey,
+	subject middleware2.AuthSubject,
+	account *service.Account,
+	protocol string,
+	model string,
+	body []byte,
+) *securityaudit.Decision {
+	if !service.IsOpenAIProOAuthAccount(account) {
+		return nil
+	}
+	return h.checkSecurityAudit(c, reqLog, apiKey, subject, protocol, model, body)
+}
+
 func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string) *securityaudit.Decision {
 	if c == nil || c.Request == nil {
 		return nil

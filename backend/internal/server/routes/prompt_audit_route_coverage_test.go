@@ -28,10 +28,10 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 	}
 
 	audited := map[string][]string{
-		"/messages":            {"gateway_handler.go"},
-		"/responses":           {"gateway_handler_responses.go"},
-		"/responses/*subpath":  {"gateway_handler_responses.go"},
-		"/chat/completions":    {"gateway_handler_chat_completions.go"},
+		"/messages":            {"gateway_handler.go", "openai_gateway_handler.go"},
+		"/responses":           {"gateway_handler_responses.go", "openai_gateway_handler.go"},
+		"/responses/*subpath":  {"gateway_handler_responses.go", "openai_gateway_handler.go"},
+		"/chat/completions":    {"gateway_handler_chat_completions.go", "openai_chat_completions.go"},
 		"/images/generations":  {"grok_media.go"},
 		"/images/edits":        {"grok_media.go"},
 		"/videos":              {"grok_media.go"},
@@ -77,9 +77,8 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 			source, readErr := os.ReadFile(filepath.Join("..", "..", "handler", filename))
 			require.NoError(t, readErr)
 			sourceText := string(source)
-			hasDirectAudit := strings.Contains(sourceText, "checkSecurityAudit")
-			hasSelectedAccountAudit := strings.Contains(sourceText, "newOpenAIAccountAuditState") &&
-				strings.Contains(sourceText, "ensureSecurityAuditForAccount")
+			hasDirectAudit := strings.Contains(sourceText, "checkSecurityAudit(")
+			hasSelectedAccountAudit := strings.Contains(sourceText, "checkSecurityAuditForSelectedOpenAIProAccount")
 			require.Truef(t, hasDirectAudit || hasSelectedAccountAudit, "%s route handler %s bypasses Coordinator", route, filename)
 		}
 	}

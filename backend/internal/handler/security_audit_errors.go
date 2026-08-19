@@ -18,12 +18,8 @@ func (h *OpenAIGatewayHandler) openAISecurityAuditError(c *gin.Context, decision
 		h.errorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := "api_error"
-	if decision.Kind == securityaudit.DecisionBlock {
-		errType = "permission_error"
-	}
 	c.JSON(securityAuditStatus(decision), gin.H{"error": gin.H{
-		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
+		"type": securityAuditErrorType(decision), "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
 }
 
@@ -35,12 +31,8 @@ func (h *GatewayHandler) openAISecurityAuditError(c *gin.Context, decision *secu
 		h.chatCompletionsErrorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := "api_error"
-	if decision.Kind == securityaudit.DecisionBlock {
-		errType = "permission_error"
-	}
 	c.JSON(securityAuditStatus(decision), gin.H{"error": gin.H{
-		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
+		"type": securityAuditErrorType(decision), "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
 }
 
@@ -65,13 +57,16 @@ func (h *GatewayHandler) anthropicSecurityAuditError(c *gin.Context, decision *s
 		h.errorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := "api_error"
-	if decision.Kind == securityaudit.DecisionBlock {
-		errType = "permission_error"
-	}
 	c.JSON(securityAuditStatus(decision), gin.H{"type": "error", "error": gin.H{
-		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
+		"type": securityAuditErrorType(decision), "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
+}
+
+func securityAuditErrorType(decision *securityaudit.Decision) string {
+	if decision != nil && decision.Kind == securityaudit.DecisionBlock {
+		return "permission_error"
+	}
+	return "api_error"
 }
 
 func googleSecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
