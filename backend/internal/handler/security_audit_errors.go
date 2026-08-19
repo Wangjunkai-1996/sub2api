@@ -1,15 +1,11 @@
 package handler
 
 import (
-	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/googleapi"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
-	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 )
@@ -78,23 +74,6 @@ func (h *GatewayHandler) anthropicSecurityAuditError(c *gin.Context, decision *s
 	}})
 }
 
-func (h *OpenAIGatewayHandler) anthropicSecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
-	if decision == nil {
-		return
-	}
-	if decision.Legacy != nil && decision.Legacy.Blocked {
-		h.anthropicErrorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
-		return
-	}
-	errType := "api_error"
-	if decision.Kind == securityaudit.DecisionBlock {
-		errType = "permission_error"
-	}
-	c.JSON(securityAuditStatus(decision), gin.H{"type": "error", "error": gin.H{
-		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
-	}})
-}
-
 func googleSecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
 	if decision == nil {
 		return
@@ -120,39 +99,6 @@ func googleSecurityAuditError(c *gin.Context, decision *securityaudit.Decision) 
 			"metadata": gin.H{"request_id": requestID},
 		}},
 	}})
-}
-
-func writeSecurityAuditWSError(ctx context.Context, conn *coderws.Conn, decision *securityaudit.Decision) {
-	if conn == nil || decision == nil {
-		return
-	}
-	if decision.Legacy != nil && decision.Legacy.Blocked {
-		legacy := decision.Legacy
-		writeContentModerationWSError(ctx, conn, (legacyContentModerationDecision{legacy}).toService())
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	payload, err := json.Marshal(gin.H{
-		"event_id": "evt_prompt_guard_rejected", "type": "error",
-		"error": gin.H{"type": "invalid_request_error", "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision)},
-	})
-	if err != nil {
-		return
-	}
-	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	_ = conn.Write(writeCtx, coderws.MessageText, payload)
-}
-
-type legacyContentModerationDecision struct{ value *securityaudit.LegacyDecision }
-
-func (d legacyContentModerationDecision) toService() *service.ContentModerationDecision {
-	if d.value == nil {
-		return nil
-	}
-	return &service.ContentModerationDecision{Allowed: d.value.Allowed, Blocked: d.value.Blocked, Flagged: d.value.Flagged, Message: d.value.Message, StatusCode: d.value.StatusCode, Action: d.value.Action}
 }
 
 func securityAuditWSCloseStatus(decision *securityaudit.Decision) coderws.StatusCode {

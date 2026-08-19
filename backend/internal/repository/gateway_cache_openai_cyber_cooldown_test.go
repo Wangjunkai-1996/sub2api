@@ -80,7 +80,8 @@ func TestGatewayCacheOpenAICyberAccountCooldownStrike(t *testing.T) {
 func TestGatewayCacheOpenAICyberAccountCooldownTTLTracksLongerCooldown(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
-	store := NewGatewayCache(client).(service.OpenAICyberAccountCooldownStore)
+	store, ok := NewGatewayCache(client).(service.OpenAICyberAccountCooldownStore)
+	require.True(t, ok)
 	ctx := context.Background()
 	now := time.Unix(1_800_000_000, 0).UTC()
 	window := 2 * time.Minute
@@ -110,7 +111,8 @@ func TestGatewayCacheOpenAICyberAccountCooldownTTLTracksLongerCooldown(t *testin
 func TestGatewayCacheOpenAICyberAccountCooldownRejectsInvalidInput(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
-	store := NewGatewayCache(client).(service.OpenAICyberAccountCooldownStore)
+	store, ok := NewGatewayCache(client).(service.OpenAICyberAccountCooldownStore)
+	require.True(t, ok)
 
 	_, err := store.RecordOpenAICyberAccountCooldownStrike(context.Background(), 0, "", 0, 0, 0, time.Now())
 	require.Error(t, err)

@@ -1153,65 +1153,6 @@ func TestOpenAIResponsesWebSocket_PreviousResponseIDKindLoggedBeforeAcquireFailu
 	require.Contains(t, strings.ToLower(closeErr.Reason), "failed to acquire user concurrency slot")
 }
 
-type contentModerationHandlerSettingRepo struct {
-	values map[string]string
-}
-
-func (r *contentModerationHandlerSettingRepo) Get(ctx context.Context, key string) (*service.Setting, error) {
-	if value, ok := r.values[key]; ok {
-		return &service.Setting{Key: key, Value: value}, nil
-	}
-	return nil, service.ErrSettingNotFound
-}
-
-func (r *contentModerationHandlerSettingRepo) GetValue(ctx context.Context, key string) (string, error) {
-	if value, ok := r.values[key]; ok {
-		return value, nil
-	}
-	return "", service.ErrSettingNotFound
-}
-
-func (r *contentModerationHandlerSettingRepo) Set(ctx context.Context, key, value string) error {
-	if r.values == nil {
-		r.values = map[string]string{}
-	}
-	r.values[key] = value
-	return nil
-}
-
-func (r *contentModerationHandlerSettingRepo) GetMultiple(ctx context.Context, keys []string) (map[string]string, error) {
-	out := map[string]string{}
-	for _, key := range keys {
-		if value, ok := r.values[key]; ok {
-			out[key] = value
-		}
-	}
-	return out, nil
-}
-
-func (r *contentModerationHandlerSettingRepo) SetMultiple(ctx context.Context, settings map[string]string) error {
-	if r.values == nil {
-		r.values = map[string]string{}
-	}
-	for key, value := range settings {
-		r.values[key] = value
-	}
-	return nil
-}
-
-func (r *contentModerationHandlerSettingRepo) GetAll(ctx context.Context) (map[string]string, error) {
-	out := make(map[string]string, len(r.values))
-	for key, value := range r.values {
-		out[key] = value
-	}
-	return out, nil
-}
-
-func (r *contentModerationHandlerSettingRepo) Delete(ctx context.Context, key string) error {
-	delete(r.values, key)
-	return nil
-}
-
 func TestOpenAIResponsesWebSocket_PassthroughUsageLogPersistsUserAgentAndReasoningEffort(t *testing.T) {
 	got := runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
 		firstPayload: `{"type":"response.create","model":"gpt-5.4","stream":false,"reasoning":{"effort":"HIGH"}}`,

@@ -164,16 +164,6 @@ func normalizeOpenAICyberAccountCooldownSettings(settings *SystemSettings) error
 	)
 }
 
-func disabledOpenAICyberAccountCooldownPolicy() OpenAICyberAccountCooldownPolicy {
-	return newOpenAICyberAccountCooldownPolicy(
-		false,
-		defaultOpenAICyberAccountCooldownWindowSeconds,
-		defaultOpenAICyberAccountCooldownFirstSeconds,
-		defaultOpenAICyberAccountCooldownEscalatedSeconds,
-		defaultOpenAICyberAccountCooldownGroupIDs,
-	)
-}
-
 func conservativeOpenAICyberAccountCooldownPolicy() OpenAICyberAccountCooldownPolicy {
 	return newOpenAICyberAccountCooldownPolicy(
 		true,
