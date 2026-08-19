@@ -31,18 +31,14 @@ func (c *advancingClock) Now() time.Time {
 }
 
 type fakeConfigStore struct {
-	cfg           ActiveConfig
-	active        bool
-	effectiveMode *Mode
+	cfg    ActiveConfig
+	active bool
 }
 
 func (s *fakeConfigStore) Start(context.Context) error    { return nil }
 func (s *fakeConfigStore) Shutdown(context.Context) error { return nil }
 func (s *fakeConfigStore) Active() (ActiveConfig, bool)   { return cloneActiveConfig(s.cfg), s.active }
 func (s *fakeConfigStore) EffectiveMode() Mode {
-	if s.effectiveMode != nil {
-		return *s.effectiveMode
-	}
 	if s.BlockingActivationDegraded() {
 		return ModeBlocking
 	}
@@ -75,9 +71,6 @@ type fakeJobRepository struct {
 	failErr     error
 
 	createdSnapshot PromptSnapshot
-	createdVersion  int64
-	createdAttempts int
-	createdCapacity int
 	markedCode      string
 	completedResult *NormalizedResult
 	completedStore  bool
@@ -104,14 +97,11 @@ func (r *fakeJobRepository) record(value string) {
 	}
 }
 
-func (r *fakeJobRepository) CreateStagingWithCapacity(_ context.Context, snapshot PromptSnapshot, version int64, attempts, capacity int) (*Job, error) {
+func (r *fakeJobRepository) CreateStagingWithCapacity(_ context.Context, snapshot PromptSnapshot, _ int64, _, _ int) (*Job, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.record("create_staging")
 	r.createdSnapshot = snapshot
-	r.createdVersion = version
-	r.createdAttempts = attempts
-	r.createdCapacity = capacity
 	if r.createErr != nil {
 		return nil, r.createErr
 	}
@@ -264,7 +254,6 @@ func TestEnqueuerStagingPayloadPublishProtocolAndFailureCleanup(t *testing.T) {
 		require.Empty(t, repo.createdSnapshot.ScanText)
 		require.Equal(t, "payload canary text", payload.values[41])
 		require.Equal(t, DefaultPayloadTTL, payload.setTTL)
-		require.Equal(t, standardAsyncMaxAttempts, repo.createdAttempts)
 	})
 
 	t.Run("queue admission failures never touch payload", func(t *testing.T) {
@@ -300,38 +289,6 @@ func TestEnqueuerStagingPayloadPublishProtocolAndFailureCleanup(t *testing.T) {
 	})
 }
 
-func TestEnqueuerStrictUsesCurrentUserTextAndSingleAttempt(t *testing.T) {
-	latest := "current:" + strings.Repeat("界", 12_100)
-	body := []byte(`{"messages":[
-		{"role":"system","content":"system instruction"},
-		{"role":"user","content":"historical user"},
-		{"role":"assistant","content":"assistant output"},
-		{"role":"tool","content":"tool output"},
-		{"role":"user","content":` + string(mustJSON(t, latest)) + `}
-	]}`)
-	repo := &fakeJobRepository{createJob: &Job{ID: 45}}
-	payload := &fakePayloadStore{values: map[int64]string{}}
-	req := Request{
-		Strict: true, Protocol: "openai_chat_completions", Model: "gpt-5.6-terra", Body: body,
-		AuditContext: strings.Repeat("lineage must stay local", 1000),
-	}
-
-	require.NoError(t, NewEnqueuer(
-		&fakeConfigStore{cfg: asyncConfig(), active: true}, repo, payload,
-	).Enqueue(context.Background(), req))
-
-	require.Equal(t, strictAsyncMaxAttempts, repo.createdAttempts)
-	require.Equal(t, int64(7), repo.createdVersion)
-	require.Equal(t, 8, repo.createdCapacity)
-	require.Equal(t, req.Protocol, repo.createdSnapshot.Protocol)
-	require.Equal(t, req.Model, repo.createdSnapshot.Model)
-	require.Equal(t, len([]rune(latest)), repo.createdSnapshot.PromptLength)
-	require.Empty(t, repo.createdSnapshot.ScanText)
-	require.Equal(t, latest, payload.values[45])
-	require.NotContains(t, payload.values[45], "historical user")
-	require.NotContains(t, payload.values[45], "lineage must stay local")
-}
-
 func TestEnqueuerSkipsOffOutOfScopeAndNoText(t *testing.T) {
 	tests := []struct {
 		name string
@@ -345,7 +302,7 @@ func TestEnqueuerSkipsOffOutOfScopeAndNoText(t *testing.T) {
 			cfg.GroupIDs = []int64{9}
 			return cfg
 		}(), req: asyncRequest()},
-		{name: "no user text", cfg: asyncConfig(), req: Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"user","content":"  "}]}`)}},
+		{name: "no user text", cfg: asyncConfig(), req: Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"function","content":"not audited"}]}`)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -418,11 +375,7 @@ func TestWorkerCompletesPassWithoutEventRefreshesEveryChunkAndDeletesPayload(t *
 	metrics := NewAtomicMetrics()
 	runner := NewRunner(&fakeConfigStore{cfg: asyncConfig(), active: true}, repo, payload, scanner, metrics)
 	runner.clock = fixedClock{now: time.Unix(100, 0).UTC()}
-	job := workerJob(1, standardAsyncMaxAttempts)
-	job.ExecutionMode = ModeAsync
-	job.Snapshot.Protocol = "openai_chat_completions"
-	job.Snapshot.Model = "gpt-5.6-terra"
-	require.NoError(t, runner.processJob(context.Background(), 0, asyncConfig(), job))
+	require.NoError(t, runner.processJob(context.Background(), 0, asyncConfig(), workerJob(1, 3)))
 	require.Equal(t, 2, scannerCalls)
 	require.Equal(t, 2, repo.refreshes)
 	require.NotNil(t, repo.completedResult)
@@ -492,86 +445,6 @@ func TestWorkerRetryBackoffTerminalFailureAndFailover(t *testing.T) {
 	runner := NewRunner(&fakeConfigStore{cfg: cfg, active: true}, repo, payload, scanner, metrics)
 	require.NoError(t, runner.processJob(context.Background(), 0, cfg, workerJob(1, 3)))
 	require.Equal(t, int64(1), metrics.Snapshot().Failovers)
-}
-
-func TestWorkerStrictAsyncUsesOneBoundedPrimaryScanWithoutRetry(t *testing.T) {
-	strictJob := func() *Job {
-		job := workerJob(1, strictAsyncMaxAttempts)
-		job.ExecutionMode = ModeAsync
-		job.Snapshot.Protocol = "openai_chat_completions"
-		job.Snapshot.Model = "gpt-5.6-terra"
-		job.Snapshot.PromptLength = 6
-		return job
-	}
-	cfg := asyncConfig()
-	cfg.Endpoints = []ActiveEndpoint{
-		{ID: "primary", Enabled: true, InputLimit: 3},
-		{ID: "backup", Enabled: true, InputLimit: 10},
-	}
-
-	t.Run("insufficient capacity fails without scanning or failover", func(t *testing.T) {
-		repo := &fakeJobRepository{}
-		payload := &fakePayloadStore{values: map[int64]string{51: "abcdef"}}
-		calls := make([]string, 0, 1)
-		runner := NewRunner(&fakeConfigStore{cfg: cfg, active: true}, repo, payload, PromptScannerFunc(func(_ context.Context, endpoint ActiveEndpoint, chunk string, _ []string) (*NormalizedResult, error) {
-			calls = append(calls, endpoint.ID+":"+chunk)
-			return integrationResult(EventPass), nil
-		}), NewAtomicMetrics())
-
-		require.Error(t, runner.processJob(context.Background(), 0, cfg, strictJob()))
-		require.Empty(t, calls)
-		require.Zero(t, repo.refreshes)
-		require.Zero(t, repo.completeCount)
-		require.Equal(t, 1, repo.failed)
-	})
-
-	t.Run("retryable failure neither fails over nor retries", func(t *testing.T) {
-		fitCfg := cfg
-		fitCfg.Endpoints = append([]ActiveEndpoint(nil), cfg.Endpoints...)
-		fitCfg.Endpoints[0].InputLimit = 10
-		repo := &fakeJobRepository{}
-		payload := &fakePayloadStore{values: map[int64]string{51: "abcdef"}}
-		calls := make([]string, 0, 1)
-		runner := NewRunner(&fakeConfigStore{cfg: fitCfg, active: true}, repo, payload, PromptScannerFunc(func(_ context.Context, endpoint ActiveEndpoint, chunk string, _ []string) (*NormalizedResult, error) {
-			calls = append(calls, endpoint.ID+":"+chunk)
-			return nil, &GuardError{Code: ErrorCodeUnavailable, Retryable: true}
-		}), NewAtomicMetrics())
-
-		require.Error(t, runner.processJob(context.Background(), 0, fitCfg, strictJob()))
-		require.Equal(t, []string{"primary:abcdef"}, calls)
-		require.Zero(t, repo.retried)
-		require.Equal(t, 1, repo.failed)
-		require.Equal(t, []int64{51}, payload.deleted)
-	})
-}
-
-func TestStrictAsyncJobMarkerRequiresEveryInvariant(t *testing.T) {
-	base := Job{
-		ExecutionMode: ModeAsync,
-		MaxAttempts:   strictAsyncMaxAttempts,
-		Snapshot: PromptSnapshot{
-			Protocol: "openai_chat_completions",
-			Model:    "gpt-5.6-terra",
-		},
-	}
-	tests := []struct {
-		name string
-		job  *Job
-		want bool
-	}{
-		{name: "strict async", job: &base, want: true},
-		{name: "nil job", job: nil},
-		{name: "blocking mode", job: func() *Job { job := base; job.ExecutionMode = ModeBlocking; return &job }()},
-		{name: "standard attempts", job: func() *Job { job := base; job.MaxAttempts = standardAsyncMaxAttempts; return &job }()},
-		{name: "anthropic protocol", job: func() *Job { job := base; job.Snapshot.Protocol = "anthropic_messages"; return &job }(), want: true},
-		{name: "non GPT model", job: func() *Job { job := base; job.Snapshot.Model = "gemini-3-pro"; return &job }(), want: true},
-		{name: "image model", job: func() *Job { job := base; job.Snapshot.Model = "gpt-image-1.5"; return &job }(), want: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			require.Equal(t, test.want, strictAsyncJob(test.job))
-		})
-	}
 }
 
 func TestWorkerPanicLeaseLossAndLifecycleAreContained(t *testing.T) {

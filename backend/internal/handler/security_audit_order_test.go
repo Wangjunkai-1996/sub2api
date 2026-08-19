@@ -24,13 +24,7 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 		{file: "gateway_handler_chat_completions.go", function: "ChatCompletions", auditToken: "checkSecurityAudit"},
 		{file: "gateway_handler_responses.go", function: "Responses", auditToken: "checkSecurityAudit"},
 		{file: "gemini_v1beta_handler.go", function: "GeminiV1BetaModels", auditToken: "checkSecurityAudit"},
-		{file: "openai_gateway_handler.go", function: "Messages", auditToken: "checkSecurityAudit"},
-		{file: "openai_images.go", function: "Images", auditToken: "checkSecurityAudit"},
 		{file: "grok_media.go", function: "handleGrokMedia", auditToken: "checkSecurityAudit"},
-		{file: "openai_embeddings.go", function: "Embeddings", auditToken: "checkSecurityAudit"},
-		{file: "openai_alpha_search.go", function: "AlphaSearch", auditToken: "checkSecurityAudit"},
-		{file: "image_task_handler.go", function: "Submit", auditToken: "checkSecurityAuditBeforeSubmit"},
-		{file: "batch_image_handler.go", function: "Submit", auditToken: "checkSecurityAuditBeforeSubmit"},
 	}
 	sideEffectTokens := []string{
 		"CheckBillingEligibility(", "SelectAccount", ".Forward", "acquireResponsesUserSlot(",
@@ -56,28 +50,26 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 	}
 }
 
-func TestOpenAIAccountAuditRunsAfterSelectionBeforeForward(t *testing.T) {
+func TestOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 	tests := []struct {
-		file         string
-		function     string
-		forwardToken string
+		file     string
+		function string
 	}{
-		{file: "openai_gateway_handler.go", function: "Responses", forwardToken: "h.gatewayService.Forward("},
-		{file: "openai_chat_completions.go", function: "ChatCompletions", forwardToken: "h.gatewayService.ForwardAsChatCompletions("},
-		{file: "openai_gateway_handler.go", function: "ResponsesWebSocket", forwardToken: "h.gatewayService.ProxyResponsesWebSocketFromClient("},
+		{file: "openai_gateway_handler.go", function: "Responses"},
+		{file: "openai_gateway_handler.go", function: "Messages"},
+		{file: "openai_chat_completions.go", function: "ChatCompletions"},
+		{file: "openai_images.go", function: "Images"},
+		{file: "openai_embeddings.go", function: "Embeddings"},
+		{file: "openai_alpha_search.go", function: "AlphaSearch"},
+		{file: "image_task_handler.go", function: "Submit"},
+		{file: "batch_image_handler.go", function: "Submit"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.file+"/"+tt.function, func(t *testing.T) {
-			functionSource := stripGoComments(goFunctionSource(t, tt.file, tt.function))
-			selectionIndex := strings.Index(functionSource, "SelectAccountWithSchedulerForCapability(")
-			auditIndex := strings.Index(functionSource, "ensureSecurityAuditForAccount(")
-			forwardIndex := strings.Index(functionSource, tt.forwardToken)
-
-			require.NotEqual(t, -1, selectionIndex, "missing account selection")
-			require.NotEqual(t, -1, auditIndex, "missing account-aware audit gate")
-			require.NotEqual(t, -1, forwardIndex, "missing upstream forward")
-			require.Less(t, selectionIndex, auditIndex, "account selection must precede account-aware audit")
-			require.Less(t, auditIndex, forwardIndex, "account-aware audit must precede the first upstream forward")
+			source := stripGoComments(goFunctionSource(t, tt.file, tt.function))
+			for _, forbidden := range []string{"checkSecurityAudit", "ensureSecurityAuditForAccount", "newOpenAIAccountAuditState"} {
+				require.NotContains(t, source, forbidden)
+			}
 		})
 	}
 }

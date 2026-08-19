@@ -3,17 +3,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
-	"github.com/Wei-Shaw/sub2api/internal/service"
-	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -93,11 +88,7 @@ func TestPromptGuardOpenAIAndClaudeErrorEnvelopesGolden(t *testing.T) {
 			require.Equal(t, decision.HTTPStatus, recorder.Code)
 			errorObject := requireObject(t, decodeErrorJSON(t, recorder)["error"])
 			require.Equal(t, decision.ErrorCode, errorObject["code"])
-			if kind == securityaudit.DecisionBlock {
-				require.Equal(t, "permission_error", errorObject["type"])
-			} else {
-				require.Equal(t, "api_error", errorObject["type"])
-			}
+			require.Equal(t, "api_error", errorObject["type"])
 		})
 
 		t.Run("claude_"+string(kind), func(t *testing.T) {
@@ -115,24 +106,6 @@ func TestPromptGuardOpenAIAndClaudeErrorEnvelopesGolden(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestMalformedAuditInputUsesUnprocessableInvalidRequestEnvelope(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	decision := &securityaudit.Decision{
-		Kind: securityaudit.DecisionBlock, HTTPStatus: http.StatusUnprocessableEntity,
-		ErrorCode: securityaudit.ErrorCodeContextIncomplete, ClientMessage: "request cannot be audited",
-	}
-
-	c, recorder := securityAuditErrorTestContext(t)
-	(&GatewayHandler{}).responsesSecurityAuditError(c, decision)
-	require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
-	require.Equal(t, "invalid_request_error", requireObject(t, decodeErrorJSON(t, recorder)["error"])["type"])
-
-	c, recorder = securityAuditErrorTestContext(t)
-	googleSecurityAuditError(c, decision)
-	require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
-	require.Equal(t, "INVALID_ARGUMENT", requireObject(t, decodeErrorJSON(t, recorder)["error"])["status"])
 }
 
 func TestPromptGuardGeminiErrorEnvelopeGolden(t *testing.T) {
@@ -170,90 +143,6 @@ func TestPromptGuardWebSocketCloseMappingGolden(t *testing.T) {
 	require.Equal(t, securityaudit.ErrorCodeInvalidResponse, securityAuditWSCloseReason(promptGuardDecision(securityaudit.DecisionInvalid)))
 }
 
-func TestOpenAIStrictContinuationErrorsSeparateInvalidLineageFromInfrastructure(t *testing.T) {
-	invalid := openAIStrictContinuationErrorDecision(service.ErrOpenAIPreviousResponseAccountUnavailable)
-	require.Equal(t, securityaudit.DecisionBlock, invalid.Kind)
-	require.Equal(t, http.StatusForbidden, invalid.HTTPStatus)
-	require.Equal(t, securityaudit.ErrorCodeLineageIncompatible, invalid.ErrorCode)
-	require.Contains(t, invalid.ClientMessage, "新建会话")
-	require.Equal(t, coderws.StatusCode(4403), securityAuditWSCloseStatus(invalid))
-
-	for _, err := range []error{service.ErrOpenAIResponseAccountStoreUnavailable, errors.New("scheduler unavailable")} {
-		decision := openAIStrictContinuationErrorDecision(err)
-		require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
-		require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
-		require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, decision.ErrorCode)
-		require.Equal(t, coderws.StatusTryAgainLater, securityAuditWSCloseStatus(decision))
-	}
-}
-
-func TestOpenAIStrictLineageCommitErrorReturnsStructuredHTTP503(t *testing.T) {
-	c, recorder := securityAuditErrorTestContext(t)
-
-	(&OpenAIGatewayHandler{}).openAIStrictLineageCommitError(c)
-
-	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-	var payload map[string]any
-	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &payload))
-	require.Equal(t, securityaudit.ErrorCodeAuditUnavailable, requireObject(t, payload["error"])["code"])
-}
-
-func TestOpenAIStrictLineageCommitErrorReplacesStreamingSuccessWithFailedEvent(t *testing.T) {
-	c, recorder := securityAuditErrorTestContext(t)
-	c.Header("Content-Type", "text/event-stream")
-	_, err := c.Writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"safe\"}\n\n"))
-	require.NoError(t, err)
-
-	(&OpenAIGatewayHandler{}).openAIStrictLineageCommitError(c)
-
-	require.Equal(t, http.StatusOK, recorder.Code)
-	require.Contains(t, recorder.Body.String(), `"type":"response.output_text.delta"`)
-	require.Contains(t, recorder.Body.String(), `"type":"response.failed"`)
-	require.Contains(t, recorder.Body.String(), securityaudit.ErrorCodeAuditUnavailable)
-	require.NotContains(t, recorder.Body.String(), `"type":"response.completed"`)
-}
-
-func TestStrictLegacyModerationWebSocketKeepsPolicyCode(t *testing.T) {
-	decision := &securityaudit.Decision{
-		Kind: securityaudit.DecisionBlock, HTTPStatus: http.StatusForbidden,
-		ErrorCode: securityaudit.ErrorCodePolicyBlocked, ClientMessage: "strict policy block",
-		Legacy: &securityaudit.LegacyDecision{
-			Blocked: true, Flagged: true, StatusCode: http.StatusForbidden,
-			ErrorCode: "content_policy_violation", Message: "legacy moderation block",
-		},
-	}
-
-	require.False(t, usesLegacySecurityAuditWSError(decision))
-	require.Equal(t, int64(4403), int64(securityAuditWSCloseStatus(decision)))
-	require.Equal(t, securityaudit.ErrorCodePolicyBlocked, securityAuditWSCloseReason(decision))
-
-	serverErr := make(chan error, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := coderws.Accept(w, r, nil)
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer conn.CloseNow()
-		writeSecurityAuditWSError(r.Context(), conn, decision)
-		serverErr <- nil
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	require.NoError(t, err)
-	defer client.CloseNow()
-	messageType, payload, err := client.Read(ctx)
-	require.NoError(t, err)
-	require.Equal(t, coderws.MessageText, messageType)
-	require.NoError(t, <-serverErr)
-	var event map[string]any
-	require.NoError(t, json.Unmarshal(payload, &event))
-	require.Equal(t, securityaudit.ErrorCodePolicyBlocked, requireObject(t, event["error"])["code"])
-}
-
 func TestLegacyModerationErrorKeepsExistingClientPriority(t *testing.T) {
 	legacy := &securityaudit.Decision{
 		Kind: securityaudit.DecisionBlock, HTTPStatus: http.StatusForbidden,
@@ -267,7 +156,4 @@ func TestLegacyModerationErrorKeepsExistingClientPriority(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "legacy exact message")
 	require.Contains(t, recorder.Body.String(), "content_policy_violation")
 	require.NotContains(t, recorder.Body.String(), securityaudit.ErrorCodeBlocked)
-	require.True(t, usesLegacySecurityAuditWSError(legacy))
-	require.Equal(t, int64(1008), int64(securityAuditWSCloseStatus(legacy)))
-	require.Equal(t, "legacy exact message", securityAuditWSCloseReason(legacy))
 }

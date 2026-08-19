@@ -22,24 +22,12 @@ func (h *OpenAIGatewayHandler) openAISecurityAuditError(c *gin.Context, decision
 		h.errorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := securityAuditErrorType(decision)
+	errType := "api_error"
+	if decision.Kind == securityaudit.DecisionBlock {
+		errType = "permission_error"
+	}
 	c.JSON(securityAuditStatus(decision), gin.H{"error": gin.H{
 		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
-	}})
-}
-
-func (h *OpenAIGatewayHandler) openAIStrictLineageCommitError(c *gin.Context) {
-	if c == nil {
-		return
-	}
-	const message = "安全审计暂时不可用，请稍后重试"
-	if c.Writer.Written() {
-		service.MarkOpsStreamError(c, securityaudit.ErrorCodeAuditUnavailable, message, http.StatusServiceUnavailable)
-		_ = writeResponsesFailedSSE(c, securityaudit.ErrorCodeAuditUnavailable, message)
-		return
-	}
-	c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
-		"type": "api_error", "code": securityaudit.ErrorCodeAuditUnavailable, "message": message,
 	}})
 }
 
@@ -51,7 +39,10 @@ func (h *GatewayHandler) openAISecurityAuditError(c *gin.Context, decision *secu
 		h.chatCompletionsErrorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := securityAuditErrorType(decision)
+	errType := "api_error"
+	if decision.Kind == securityaudit.DecisionBlock {
+		errType = "permission_error"
+	}
 	c.JSON(securityAuditStatus(decision), gin.H{"error": gin.H{
 		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
@@ -66,7 +57,7 @@ func (h *GatewayHandler) responsesSecurityAuditError(c *gin.Context, decision *s
 		return
 	}
 	c.JSON(securityAuditStatus(decision), gin.H{"error": gin.H{
-		"type": securityAuditErrorType(decision), "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
+		"type": "api_error", "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
 }
 
@@ -78,7 +69,10 @@ func (h *GatewayHandler) anthropicSecurityAuditError(c *gin.Context, decision *s
 		h.errorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := securityAuditErrorType(decision)
+	errType := "api_error"
+	if decision.Kind == securityaudit.DecisionBlock {
+		errType = "permission_error"
+	}
 	c.JSON(securityAuditStatus(decision), gin.H{"type": "error", "error": gin.H{
 		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
@@ -92,20 +86,13 @@ func (h *OpenAIGatewayHandler) anthropicSecurityAuditError(c *gin.Context, decis
 		h.anthropicErrorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
 		return
 	}
-	errType := securityAuditErrorType(decision)
+	errType := "api_error"
+	if decision.Kind == securityaudit.DecisionBlock {
+		errType = "permission_error"
+	}
 	c.JSON(securityAuditStatus(decision), gin.H{"type": "error", "error": gin.H{
 		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
 	}})
-}
-
-func securityAuditErrorType(decision *securityaudit.Decision) string {
-	if decision != nil && decision.ErrorCode == securityaudit.ErrorCodeContextIncomplete {
-		return "invalid_request_error"
-	}
-	if decision != nil && decision.Kind == securityaudit.DecisionBlock {
-		return "permission_error"
-	}
-	return "api_error"
 }
 
 func googleSecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
@@ -139,7 +126,7 @@ func writeSecurityAuditWSError(ctx context.Context, conn *coderws.Conn, decision
 	if conn == nil || decision == nil {
 		return
 	}
-	if usesLegacySecurityAuditWSError(decision) {
+	if decision.Legacy != nil && decision.Legacy.Blocked {
 		legacy := decision.Legacy
 		writeContentModerationWSError(ctx, conn, (legacyContentModerationDecision{legacy}).toService())
 		return
@@ -168,24 +155,11 @@ func (d legacyContentModerationDecision) toService() *service.ContentModerationD
 	return &service.ContentModerationDecision{Allowed: d.value.Allowed, Blocked: d.value.Blocked, Flagged: d.value.Flagged, Message: d.value.Message, StatusCode: d.value.StatusCode, Action: d.value.Action}
 }
 
-func usesLegacySecurityAuditWSError(decision *securityaudit.Decision) bool {
-	if decision == nil || decision.Legacy == nil || !decision.Legacy.Blocked {
-		return false
-	}
-	switch strings.TrimSpace(decision.ErrorCode) {
-	case securityaudit.ErrorCodePolicyBlocked, securityaudit.ErrorCodeContextIncomplete, securityaudit.ErrorCodeLineageIncompatible,
-		securityaudit.ErrorCodeAuditInputTooLarge, securityaudit.ErrorCodeAuditUnavailable:
-		return false
-	default:
-		return true
-	}
-}
-
 func securityAuditWSCloseStatus(decision *securityaudit.Decision) coderws.StatusCode {
 	if decision == nil {
 		return coderws.StatusInternalError
 	}
-	if usesLegacySecurityAuditWSError(decision) {
+	if decision.Legacy != nil && decision.Legacy.Blocked {
 		return coderws.StatusPolicyViolation
 	}
 	if decision.Kind == securityaudit.DecisionBlock {
@@ -198,7 +172,7 @@ func securityAuditWSCloseReason(decision *securityaudit.Decision) string {
 	if decision == nil {
 		return securityaudit.ErrorCodeUnavailable
 	}
-	if usesLegacySecurityAuditWSError(decision) {
+	if decision.Legacy != nil && decision.Legacy.Blocked {
 		message := strings.TrimSpace(decision.Legacy.Message)
 		if message != "" {
 			return message

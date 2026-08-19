@@ -2,7 +2,6 @@ package securityaudit
 
 import (
 	"context"
-	"errors"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -15,13 +14,6 @@ func NewLegacyModerationAdapter(svc *service.ContentModerationService) LegacyEng
 	return &LegacyModerationAdapter{service: svc}
 }
 
-func (a *LegacyModerationAdapter) BlockingApplies(ctx context.Context, req Request) (bool, error) {
-	if a == nil || a.service == nil {
-		return false, errors.New("strict content moderation service unavailable")
-	}
-	return a.service.StrictPreBlockApplies(ctx, cloneInt64Ptr(req.GroupID))
-}
-
 func (a *LegacyModerationAdapter) Check(ctx context.Context, req Request) (*LegacyDecision, error) {
 	if a == nil || a.service == nil {
 		return nil, nil
@@ -30,9 +22,7 @@ func (a *LegacyModerationAdapter) Check(ctx context.Context, req Request) (*Lega
 		RequestID: req.RequestID, UserID: req.UserID, UserEmail: req.UserEmail,
 		APIKeyID: req.APIKeyID, APIKeyName: req.APIKeyName, GroupID: cloneInt64Ptr(req.GroupID),
 		GroupName: req.GroupName, Endpoint: req.Endpoint, Provider: req.Provider,
-		Model: req.Model, Protocol: req.Protocol, Body: req.Body, Strict: req.Strict,
-		StrictScopeVerified: req.ForceStrictAdmission, Document: req.Document.Clone(),
-		AuditContext: req.AuditContext,
+		Model: req.Model, Protocol: req.Protocol, Body: req.Body,
 	})
 	if err != nil || decision == nil {
 		return nil, err
@@ -40,6 +30,6 @@ func (a *LegacyModerationAdapter) Check(ctx context.Context, req Request) (*Lega
 	return &LegacyDecision{
 		Allowed: decision.Allowed, Blocked: decision.Blocked, Flagged: decision.Flagged,
 		Message: decision.Message, StatusCode: decision.StatusCode,
-		ErrorCode: "content_policy_violation", Action: decision.Action, Unavailable: decision.Unavailable,
+		ErrorCode: "content_policy_violation", Action: decision.Action,
 	}, nil
 }

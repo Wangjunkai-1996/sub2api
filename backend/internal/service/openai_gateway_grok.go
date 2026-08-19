@@ -190,9 +190,6 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	var usage *OpenAIUsage
 	var firstTokenMs *int
 	responseID := ""
-	terminalEvent := ""
-	var lineageOutput []byte
-	lineageComplete := false
 	searchCount := 0
 	imageCount := 0
 	var imageOutputSizes []string
@@ -212,9 +209,6 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		usage = streamResult.usage
 		firstTokenMs = streamResult.firstTokenMs
 		responseID = strings.TrimSpace(streamResult.responseID)
-		terminalEvent = streamResult.terminalEvent
-		lineageOutput = streamResult.lineageOutput
-		lineageComplete = streamResult.lineageComplete
 		searchCount = streamResult.searchCount
 		imageCount = streamResult.imageCount
 		imageOutputSizes = streamResult.imageOutputSizes
@@ -225,9 +219,6 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		}
 		usage = nonStreamResult.usage
 		responseID = strings.TrimSpace(nonStreamResult.responseID)
-		terminalEvent = nonStreamResult.terminalEvent
-		lineageOutput = nonStreamResult.lineageOutput
-		lineageComplete = nonStreamResult.lineageComplete
 		searchCount = nonStreamResult.searchCount
 		imageCount = nonStreamResult.imageCount
 		imageOutputSizes = nonStreamResult.imageOutputSizes
@@ -238,20 +229,18 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	}
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(patchedBody, originalModel)
 	result := &OpenAIForwardResult{
-		RequestID:             firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
-		ResponseID:            responseID,
-		Usage:                 *usage,
-		Model:                 originalModel,
-		UpstreamModel:         upstreamModel,
-		ReasoningEffort:       reasoningEffort,
-		Stream:                reqStream,
-		OpenAIWSMode:          false,
-		UpstreamTerminalEvent: terminalEvent,
-		ResponseHeaders:       resp.Header.Clone(),
-		Duration:              time.Since(startTime),
-		FirstTokenMs:          firstTokenMs,
+		RequestID:       firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
+		ResponseID:      responseID,
+		Usage:           *usage,
+		Model:           originalModel,
+		UpstreamModel:   upstreamModel,
+		ReasoningEffort: reasoningEffort,
+		Stream:          reqStream,
+		OpenAIWSMode:    false,
+		ResponseHeaders: resp.Header.Clone(),
+		Duration:        time.Since(startTime),
+		FirstTokenMs:    firstTokenMs,
 	}
-	result.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
 	// Propagate search/image counters from the shared Responses handler — without
 	// this, stream/JSON counting runs but search_price_per_1k / image bills never apply.
 	if searchCount > 0 {

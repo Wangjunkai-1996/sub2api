@@ -641,17 +641,12 @@ export interface SystemSettings {
   payment_enabled: boolean;
   risk_control_enabled: boolean;
 
-  // Cyber session block
-  cyber_session_block_enabled: boolean;
-  cyber_session_block_ttl_seconds: number;
-  cyber_session_block_all_groups: boolean;
-  cyber_session_block_group_ids: number[];
-
   // OpenAI Cyber account cooldown
   openai_cyber_account_cooldown_enabled: boolean;
   openai_cyber_account_cooldown_window_seconds: number;
   openai_cyber_account_cooldown_first_seconds: number;
   openai_cyber_account_cooldown_escalated_seconds: number;
+  openai_cyber_account_cooldown_group_ids: number[];
 
   payment_min_amount: number;
   payment_max_amount: number;
@@ -684,7 +679,6 @@ export interface SystemSettings {
   openai_advanced_scheduler_enabled?: boolean;
   openai_advanced_scheduler_sticky_weighted_enabled?: boolean;
   openai_advanced_scheduler_subscription_priority_enabled?: boolean;
-  openai_account_audit_long_text_oauth_rollout_percent?: number;
   openai_advanced_scheduler_lb_top_k?: string;
   openai_advanced_scheduler_weight_priority?: string;
   openai_advanced_scheduler_weight_load?: string;
@@ -960,17 +954,12 @@ export interface UpdateSettingsRequest {
   payment_enabled?: boolean;
   risk_control_enabled?: boolean;
 
-  // Cyber session block
-  cyber_session_block_enabled?: boolean;
-  cyber_session_block_ttl_seconds?: number;
-  cyber_session_block_all_groups?: boolean;
-  cyber_session_block_group_ids?: number[];
-
   // OpenAI Cyber account cooldown
   openai_cyber_account_cooldown_enabled?: boolean;
   openai_cyber_account_cooldown_window_seconds?: number;
   openai_cyber_account_cooldown_first_seconds?: number;
   openai_cyber_account_cooldown_escalated_seconds?: number;
+  openai_cyber_account_cooldown_group_ids?: number[];
 
   payment_min_amount?: number;
   payment_max_amount?: number;
@@ -1003,7 +992,6 @@ export interface UpdateSettingsRequest {
   openai_advanced_scheduler_enabled?: boolean;
   openai_advanced_scheduler_sticky_weighted_enabled?: boolean;
   openai_advanced_scheduler_subscription_priority_enabled?: boolean;
-  openai_account_audit_long_text_oauth_rollout_percent?: number;
   openai_advanced_scheduler_lb_top_k?: string;
   openai_advanced_scheduler_weight_priority?: string;
   openai_advanced_scheduler_weight_load?: string;

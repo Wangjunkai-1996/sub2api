@@ -136,6 +136,11 @@ func TestOpenAICyberAccountCooldownEligibility(t *testing.T) {
 		want    bool
 	}{
 		{name: "pro oauth in pro pool via group ids", account: openAICyberCooldownEligibleAccount(), want: true},
+		{name: "pro oauth in pro pool via account groups", account: &Account{
+			ID: 11, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+			Credentials:   map[string]any{"plan_type": " Pro "},
+			AccountGroups: []AccountGroup{{GroupID: openAICyberAccountCooldownProGroupID}},
+		}, want: true},
 		{name: "chatgptpro alias is not exact pro", account: &Account{
 			ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
 			Credentials:   map[string]any{"plan_type": " ChatGPTPro "},
@@ -185,6 +190,20 @@ func TestOpenAICyberAccountCooldownEligibility(t *testing.T) {
 			require.Equal(t, tc.want, isOpenAICyberAccountCooldownEligible(tc.account))
 		})
 	}
+}
+
+func TestOpenAICyberAccountCooldownEligibilityUsesConfiguredGroups(t *testing.T) {
+	account := &Account{
+		ID:          12,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "pro"},
+		GroupIDs:    []int64{27},
+	}
+	policy := newOpenAICyberAccountCooldownPolicy(true, 3600, 3600, 7200, []int64{27})
+
+	require.True(t, isOpenAICyberAccountCooldownEligibleForPolicy(account, policy))
+	require.False(t, isOpenAICyberAccountCooldownEligibleForPolicy(account, conservativeOpenAICyberAccountCooldownPolicy()))
 }
 
 func TestOpenAICyberAccountCooldownIneligibleAccountsSkipAllState(t *testing.T) {

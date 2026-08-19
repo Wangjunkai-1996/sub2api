@@ -516,9 +516,6 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if before.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled != after.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled {
 		changed = append(changed, "openai_advanced_scheduler_subscription_priority_enabled")
 	}
-	if before.OpenAIAccountAuditLongTextOAuthRolloutPercent != after.OpenAIAccountAuditLongTextOAuthRolloutPercent {
-		changed = append(changed, "openai_account_audit_long_text_oauth_rollout_percent")
-	}
 	if before.OpenAIAdvancedSchedulerLBTopK != after.OpenAIAdvancedSchedulerLBTopK {
 		changed = append(changed, "openai_advanced_scheduler_lb_top_k")
 	}
@@ -595,18 +592,6 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if before.RiskControlEnabled != after.RiskControlEnabled {
 		changed = append(changed, "risk_control_enabled")
 	}
-	if before.CyberSessionBlockEnabled != after.CyberSessionBlockEnabled {
-		changed = append(changed, "cyber_session_block_enabled")
-	}
-	if before.CyberSessionBlockTTLSeconds != after.CyberSessionBlockTTLSeconds {
-		changed = append(changed, "cyber_session_block_ttl_seconds")
-	}
-	if before.CyberSessionBlockAllGroups != after.CyberSessionBlockAllGroups {
-		changed = append(changed, "cyber_session_block_all_groups")
-	}
-	if !slices.Equal(before.CyberSessionBlockGroupIDs, after.CyberSessionBlockGroupIDs) {
-		changed = append(changed, "cyber_session_block_group_ids")
-	}
 	if before.OpenAICyberAccountCooldownEnabled != after.OpenAICyberAccountCooldownEnabled {
 		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownEnabled)
 	}
@@ -618,6 +603,9 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	}
 	if before.OpenAICyberAccountCooldownEscalatedSeconds != after.OpenAICyberAccountCooldownEscalatedSeconds {
 		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds)
+	}
+	if !slices.Equal(before.OpenAICyberAccountCooldownGroupIDs, after.OpenAICyberAccountCooldownGroupIDs) {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownGroupIDs)
 	}
 	// Default platform quotas（JSON map，整体比较）
 	if !equalPlatformQuotaSettings(before.DefaultPlatformQuotas, after.DefaultPlatformQuotas) {

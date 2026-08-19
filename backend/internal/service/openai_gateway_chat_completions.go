@@ -395,7 +395,7 @@ func (s *OpenAIGatewayService) handleChatCompletionsErrorResponse(
 	account *Account,
 	requestedModel ...string,
 ) (*OpenAIForwardResult, error) {
-	return s.handleCompatErrorResponse(resp, c, account, writeChatCompletionsErrorWithCode, requestedModel...)
+	return s.handleCompatErrorResponse(resp, c, account, writeChatCompletionsError, requestedModel...)
 }
 
 // handleChatBufferedStreamingResponse reads all Responses SSE events from the
@@ -443,7 +443,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 			if clientMsg == "" {
 				clientMsg = "Request blocked by upstream cyber-security policy"
 			}
-			writeChatCompletionsErrorWithCode(c, http.StatusBadRequest, "invalid_request_error", "cyber_policy", "Request blocked by upstream cyber-security policy")
+			writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", clientMsg)
 			return nil, fmt.Errorf("openai cyber_policy: %s", msg)
 		}
 		message := openAICompatFailedResponseMessage(finalResponse)
@@ -632,7 +632,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				if !clientDisconnected {
 					// 被 refusal 检测扣留的 pendingSSE 有意丢弃——cyber 拦截优先于部分内容下发。
 					writeStreamHeaders()
-					clientMsg := "Request blocked by upstream cyber-security policy"
+					clientMsg := msg
+					if clientMsg == "" {
+						clientMsg = "Request blocked by upstream cyber-security policy"
+					}
 					if _, err := fmt.Fprint(c.Writer, buildChatStreamErrorSSE(code, clientMsg)); err == nil {
 						_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 						if fl, ok := c.Writer.(http.Flusher); ok {
@@ -994,16 +997,13 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 
 // writeChatCompletionsError writes an error response in OpenAI Chat Completions format.
 func writeChatCompletionsError(c *gin.Context, statusCode int, errType, message string) {
-	writeChatCompletionsErrorWithCode(c, statusCode, errType, "", message)
-}
-
-func writeChatCompletionsErrorWithCode(c *gin.Context, statusCode int, errType, code, message string) {
 	MarkResponseCommitted(c)
-	errorBody := gin.H{"type": errType, "message": message}
-	if code = strings.TrimSpace(code); code != "" {
-		errorBody["code"] = code
-	}
-	c.JSON(statusCode, gin.H{"error": errorBody})
+	c.JSON(statusCode, gin.H{
+		"error": gin.H{
+			"type":    errType,
+			"message": message,
+		},
+	})
 }
 
 // buildChatStreamErrorSSE builds one SSE data frame carrying an OpenAI chat

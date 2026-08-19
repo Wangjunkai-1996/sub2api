@@ -70,20 +70,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			body = liteBody
 		}
 	}
-	auditedStrictContinuation := openAIStrictHTTPContinuationRequired(ctx)
-	hardBoundContinuation := openAIHardBoundHTTPContinuationRequired(ctx)
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
-	if auditedStrictContinuation {
-		// Audited continuations intentionally bridge HTTP ingress to the producing
-		// account's native Responses WSv2 transport. The HTTP endpoint used by some
-		// compatible accounts rejects previous_response_id outright.
-		if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
-			return nil, ErrOpenAIPreviousResponseAccountUnavailable
-		}
-	} else {
-		// Ordinary HTTP ingress keeps the legacy HTTP transport contract.
-		wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
-	}
+	// 仅允许 WS 入站请求走 WS 上游，避免出现 HTTP -> WS 协议混用。
+	wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
 	passthroughEnabled := account.IsOpenAIPassthroughEnabled()
 	compactPath := isOpenAIResponsesCompactPath(c)
 	if shouldFlattenOpenAIResponsesNamespaces(account, wsDecision.Transport, passthroughEnabled, compactPath) {
@@ -172,7 +161,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		return nil, errors.New("openai ws v1 is temporarily unsupported; use ws v2")
 	}
-	if passthroughEnabled && !auditedStrictContinuation {
+	if passthroughEnabled {
 		attemptImageIntentInvalidated := false
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			strippedBody, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(body)
@@ -499,7 +488,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 		}
 	}
-	if previousResponseID := gjson.GetBytes(body, "previous_response_id"); wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 && previousResponseID.Exists() && strings.TrimSpace(previousResponseID.String()) == "" {
+	if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 && gjson.GetBytes(body, "previous_response_id").Exists() {
 		markPatchDelete("previous_response_id")
 	}
 	if openAIRequestBodyMayContainEmptyBase64InputImage(body) {
@@ -604,14 +593,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			hasPreviousResponseID,
 		)
 		maxAttempts := openAIWSReconnectRetryLimit + 1
-		if hardBoundContinuation {
-			maxAttempts = 1
-		}
 		wsAttempts := 0
 		var wsResult *OpenAIForwardResult
 		var wsErr error
 		wsLastFailureReason := ""
-		agentTaskRecoveryTried := hardBoundContinuation
+		agentTaskRecoveryTried := false
 		wsPrevResponseRecoveryTried := false
 		wsInvalidEncryptedContentRecoveryTried := false
 		recoverPrevResponseNotFound := func(attempt int) bool {
@@ -701,10 +687,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if wsErr == nil {
 				break
 			}
-			var lineageCommitErr *OpenAIStrictLineageCommitError
-			if errors.As(wsErr, &lineageCommitErr) {
-				break
-			}
 			if c != nil && c.Writer != nil && c.Writer.Written() {
 				break
 			}
@@ -719,10 +701,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			// previous_response_not_found 说明续链锚点不可用：
 			// 对非 function_call_output 场景，允许一次“去掉 previous_response_id 后重放”。
-			if !hardBoundContinuation && reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
+			if reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
 				continue
 			}
-			if !hardBoundContinuation && reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
+			if reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
 				continue
 			}
 			if retryable && attempt < maxAttempts {
@@ -813,21 +795,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			return wsResult, nil
 		}
-		var lineageCommitErr *OpenAIStrictLineageCommitError
-		if errors.As(wsErr, &lineageCommitErr) {
-			if wsResult != nil {
-				wsResult.UpstreamModel = upstreamModel
-				if wsResult.BillingModel == "" {
-					wsResult.BillingModel = billingModel
-				}
-				if wsResult.ImageCount > 0 {
-					wsResult.ImageSize = imageSizeTier
-					wsResult.ImageInputSize = imageInputSize
-					wsResult.BillingModel = imageBillingModel
-				}
-			}
-			return wsResult, wsErr
-		}
 		s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
 		return nil, wsErr
 	}
@@ -847,7 +814,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	httpInvalidEncryptedContentRetryTried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
-	allowInternalReplay := !hardBoundContinuation
 	for {
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
@@ -913,7 +879,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 			upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 			upstreamCode := extractUpstreamErrorCode(respBody)
-			if allowInternalReplay && !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
+			if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
 				agentTaskRecoveryTried = true
 				expectedTaskID := account.GetCredential("task_id")
 				if err := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); err != nil {
@@ -923,7 +889,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			respBody = s.redactAgentIdentitySensitiveBody(ctx, account, respBody)
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
-			if allowInternalReplay && !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && upstreamCode == "invalid_encrypted_content" {
+			if !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && upstreamCode == "invalid_encrypted_content" {
 				decoded, decodeErr := ensureReqBody()
 				if decodeErr != nil {
 					return nil, decodeErr
@@ -940,16 +906,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				}
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
 			}
-			if allowInternalReplay {
-				if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
-					return nil, fmt.Errorf("normalize rejected Responses field retry body: %w", retryErr)
-				} else if changed && rejectedFieldRetryState.Allow(retryBody) {
-					body = retryBody
-					requestView = newOpenAIRequestView(body)
-					reqBody = nil
-					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request after %s (account: %s)", reason, account.Name)
-					continue
-				}
+			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
+				return nil, fmt.Errorf("normalize rejected Responses field retry body: %w", retryErr)
+			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
+				body = retryBody
+				requestView = newOpenAIRequestView(body)
+				reqBody = nil
+				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request after %s (account: %s)", reason, account.Name)
+				continue
 			}
 			if s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody) {
 				upstreamDetail := ""
@@ -992,45 +956,27 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		var usage *OpenAIUsage
 		var firstTokenMs *int
 		responseID := ""
-		terminalEvent := ""
-		var lineageOutput []byte
-		lineageComplete := false
-		var responseErr error
 		imageCount := 0
 		searchCount := 0
 		var imageOutputSizes []string
 		if reqStream {
 			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
 			if err != nil {
-				var lineageCommitErr *OpenAIStrictLineageCommitError
-				if !errors.As(err, &lineageCommitErr) || streamResult == nil {
-					return nil, err
-				}
-				responseErr = err
+				return nil, err
 			}
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
 			responseID = strings.TrimSpace(streamResult.responseID)
-			terminalEvent = streamResult.terminalEvent
-			lineageOutput = streamResult.lineageOutput
-			lineageComplete = streamResult.lineageComplete
 			imageCount = streamResult.imageCount
 			imageOutputSizes = streamResult.imageOutputSizes
 			searchCount = streamResult.searchCount
 		} else {
 			nonStreamResult, err := s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
 			if err != nil {
-				var lineageCommitErr *OpenAIStrictLineageCommitError
-				if !errors.As(err, &lineageCommitErr) || nonStreamResult == nil {
-					return nil, err
-				}
-				responseErr = err
+				return nil, err
 			}
 			usage = nonStreamResult.usage
 			responseID = strings.TrimSpace(nonStreamResult.responseID)
-			terminalEvent = nonStreamResult.terminalEvent
-			lineageOutput = nonStreamResult.lineageOutput
-			lineageComplete = nonStreamResult.lineageComplete
 			imageCount = nonStreamResult.imageCount
 			imageOutputSizes = nonStreamResult.imageOutputSizes
 			searchCount = nonStreamResult.searchCount
@@ -1062,11 +1008,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			ReasoningEffort:               reasoningEffort,
 			Stream:                        reqStream,
 			OpenAIWSMode:                  false,
-			UpstreamTerminalEvent:         terminalEvent,
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
 		}
-		forwardResult.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
 		if imageCount > 0 {
 			forwardResult.ImageCount = imageCount
 			forwardResult.ImageSize = imageSizeTier
@@ -1080,7 +1024,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if searchCount > 0 && account != nil && account.IsGrok() {
 			forwardResult.SearchCount = searchCount
 		}
-		return forwardResult, responseErr
+		return forwardResult, nil
 	}
 }
 

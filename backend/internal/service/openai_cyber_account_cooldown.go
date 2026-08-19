@@ -16,9 +16,7 @@ import (
 const (
 	openAICyberAccountCooldownReason       = "upstream_cyber_policy"
 	openAICyberAccountCooldownRedisTimeout = 500 * time.Millisecond
-	// Kept as the compiled default for backward-compatible tests and settings.
-	// Runtime eligibility uses OpenAIAccountAuditRoutingPolicy instead.
-	openAICyberAccountCooldownProGroupID = int64(12)
+	openAICyberAccountCooldownProGroupID   = int64(12)
 )
 
 var (
@@ -120,7 +118,7 @@ func openAICyberAccountCooldownRedisContext(ctx context.Context) (context.Contex
 // Pro OAuth pool. Group membership can come from either repository-hydrated
 // AccountGroups or the scheduler snapshot's flattened GroupIDs.
 func isOpenAICyberAccountCooldownEligible(account *Account) bool {
-	return ClassifyOpenAIAccountAuditEligibility(account, DefaultOpenAIAccountAuditRoutingPolicy()).Eligible
+	return isOpenAICyberAccountCooldownEligibleForPolicy(account, conservativeOpenAICyberAccountCooldownPolicy())
 }
 
 func isPotentialOpenAICyberAccountCooldownEligible(account *Account) bool {
@@ -128,8 +126,21 @@ func isPotentialOpenAICyberAccountCooldownEligible(account *Account) bool {
 		account.Type == AccountTypeOAuth && strings.EqualFold(strings.TrimSpace(account.GetCredential("plan_type")), "pro")
 }
 
-func (s *OpenAIGatewayService) isOpenAICyberAccountCooldownEligible(ctx context.Context, account *Account) bool {
-	return s.ClassifyOpenAIAccountAuditEligibility(ctx, account).Eligible
+func isOpenAICyberAccountCooldownEligibleForPolicy(account *Account, policy OpenAICyberAccountCooldownPolicy) bool {
+	if !isPotentialOpenAICyberAccountCooldownEligible(account) {
+		return false
+	}
+	for _, groupID := range account.GroupIDs {
+		if policy.IncludesGroup(groupID) {
+			return true
+		}
+	}
+	for _, accountGroup := range account.AccountGroups {
+		if policy.IncludesGroup(accountGroup.GroupID) {
+			return true
+		}
+	}
+	return false
 }
 
 // ApplyCyberPolicyAccountCooldown applies the post-upstream account circuit
@@ -152,11 +163,8 @@ func (s *OpenAIGatewayService) ApplyCyberPolicyAccountCooldown(
 			clearPending()
 		}
 	}()
-	if !s.isOpenAICyberAccountCooldownEligible(ctx, account) {
-		return result
-	}
 	policy := s.settingService.GetOpenAICyberAccountCooldownRuntime(ctx)
-	if !policy.Enabled() {
+	if !policy.Enabled() || !isOpenAICyberAccountCooldownEligibleForPolicy(account, policy) {
 		return result
 	}
 
@@ -235,19 +243,20 @@ func (s *OpenAIGatewayService) ApplyCyberPolicyAccountCooldown(
 // An enabled policy requires a readable Redis deadline; failures are closed so
 // a DB persistence failure cannot become a cross-instance scheduling bypass.
 func (s *OpenAIGatewayService) RecheckOpenAICyberAccountCooldown(ctx context.Context, account *Account) error {
-	if s == nil || !s.isOpenAICyberAccountCooldownEligible(ctx, account) {
+	if s == nil || !isPotentialOpenAICyberAccountCooldownEligible(account) {
 		return nil
-	}
-	if s.isOpenAIAccountRuntimeBlocked(account) {
-		return ErrOpenAICyberAccountCooldownBlocked
 	}
 	// Tests and deliberately minimal service instances have no runtime setting
 	// service. Production constructors always provide one.
 	if s.settingService == nil {
 		return nil
 	}
-	if !s.settingService.GetOpenAICyberAccountCooldownRuntime(ctx).Enabled() {
+	policy := s.settingService.GetOpenAICyberAccountCooldownRuntime(ctx)
+	if !policy.Enabled() || !isOpenAICyberAccountCooldownEligibleForPolicy(account, policy) {
 		return nil
+	}
+	if s.isOpenAIAccountRuntimeBlocked(account) {
+		return ErrOpenAICyberAccountCooldownBlocked
 	}
 	store := s.openAICyberAccountCooldownStore()
 	if store == nil {

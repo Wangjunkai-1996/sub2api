@@ -91,9 +91,9 @@ func TestHandleErrorResponse_MatchesCompatSiblingForDeterministic400(t *testing.
 
 	compatCtx, _ := newOpenAIUpstreamErrorTestContext(t)
 	var compatStatus int
-	var compatType, compatCode, compatMsg string
-	writeError := func(_ *gin.Context, statusCode int, errType, code, message string) {
-		compatStatus, compatType, compatCode, compatMsg = statusCode, errType, code, message
+	var compatType, compatMsg string
+	writeError := func(_ *gin.Context, statusCode int, errType, message string) {
+		compatStatus, compatType, compatMsg = statusCode, errType, message
 	}
 	_, compatErr := svc.handleCompatErrorResponse(
 		newOpenAIUpstreamErrorResponse(http.StatusBadRequest, openAIInvalidFunctionParametersBody),
@@ -106,7 +106,6 @@ func TestHandleErrorResponse_MatchesCompatSiblingForDeterministic400(t *testing.
 		"两条路径的 error.type 必须一致")
 	require.Equal(t, compatMsg, gjson.Get(nativeRec.Body.String(), "error.message").String(),
 		"两条路径的 message 必须一致")
-	require.Empty(t, compatCode, "deterministic upstream errors do not invent a compat code")
 }
 
 // 上游只给 message、没有 type/code/param 时，仍要回 400 + 真实 message，

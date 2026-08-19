@@ -10,18 +10,9 @@ const (
 	OpenAIUpstreamTransportHTTPSSE              OpenAIUpstreamTransport = "http_sse"
 	OpenAIUpstreamTransportResponsesWebsocket   OpenAIUpstreamTransport = "responses_websockets"
 	OpenAIUpstreamTransportResponsesWebsocketV2 OpenAIUpstreamTransport = "responses_websockets_v2"
-	// OpenAIUpstreamTransportResponsesWebsocketV2Audited requires a native
-	// WSv2-capable account whose ingress mode runs every turn through the strict
-	// audit lifecycle. HTTP strict turns use this contract so a successful first
-	// turn cannot create a lineage that a later native continuation cannot reuse.
-	OpenAIUpstreamTransportResponsesWebsocketV2Audited OpenAIUpstreamTransport = "responses_websockets_v2_audited"
 	// OpenAIUpstreamTransportResponsesWebsocketV2Ingress 用于 WS ingress 入口选账号：
 	// mode_router_v2 开启时允许 ctx_pool/passthrough/http_bridge，拒绝 off。
 	OpenAIUpstreamTransportResponsesWebsocketV2Ingress OpenAIUpstreamTransport = "responses_websockets_v2_ingress"
-	// OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress is the strict WS
-	// ingress contract. It additionally permits http_bridge, whose per-turn
-	// parser and hooks provide the same audited lifecycle, but rejects passthrough.
-	OpenAIUpstreamTransportResponsesWebsocketV2AuditedIngress OpenAIUpstreamTransport = "responses_websockets_v2_audited_ingress"
 )
 
 // OpenAIWSProtocolDecision 表示协议决策结果。

@@ -194,7 +194,6 @@ func TestConfigManagerUndecryptableTokenStillFailsClosedForBlockingIntent(t *tes
 	service := &PromptService{config: manager, evaluator: NewGuardEvaluator(NewOpenAICompatibleScanner(), nil, nil)}
 	decision, err := service.Evaluate(context.Background(), Request{
 		Protocol: "openai_chat_completions",
-		Model:    "gpt-5.6-terra",
 		Body:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 	})
 	require.Error(t, err, "blocking intent with no usable endpoint must not let requests pass unaudited")
@@ -302,7 +301,7 @@ func TestConfigManagerStaleWeakerSnapshotFailsClosedWhenBlockingExpected(t *test
 	require.Equal(t, ModeBlocking, manager.EffectiveMode())
 
 	service := &PromptService{config: manager, evaluator: NewGuardEvaluator(nil, nil, nil)}
-	decision, err := service.Evaluate(context.Background(), Request{Protocol: "openai_chat_completions", Model: "gpt-5.6-terra", Body: []byte(`{"messages":[{"role":"user","content":"hi"}]}`)})
+	decision, err := service.Evaluate(context.Background(), Request{Protocol: "openai_chat_completions", Body: []byte(`{"messages":[{"role":"user","content":"hi"}]}`)})
 	require.Error(t, err)
 	require.Nil(t, decision)
 	var guardErr *GuardError
@@ -328,40 +327,24 @@ func (r *switchableSettingRepository) GetMultiple(ctx context.Context, keys []st
 	return r.staticSettingRepository.GetMultiple(ctx, keys)
 }
 
-func TestConfigManagerStartupLoadFailureFailsClosedWithoutTrustedSnapshot(t *testing.T) {
-	// A cold process cannot know whether the unavailable settings contain a
-	// strict group policy, so gateway admission must stay closed until one full
-	// snapshot has loaded.
+func TestConfigManagerStartupLoadFailureDoesNotBlockWhenBlockingNotIntended(t *testing.T) {
+	// Settings unavailable and no prior blocking intent: stay ModeOff so the
+	// gateway remains usable and admins can still disable/configure Prompt Audit.
 	manager := NewConfigManager(nil, errorSettingRepository{}, nil, prefixEncryptor{}, testTotpKeyConfig())
 	err := manager.Start(context.Background())
 	require.Error(t, err)
 	require.True(t, manager.configUntrusted.Load())
-	require.True(t, manager.BlockingActivationDegraded())
-	require.Equal(t, ModeBlocking, manager.EffectiveMode())
+	require.False(t, manager.BlockingActivationDegraded())
+	require.Equal(t, ModeOff, manager.EffectiveMode())
 
 	service := &PromptService{config: manager, evaluator: NewGuardEvaluator(nil, nil, nil)}
 	decision, evalErr := service.Evaluate(context.Background(), Request{
 		Protocol: "openai_chat_completions",
-		Model:    "gpt-5.6-terra",
 		Body:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 	})
-	require.Error(t, evalErr)
-	require.Nil(t, decision)
-	var guardErr *GuardError
-	require.ErrorAs(t, evalErr, &guardErr)
-	require.Equal(t, ErrorCodeUnavailable, guardErr.Code)
-
-	coordinator := NewCoordinator(&fakeLegacyEngine{strict: true, decision: &LegacyDecision{Allowed: true}}, service)
-	strictGroupID := int64(12)
-	admission := coordinator.Check(context.Background(), Request{
-		Protocol: "openai_chat_completions",
-		Model:    "gpt-5.6-terra",
-		GroupID:  &strictGroupID,
-		Body:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
-	})
-	require.False(t, admission.AllowNextStage)
-	require.Equal(t, DecisionUnavailable, admission.Kind)
-	require.Equal(t, ErrorCodeAuditUnavailable, admission.ErrorCode)
+	require.NoError(t, evalErr)
+	require.NotNil(t, decision)
+	require.Equal(t, DecisionAllow, decision.Kind)
 	require.NoError(t, manager.Shutdown(context.Background()))
 }
 
@@ -376,7 +359,6 @@ func TestConfigManagerStartupLoadFailureFailsClosedWhenBlockingIntended(t *testi
 	service := &PromptService{config: manager, evaluator: NewGuardEvaluator(nil, nil, nil)}
 	decision, err := service.Evaluate(context.Background(), Request{
 		Protocol: "openai_chat_completions",
-		Model:    "gpt-5.6-terra",
 		Body:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 	})
 	require.Error(t, err)
@@ -411,20 +393,19 @@ func TestConfigManagerUntrustedClearsOnSuccessfulDisable(t *testing.T) {
 	service := &PromptService{config: manager, evaluator: NewGuardEvaluator(nil, nil, nil)}
 	decision, evalErr := service.Evaluate(context.Background(), Request{
 		Protocol: "openai_chat_completions",
-		Model:    "gpt-5.6-terra",
 		Body:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 	})
 	require.NoError(t, evalErr)
 	require.Equal(t, DecisionAllow, decision.Kind)
 }
 
-func TestConfigManagerUntrustedWithoutSnapshotFailsClosedEvenWithoutObservedBlocking(t *testing.T) {
+func TestConfigManagerUntrustedWithoutBlockingDoesNotForceBlockingMode(t *testing.T) {
 	manager := &ConfigManager{}
 	manager.observeExpectedState(`{"enabled":true,"blocking_enabled":false,"config_version":2}`, true)
 	manager.markConfigUntrusted()
 	require.False(t, manager.expectedBlocking.Load())
-	require.True(t, manager.BlockingActivationDegraded())
-	require.Equal(t, ModeBlocking, manager.EffectiveMode(), "observed intent is not a complete trustworthy snapshot")
+	require.False(t, manager.BlockingActivationDegraded())
+	require.Equal(t, ModeOff, manager.EffectiveMode(), "async intent + untrusted must not force blocking unavailable")
 }
 
 func TestParseLegacyConfigDefaultsMissingFieldsWithoutEnablingBlocking(t *testing.T) {

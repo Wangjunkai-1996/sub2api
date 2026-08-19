@@ -85,7 +85,6 @@ const baseConfig = (): ContentModerationConfig => ({
   api_key_masks: [],
   api_key_statuses: [],
   timeout_ms: 3000,
-  max_rpm: 120,
   sample_rate: 100,
   all_groups: true,
   group_ids: [],
@@ -244,7 +243,6 @@ describe('admin RiskControlView', () => {
     await flushPromises()
 
     expect(updateConfig).toHaveBeenCalledWith(expect.objectContaining({
-      max_rpm: 120,
       model_filter: {
         type: 'include',
         models: ['gpt-5.5', 'gpt-5.4'],

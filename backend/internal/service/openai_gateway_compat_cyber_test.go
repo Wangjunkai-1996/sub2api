@@ -69,8 +69,6 @@ func TestForwardAsChatCompletions_BufferedCyberPolicyNoFailover(t *testing.T) {
 	require.NotNil(t, mark, "cyber mark must be set for handler-side recording")
 	require.Equal(t, "cyber_policy", mark.Code)
 	require.True(t, c.Writer.Written(), "cyber error must be written to client (passthrough)")
-	require.Contains(t, rec.Body.String(), `"code":"cyber_policy"`)
-	require.NotContains(t, rec.Body.String(), "flagged for cyber policy")
 }
 
 // I-1: chat completions 流式客户端 cyber 命中——result 必须被丢弃（返回 nil），
@@ -92,8 +90,6 @@ func TestForwardAsChatCompletions_StreamCyberPolicyDropsResult(t *testing.T) {
 	require.False(t, errors.As(err, &failoverErr), "cyber must NOT trigger failover")
 	require.NotNil(t, GetOpsCyberPolicy(c), "cyber mark must be set")
 	require.Contains(t, rec.Body.String(), "data: [DONE]", "stream must terminate with [DONE]")
-	require.Contains(t, rec.Body.String(), `"code":"cyber_policy"`)
-	require.NotContains(t, rec.Body.String(), "flagged for cyber policy")
 }
 
 // anthropic 非流式客户端（buffered 路径）cyber 命中——不 failover、标记已设、以 anthropic 错误格式回写、丢弃 result。
@@ -117,8 +113,6 @@ func TestForwardAsAnthropic_BufferedCyberPolicyNoFailover(t *testing.T) {
 	require.Equal(t, "cyber_policy", mark.Code)
 	require.True(t, c.Writer.Written(), "anthropic cyber error must be written to client")
 	require.Contains(t, rec.Body.String(), `"type":"error"`, "must use anthropic error envelope")
-	require.Contains(t, rec.Body.String(), `"code":"cyber_policy"`)
-	require.NotContains(t, rec.Body.String(), "flagged for cyber policy")
 }
 
 // anthropic 流式客户端 cyber 命中——不 failover、标记已设、下发 anthropic SSE error 事件、丢弃 result。
@@ -139,6 +133,4 @@ func TestForwardAsAnthropic_StreamCyberPolicyNoFailover(t *testing.T) {
 	require.False(t, errors.As(err, &failoverErr), "cyber must NOT trigger failover")
 	require.NotNil(t, GetOpsCyberPolicy(c), "cyber mark must be set")
 	require.Contains(t, rec.Body.String(), "event: error", "must emit anthropic SSE error event")
-	require.Contains(t, rec.Body.String(), `"code":"cyber_policy"`)
-	require.NotContains(t, rec.Body.String(), "flagged for cyber policy")
 }

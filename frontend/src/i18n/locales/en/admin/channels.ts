@@ -288,7 +288,6 @@ export default {
       clearApiKey: 'Clear stored key',
       keepApiKey: 'Keep stored key',
       timeoutMs: 'HTTP Timeout (ms)',
-      maxRpm: 'Strict Audit Max RPM',
       retryCount: 'Retry Count',
       sampleRate: 'Sample Rate',
       proxy: 'Proxy Server',

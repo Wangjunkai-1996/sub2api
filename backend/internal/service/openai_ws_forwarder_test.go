@@ -134,32 +134,6 @@ func TestOpenAIForwardResultSucceededForScheduling_TerminalEvents(t *testing.T) 
 	}
 }
 
-func TestOpenAIForwardResultCompletedForLineage(t *testing.T) {
-	complete := func(responseID, event string) *OpenAIForwardResult {
-		result := &OpenAIForwardResult{ResponseID: responseID, UpstreamTerminalEvent: event}
-		result.setOpenAIResponsesLineageOutput([]byte(`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]`), true)
-		return result
-	}
-	tests := []struct {
-		name     string
-		result   *OpenAIForwardResult
-		expected bool
-	}{
-		{name: "nil", result: nil, expected: false},
-		{name: "missing terminal", result: &OpenAIForwardResult{ResponseID: "resp_missing"}, expected: false},
-		{name: "completed without output", result: &OpenAIForwardResult{ResponseID: "resp_missing_output", UpstreamTerminalEvent: "response.completed"}, expected: false},
-		{name: "completed", result: complete("resp_completed", "response.completed"), expected: true},
-		{name: "done", result: complete("resp_done", "response.done"), expected: true},
-		{name: "incomplete", result: &OpenAIForwardResult{ResponseID: "resp_incomplete", UpstreamTerminalEvent: "response.incomplete"}, expected: false},
-		{name: "cancelled", result: &OpenAIForwardResult{ResponseID: "resp_cancelled", UpstreamTerminalEvent: "response.cancelled"}, expected: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.expected, tt.result.CompletedForLineage())
-		})
-	}
-}
-
 func TestOpenAIWSTerminalEvent_ResponseFailedRecordsModelTransient(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	svc.rateLimitService = NewRateLimitService(transientCooldownAccountRepo{}, nil, &config.Config{}, nil, nil)

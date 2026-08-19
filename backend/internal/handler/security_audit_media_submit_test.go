@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,13 +26,9 @@ type handlerPromptEngine struct {
 	evaluated int
 	enqueued  int
 	requests  []securityaudit.Request
-	strict    bool
 }
 
 func (e *handlerPromptEngine) EffectiveMode() securityaudit.Mode { return e.mode }
-func (e *handlerPromptEngine) BlockingApplies(req securityaudit.Request) bool {
-	return e.strict
-}
 func (e *handlerPromptEngine) Enqueue(_ context.Context, req securityaudit.Request) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -68,27 +63,9 @@ func securityAuditMediaTestMiddleware(c *gin.Context) {
 }
 
 func blockingHandlerPromptEngine() *handlerPromptEngine {
-	return &handlerPromptEngine{mode: securityaudit.ModeBlocking, strict: true, decision: &securityaudit.PromptDecision{
+	return &handlerPromptEngine{mode: securityaudit.ModeBlocking, decision: &securityaudit.PromptDecision{
 		Kind: securityaudit.DecisionBlock, ErrorCode: securityaudit.ErrorCodeBlocked, AllowNextStage: false,
 	}}
-}
-
-func nonStrictMediaModerationService(t *testing.T) *service.ContentModerationService {
-	t.Helper()
-	strictGroupID := int64(999)
-	cfg := service.ContentModerationConfig{
-		Enabled: true, Mode: service.ContentModerationModePreBlock, SampleRate: 100,
-		AllGroups: false, GroupIDs: []int64{strictGroupID}, APIKeys: []string{"sk-test"},
-	}
-	rawCfg, err := json.Marshal(cfg)
-	require.NoError(t, err)
-	return service.NewContentModerationService(
-		&contentModerationHandlerSettingRepo{values: map[string]string{
-			service.SettingKeyRiskControlEnabled:      "true",
-			service.SettingKeyContentModerationConfig: string(rawCfg),
-		}},
-		&contentModerationHandlerTestRepo{}, nil, nil, nil, nil, nil, nil,
-	)
 }
 
 func TestAsyncImageRouteBypassesPromptGuardAndCreatesTask(t *testing.T) {
@@ -96,7 +73,7 @@ func TestAsyncImageRouteBypassesPromptGuardAndCreatesTask(t *testing.T) {
 	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
 	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
 	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine), contentModerationService: nonStrictMediaModerationService(t)}
+	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
 	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
 	var executions atomic.Int32
 	h.execute = func(_ string, c *gin.Context) {
@@ -124,82 +101,12 @@ func TestAsyncImageRouteBypassesPromptGuardAndCreatesTask(t *testing.T) {
 	require.Empty(t, requests)
 }
 
-func TestAsyncImageAuditBypassIsNotRepeatedByDetachedExecution(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
-	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
-	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine), contentModerationService: nonStrictMediaModerationService(t)}
-	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
-	var executionMu sync.Mutex
-	repeatedDecision := false
-	h.execute = func(_ string, c *gin.Context) {
-		apiKey, _ := middleware2.GetAPIKeyFromContext(c)
-		subject, _ := middleware2.GetAuthSubjectFromContext(c)
-		decision := openAI.checkSecurityAudit(c, nil, apiKey, subject, service.ContentModerationProtocolOpenAIImages, "gpt-image-2", []byte(`{"prompt":"must not rescan"}`))
-		executionMu.Lock()
-		repeatedDecision = decision != nil
-		executionMu.Unlock()
-		c.JSON(http.StatusOK, gin.H{"created": 1, "data": []any{}})
-	}
-
-	router := gin.New()
-	router.Use(securityAuditMediaTestMiddleware)
-	router.POST("/v1/images/generations/async", h.Submit)
-	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations/async", strings.NewReader(`{"model":"gpt-image-2","prompt":"allowed async prompt"}`))
-	request.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
-	require.Equal(t, http.StatusAccepted, recorder.Code)
-	require.Eventually(t, func() bool {
-		store.mu.RLock()
-		defer store.mu.RUnlock()
-		for _, task := range store.tasks {
-			if task.Status == service.ImageTaskStatusCompleted {
-				return true
-			}
-		}
-		return false
-	}, time.Second, 10*time.Millisecond)
-	evaluated, enqueued, requests := engine.snapshot()
-	require.Zero(t, evaluated)
-	require.Zero(t, enqueued)
-	require.Empty(t, requests)
-	executionMu.Lock()
-	require.False(t, repeatedDecision)
-	executionMu.Unlock()
-}
-
-func TestBatchImageRouteBypassesPromptGuard(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine), contentModerationService: nonStrictMediaModerationService(t)}
-	h := &BatchImageHandler{openAI: openAI}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/batches", nil)
-	securityAuditMediaTestMiddleware(c)
-
-	allowed := h.checkSecurityAuditBeforeSubmit(c, &service.BatchImageSubmitRequest{
-		Model: "gemini-image-test",
-		Items: []service.BatchImageSubmitItem{{
-			CustomID: "one", Prompt: "must bypass prompt guard",
-		}},
-	})
-
-	require.True(t, allowed)
-	evaluated, enqueued, requests := engine.snapshot()
-	require.Zero(t, evaluated)
-	require.Zero(t, enqueued)
-	require.Empty(t, requests)
-}
-
 func TestSecurityAuditBlockingFailuresLeaveAllDownstreamCountersAtZero(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, kind := range []securityaudit.DecisionKind{securityaudit.DecisionBlock, securityaudit.DecisionUnavailable, securityaudit.DecisionInvalid} {
 		t.Run(string(kind), func(t *testing.T) {
 			promptDecision := promptGuardDecision(kind)
-			engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, strict: true, decision: &securityaudit.PromptDecision{
+			engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, decision: &securityaudit.PromptDecision{
 				Kind: kind, ErrorCode: promptDecision.ErrorCode, AllowNextStage: false,
 			}}
 			coordinator := securityaudit.NewCoordinator(nil, engine)
@@ -229,25 +136,4 @@ func TestSecurityAuditBlockingFailuresLeaveAllDownstreamCountersAtZero(t *testin
 			require.Equal(t, promptDecision.HTTPStatus, recorder.Code)
 		})
 	}
-}
-
-type handlerAllowLineageStore struct {
-	summary securityaudit.AuditSummary
-	loadErr error
-	loads   atomic.Int32
-	lookup  securityaudit.LineageLookup
-}
-
-func (s *handlerAllowLineageStore) Load(_ context.Context, lookup securityaudit.LineageLookup) (*securityaudit.AuditSummary, error) {
-	s.loads.Add(1)
-	s.lookup = lookup
-	if s.loadErr != nil {
-		return nil, s.loadErr
-	}
-	result := s.summary.Clone()
-	return &result, nil
-}
-
-func (s *handlerAllowLineageStore) BindAllowedResponse(context.Context, securityaudit.AuditSummary, string) error {
-	return nil
 }

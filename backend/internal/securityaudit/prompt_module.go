@@ -18,11 +18,6 @@ var ProviderSet = wire.NewSet(
 	wire.Bind(new(PromptEngine), new(*PromptService)),
 	wire.Bind(new(PromptAdminService), new(*PromptService)),
 	NewLegacyModerationAdapter,
-	NewRedisStrictAuditLineageStore,
-	ProvideCoordinator,
+	NewCoordinator,
 	NewPromptAdminHandler,
 )
-
-func ProvideCoordinator(legacy LegacyEngine, prompt PromptEngine, lineage *RedisStrictAuditLineageStore) *Coordinator {
-	return NewCoordinator(legacy, prompt).SetLineageStore(lineage)
-}

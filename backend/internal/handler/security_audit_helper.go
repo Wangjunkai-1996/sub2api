@@ -1,15 +1,10 @@
 package handler
 
 import (
-	"context"
 	"crypto/sha256"
-	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 
-	"github.com/Wei-Shaw/sub2api/internal/auditinput"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -26,332 +21,6 @@ type securityAuditWSDedupeEntry struct {
 	turn     int
 	bodyHash [sha256.Size]byte
 	decision securityaudit.Decision
-}
-
-type openAIAccountAuditState struct {
-	mu              sync.Mutex
-	protocol        string
-	model           string
-	body            []byte
-	stage           string
-	routingContext  *auditinput.SecurityRoutingContext
-	document        *auditinput.Document
-	policy          service.OpenAIAccountAuditRoutingPolicy
-	routePreference service.OpenAIAccountRoutingPreference
-	routeResolved   bool
-	passed          bool
-	terminal        bool
-	decision        securityaudit.Decision
-	summary         *securityaudit.AuditSummary
-}
-
-func newOpenAIAccountAuditState(
-	protocol string,
-	model string,
-	body []byte,
-	stage string,
-	policy service.OpenAIAccountAuditRoutingPolicy,
-) *openAIAccountAuditState {
-	if strings.TrimSpace(stage) == "" {
-		stage = "http"
-	}
-	routingContext := auditinput.ParseSecurityRoutingContext(protocol, body)
-	var document *auditinput.Document
-	if routingContext != nil {
-		document = routingContext.Document
-	}
-	return &openAIAccountAuditState{
-		protocol:       strings.TrimSpace(protocol),
-		model:          strings.TrimSpace(model),
-		body:           append([]byte(nil), body...),
-		stage:          strings.TrimSpace(stage),
-		routingContext: routingContext,
-		document:       document,
-		policy:         policy,
-	}
-}
-
-func (s *openAIAccountAuditState) auditTextRunes() int {
-	if s == nil {
-		return 0
-	}
-	if s.routingContext != nil {
-		return s.routingContext.AuditTextRunes
-	}
-	if s.document == nil {
-		return 0
-	}
-	return s.document.AuditTextRunes
-}
-
-func (s *openAIAccountAuditState) preferAPIKey() bool {
-	if s == nil {
-		return false
-	}
-	return s.effectiveRoutingPreference() == service.OpenAIAccountRoutingPreferenceAPIKey
-}
-
-func (s *openAIAccountAuditState) effectiveRoutingPreference() service.OpenAIAccountRoutingPreference {
-	if s == nil {
-		return service.OpenAIAccountRoutingPreferenceNone
-	}
-	if s.routeResolved {
-		return s.routePreference
-	}
-	return s.routingPreference("")
-}
-
-func (s *openAIAccountAuditState) setRoutingPreference(preference service.OpenAIAccountRoutingPreference) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.routePreference = preference
-	s.routeResolved = true
-	s.mu.Unlock()
-}
-
-func (s *openAIAccountAuditState) auditContextReliable() bool {
-	return s != nil && s.routingContext != nil && s.routingContext.Reliable
-}
-
-func (s *openAIAccountAuditState) auditRoutingReason() service.OpenAIAccountAuditRoutingReason {
-	if s == nil {
-		return service.OpenAIAccountAuditRoutingStateUnavailable
-	}
-	if !s.auditContextReliable() {
-		return service.OpenAIAccountAuditRoutingContextUnreliable
-	}
-	textRunes := s.auditTextRunes()
-	if textRunes > s.policy.LongTextRuneThreshold() || !service.StrictContentModerationSupportsTextRunes(textRunes) {
-		return service.OpenAIAccountAuditRoutingLongText
-	}
-	return service.OpenAIAccountAuditRoutingNormal
-}
-
-func (s *openAIAccountAuditState) routingPreference(stableKey string) service.OpenAIAccountRoutingPreference {
-	if s == nil {
-		return service.OpenAIAccountRoutingPreferenceNone
-	}
-	switch s.auditRoutingReason() {
-	case service.OpenAIAccountAuditRoutingContextUnreliable:
-		return service.OpenAIAccountRoutingPreferenceAPIKey
-	case service.OpenAIAccountAuditRoutingLongText:
-		if !service.StrictContentModerationSupportsTextRunes(s.auditTextRunes()) {
-			return service.OpenAIAccountRoutingPreferenceAPIKey
-		}
-		if !s.policy.PreferAPIKeyEnabled() {
-			return service.OpenAIAccountRoutingPreferenceNone
-		}
-		stableKey = strings.TrimSpace(stableKey)
-		if stableKey == "" {
-			digest := sha256.Sum256(s.body)
-			stableKey = fmt.Sprintf("body:%x", digest[:])
-		}
-		if s.policy.LongTextOAuthRolloutSelected(stableKey) {
-			return service.OpenAIAccountRoutingPreferenceAuditedOAuth
-		}
-		return service.OpenAIAccountRoutingPreferenceAPIKey
-	default:
-		return service.OpenAIAccountRoutingPreferenceNone
-	}
-}
-
-func (s *openAIAccountAuditState) auditContextIssue() string {
-	if s == nil || s.routingContext == nil {
-		return auditinput.SecurityRoutingReasonIncomplete
-	}
-	return strings.TrimSpace(s.routingContext.UnreliableReason)
-}
-
-func (s *openAIAccountAuditState) routingOptions(
-	auditTransport service.OpenAIUpstreamTransport,
-	auditCapability service.OpenAIEndpointCapability,
-	stableKey ...string,
-) service.OpenAIAccountRoutingOptions {
-	if s == nil {
-		return service.OpenAIAccountRoutingOptions{}
-	}
-	key := ""
-	if len(stableKey) > 0 {
-		key = stableKey[0]
-	}
-	preference := s.routingPreference(key)
-	s.setRoutingPreference(preference)
-	return service.OpenAIAccountRoutingOptions{
-		Preference:                      preference,
-		AuditRoutingReason:              s.auditRoutingReason(),
-		AuditPolicy:                     s.policy,
-		AuditRequiredTransport:          auditTransport,
-		AuditRequiredEndpointCapability: auditCapability,
-	}
-}
-
-func openAIAccountRoutingPreferenceLogValue(preference service.OpenAIAccountRoutingPreference) string {
-	if preference == service.OpenAIAccountRoutingPreferenceNone {
-		return "none"
-	}
-	return string(preference)
-}
-
-// finalizeOpenAIAccountAuditRoutingDecision records the scheduler contract
-// after any platform override. The stable cohort key is intentionally omitted.
-func finalizeOpenAIAccountAuditRoutingDecision(
-	reqLog *zap.Logger,
-	state *openAIAccountAuditState,
-	options service.OpenAIAccountRoutingOptions,
-) {
-	if state != nil {
-		state.setRoutingPreference(options.Preference)
-	}
-	if reqLog == nil {
-		return
-	}
-	reason := options.AuditRoutingReason
-	if reason == "" && state != nil {
-		reason = state.auditRoutingReason()
-	}
-	reqLog.Info("security_audit.routing_decision",
-		zap.String("audit_routing_reason", string(reason)),
-		zap.String("audit_routing_preference", openAIAccountRoutingPreferenceLogValue(options.Preference)),
-		zap.Int("audit_text_runes", state.auditTextRunes()),
-		zap.Bool("audit_context_reliable", state.auditContextReliable()),
-		zap.Int("long_text_oauth_rollout_percent", options.AuditPolicy.LongTextOAuthRolloutPercent()),
-		zap.Bool("long_text_oauth_rollout_selected", options.Preference == service.OpenAIAccountRoutingPreferenceAuditedOAuth),
-	)
-}
-
-func openAIAccountAuditStableRoutingKey(c *gin.Context, sessionHash string) string {
-	if sessionHash = strings.TrimSpace(sessionHash); sessionHash != "" {
-		return "session:" + sessionHash
-	}
-	if c == nil || c.Request == nil {
-		return ""
-	}
-	ctx := c.Request.Context()
-	if clientRequestID, _ := ctx.Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(clientRequestID) != "" {
-		return "client_request:" + strings.TrimSpace(clientRequestID)
-	}
-	if requestID := contentModerationRequestID(ctx); requestID != "" {
-		return "request:" + requestID
-	}
-	return ""
-}
-
-func (s *openAIAccountAuditState) summaryClone() *securityaudit.AuditSummary {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.summary == nil {
-		return nil
-	}
-	cloned := s.summary.Clone()
-	return &cloned
-}
-
-func auditUnavailableForAccountPolicy() *securityaudit.Decision {
-	return &securityaudit.Decision{
-		Kind: securityaudit.DecisionUnavailable, HTTPStatus: http.StatusServiceUnavailable,
-		ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
-		ClientMessage: "安全审计暂时不可用，请稍后重试",
-	}
-}
-
-func (h *OpenAIGatewayHandler) ensureSecurityAuditForAccount(
-	c *gin.Context,
-	reqLog *zap.Logger,
-	apiKey *service.APIKey,
-	subject middleware2.AuthSubject,
-	account *service.Account,
-	state *openAIAccountAuditState,
-) (*securityaudit.Decision, service.OpenAIAccountAuditEligibility) {
-	if state == nil {
-		eligibility := service.OpenAIAccountAuditEligibility{Indeterminate: true, Reason: service.OpenAIAccountAuditPolicyUnavailable}
-		return auditUnavailableForAccountPolicy(), eligibility
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	eligibility := service.ClassifyOpenAIAccountAuditEligibility(account, state.policy)
-	if state.terminal {
-		decision := state.decision
-		return &decision, eligibility
-	}
-	if reqLog != nil {
-		fields := []zap.Field{
-			zap.Int("audit_text_runes", state.auditTextRunes()),
-			zap.Bool("prefer_apikey", state.preferAPIKey()),
-			zap.String("audit_routing_reason", string(state.auditRoutingReason())),
-			zap.String("audit_routing_preference", openAIAccountRoutingPreferenceLogValue(state.effectiveRoutingPreference())),
-			zap.Int("long_text_oauth_rollout_percent", state.policy.LongTextOAuthRolloutPercent()),
-			zap.Bool("long_text_oauth_rollout_selected", state.effectiveRoutingPreference() == service.OpenAIAccountRoutingPreferenceAuditedOAuth),
-			zap.Bool("audit_context_reliable", state.auditContextReliable()),
-			zap.String("audit_context_issue", state.auditContextIssue()),
-			zap.Bool("audit_required", eligibility.Eligible || eligibility.Indeterminate),
-			zap.String("audit_eligibility_reason", string(eligibility.Reason)),
-			zap.Int64("audit_account_group_id", eligibility.MatchedGroupID),
-		}
-		if account != nil {
-			fields = append(fields, zap.Int64("account_id", account.ID), zap.String("account_type", account.Type))
-		}
-		reqLog.Info("security_audit.account_admission", fields...)
-	}
-	if !eligibility.Eligible {
-		if eligibility.Indeterminate {
-			decision := auditUnavailableForAccountPolicy()
-			state.terminal = true
-			state.decision = *decision
-			return decision, eligibility
-		}
-		return nil, eligibility
-	}
-	if state.passed {
-		decision := state.decision
-		if reqLog != nil {
-			reqLog.Info("security_audit.account_check_reused",
-				zap.Int64("account_id", account.ID),
-				zap.String("account_type", account.Type),
-				zap.Int("audit_text_runes", state.auditTextRunes()),
-			)
-		}
-		return &decision, eligibility
-	}
-	if h == nil || h.securityAuditCoordinator == nil || c == nil || c.Request == nil {
-		decision := auditUnavailableForAccountPolicy()
-		state.terminal = true
-		state.decision = *decision
-		return decision, eligibility
-	}
-	if !strictAuditProtocolApplies(c, apiKey, state.protocol) ||
-		strictAuditRequestBypassesTextAudit(c, state.protocol, state.model, state.body) {
-		return nil, eligibility
-	}
-
-	request := buildSecurityAuditRequest(c, apiKey, subject, state.protocol, state.model, state.body, state.stage)
-	request.Document = state.document.Clone()
-	request.ForceStrictAdmission = true
-	logSecurityAuditStart(reqLog, request, len(state.body), false)
-	decision := h.securityAuditCoordinator.Check(c.Request.Context(), request)
-	logSecurityAuditDone(reqLog, request, decision, false)
-	if !decision.AllowNextStage {
-		state.terminal = true
-		state.decision = decision
-		return &decision, eligibility
-	}
-	if decision.Audit == nil {
-		unavailable := auditUnavailableForAccountPolicy()
-		state.terminal = true
-		state.decision = *unavailable
-		return unavailable, eligibility
-	}
-	service.MarkOpenAIStrictAuditRequest(c)
-	state.passed = true
-	state.decision = decision
-	cloned := decision.Audit.Clone()
-	state.summary = &cloned
-	return &decision, eligibility
 }
 
 // cachesSecurityAuditCompletion reports whether a successful audit may be
@@ -396,101 +65,9 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditStage(c *gin.Context, reqLog *z
 	return runSecurityAudit(c, reqLog, h.securityAuditCoordinator, h.contentModerationService, apiKey, subject, protocol, model, body, stage)
 }
 
-func cloneSecurityAuditSummary(decision *securityaudit.Decision) *securityaudit.AuditSummary {
-	if decision == nil || !decision.AllowNextStage || decision.Audit == nil {
-		return nil
-	}
-	cloned := decision.Audit.Clone()
-	return &cloned
-}
-
-func securityAuditResponseLineageRequired(summary *securityaudit.AuditSummary) bool {
-	return summary != nil && summary.ResponseLineageRequired()
-}
-
-func (h *OpenAIGatewayHandler) bindAllowedSecurityAuditResponse(ctx context.Context, reqLog *zap.Logger, summary *securityaudit.AuditSummary, result *service.OpenAIForwardResult) error {
-	if summary != nil && !summary.ResponseLineageRequired() {
-		return nil
-	}
-	if h == nil || h.securityAuditCoordinator == nil || summary == nil {
-		return fmt.Errorf("strict audit lineage coordinator is unavailable")
-	}
-	if result == nil || !result.CompletedForLineage() || strings.TrimSpace(result.ResponseID) == "" {
-		if reqLog != nil {
-			responseIDLen := 0
-			if result != nil {
-				responseIDLen = len(strings.TrimSpace(result.ResponseID))
-			}
-			reqLog.Warn("security_audit.lineage_output_incomplete",
-				zap.Int64("api_key_id", summary.APIKeyID),
-				zap.Int64p("group_id", summary.GroupID),
-				zap.Int("response_id_len", responseIDLen),
-			)
-		}
-		return fmt.Errorf("%w: successful response output is incomplete", securityaudit.ErrLineageInvalid)
-	}
-	output, complete := result.OpenAIResponsesLineageOutput()
-	if !complete {
-		return fmt.Errorf("%w: successful response output is incomplete", securityaudit.ErrLineageInvalid)
-	}
-	augmented, err := securityaudit.AppendResponsesOutput(summary.Clone(), output)
-	if err != nil {
-		if reqLog != nil {
-			reqLog.Warn("security_audit.lineage_output_incomplete",
-				zap.Int64("api_key_id", summary.APIKeyID),
-				zap.Int64p("group_id", summary.GroupID),
-				zap.Int("response_id_len", len(strings.TrimSpace(result.ResponseID))),
-				zap.Error(err),
-			)
-		}
-		return err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	} else {
-		ctx = context.WithoutCancel(ctx)
-	}
-	if err := h.securityAuditCoordinator.BindAllowedResponse(ctx, augmented, result.ResponseID); err != nil {
-		if reqLog != nil {
-			reqLog.Warn("security_audit.lineage_bind_failed",
-				zap.Int64("api_key_id", summary.APIKeyID),
-				zap.Int64p("group_id", summary.GroupID),
-				zap.Int("response_id_len", len(strings.TrimSpace(result.ResponseID))),
-				zap.Error(err),
-			)
-		}
-		return err
-	}
-	return nil
-}
-
 func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string) *securityaudit.Decision {
 	if c == nil || c.Request == nil {
 		return nil
-	}
-	// Strict admission is intentionally limited to OpenAI text protocols. A
-	// composite group is only eligible after its target platform has resolved to
-	// OpenAI; an unresolved composite target must not accidentally audit Grok.
-	if !strictAuditProtocolApplies(c, apiKey, protocol) {
-		return nil
-	}
-	model = clientRequestedModel(c, model)
-	if strictAuditRequestBypassesTextAudit(c, protocol, model, body) {
-		return nil
-	}
-	if legacy != nil {
-		scopeInput := buildContentModerationInput(c, apiKey, subject, protocol, model, body)
-		applies, err := legacy.StrictPreBlockApplies(c.Request.Context(), scopeInput.GroupID)
-		if err != nil {
-			return &securityaudit.Decision{
-				Kind: securityaudit.DecisionUnavailable, HTTPStatus: http.StatusServiceUnavailable,
-				ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
-				ClientMessage: "安全审计暂时不可用，请稍后重试",
-			}
-		}
-		if !applies {
-			return nil
-		}
 	}
 	cacheCompletion := cachesSecurityAuditCompletion(stage)
 	if cacheCompletion {
@@ -499,11 +76,23 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 		}
 	}
 	if coordinator == nil {
-		return &securityaudit.Decision{
-			Kind: securityaudit.DecisionUnavailable, HTTPStatus: http.StatusServiceUnavailable,
-			ErrorCode:     securityaudit.ErrorCodeAuditUnavailable,
-			ClientMessage: "安全审计暂时不可用，请稍后重试",
+		legacyDecision := runContentModeration(c, reqLog, legacy, apiKey, subject, protocol, model, body)
+		if legacyDecision == nil {
+			return nil
 		}
+		decision := securityaudit.Decision{Kind: securityaudit.DecisionAllow, HTTPStatus: http.StatusOK, AllowNextStage: true}
+		decision.Legacy = &securityaudit.LegacyDecision{
+			Allowed: legacyDecision.Allowed, Blocked: legacyDecision.Blocked, Flagged: legacyDecision.Flagged,
+			Message: legacyDecision.Message, StatusCode: legacyDecision.StatusCode,
+			ErrorCode: "content_policy_violation", Action: legacyDecision.Action,
+		}
+		if legacyDecision.Blocked {
+			decision.Kind, decision.HTTPStatus, decision.ErrorCode, decision.ClientMessage, decision.AllowNextStage = securityaudit.DecisionBlock, contentModerationStatus(legacyDecision), "content_policy_violation", legacyDecision.Message, false
+		}
+		if decision.AllowNextStage && cacheCompletion {
+			c.Set(securityAuditCompletedContextKey, true)
+		}
+		return &decision
 	}
 	request := buildSecurityAuditRequest(c, apiKey, subject, protocol, model, body, stage)
 	if isSecurityAuditWebSocketStage(request.Stage) {
@@ -530,55 +119,11 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 	}
 	logSecurityAuditStart(reqLog, request, len(body), false)
 	decision := coordinator.Check(c.Request.Context(), request)
-	if decision.AllowNextStage && decision.Audit != nil {
-		service.MarkOpenAIStrictAuditRequest(c)
-	}
 	if decision.AllowNextStage && cacheCompletion {
 		c.Set(securityAuditCompletedContextKey, true)
 	}
 	logSecurityAuditDone(reqLog, request, decision, false)
 	return &decision
-}
-
-func strictAuditRequestBypassesTextAudit(c *gin.Context, protocol, model string, body []byte) bool {
-	if strings.EqualFold(strings.TrimSpace(protocol), service.ContentModerationProtocolOpenAIResponses) {
-		endpoint := "/v1/responses"
-		if c != nil && c.Request != nil && strings.TrimSpace(c.Request.URL.Path) != "" {
-			endpoint = c.Request.URL.Path
-		}
-		if service.IsExplicitImageGenerationIntent(endpoint, model, body) {
-			return true
-		}
-	}
-	return false
-}
-
-func strictAuditProtocolApplies(c *gin.Context, apiKey *service.APIKey, protocol string) bool {
-	switch strings.ToLower(strings.TrimSpace(protocol)) {
-	case service.ContentModerationProtocolOpenAIResponses, service.ContentModerationProtocolOpenAIChat:
-	default:
-		return false
-	}
-	platform := ""
-	if apiKey != nil && apiKey.Group != nil {
-		platform = strings.TrimSpace(apiKey.Group.Platform)
-	}
-	if c != nil && c.Request != nil {
-		ctx := c.Request.Context()
-		if resolved, ok := service.ResolvedTargetPlatformFromContext(ctx); ok {
-			platform = strings.TrimSpace(resolved)
-		}
-		if forced, ok := middleware2.GetForcePlatformFromContext(c); ok {
-			platform = strings.TrimSpace(forced)
-		}
-	}
-	if platform == "" {
-		return true
-	}
-	if platform == service.PlatformComposite {
-		return false
-	}
-	return platform == service.PlatformOpenAI
 }
 
 func logSecurityAuditStart(reqLog *zap.Logger, request securityaudit.Request, bodyBytes int, cached bool) {
@@ -590,7 +135,7 @@ func logSecurityAuditStart(reqLog *zap.Logger, request securityaudit.Request, bo
 		zap.Int64("api_key_id", request.APIKeyID), zap.Int64p("group_id", request.GroupID),
 		zap.String("endpoint", request.Endpoint), zap.String("provider", request.Provider),
 		zap.String("protocol", request.Protocol), zap.String("model", request.Model), zap.String("stage", request.Stage),
-		zap.Int("body_bytes", bodyBytes), zap.Int("body_chars", len([]rune(string(request.Body)))), zap.Bool("cached", cached))
+		zap.Int("body_bytes", bodyBytes), zap.Bool("cached", cached))
 }
 
 func logSecurityAuditDone(reqLog *zap.Logger, request securityaudit.Request, decision securityaudit.Decision, cached bool) {

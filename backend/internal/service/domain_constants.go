@@ -139,9 +139,11 @@ const DingTalkConnectSyntheticEmailDomain = "@dingtalk-connect.invalid"
 // Setting keys
 const (
 	// 注册设置
-	SettingKeyRegistrationEnabled                        = "registration_enabled"                // 是否开放注册
-	SettingKeyEmailVerifyEnabled                         = "email_verify_enabled"                // 是否开启邮件验证
-	SettingKeyRegistrationEmailSuffixWhitelist           = "registration_email_suffix_whitelist" // 注册邮箱后缀白名单（JSON 数组）
+	SettingKeyRegistrationEnabled              = "registration_enabled"                // 是否开放注册
+	SettingKeyEmailVerifyEnabled               = "email_verify_enabled"                // 是否开启邮件验证
+	SettingKeyRegistrationEmailSuffixWhitelist = "registration_email_suffix_whitelist" // 注册邮箱后缀白名单（JSON 数组）
+	// 白名单非空时，是否放行非白名单域名按主域名限量注册（每域名 1 个账户）。
+	// 默认 false：非白名单域名直接拒绝（白名单严格模式）。
 	SettingKeyRegistrationEmailDomainQuotaEnabled        = "registration_email_domain_quota_enabled"
 	SettingKeyPromoCodeEnabled                           = "promo_code_enabled"               // 是否启用优惠码功能
 	SettingKeyPasswordResetEnabled                       = "password_reset_enabled"           // 是否启用忘记密码功能（需要先开启邮件验证）
@@ -155,14 +157,11 @@ const (
 	SettingKeyAffiliateAdminRechargeEnabled              = "affiliate_admin_recharge_enabled" // 管理员充值是否产生返利
 	SettingKeyRiskControlEnabled                         = "risk_control_enabled"             // 是否启用风控中心入口与审计链路
 	SettingKeyContentModerationConfig                    = "content_moderation_config"        // 内容审计配置（JSON）
-	SettingKeyCyberSessionBlockEnabled                   = "cyber_session_block_enabled"      // cyber 命中后会话级自动屏蔽总开关(默认关)
-	SettingKeyCyberSessionBlockTTLSeconds                = "cyber_session_block_ttl_seconds"  // 会话屏蔽 TTL 秒数(默认 3600)
-	SettingKeyCyberSessionBlockAllGroups                 = "cyber_session_block_all_groups"   // 是否对全部 API Key 分组执行本地会话屏蔽(默认 true)
-	SettingKeyCyberSessionBlockGroupIDs                  = "cyber_session_block_group_ids"    // 指定分组模式下的分组 ID（JSON 数组）
 	SettingKeyOpenAICyberAccountCooldownEnabled          = "openai_cyber_account_cooldown_enabled"
 	SettingKeyOpenAICyberAccountCooldownWindowSeconds    = "openai_cyber_account_cooldown_window_seconds"
 	SettingKeyOpenAICyberAccountCooldownFirstSeconds     = "openai_cyber_account_cooldown_first_seconds"
 	SettingKeyOpenAICyberAccountCooldownEscalatedSeconds = "openai_cyber_account_cooldown_escalated_seconds"
+	SettingKeyOpenAICyberAccountCooldownGroupIDs         = "openai_cyber_account_cooldown_group_ids"
 	SettingKeyLoginAgreementEnabled                      = "login_agreement_enabled"    // 登录前是否要求同意条款
 	SettingKeyLoginAgreementMode                         = "login_agreement_mode"       // 条款确认展示模式：modal / checkbox
 	SettingKeyLoginAgreementUpdatedAt                    = "login_agreement_updated_at" // 条款更新日期（展示用）
@@ -544,25 +543,17 @@ const (
 	SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled = "openai_advanced_scheduler_sticky_weighted_enabled"
 	// SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled OpenAI 高级调度下是否优先使用订阅账号池。
 	SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled = "openai_advanced_scheduler_subscription_priority_enabled"
-	// SettingKeyOpenAIAccountAuditGroupIDs stores the account groups eligible for local OpenAI audit.
-	SettingKeyOpenAIAccountAuditGroupIDs = "openai_account_audit_group_ids"
-	// SettingKeyOpenAIAccountAuditLongTextRuneThreshold stores the normalized rune threshold for APIKey preference.
-	SettingKeyOpenAIAccountAuditLongTextRuneThreshold = "openai_account_audit_long_text_rune_threshold"
-	// SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled controls long-text APIKey preference.
-	SettingKeyOpenAIAccountAuditPreferAPIKeyEnabled = "openai_account_audit_prefer_apikey_enabled"
-	// SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent controls the stable long-text audited OAuth rollout.
-	SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent = "openai_account_audit_long_text_oauth_rollout_percent"
-	SettingKeyOpenAIAdvancedSchedulerLBTopK                 = "openai_advanced_scheduler_lb_top_k"
-	SettingKeyOpenAIAdvancedSchedulerWeightPriority         = "openai_advanced_scheduler_weight_priority"
-	SettingKeyOpenAIAdvancedSchedulerWeightLoad             = "openai_advanced_scheduler_weight_load"
-	SettingKeyOpenAIAdvancedSchedulerWeightQueue            = "openai_advanced_scheduler_weight_queue"
-	SettingKeyOpenAIAdvancedSchedulerWeightErrorRate        = "openai_advanced_scheduler_weight_error_rate"
-	SettingKeyOpenAIAdvancedSchedulerWeightTTFT             = "openai_advanced_scheduler_weight_ttft"
-	SettingKeyOpenAIAdvancedSchedulerWeightReset            = "openai_advanced_scheduler_weight_reset"
-	SettingKeyOpenAIAdvancedSchedulerWeightQuotaHeadroom    = "openai_advanced_scheduler_weight_quota_headroom"
-	SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost     = "openai_advanced_scheduler_weight_upstream_cost"
-	SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse = "openai_advanced_scheduler_weight_previous_response"
-	SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky    = "openai_advanced_scheduler_weight_session_sticky"
+	SettingKeyOpenAIAdvancedSchedulerLBTopK                      = "openai_advanced_scheduler_lb_top_k"
+	SettingKeyOpenAIAdvancedSchedulerWeightPriority              = "openai_advanced_scheduler_weight_priority"
+	SettingKeyOpenAIAdvancedSchedulerWeightLoad                  = "openai_advanced_scheduler_weight_load"
+	SettingKeyOpenAIAdvancedSchedulerWeightQueue                 = "openai_advanced_scheduler_weight_queue"
+	SettingKeyOpenAIAdvancedSchedulerWeightErrorRate             = "openai_advanced_scheduler_weight_error_rate"
+	SettingKeyOpenAIAdvancedSchedulerWeightTTFT                  = "openai_advanced_scheduler_weight_ttft"
+	SettingKeyOpenAIAdvancedSchedulerWeightReset                 = "openai_advanced_scheduler_weight_reset"
+	SettingKeyOpenAIAdvancedSchedulerWeightQuotaHeadroom         = "openai_advanced_scheduler_weight_quota_headroom"
+	SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost          = "openai_advanced_scheduler_weight_upstream_cost"
+	SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse      = "openai_advanced_scheduler_weight_previous_response"
+	SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky         = "openai_advanced_scheduler_weight_session_sticky"
 
 	// SettingKeyBackendModeEnabled Backend 模式：禁用用户注册和自助服务，仅管理员可登录
 	SettingKeyBackendModeEnabled = "backend_mode_enabled"

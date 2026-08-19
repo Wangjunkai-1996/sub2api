@@ -80,6 +80,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
+	if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
+		body = cappedBody
+	}
 	reqStream, ok := parseOpenAICompatibleStream(body)
 	if !ok {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
@@ -94,17 +97,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	setOpsRequestContext(c, reqModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
-
-	auditState := newOpenAIAccountAuditState(
-		service.ContentModerationProtocolOpenAIChat,
-		reqModel,
-		body,
-		"http",
-		h.gatewayService.OpenAIAccountAuditRoutingPolicy(c.Request.Context()),
-	)
-	if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
-		body = cappedBody
-	}
 
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
@@ -149,17 +141,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 
 	// 分组利润控制：chat completions 文本入口请求级装门并固定 pricingAt。
-	routingOptions := auditState.routingOptions(
-		service.OpenAIUpstreamTransportAny,
-		"",
-		openAIAccountAuditStableRoutingKey(c, sessionHash),
-	)
-	if requestPlatform != service.PlatformOpenAI {
-		routingOptions.Preference = service.OpenAIAccountRoutingPreferenceNone
-	}
-	finalizeOpenAIAccountAuditRoutingDecision(reqLog, auditState, routingOptions)
-	routingCtx := service.WithOpenAIAccountRoutingOptions(c.Request.Context(), routingOptions)
-	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(routingCtx, apiKey.GroupID)
+	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
 	c.Request = c.Request.WithContext(ccPricingCtx)
 
 	for {
@@ -232,23 +214,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
-		releaseAccount := func() {
-			if accountReleaseFunc != nil {
-				accountReleaseFunc()
-				accountReleaseFunc = nil
-			}
-		}
-		eligibility := service.ClassifyOpenAIAccountAuditEligibility(account, auditState.policy)
-		if eligibility.Eligible && h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatChat) {
-			releaseAccount()
-			return
-		}
-		decision, eligibility := h.ensureSecurityAuditForAccount(c, reqLog, apiKey, subject, account, auditState)
-		if decision != nil && !decision.AllowNextStage {
-			releaseAccount()
-			h.openAISecurityAuditError(c, decision)
-			return
-		}
 
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		forwardStart := time.Now()
@@ -260,16 +225,13 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		writerSizeBeforeForward := c.Writer.Size()
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
-				releaseAccount()
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
 			}()
-			result, err := h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
-			cyberBlockKeyChat := ""
-			if eligibility.Eligible && service.GetOpsCyberPolicy(c) != nil {
-				cyberBlockKeyChat = h.cyberSessionBlockKeyForAPIKey(c, apiKey, body)
-			}
-			h.recordCyberPolicyIfMarkedWithEligibility(c, apiKey, account, eligibility.Eligible, subscription, reqModel, err != nil, cyberBlockKeyChat, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
-			return result, err
+			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
+		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)

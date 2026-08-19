@@ -211,15 +211,12 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		// 风控中心功能（默认关闭，显式启用）
 		SettingKeyRiskControlEnabled: "false",
 
-		// cyber 会话屏蔽（默认关闭，TTL 默认 3600s，默认覆盖全部分组以兼容旧行为）
-		SettingKeyCyberSessionBlockEnabled:                   "false",
-		SettingKeyCyberSessionBlockTTLSeconds:                "3600",
-		SettingKeyCyberSessionBlockAllGroups:                 "true",
-		SettingKeyCyberSessionBlockGroupIDs:                  "[]",
+		// Upstream Cyber account cooldown. Only configured OpenAI OAuth Pro pools qualify.
 		SettingKeyOpenAICyberAccountCooldownEnabled:          "false",
 		SettingKeyOpenAICyberAccountCooldownWindowSeconds:    strconv.Itoa(defaultOpenAICyberAccountCooldownWindowSeconds),
 		SettingKeyOpenAICyberAccountCooldownFirstSeconds:     strconv.Itoa(defaultOpenAICyberAccountCooldownFirstSeconds),
 		SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: strconv.Itoa(defaultOpenAICyberAccountCooldownEscalatedSeconds),
+		SettingKeyOpenAICyberAccountCooldownGroupIDs:         "[12]",
 
 		// Claude Code version check (default: empty = disabled)
 		SettingKeyMinClaudeCodeVersion: "",
@@ -252,7 +249,6 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		openAIAdvancedSchedulerSettingKey:                            "false",
 		SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled:       "false",
 		SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled: "false",
-		SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent:      "0",
 		SettingKeyOpenAIAdvancedSchedulerLBTopK:                      "",
 		SettingKeyOpenAIAdvancedSchedulerWeightPriority:              "",
 		SettingKeyOpenAIAdvancedSchedulerWeightLoad:                  "",
@@ -284,28 +280,6 @@ func parseForwardedClientIPHeadersSetting(value string) ([]string, error) {
 		return nil, fmt.Errorf("parse forwarded_client_ip_headers: %w", err)
 	}
 	return normalized, nil
-}
-
-func parseCyberSessionBlockAllGroupsSetting(value string) (bool, error) {
-	switch strings.TrimSpace(value) {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	default:
-		return false, fmt.Errorf("value must be true or false")
-	}
-}
-
-func parseCyberSessionBlockGroupIDsSetting(value string) ([]int64, error) {
-	var ids []int64
-	if err := json.Unmarshal([]byte(value), &ids); err != nil {
-		return nil, fmt.Errorf("value must be a JSON integer array: %w", err)
-	}
-	if ids == nil {
-		return nil, fmt.Errorf("value must be a JSON array")
-	}
-	return normalizeInt64IDs(ids), nil
 }
 
 // parseSettings 解析设置到结构体
@@ -852,35 +826,6 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	// 风控中心功能（默认关闭，严格 true 才启用）
 	result.RiskControlEnabled = settings[SettingKeyRiskControlEnabled] == "true"
 
-	// cyber 会话屏蔽（默认关闭，TTL 默认 3600s；范围键缺失时兼容旧版全分组行为）
-	result.CyberSessionBlockEnabled = settings[SettingKeyCyberSessionBlockEnabled] == "true"
-	if v, err := strconv.Atoi(strings.TrimSpace(settings[SettingKeyCyberSessionBlockTTLSeconds])); err == nil && v > 0 {
-		result.CyberSessionBlockTTLSeconds = v
-	} else {
-		result.CyberSessionBlockTTLSeconds = 3600
-	}
-	result.CyberSessionBlockAllGroups = true
-	result.CyberSessionBlockGroupIDs = []int64{}
-	if raw, ok := settings[SettingKeyCyberSessionBlockAllGroups]; ok {
-		allGroups, err := parseCyberSessionBlockAllGroupsSetting(raw)
-		if err != nil {
-			slog.Warn("invalid cyber_session_block_all_groups setting; using fail-open scope", "error", err)
-			result.CyberSessionBlockAllGroups = false
-		} else {
-			result.CyberSessionBlockAllGroups = allGroups
-		}
-	}
-	if raw, ok := settings[SettingKeyCyberSessionBlockGroupIDs]; ok {
-		groupIDs, err := parseCyberSessionBlockGroupIDsSetting(raw)
-		if err != nil {
-			slog.Warn("invalid cyber_session_block_group_ids setting; using fail-open scope", "error", err)
-			result.CyberSessionBlockAllGroups = false
-			result.CyberSessionBlockGroupIDs = []int64{}
-		} else {
-			result.CyberSessionBlockGroupIDs = groupIDs
-		}
-	}
-
 	result.OpenAICyberAccountCooldownEnabled = settings[SettingKeyOpenAICyberAccountCooldownEnabled] == "true"
 	result.OpenAICyberAccountCooldownWindowSeconds = parseOpenAICyberAccountCooldownSeconds(
 		settings[SettingKeyOpenAICyberAccountCooldownWindowSeconds],
@@ -897,6 +842,12 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	if result.OpenAICyberAccountCooldownEscalatedSeconds < result.OpenAICyberAccountCooldownFirstSeconds {
 		result.OpenAICyberAccountCooldownEscalatedSeconds = result.OpenAICyberAccountCooldownFirstSeconds
 	}
+	groupIDs, err := parseOpenAICyberAccountCooldownGroupIDs(settings[SettingKeyOpenAICyberAccountCooldownGroupIDs])
+	if err != nil {
+		slog.Warn("invalid OpenAI Cyber account cooldown group IDs; using default", "error", err)
+		groupIDs = append([]int64(nil), defaultOpenAICyberAccountCooldownGroupIDs...)
+	}
+	result.OpenAICyberAccountCooldownGroupIDs = groupIDs
 
 	// Claude Code version check
 	result.MinClaudeCodeVersion = settings[SettingKeyMinClaudeCodeVersion]
@@ -970,9 +921,6 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	result.OpenAIAdvancedSchedulerEnabled = settings[openAIAdvancedSchedulerSettingKey] == "true"
 	result.OpenAIAdvancedSchedulerStickyWeightedEnabled = settings[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled] == "true"
 	result.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled = settings[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled] == "true"
-	if value, err := strconv.Atoi(strings.TrimSpace(settings[SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent])); err == nil && value >= 0 && value <= 100 {
-		result.OpenAIAccountAuditLongTextOAuthRolloutPercent = value
-	}
 	result.OpenAIAdvancedSchedulerLBTopK = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerLBTopK])
 	result.OpenAIAdvancedSchedulerWeightPriority = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerWeightPriority])
 	result.OpenAIAdvancedSchedulerWeightLoad = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerWeightLoad])

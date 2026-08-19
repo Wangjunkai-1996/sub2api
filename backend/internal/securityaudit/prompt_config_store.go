@@ -42,10 +42,11 @@ type ConfigManager struct {
 	// activated. A config version alone cannot distinguish async from blocking.
 	expectedBlocking atomic.Bool
 	// configUntrusted is set when a load/reload fails before a trustworthy
-	// snapshot is installed. A cold process cannot safely infer whether the
-	// persisted policy protects a strict group, so it fails closed until one
-	// complete snapshot has been loaded. After that, expectedBlocking prevents a
-	// failed blocking activation from falling back to a weaker snapshot.
+	// snapshot is installed. Combined with expectedBlocking, EffectiveMode
+	// fails closed so a persisted blocking policy cannot be silently skipped
+	// after startup or invalidation errors. Without blocking intent, untrusted
+	// alone must not force ModeBlocking—Prompt Audit is default-off and must
+	// not take the gateway down for every API request (see issue #4560).
 	configUntrusted atomic.Bool
 
 	stateMu       sync.RWMutex
@@ -186,16 +187,9 @@ func (m *ConfigManager) BlockingActivationDegraded() bool {
 	if m == nil {
 		return false
 	}
-	// With no trustworthy snapshot, the process cannot distinguish a default-off
-	// installation from a persisted strict policy. Keep gateway admission closed
-	// until the first successful load; admin endpoints remain available.
-	if m.configUntrusted.Load() {
-		if _, ok := m.Active(); !ok {
-			return true
-		}
-	}
-	// Once a trustworthy snapshot exists, fail closed only when storage intent
-	// requires blocking. This preserves an explicitly configured off/async mode.
+	// Fail closed only when storage intent requires blocking. Untrusted config
+	// without blocking intent must remain ModeOff so administrators can still
+	// operate the gateway and turn Prompt Audit off after a failed reload.
 	if !m.expectedBlocking.Load() {
 		return false
 	}

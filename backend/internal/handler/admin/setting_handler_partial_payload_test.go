@@ -39,14 +39,24 @@ func TestUpdateSettingsPartialPayloadKeepsUnsentKeys(t *testing.T) {
 	require.Equal(t, "true", repo.values[service.SettingKeyTurnstileEnabled])
 }
 
-func TestUpdateSettingsPartialPayloadKeepsOpenAIAccountAuditLongTextOAuthRollout(t *testing.T) {
+func TestUpdateSettingsPartialPayloadKeepsUnsentOpenAICyberCooldownFields(t *testing.T) {
 	h, repo := newStepUpSwitchTestHandler(t, map[string]string{
-		service.SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent: "20",
+		service.SettingKeyOpenAICyberAccountCooldownEnabled:          "false",
+		service.SettingKeyOpenAICyberAccountCooldownWindowSeconds:    "7200",
+		service.SettingKeyOpenAICyberAccountCooldownFirstSeconds:     "600",
+		service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: "3600",
+		service.SettingKeyOpenAICyberAccountCooldownGroupIDs:         "[12,13]",
 	})
 
-	rec := doUpdateSettings(t, h, map[string]any{"risk_control_enabled": true}, nil)
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, "20", repo.values[service.SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent])
+	rec := doUpdateSettings(t, h, map[string]any{
+		"openai_cyber_account_cooldown_enabled": true,
+	}, nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, "true", repo.values[service.SettingKeyOpenAICyberAccountCooldownEnabled])
+	require.Equal(t, "7200", repo.values[service.SettingKeyOpenAICyberAccountCooldownWindowSeconds])
+	require.Equal(t, "600", repo.values[service.SettingKeyOpenAICyberAccountCooldownFirstSeconds])
+	require.Equal(t, "3600", repo.values[service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds])
+	require.Equal(t, "[12,13]", repo.values[service.SettingKeyOpenAICyberAccountCooldownGroupIDs])
 }
 
 // A full payload keeps whole-document semantics: fields explicitly set to their

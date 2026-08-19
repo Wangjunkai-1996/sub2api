@@ -3,7 +3,6 @@ package service
 import (
 	"testing"
 
-	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 	"github.com/stretchr/testify/require"
 )
 
@@ -177,13 +176,4 @@ func TestExtractContentModerationInput_ResponsesLastIsAssistantSkipped(t *testin
 
 	require.Empty(t, input.Text)
 	require.Empty(t, input.Images)
-}
-
-func TestStrictBlockedKeywordUsesOnlyCurrentUserDocument(t *testing.T) {
-	document := auditinput.ParseForTextAudit(ContentModerationProtocolOpenAIResponses, []byte(`{"input":"safe current text"}`))
-	require.True(t, document.Complete)
-
-	keyword, blocked := strictBlockedKeyword(document, []string{"historical blocked keyword"})
-	require.False(t, blocked)
-	require.Empty(t, keyword)
 }

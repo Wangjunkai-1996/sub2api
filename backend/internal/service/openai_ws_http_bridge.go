@@ -17,10 +17,9 @@ import (
 )
 
 const (
-	openAIWSClientReadLimitBytesDefault       int64 = 64 * 1024 * 1024
-	openAIWSHTTPBridgeThresholdBytesDefault   int64 = 15 * 1024 * 1024
-	openAIWSHTTPBridgeErrorBodyLimitBytes           = 64 * 1024
-	openAIWSStrictLineageTerminalDrainTimeout       = 2 * time.Second
+	openAIWSClientReadLimitBytesDefault     int64 = 64 * 1024 * 1024
+	openAIWSHTTPBridgeThresholdBytesDefault int64 = 15 * 1024 * 1024
+	openAIWSHTTPBridgeErrorBodyLimitBytes         = 64 * 1024
 )
 
 // ResolveOpenAIWSClientFirstMessageTimeout returns the effective client ingress deadline.
@@ -281,22 +280,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
-	var lineageOutput []byte
-	lineageComplete := false
-	lineageTerminalCount := 0
-	var lineageAccumulator *openAIResponsesLineageAccumulator
-	if openAIResponsesLineageCaptureEnabled(c) {
-		lineageAccumulator = newOpenAIResponsesLineageAccumulator()
-	}
-	strictLineageTerminalSeen := false
-	var strictTerminalMessage []byte
-	var strictTerminalResult *OpenAIForwardResult
-	var strictLineageDrainTimer *time.Timer
-	defer func() {
-		if strictLineageDrainTimer != nil {
-			strictLineageDrainTimer.Stop()
-		}
-	}()
 	sawDone := false
 	wroteDownstream := false
 	clientDisconnected := false
@@ -318,7 +301,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		imageCount := imageCounter.Count()
 		result := &OpenAIForwardResult{
 			RequestID:                     responseID,
-			ResponseID:                    responseID,
 			Usage:                         usage,
 			Model:                         originalModel,
 			UpstreamModel:                 mappedModel,
@@ -333,7 +315,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			Duration:                      time.Since(turnStart),
 			FirstTokenMs:                  firstTokenMs,
 		}
-		result.setOpenAIResponsesLineageOutput(lineageOutput, lineageComplete)
 		if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 			result.wsReplayInput = replayInput
 			result.wsReplayInputExists = true
@@ -346,25 +327,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			result.BillingModel = imageBillingModel
 		}
 		return result
-	}
-	finishStrictTerminal := func() (*OpenAIForwardResult, error) {
-		if strictTerminalResult == nil {
-			return resultWithUsage(), &OpenAIStrictLineageCommitError{cause: fmt.Errorf("strict websocket terminal is unavailable")}
-		}
-		if err := commitOpenAIStrictLineageBeforeSuccess(c, turn, strictTerminalResult); err != nil {
-			return strictTerminalResult, err
-		}
-		if !clientDisconnected {
-			if err := writeClientMessage(strictTerminalMessage); err != nil {
-				if !isOpenAIWSClientDisconnectError(err) {
-					return strictTerminalResult, wrapOpenAIWSIngressTurnError("write_client", fmt.Errorf("write client websocket terminal: %w", err), wroteDownstream)
-				}
-				clientDisconnected = true
-			} else {
-				wroteDownstream = true
-			}
-		}
-		return strictTerminalResult, nil
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -388,26 +350,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if trimmedData == "[DONE]" {
 			sawDone = true
-			if strictLineageTerminalSeen && openAIStrictLineageCommitRequired(c) {
-				return finishStrictTerminal()
-			}
 			continue
-		}
-		if strictLineageTerminalSeen {
-			// A terminal event is the final model-visible response. Any later data
-			// makes the raw stream ambiguous, so keep the client-visible first
-			// terminal but never persist it as strict lineage evidence.
-			lineageOutput, lineageComplete = nil, false
-			if openAIStrictLineageCommitRequired(c) {
-				if strictTerminalResult == nil {
-					strictTerminalResult = resultWithUsage()
-				}
-				strictTerminalResult.setOpenAIResponsesLineageOutput(nil, false)
-				if err := commitOpenAIStrictLineageBeforeSuccess(c, turn, strictTerminalResult); err != nil {
-					return strictTerminalResult, err
-				}
-			}
-			return resultWithUsage(), nil
 		}
 
 		upstreamMessage := []byte(trimmedData)
@@ -447,26 +390,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 		}
 		replayCollector.AddEvent(eventType, upstreamMessage)
-		if lineageAccumulator != nil {
-			lineageAccumulator.Observe(upstreamMessage)
-		}
-		isTerminalEvent := isOpenAIWSTerminalEvent(eventType)
-		isSuccessTerminalEvent := eventType == "response.completed" || eventType == "response.done"
-		if isTerminalEvent {
-			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, canonicalOpenAIAccountSchedulingModel(account, originalModel), resp.Header, upstreamMessage)
-			if openAIResponsesLineageCaptureEnabled(c) {
-				lineageTerminalCount++
-				if lineageTerminalCount == 1 && isSuccessTerminalEvent {
-					lineageOutput, lineageComplete = lineageAccumulator.SuccessTerminalOutput(upstreamMessage, responseID)
-				} else {
-					lineageOutput, lineageComplete = nil, false
-				}
-			}
-			if isSuccessTerminalEvent {
-				strictTerminalMessage = append(strictTerminalMessage[:0], upstreamMessage...)
-				strictTerminalResult = resultWithUsage()
-			}
-		}
 
 		var upstreamEventErr error
 		if eventType == "error" {
@@ -512,7 +435,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				clientMessage = rewritten
 			}
 		}
-		if !clientDisconnected && !(isSuccessTerminalEvent && openAIStrictLineageCommitRequired(c)) {
+		if !clientDisconnected {
 			if err := writeClientMessage(clientMessage); err != nil {
 				if isOpenAIWSClientDisconnectError(err) {
 					clientDisconnected = true
@@ -539,7 +462,8 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if upstreamEventErr != nil {
 			return resultWithUsage(), upstreamEventErr
 		}
-		if isTerminalEvent {
+		if isOpenAIWSTerminalEvent(eventType) {
+			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, canonicalOpenAIAccountSchedulingModel(account, originalModel), resp.Header, upstreamMessage)
 			terminalEventCount++
 			firstTokenMsValue := -1
 			if firstTokenMs != nil {
@@ -560,46 +484,15 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				firstTokenMsValue,
 				clientDisconnected,
 			)
-			if openAIResponsesLineageCaptureEnabled(c) && isSuccessTerminalEvent {
-				strictLineageTerminalSeen = true
-				strictLineageDrainTimer = time.AfterFunc(openAIWSStrictLineageTerminalDrainTimeout, func() {
-					_ = resp.Body.Close()
-				})
-				continue
-			}
-			if isSuccessTerminalEvent {
-				if err := commitOpenAIStrictLineageBeforeSuccess(c, turn, strictTerminalResult); err != nil {
-					return strictTerminalResult, err
-				}
-			}
 			return resultWithUsage(), nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if strictLineageTerminalSeen {
-			if openAIStrictLineageCommitRequired(c) {
-				if strictTerminalResult == nil {
-					strictTerminalResult = resultWithUsage()
-				}
-				strictTerminalResult.setOpenAIResponsesLineageOutput(nil, false)
-				if commitErr := commitOpenAIStrictLineageBeforeSuccess(c, turn, strictTerminalResult); commitErr != nil {
-					return strictTerminalResult, commitErr
-				}
-			}
-			lineageOutput, lineageComplete = nil, false
-			return resultWithUsage(), nil
-		}
 		streamErr := fmt.Errorf("read upstream http bridge stream: %w", err)
 		if turn == 1 && !wroteDownstream {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, streamErr, true)
 		}
 		return resultWithUsage(), streamErr
-	}
-	if strictLineageTerminalSeen {
-		if openAIStrictLineageCommitRequired(c) {
-			return finishStrictTerminal()
-		}
-		return resultWithUsage(), nil
 	}
 	terminalErr := errors.New("upstream http bridge stream ended before terminal event")
 	if sawDone {

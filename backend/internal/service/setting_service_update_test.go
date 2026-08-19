@@ -9,7 +9,6 @@ import (
 	"math"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
@@ -404,10 +403,6 @@ func TestSettingService_UpdateSettings_PaymentVisibleMethodsAndAdvancedScheduler
 
 	repo := &settingUpdateRepoStub{}
 	svc := NewSettingService(repo, &config.Config{})
-	svc.openAIAccountAuditRoutingRuntimeCache.Store(&cachedOpenAIAccountAuditRoutingRuntime{
-		policy:    DefaultOpenAIAccountAuditRoutingPolicy(),
-		expiresAt: time.Now().Add(time.Minute).UnixNano(),
-	})
 
 	err := svc.UpdateSettings(context.Background(), &SystemSettings{
 		PaymentVisibleMethodAlipaySource:                   "alipay",
@@ -419,7 +414,6 @@ func TestSettingService_UpdateSettings_PaymentVisibleMethodsAndAdvancedScheduler
 		OpenAIAdvancedSchedulerEnabled:                     true,
 		OpenAIAdvancedSchedulerStickyWeightedEnabled:       true,
 		OpenAIAdvancedSchedulerSubscriptionPriorityEnabled: true,
-		OpenAIAccountAuditLongTextOAuthRolloutPercent:      17,
 		OpenAIAdvancedSchedulerLBTopK:                      " 3 ",
 		OpenAIAdvancedSchedulerWeightPriority:              "2.50",
 		OpenAIAdvancedSchedulerWeightLoad:                  "0",
@@ -442,7 +436,6 @@ func TestSettingService_UpdateSettings_PaymentVisibleMethodsAndAdvancedScheduler
 	require.Equal(t, "true", repo.updates[openAIAdvancedSchedulerSettingKey])
 	require.Equal(t, "true", repo.updates[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled])
 	require.Equal(t, "true", repo.updates[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled])
-	require.Equal(t, "17", repo.updates[SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent])
 	require.Equal(t, "3", repo.updates[SettingKeyOpenAIAdvancedSchedulerLBTopK])
 	require.Equal(t, "2.5", repo.updates[SettingKeyOpenAIAdvancedSchedulerWeightPriority])
 	require.Equal(t, "0", repo.updates[SettingKeyOpenAIAdvancedSchedulerWeightLoad])
@@ -454,7 +447,6 @@ func TestSettingService_UpdateSettings_PaymentVisibleMethodsAndAdvancedScheduler
 	require.Equal(t, "1.5", repo.updates[SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost])
 	require.Equal(t, "8", repo.updates[SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse])
 	require.Equal(t, "4", repo.updates[SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky])
-	require.Equal(t, 17, svc.GetOpenAIAccountAuditRoutingRuntime(context.Background()).LongTextOAuthRolloutPercent())
 }
 
 func TestSettingService_UpdateSettingsRejectsInvalidOpenAIOAuthSchedulingRateMultiplier(t *testing.T) {
@@ -463,18 +455,6 @@ func TestSettingService_UpdateSettingsRejectsInvalidOpenAIOAuthSchedulingRateMul
 
 	for _, rate := range []float64{-0.01, math.NaN(), math.Inf(1)} {
 		err := svc.UpdateSettings(context.Background(), &SystemSettings{OpenAIOAuthSchedulingRateMultiplier: rate})
-		require.Error(t, err)
-	}
-}
-
-func TestSettingService_UpdateSettingsRejectsInvalidOpenAIAccountAuditLongTextOAuthRolloutPercent(t *testing.T) {
-	repo := &settingUpdateRepoStub{}
-	svc := NewSettingService(repo, &config.Config{})
-
-	for _, percent := range []int{-1, 101} {
-		err := svc.UpdateSettings(context.Background(), &SystemSettings{
-			OpenAIAccountAuditLongTextOAuthRolloutPercent: percent,
-		})
 		require.Error(t, err)
 	}
 }
@@ -537,20 +517,6 @@ func TestSettingService_ParseSettingsDefaultsOpenAIOAuthSchedulingRateMultiplier
 
 	require.Equal(t, 1.0, svc.parseSettings(map[string]string{}).OpenAIOAuthSchedulingRateMultiplier)
 	require.Equal(t, 0.05, svc.parseSettings(map[string]string{SettingKeyOpenAIOAuthSchedulingRateMultiplier: "0.05"}).OpenAIOAuthSchedulingRateMultiplier)
-}
-
-func TestSettingService_ParseSettingsOpenAIAccountAuditLongTextOAuthRolloutPercent(t *testing.T) {
-	svc := NewSettingService(&settingUpdateRepoStub{}, &config.Config{})
-
-	require.Equal(t, 0, svc.parseSettings(map[string]string{}).OpenAIAccountAuditLongTextOAuthRolloutPercent)
-	require.Equal(t, 25, svc.parseSettings(map[string]string{
-		SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent: "25",
-	}).OpenAIAccountAuditLongTextOAuthRolloutPercent)
-	for _, raw := range []string{"-1", "101", "invalid"} {
-		require.Equal(t, 0, svc.parseSettings(map[string]string{
-			SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent: raw,
-		}).OpenAIAccountAuditLongTextOAuthRolloutPercent)
-	}
 }
 
 func TestSettingService_GetAllSettings_OpenAIAdvancedSchedulerEffectiveValuesUseConfig(t *testing.T) {

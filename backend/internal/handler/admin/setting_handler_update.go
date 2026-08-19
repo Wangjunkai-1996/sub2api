@@ -277,7 +277,6 @@ type UpdateSettingsRequest struct {
 	OpenAIAdvancedSchedulerEnabled                     *bool    `json:"openai_advanced_scheduler_enabled"`
 	OpenAIAdvancedSchedulerStickyWeightedEnabled       *bool    `json:"openai_advanced_scheduler_sticky_weighted_enabled"`
 	OpenAIAdvancedSchedulerSubscriptionPriorityEnabled *bool    `json:"openai_advanced_scheduler_subscription_priority_enabled"`
-	OpenAIAccountAuditLongTextOAuthRolloutPercent      *int     `json:"openai_account_audit_long_text_oauth_rollout_percent"`
 	OpenAIAdvancedSchedulerLBTopK                      *string  `json:"openai_advanced_scheduler_lb_top_k"`
 	OpenAIAdvancedSchedulerWeightPriority              *string  `json:"openai_advanced_scheduler_weight_priority"`
 	OpenAIAdvancedSchedulerWeightLoad                  *string  `json:"openai_advanced_scheduler_weight_load"`
@@ -353,15 +352,11 @@ type UpdateSettingsRequest struct {
 	// 风控中心功能开关
 	RiskControlEnabled *bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关、TTL 与独立分组范围
-	CyberSessionBlockEnabled                   *bool    `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds                *int     `json:"cyber_session_block_ttl_seconds"`
-	CyberSessionBlockAllGroups                 *bool    `json:"cyber_session_block_all_groups"`
-	CyberSessionBlockGroupIDs                  *[]int64 `json:"cyber_session_block_group_ids"`
 	OpenAICyberAccountCooldownEnabled          *bool    `json:"openai_cyber_account_cooldown_enabled"`
 	OpenAICyberAccountCooldownWindowSeconds    *int     `json:"openai_cyber_account_cooldown_window_seconds"`
 	OpenAICyberAccountCooldownFirstSeconds     *int     `json:"openai_cyber_account_cooldown_first_seconds"`
 	OpenAICyberAccountCooldownEscalatedSeconds *int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         *[]int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// OpenAI fast/flex policy (optional, only updated when provided)
 	OpenAIFastPolicySettings *dto.OpenAIFastPolicySettings `json:"openai_fast_policy_settings,omitempty"`
@@ -1490,53 +1485,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
-	// cyber 会话屏蔽 TTL 校验：提供时必须 > 0
-	if req.CyberSessionBlockTTLSeconds != nil && *req.CyberSessionBlockTTLSeconds <= 0 {
-		response.BadRequest(c, "cyber_session_block_ttl_seconds must be > 0")
-		return
-	}
-	cyberSessionBlockAllGroups := previousSettings.CyberSessionBlockAllGroups
-	if req.CyberSessionBlockAllGroups != nil {
-		cyberSessionBlockAllGroups = *req.CyberSessionBlockAllGroups
-	}
-	cyberSessionBlockGroupIDs := append([]int64(nil), previousSettings.CyberSessionBlockGroupIDs...)
-	if req.CyberSessionBlockGroupIDs != nil {
-		cyberSessionBlockGroupIDs = append([]int64(nil), (*req.CyberSessionBlockGroupIDs)...)
-	}
-	if !cyberSessionBlockAllGroups {
-		hasPositiveGroupID := false
-		for _, groupID := range cyberSessionBlockGroupIDs {
-			if groupID > 0 {
-				hasPositiveGroupID = true
-				break
-			}
-		}
-		if !hasPositiveGroupID {
-			response.BadRequest(c, "cyber_session_block_group_ids must contain at least one positive group ID when cyber_session_block_all_groups is false")
-			return
-		}
-	}
-	openAICyberAccountCooldownWindowSeconds := previousSettings.OpenAICyberAccountCooldownWindowSeconds
-	if req.OpenAICyberAccountCooldownWindowSeconds != nil {
-		openAICyberAccountCooldownWindowSeconds = *req.OpenAICyberAccountCooldownWindowSeconds
-	}
-	openAICyberAccountCooldownFirstSeconds := previousSettings.OpenAICyberAccountCooldownFirstSeconds
-	if req.OpenAICyberAccountCooldownFirstSeconds != nil {
-		openAICyberAccountCooldownFirstSeconds = *req.OpenAICyberAccountCooldownFirstSeconds
-	}
-	openAICyberAccountCooldownEscalatedSeconds := previousSettings.OpenAICyberAccountCooldownEscalatedSeconds
-	if req.OpenAICyberAccountCooldownEscalatedSeconds != nil {
-		openAICyberAccountCooldownEscalatedSeconds = *req.OpenAICyberAccountCooldownEscalatedSeconds
-	}
-	if err := service.ValidateOpenAICyberAccountCooldownDurations(
-		openAICyberAccountCooldownWindowSeconds,
-		openAICyberAccountCooldownFirstSeconds,
-		openAICyberAccountCooldownEscalatedSeconds,
-	); err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-
 	settings := &service.SystemSettings{
 		// 系统全局 platform quota 默认值（整体替换语义）
 		DefaultPlatformQuotas:       req.DefaultPlatformQuotas,
@@ -1866,12 +1814,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled
 		}(),
-		OpenAIAccountAuditLongTextOAuthRolloutPercent: func() int {
-			if req.OpenAIAccountAuditLongTextOAuthRolloutPercent != nil {
-				return *req.OpenAIAccountAuditLongTextOAuthRolloutPercent
-			}
-			return previousSettings.OpenAIAccountAuditLongTextOAuthRolloutPercent
-		}(),
 		OpenAIAdvancedSchedulerLBTopK:                 stringSetting(req.OpenAIAdvancedSchedulerLBTopK, previousSettings.OpenAIAdvancedSchedulerLBTopK),
 		OpenAIAdvancedSchedulerWeightPriority:         stringSetting(req.OpenAIAdvancedSchedulerWeightPriority, previousSettings.OpenAIAdvancedSchedulerWeightPriority),
 		OpenAIAdvancedSchedulerWeightLoad:             stringSetting(req.OpenAIAdvancedSchedulerWeightLoad, previousSettings.OpenAIAdvancedSchedulerWeightLoad),
@@ -1997,29 +1939,30 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.RiskControlEnabled
 		}(),
-		CyberSessionBlockEnabled: func() bool {
-			if req.CyberSessionBlockEnabled != nil {
-				return *req.CyberSessionBlockEnabled
-			}
-			return previousSettings.CyberSessionBlockEnabled
-		}(),
-		CyberSessionBlockTTLSeconds: func() int {
-			if req.CyberSessionBlockTTLSeconds != nil {
-				return *req.CyberSessionBlockTTLSeconds
-			}
-			return previousSettings.CyberSessionBlockTTLSeconds
-		}(),
-		CyberSessionBlockAllGroups: cyberSessionBlockAllGroups,
-		CyberSessionBlockGroupIDs:  cyberSessionBlockGroupIDs,
 		OpenAICyberAccountCooldownEnabled: func() bool {
 			if req.OpenAICyberAccountCooldownEnabled != nil {
 				return *req.OpenAICyberAccountCooldownEnabled
 			}
 			return previousSettings.OpenAICyberAccountCooldownEnabled
 		}(),
-		OpenAICyberAccountCooldownWindowSeconds:    openAICyberAccountCooldownWindowSeconds,
-		OpenAICyberAccountCooldownFirstSeconds:     openAICyberAccountCooldownFirstSeconds,
-		OpenAICyberAccountCooldownEscalatedSeconds: openAICyberAccountCooldownEscalatedSeconds,
+		OpenAICyberAccountCooldownWindowSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownWindowSeconds,
+			previousSettings.OpenAICyberAccountCooldownWindowSeconds,
+		),
+		OpenAICyberAccountCooldownFirstSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownFirstSeconds,
+			previousSettings.OpenAICyberAccountCooldownFirstSeconds,
+		),
+		OpenAICyberAccountCooldownEscalatedSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownEscalatedSeconds,
+			previousSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		),
+		OpenAICyberAccountCooldownGroupIDs: func() []int64 {
+			if req.OpenAICyberAccountCooldownGroupIDs != nil {
+				return append([]int64(nil), (*req.OpenAICyberAccountCooldownGroupIDs)...)
+			}
+			return append([]int64(nil), previousSettings.OpenAICyberAccountCooldownGroupIDs...)
+		}(),
 	}
 
 	// req.AuthSourceXxxPlatformQuotas 为 nil 表示本次请求未包含该 source 的 quota 配置（保留 previousAuthSourceDefaults 中的值）；
@@ -2351,7 +2294,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAIAdvancedSchedulerEnabled:                         updatedSettings.OpenAIAdvancedSchedulerEnabled,
 		OpenAIAdvancedSchedulerStickyWeightedEnabled:           updatedSettings.OpenAIAdvancedSchedulerStickyWeightedEnabled,
 		OpenAIAdvancedSchedulerSubscriptionPriorityEnabled:     updatedSettings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled,
-		OpenAIAccountAuditLongTextOAuthRolloutPercent:          updatedSettings.OpenAIAccountAuditLongTextOAuthRolloutPercent,
 		OpenAIAdvancedSchedulerLBTopK:                          updatedSettings.OpenAIAdvancedSchedulerLBTopK,
 		OpenAIAdvancedSchedulerWeightPriority:                  updatedSettings.OpenAIAdvancedSchedulerWeightPriority,
 		OpenAIAdvancedSchedulerWeightLoad:                      updatedSettings.OpenAIAdvancedSchedulerWeightLoad,
@@ -2422,14 +2364,11 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		AffiliateEnabled: updatedSettings.AffiliateEnabled,
 
 		RiskControlEnabled:                         updatedSettings.RiskControlEnabled,
-		CyberSessionBlockEnabled:                   updatedSettings.CyberSessionBlockEnabled,
-		CyberSessionBlockTTLSeconds:                updatedSettings.CyberSessionBlockTTLSeconds,
-		CyberSessionBlockAllGroups:                 updatedSettings.CyberSessionBlockAllGroups,
-		CyberSessionBlockGroupIDs:                  updatedSettings.CyberSessionBlockGroupIDs,
 		OpenAICyberAccountCooldownEnabled:          updatedSettings.OpenAICyberAccountCooldownEnabled,
 		OpenAICyberAccountCooldownWindowSeconds:    updatedSettings.OpenAICyberAccountCooldownWindowSeconds,
 		OpenAICyberAccountCooldownFirstSeconds:     updatedSettings.OpenAICyberAccountCooldownFirstSeconds,
 		OpenAICyberAccountCooldownEscalatedSeconds: updatedSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		OpenAICyberAccountCooldownGroupIDs:         updatedSettings.OpenAICyberAccountCooldownGroupIDs,
 		AccountSchedulingThresholds:                updatedSettings.AccountSchedulingThresholds,
 		AllowUserViewErrorRequests:                 updatedSettings.AllowUserViewErrorRequests,
 	}

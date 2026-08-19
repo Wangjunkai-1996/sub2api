@@ -259,7 +259,7 @@ type OpenAIForwardResult struct {
 	Stream          bool
 	OpenAIWSMode    bool
 	// UpstreamTerminalEvent is the normalized terminal event observed on an
-	// upstream Responses HTTP or WebSocket turn. Empty preserves legacy success.
+	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
 	UpstreamTerminalEvent string
 	ResponseHeaders       http.Header
 	Duration              time.Duration
@@ -286,9 +286,6 @@ type OpenAIForwardResult struct {
 
 	wsReplayInput       []json.RawMessage
 	wsReplayInputExists bool
-
-	responsesLineageOutput         json.RawMessage
-	responsesLineageOutputComplete bool
 }
 
 // SucceededForScheduling reports whether this result is an upstream success
@@ -297,20 +294,6 @@ type OpenAIForwardResult struct {
 func (r *OpenAIForwardResult) SucceededForScheduling() bool {
 	if r == nil || !r.OpenAIWSMode || r.UpstreamTerminalEvent == "" {
 		return true
-	}
-	switch r.UpstreamTerminalEvent {
-	case "response.completed", "response.done":
-		return true
-	default:
-		return false
-	}
-}
-
-// CompletedForLineage reports whether an audited Responses request reached a
-// successful upstream terminal event and may create a continuation ledger.
-func (r *OpenAIForwardResult) CompletedForLineage() bool {
-	if r == nil || !r.responsesLineageOutputComplete || len(r.responsesLineageOutput) == 0 {
-		return false
 	}
 	switch r.UpstreamTerminalEvent {
 	case "response.completed", "response.done":
@@ -418,10 +401,6 @@ var defaultOpenAICodexSnapshotPersistThrottle = newAccountWriteThrottle(openAICo
 // ErrNoAvailableCompactAccounts indicates a legacy /responses/compact request
 // needs compact support but no compatible account is available.
 var ErrNoAvailableCompactAccounts = errors.New("no available accounts support /responses/compact")
-
-// ErrOpenAIPreviousResponseAccountUnavailable means a continuation cannot be
-// routed back to the account that produced its previous response.
-var ErrOpenAIPreviousResponseAccountUnavailable = errors.New("previous response account unavailable")
 
 // OpenAIGatewayService handles OpenAI API gateway operations
 type OpenAIGatewayService struct {

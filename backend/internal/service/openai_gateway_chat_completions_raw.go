@@ -43,7 +43,7 @@ var openaiCCRawAllowedHeaders = map[string]bool{
 //
 // 与 ForwardAsChatCompletions 的关键差异：
 //
-//   - 不调用 apicompat.ChatCompletionsToResponses，body 仅做模型 ID 和上游兼容改写
+//   - 不调用 apicompat.ChatCompletionsToResponses，body 仅做模型 ID 改写
 //   - 上游 URL 拼到 /v1/chat/completions 而非 /v1/responses
 //   - 流式响应 SSE 直接透传给客户端（上游 chunk 已是 CC 格式）
 //   - 非流式响应 JSON 直接透传，仅按需提取 usage
@@ -94,7 +94,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		upstreamBody = normalizedBody
 	}
 
-	// 4. Apply OpenAI fast policy on the CC body.
+	// 4. Apply OpenAI fast policy on the CC body
 	updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, upstreamBody)
 	if policyErr != nil {
 		var blocked *OpenAIFastBlockedError

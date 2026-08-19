@@ -28,30 +28,30 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 	}
 
 	audited := map[string][]string{
-		"/messages":                 {"gateway_handler.go", "openai_gateway_handler.go"},
-		"/responses":                {"gateway_handler_responses.go", "openai_gateway_handler.go"},
-		"/responses/*subpath":       {"gateway_handler_responses.go", "openai_gateway_handler.go"},
-		"/chat/completions":         {"gateway_handler_chat_completions.go", "openai_chat_completions.go"},
-		"/embeddings":               {"openai_embeddings.go"},
-		"/alpha/search":             {"openai_alpha_search.go"},
-		"/live":                     {"openai_live.go"},
-		"/realtime/calls":           {"openai_live.go"},
-		"/images/generations":       {"openai_images.go", "grok_media.go"},
-		"/images/edits":             {"openai_images.go", "grok_media.go"},
-		"/images/generations/async": {"image_task_handler.go"},
-		"/images/edits/async":       {"image_task_handler.go"},
-		"/images/batches":           {"batch_image_handler.go"},
-		"/videos":                   {"grok_media.go"},
-		"/videos/generations":       {"grok_media.go"},
-		"/videos/edits":             {"grok_media.go"},
-		"/videos/extensions":        {"grok_media.go"},
-		"/models/*modelAction":      {"gemini_v1beta_handler.go"},
-		"/tts":                      {"grok_audio.go"},
-		"/web_search":               {"gateway_web_search.go"},
-		"/x_search":                 {"gateway_web_search.go"},
+		"/messages":            {"gateway_handler.go"},
+		"/responses":           {"gateway_handler_responses.go"},
+		"/responses/*subpath":  {"gateway_handler_responses.go"},
+		"/chat/completions":    {"gateway_handler_chat_completions.go"},
+		"/images/generations":  {"grok_media.go"},
+		"/images/edits":        {"grok_media.go"},
+		"/videos":              {"grok_media.go"},
+		"/videos/generations":  {"grok_media.go"},
+		"/videos/edits":        {"grok_media.go"},
+		"/videos/extensions":   {"grok_media.go"},
+		"/models/*modelAction": {"gemini_v1beta_handler.go"},
+		"/tts":                 {"grok_audio.go"},
+		"/web_search":          {"gateway_web_search.go"},
+		"/x_search":            {"gateway_web_search.go"},
 	}
 	excluded := map[string]string{
 		"/messages/count_tokens":     "tokenization only; it does not execute a model request",
+		"/embeddings":                "OpenAI proactive prompt auditing is disabled",
+		"/alpha/search":              "OpenAI proactive prompt auditing is disabled",
+		"/live":                      "OpenAI proactive prompt auditing is disabled",
+		"/realtime/calls":            "OpenAI proactive prompt auditing is disabled",
+		"/images/generations/async":  "OpenAI proactive prompt auditing is disabled",
+		"/images/edits/async":        "OpenAI proactive prompt auditing is disabled",
+		"/images/batches":            "OpenAI proactive prompt auditing is disabled",
 		"/images/batches/:id/cancel": "control-plane cancellation with no user prompt",
 		"/stt":                       "speech transcription is not a text-generation prompt",
 		"/custom-voices":             "voice profile management has no model prompt",
@@ -91,35 +91,15 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocketHasFirstAndSubsequentTurnPromptGates(t *testing.T) {
+func TestResponsesWebSocketDoesNotRunPromptAudit(t *testing.T) {
 	routeSource, err := os.ReadFile("gateway.go")
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, strings.Count(string(routeSource), `.GET("/responses"`), 2)
 	handlerSource, err := os.ReadFile(filepath.Join("..", "..", "handler", "openai_gateway_handler.go"))
 	require.NoError(t, err)
-	require.Contains(t, string(handlerSource), `newOpenAIAccountAuditState`)
-	require.Contains(t, string(handlerSource), `ensureSecurityAuditForAccount`)
-	require.Contains(t, string(handlerSource), `"first_turn"`)
-	require.Contains(t, string(handlerSource), `"subsequent_turn"`)
-	wsStart := strings.Index(string(handlerSource), `func (h *OpenAIGatewayHandler) ResponsesWebSocket`)
-	require.NotEqual(t, -1, wsStart)
-	wsSource := string(handlerSource)[wsStart:]
-	firstTurnState := strings.Index(wsSource, `"first_turn"`)
-	firstUserSlot := strings.Index(wsSource, `TryAcquireUserSlotForAPIKey`)
-	firstAccountAudit := strings.Index(wsSource, `ensureSecurityAuditForAccount`)
-	require.NotEqual(t, -1, firstTurnState)
-	require.NotEqual(t, -1, firstUserSlot)
-	require.NotEqual(t, -1, firstAccountAudit)
-	require.Less(t,
-		firstTurnState,
-		firstUserSlot,
-		"the first response.create audit state must be prepared before per-request slots",
-	)
-	require.Greater(t,
-		firstAccountAudit,
-		firstUserSlot,
-		"the first response.create audit must run after the final account is selected",
-	)
+	require.Contains(t, string(handlerSource), `func (h *OpenAIGatewayHandler) ResponsesWebSocket`)
+	require.NotContains(t, string(handlerSource), `newOpenAIAccountAuditState`)
+	require.NotContains(t, string(handlerSource), `ensureSecurityAuditForAccount`)
 }
 
 func TestPromptAuditAdminRoutesRejectUnauthenticatedAndNonAdminRequests(t *testing.T) {

@@ -10,8 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/Wei-Shaw/sub2api/internal/auditinput"
 )
 
 type PromptService struct {
@@ -109,28 +107,8 @@ func (s *PromptService) EffectiveMode() Mode {
 	return s.config.EffectiveMode()
 }
 
-func (s *PromptService) BlockingApplies(req Request) bool {
-	if !promptGuardRequestSupported(req) || s == nil || s.config == nil || s.EffectiveMode() != ModeBlocking {
-		return false
-	}
-	cfg, ok := s.config.Active()
-	if !ok {
-		// Never expand strict blocking to groups that are not present in a
-		// trusted snapshot. ConfigManager retains last-known-good state for the
-		// configured protected groups during transient reload failures.
-		return false
-	}
-	return cfg.EffectiveMode() == ModeBlocking && (req.ForceStrictAdmission || cfg.IncludesGroup(req.GroupID))
-}
-
 func (s *PromptService) Enqueue(_ context.Context, req Request) error {
-	if !promptGuardRequestSupported(req) {
-		return nil
-	}
-	if req.Strict && strictNoCurrentUserTextRequest(req) {
-		return nil
-	}
-	if s == nil || s.config == nil || s.enqueuer == nil || s.EffectiveMode() != ModeAsync {
+	if s == nil || s.enqueuer == nil || s.EffectiveMode() != ModeAsync {
 		return nil
 	}
 	select {
@@ -162,12 +140,6 @@ func (s *PromptService) Enqueue(_ context.Context, req Request) error {
 }
 
 func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecision, error) {
-	if !promptGuardRequestSupported(req) {
-		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
-	}
-	if req.Strict && strictNoCurrentUserTextRequest(req) {
-		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
-	}
 	if s == nil || s.config == nil || s.evaluator == nil {
 		return nil, &GuardError{Code: ErrorCodeUnavailable}
 	}
@@ -181,54 +153,17 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 		}
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	if cfg.EffectiveMode() != ModeBlocking || (!req.ForceStrictAdmission && !cfg.IncludesGroup(req.GroupID)) {
+	if cfg.EffectiveMode() != ModeBlocking || !cfg.IncludesGroup(req.GroupID) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	// Strict blocking scans the complete current increment. Lineage remains a
-	// local admission check and is not forwarded to Prompt Guard.
-	snapshot, err := ExtractBlockingPromptSnapshot(req, false)
+	snapshot, err := ExtractBlockingPromptSnapshot(req, cfg.BlockingLatestTurnOnly)
 	if errors.Is(err, ErrNoPromptText) {
-		if strictNoCurrentUserTextRequest(req) {
-			return &PromptDecision{Kind: DecisionAllow, ConfigVersion: cfg.ConfigVersion, AllowNextStage: true}, nil
-		}
-		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
+		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
 	if err != nil {
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
 	}
-	var decision *PromptDecision
-	if req.Strict {
-		decision, err = s.evaluator.EvaluateStrict(ctx, cfg, snapshot)
-	} else {
-		decision, err = s.evaluator.Evaluate(ctx, cfg, snapshot)
-	}
-	if decision != nil {
-		decision.ConfigVersion = cfg.ConfigVersion
-	}
-	return decision, err
-}
-
-func promptGuardRequestSupported(req Request) bool {
-	return true
-}
-
-func strictImageOnlyDocument(document *auditinput.Document) bool {
-	return strictNoCurrentUserTextDocument(document) && document.HasImages
-}
-
-func strictNoCurrentUserTextDocument(document *auditinput.Document) bool {
-	return document != nil && document.TextAuditClass == auditinput.TextAuditKnownNoText
-}
-
-func strictNoCurrentUserTextRequest(req Request) bool {
-	if req.Document != nil && strings.TrimSpace(req.Document.NormalizedText) != "" {
-		return false
-	}
-	document := req.Document
-	if document == nil {
-		document = auditinput.ParseForTextAudit(req.Protocol, req.Body)
-	}
-	return strictNoCurrentUserTextDocument(document)
+	return s.evaluator.Evaluate(ctx, cfg, snapshot)
 }
 
 func (s *PromptService) GetConfig() (PublicConfig, error) { return s.config.Public() }

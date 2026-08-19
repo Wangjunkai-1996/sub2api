@@ -168,14 +168,11 @@ type SystemSettings struct {
 	DefaultConcurrency                         int
 	DefaultBalance                             float64
 	RiskControlEnabled                         bool
-	CyberSessionBlockEnabled                   bool
-	CyberSessionBlockTTLSeconds                int
-	CyberSessionBlockAllGroups                 bool
-	CyberSessionBlockGroupIDs                  []int64
 	OpenAICyberAccountCooldownEnabled          bool
 	OpenAICyberAccountCooldownWindowSeconds    int
 	OpenAICyberAccountCooldownFirstSeconds     int
 	OpenAICyberAccountCooldownEscalatedSeconds int
+	OpenAICyberAccountCooldownGroupIDs         []int64
 	AffiliateEnabled                           bool
 	AffiliateRebateRate                        float64
 	AffiliateRebateFreezeHours                 int
@@ -268,7 +265,6 @@ type SystemSettings struct {
 	OpenAIAdvancedSchedulerEnabled                         bool
 	OpenAIAdvancedSchedulerStickyWeightedEnabled           bool
 	OpenAIAdvancedSchedulerSubscriptionPriorityEnabled     bool
-	OpenAIAccountAuditLongTextOAuthRolloutPercent          int
 	OpenAIAdvancedSchedulerLBTopK                          string
 	OpenAIAdvancedSchedulerWeightPriority                  string
 	OpenAIAdvancedSchedulerWeightLoad                      string

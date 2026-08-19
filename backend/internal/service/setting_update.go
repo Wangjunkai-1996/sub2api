@@ -102,7 +102,6 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	if err := s.validateDefaultSubscriptionGroups(ctx, settings.DefaultSubscriptions); err != nil {
 		return nil, err
 	}
-	settings.CyberSessionBlockGroupIDs = normalizeInt64IDs(settings.CyberSessionBlockGroupIDs)
 	if err := normalizeOpenAICyberAccountCooldownSettings(settings); err != nil {
 		return nil, infraerrors.BadRequest("INVALID_OPENAI_CYBER_ACCOUNT_COOLDOWN", err.Error())
 	}
@@ -129,12 +128,6 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	}
 	if err := s.normalizeOpenAIAdvancedSchedulerOverrides(settings); err != nil {
 		return nil, err
-	}
-	if settings.OpenAIAccountAuditLongTextOAuthRolloutPercent < 0 || settings.OpenAIAccountAuditLongTextOAuthRolloutPercent > 100 {
-		return nil, infraerrors.BadRequest(
-			"INVALID_OPENAI_ACCOUNT_AUDIT_LONG_TEXT_OAUTH_ROLLOUT_PERCENT",
-			"OpenAI account audit long-text OAuth rollout percent must be between 0 and 100",
-		)
 	}
 	settings.PaymentVisibleMethodAlipaySource = alipaySource
 	settings.PaymentVisibleMethodWxpaySource = wxpaySource
@@ -451,21 +444,15 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	// 风控中心功能开关
 	updates[SettingKeyRiskControlEnabled] = strconv.FormatBool(settings.RiskControlEnabled)
 
-	// cyber 会话屏蔽开关、TTL 与独立分组范围
-	updates[SettingKeyCyberSessionBlockEnabled] = strconv.FormatBool(settings.CyberSessionBlockEnabled)
-	if settings.CyberSessionBlockTTLSeconds > 0 {
-		updates[SettingKeyCyberSessionBlockTTLSeconds] = strconv.Itoa(settings.CyberSessionBlockTTLSeconds)
-	}
-	updates[SettingKeyCyberSessionBlockAllGroups] = strconv.FormatBool(settings.CyberSessionBlockAllGroups)
-	groupIDsJSON, err := json.Marshal(settings.CyberSessionBlockGroupIDs)
-	if err != nil {
-		return nil, fmt.Errorf("marshal cyber session block group IDs: %w", err)
-	}
-	updates[SettingKeyCyberSessionBlockGroupIDs] = string(groupIDsJSON)
 	updates[SettingKeyOpenAICyberAccountCooldownEnabled] = strconv.FormatBool(settings.OpenAICyberAccountCooldownEnabled)
 	updates[SettingKeyOpenAICyberAccountCooldownWindowSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownWindowSeconds)
 	updates[SettingKeyOpenAICyberAccountCooldownFirstSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownFirstSeconds)
 	updates[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownEscalatedSeconds)
+	cooldownGroupIDsJSON, err := json.Marshal(settings.OpenAICyberAccountCooldownGroupIDs)
+	if err != nil {
+		return nil, fmt.Errorf("marshal OpenAI Cyber account cooldown group IDs: %w", err)
+	}
+	updates[SettingKeyOpenAICyberAccountCooldownGroupIDs] = string(cooldownGroupIDsJSON)
 
 	// Claude Code version check
 	updates[SettingKeyMinClaudeCodeVersion] = settings.MinClaudeCodeVersion
@@ -512,7 +499,6 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[openAIAdvancedSchedulerSettingKey] = strconv.FormatBool(settings.OpenAIAdvancedSchedulerEnabled)
 	updates[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled] = strconv.FormatBool(settings.OpenAIAdvancedSchedulerStickyWeightedEnabled)
 	updates[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled] = strconv.FormatBool(settings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled)
-	updates[SettingKeyOpenAIAccountAuditLongTextOAuthRolloutPercent] = strconv.Itoa(settings.OpenAIAccountAuditLongTextOAuthRolloutPercent)
 	updates[SettingKeyOpenAIAdvancedSchedulerLBTopK] = settings.OpenAIAdvancedSchedulerLBTopK
 	updates[SettingKeyOpenAIAdvancedSchedulerWeightPriority] = settings.OpenAIAdvancedSchedulerWeightPriority
 	updates[SettingKeyOpenAIAdvancedSchedulerWeightLoad] = settings.OpenAIAdvancedSchedulerWeightLoad
@@ -709,16 +695,6 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		max:       settings.MaxClaudeCodeVersion,
 		expiresAt: time.Now().Add(versionBoundsCacheTTL).UnixNano(),
 	})
-	s.cyberSessionBlockRuntimeSF.Forget(cyberSessionBlockRuntimeSFKey)
-	s.cyberSessionBlockRuntimeCache.Store(&cachedCyberSessionBlockRuntime{
-		policy: newCyberSessionBlockPolicy(
-			settings.CyberSessionBlockEnabled,
-			time.Duration(settings.CyberSessionBlockTTLSeconds)*time.Second,
-			settings.CyberSessionBlockAllGroups,
-			settings.CyberSessionBlockGroupIDs,
-		),
-		expiresAt: time.Now().Add(cyberSessionBlockRuntimeCacheTTL).UnixNano(),
-	})
 	s.openAICyberAccountCooldownRuntimeSF.Forget(openAICyberAccountCooldownRuntimeSFKey)
 	s.openAICyberAccountCooldownRuntimeCache.Store(&cachedOpenAICyberAccountCooldownRuntime{
 		policy: newOpenAICyberAccountCooldownPolicy(
@@ -726,6 +702,7 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 			settings.OpenAICyberAccountCooldownWindowSeconds,
 			settings.OpenAICyberAccountCooldownFirstSeconds,
 			settings.OpenAICyberAccountCooldownEscalatedSeconds,
+			settings.OpenAICyberAccountCooldownGroupIDs,
 		),
 		expiresAt: time.Now().Add(openAICyberAccountCooldownRuntimeCacheTTL).UnixNano(),
 	})
@@ -790,7 +767,6 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		}),
 		expiresAt: time.Now().Add(openAIAdvancedSchedulerSettingCacheTTL).UnixNano(),
 	})
-	s.refreshOpenAIAccountAuditLongTextOAuthRolloutPercent(settings.OpenAIAccountAuditLongTextOAuthRolloutPercent)
 	// Invalidate the quota auto-pause cache and let the next read trigger a fresh load.
 	// We can't know from here whether ops_advanced_settings was also touched, so be
 	// defensive: store an expired entry — GetOpenAIQuotaAutoPauseSettings will serve

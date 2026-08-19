@@ -18,13 +18,9 @@ type concurrencyCacheMock struct {
 	releaseUserCalled     int32
 	releaseAccountCalled  int32
 	releaseIngressCalled  int32
-	acquireUserCalled     int32
-	acquireAccountCalled  int32
-	acquireIngressCalled  int32
 }
 
 func (m *concurrencyCacheMock) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
-	atomic.AddInt32(&m.acquireAccountCalled, 1)
 	if m.acquireAccountSlotFn != nil {
 		return m.acquireAccountSlotFn(ctx, accountID, maxConcurrency, requestID)
 	}
@@ -61,7 +57,6 @@ func (m *concurrencyCacheMock) GetAccountWaitingCount(ctx context.Context, accou
 }
 
 func (m *concurrencyCacheMock) AcquireUserSlot(ctx context.Context, userID int64, maxConcurrency int, requestID string) (bool, error) {
-	atomic.AddInt32(&m.acquireUserCalled, 1)
 	if m.acquireUserSlotFn != nil {
 		return m.acquireUserSlotFn(ctx, userID, maxConcurrency, requestID)
 	}
@@ -106,7 +101,6 @@ func (m *concurrencyCacheMock) CleanupStaleProcessSlots(ctx context.Context, act
 }
 
 func (m *concurrencyCacheMock) AcquireOpenAIWSIngressLease(ctx context.Context, apiKeyID int64, maxConnections int, leaseID string) (bool, error) {
-	atomic.AddInt32(&m.acquireIngressCalled, 1)
 	if m.acquireIngressLeaseFn != nil {
 		return m.acquireIngressLeaseFn(ctx, apiKeyID, maxConnections, leaseID)
 	}
