@@ -359,6 +359,9 @@ func registerTrafficDirectorRoutes(groups *gin.RouterGroup, h *handler.Handlers)
 	if h != nil && h.Admin != nil {
 		trafficDirector = h.Admin.TrafficDirector
 	}
+	if trafficDirector == nil {
+		trafficDirector = adminhandler.NewTrafficDirectorHandler(nil)
+	}
 	groups.GET("/:id/traffic-director", trafficDirector.Get)
 	groups.GET("/:id/traffic-director/versions", trafficDirector.ListVersions)
 	groups.GET("/:id/traffic-director/versions/:version", trafficDirector.GetVersion)

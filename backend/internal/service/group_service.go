@@ -11,6 +11,14 @@ import (
 var (
 	ErrGroupNotFound = infraerrors.NotFound("GROUP_NOT_FOUND", "group not found")
 	ErrGroupExists   = infraerrors.Conflict("GROUP_EXISTS", "group name already exists")
+	// ErrGroupTrafficDirectorVersionConflict is returned when an ordinary Group
+	// update was built from a stale Traffic Director head. The conditional
+	// repository update uses this optimistic-concurrency guard so a concurrent
+	// policy publication cannot be silently overwritten by an admin save.
+	ErrGroupTrafficDirectorVersionConflict = infraerrors.Conflict(
+		"GROUP_TRAFFIC_DIRECTOR_VERSION_CONFLICT",
+		"group changed while the Traffic Director policy was being updated",
+	)
 )
 
 type GroupRepository interface {

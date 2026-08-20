@@ -147,6 +147,12 @@ type Group struct {
 	SchedulerType string `json:"scheduler_type,omitempty"`
 	// 分组级高级调度稀疏覆盖；缺失字段继承全局值，显式 false/0 必须保留
 	AdvancedSchedulerOverrides domain.AdvancedSchedulerOverrides `json:"advanced_scheduler_overrides,omitempty"`
+	// 已发布 Traffic Director 模式：legacy/shadow/enforced
+	TrafficDirectorMode string `json:"traffic_director_mode,omitempty"`
+	// 已发布 Traffic Director 版本；0 为合成的 legacy 版本
+	TrafficDirectorVersion int64 `json:"traffic_director_version,omitempty"`
+	// 已发布 Traffic Director 规范；legacy 模式为 NULL
+	TrafficDirectorSpec *domain.TrafficDirectorSpec `json:"traffic_director_spec,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
 	// The values are being populated by the GroupQuery when eager-loading is set.
 	Edges        GroupEdges `json:"edges"`
@@ -253,15 +259,15 @@ func (*Group) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case group.FieldVideoModelPrices, group.FieldModelPricing, group.FieldModelRouting, group.FieldSupportedModelScopes, group.FieldMessagesDispatchModelConfig, group.FieldModelsListConfig, group.FieldReasoningEffortMappings, group.FieldAdvancedSchedulerOverrides:
+		case group.FieldVideoModelPrices, group.FieldModelPricing, group.FieldModelRouting, group.FieldSupportedModelScopes, group.FieldMessagesDispatchModelConfig, group.FieldModelsListConfig, group.FieldReasoningEffortMappings, group.FieldAdvancedSchedulerOverrides, group.FieldTrafficDirectorSpec:
 			values[i] = new([]byte)
 		case group.FieldPeakRateEnabled, group.FieldIsExclusive, group.FieldAllowImageGeneration, group.FieldAllowBatchImageGeneration, group.FieldImageRateIndependent, group.FieldVideoRateIndependent, group.FieldLongContextPricingEnabled, group.FieldClaudeCodeOnly, group.FieldModelRoutingEnabled, group.FieldMcpXMLInject, group.FieldAllowMessagesDispatch, group.FieldAllowLive, group.FieldRequireOauthOnly, group.FieldRequirePrivacySet, group.FieldProfitControlEnabled:
 			values[i] = new(sql.NullBool)
 		case group.FieldRateMultiplier, group.FieldPeakRateMultiplier, group.FieldDailyLimitUsd, group.FieldWeeklyLimitUsd, group.FieldMonthlyLimitUsd, group.FieldImageRateMultiplier, group.FieldImagePrice1k, group.FieldImagePrice2k, group.FieldImagePrice4k, group.FieldBatchImageDiscountMultiplier, group.FieldBatchImageHoldMultiplier, group.FieldVideoRateMultiplier, group.FieldVideoPrice480p, group.FieldVideoPrice720p, group.FieldVideoPrice1080p, group.FieldWebSearchPricePerCall, group.FieldSearchPricePer1k, group.FieldAudioRealtimePricePerMin, group.FieldAudioTtsPricePerMillionChars, group.FieldAudioSttPricePerHour, group.FieldProfitMinMargin, group.FieldProfitSafetyBuffer:
 			values[i] = new(sql.NullFloat64)
-		case group.FieldID, group.FieldDefaultValidityDays, group.FieldFallbackGroupID, group.FieldFallbackGroupIDOnInvalidRequest, group.FieldSortOrder, group.FieldRpmLimit:
+		case group.FieldID, group.FieldDefaultValidityDays, group.FieldFallbackGroupID, group.FieldFallbackGroupIDOnInvalidRequest, group.FieldSortOrder, group.FieldRpmLimit, group.FieldTrafficDirectorVersion:
 			values[i] = new(sql.NullInt64)
-		case group.FieldName, group.FieldDescription, group.FieldPeakStart, group.FieldPeakEnd, group.FieldStatus, group.FieldDuplicateOperationID, group.FieldPlatform, group.FieldSubscriptionType, group.FieldDefaultMappedModel, group.FieldMaxReasoningEffort, group.FieldSchedulerType:
+		case group.FieldName, group.FieldDescription, group.FieldPeakStart, group.FieldPeakEnd, group.FieldStatus, group.FieldDuplicateOperationID, group.FieldPlatform, group.FieldSubscriptionType, group.FieldDefaultMappedModel, group.FieldMaxReasoningEffort, group.FieldSchedulerType, group.FieldTrafficDirectorMode:
 			values[i] = new(sql.NullString)
 		case group.FieldCreatedAt, group.FieldUpdatedAt, group.FieldDeletedAt:
 			values[i] = new(sql.NullTime)
@@ -705,6 +711,26 @@ func (_m *Group) assignValues(columns []string, values []any) error {
 					return fmt.Errorf("unmarshal field advanced_scheduler_overrides: %w", err)
 				}
 			}
+		case group.FieldTrafficDirectorMode:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field traffic_director_mode", values[i])
+			} else if value.Valid {
+				_m.TrafficDirectorMode = value.String
+			}
+		case group.FieldTrafficDirectorVersion:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field traffic_director_version", values[i])
+			} else if value.Valid {
+				_m.TrafficDirectorVersion = value.Int64
+			}
+		case group.FieldTrafficDirectorSpec:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field traffic_director_spec", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.TrafficDirectorSpec); err != nil {
+					return fmt.Errorf("unmarshal field traffic_director_spec: %w", err)
+				}
+			}
 		default:
 			_m.selectValues.Set(columns[i], values[i])
 		}
@@ -1010,6 +1036,15 @@ func (_m *Group) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("advanced_scheduler_overrides=")
 	builder.WriteString(fmt.Sprintf("%v", _m.AdvancedSchedulerOverrides))
+	builder.WriteString(", ")
+	builder.WriteString("traffic_director_mode=")
+	builder.WriteString(_m.TrafficDirectorMode)
+	builder.WriteString(", ")
+	builder.WriteString("traffic_director_version=")
+	builder.WriteString(fmt.Sprintf("%v", _m.TrafficDirectorVersion))
+	builder.WriteString(", ")
+	builder.WriteString("traffic_director_spec=")
+	builder.WriteString(fmt.Sprintf("%v", _m.TrafficDirectorSpec))
 	builder.WriteByte(')')
 	return builder.String()
 }

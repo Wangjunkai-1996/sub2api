@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,11 +39,13 @@ func TestGroupSchedulerAuthSnapshotRoundTripPreservesSparseOverrides(t *testing.
 		Status:  StatusActive,
 		User:    &User{ID: 9, Status: StatusActive, Role: RoleUser},
 		Group: &Group{
-			ID:            groupID,
-			Name:          "advanced",
-			Platform:      PlatformOpenAI,
-			Status:        StatusActive,
-			SchedulerType: GroupSchedulerTypeAdvanced,
+			ID:                     groupID,
+			Name:                   "advanced",
+			Platform:               PlatformOpenAI,
+			Status:                 StatusActive,
+			SchedulerType:          GroupSchedulerTypeAdvanced,
+			TrafficDirectorMode:    domain.TrafficDirectorModeShadow,
+			TrafficDirectorVersion: 7,
 			AdvancedSchedulerOverrides: AdvancedSchedulerOverrides{
 				StickyWeightedEnabled: schedulerServiceTestPointer(false),
 				WeightLoad:            schedulerServiceTestPointer(0.0),
@@ -54,9 +57,10 @@ func TestGroupSchedulerAuthSnapshotRoundTripPreservesSparseOverrides(t *testing.
 
 	snapshot := svc.snapshotFromAPIKey(context.Background(), apiKey)
 	require.NotNil(t, snapshot)
-	require.Equal(t, 21, snapshot.Version)
+	require.Equal(t, 22, snapshot.Version)
 	payload, err := json.Marshal(snapshot)
 	require.NoError(t, err)
+	require.NotContains(t, string(payload), "traffic_director_spec")
 	var cached APIKeyAuthSnapshot
 	require.NoError(t, json.Unmarshal(payload, &cached))
 
@@ -68,6 +72,8 @@ func TestGroupSchedulerAuthSnapshotRoundTripPreservesSparseOverrides(t *testing.
 	require.NotNil(t, restored.Group.AdvancedSchedulerOverrides.WeightLoad)
 	require.Zero(t, *restored.Group.AdvancedSchedulerOverrides.WeightLoad)
 	require.Nil(t, restored.Group.AdvancedSchedulerOverrides.WeightPriority)
+	require.Equal(t, domain.TrafficDirectorModeShadow, restored.Group.TrafficDirectorMode)
+	require.Equal(t, int64(7), restored.Group.TrafficDirectorVersion)
 }
 
 func TestCloneGroupForDuplicateDeepCopiesSchedulerOverrides(t *testing.T) {

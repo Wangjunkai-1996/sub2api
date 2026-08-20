@@ -29,6 +29,63 @@ type TrafficDirectorEvaluation struct {
 	FallbackPoolKeys []string `json:"fallback_pool_keys"`
 }
 
+// trafficDirectorCompiledPolicy is built once when an immutable policy enters
+// the cache. Request routing only reads these structures; it does not repeat
+// validation, sorting, map construction, or fallback-graph traversal.
+// Callers must treat the value as immutable after construction.
+type trafficDirectorCompiledPolicy struct {
+	spec           domain.TrafficDirectorSpec
+	poolsByKey     map[string]domain.TrafficDirectorPool
+	fallbackChains map[string][]string
+}
+
+func compileNormalizedTrafficDirectorSpec(
+	normalized domain.TrafficDirectorSpec,
+) (*trafficDirectorCompiledPolicy, error) {
+	poolsByKey := make(map[string]domain.TrafficDirectorPool, len(normalized.Pools))
+	for _, pool := range normalized.Pools {
+		pool.AccountIDs = append([]int64(nil), pool.AccountIDs...)
+		poolsByKey[pool.Key] = pool
+	}
+
+	compiled := &trafficDirectorCompiledPolicy{
+		spec:           normalized,
+		poolsByKey:     poolsByKey,
+		fallbackChains: make(map[string][]string, len(normalized.Pools)),
+	}
+	compiled.spec.Pools = make([]domain.TrafficDirectorPool, len(normalized.Pools))
+	for index, pool := range normalized.Pools {
+		compiled.spec.Pools[index] = poolsByKey[pool.Key]
+		chain, err := followTrafficDirectorFallback(poolsByKey, pool.Key)
+		if err != nil {
+			return nil, err
+		}
+		compiled.fallbackChains[pool.Key] = chain
+	}
+	return compiled, nil
+}
+
+func (p *trafficDirectorCompiledPolicy) evaluate(groupID int64, routingKey string) (TrafficDirectorEvaluation, error) {
+	if p == nil || groupID <= 0 {
+		return TrafficDirectorEvaluation{}, invalidTrafficDirectorEvaluation("compiled policy or group ID is invalid")
+	}
+	if strings.TrimSpace(routingKey) == "" {
+		return TrafficDirectorEvaluation{}, invalidTrafficDirectorEvaluation("routing key must not be empty")
+	}
+	homePoolKey := chooseTrafficDirectorHomePool(p.spec.Pools, groupID, routingKey)
+	if homePoolKey == "" {
+		return TrafficDirectorEvaluation{}, invalidTrafficDirectorEvaluation("policy has no positive-weight pool")
+	}
+	chain := p.fallbackChains[homePoolKey]
+	if len(chain) == 0 {
+		return TrafficDirectorEvaluation{}, invalidTrafficDirectorEvaluation("compiled fallback chain is empty")
+	}
+	return TrafficDirectorEvaluation{
+		HomePoolKey:      homePoolKey,
+		FallbackPoolKeys: append([]string(nil), chain[1:]...),
+	}, nil
+}
+
 // TrafficDirectorValidationResult contains the canonical policy and accounts
 // which belong to the group but are intentionally outside every configured pool.
 type TrafficDirectorValidationResult struct {
@@ -322,20 +379,11 @@ func evaluateNormalizedTrafficDirector(
 	groupID int64,
 	routingKey string,
 ) (TrafficDirectorEvaluation, error) {
-	homePoolKey := chooseTrafficDirectorHomePool(spec.Pools, groupID, routingKey)
-	fallbackChain, err := FollowFallback(spec, homePoolKey)
+	compiled, err := compileNormalizedTrafficDirectorSpec(spec)
 	if err != nil {
 		return TrafficDirectorEvaluation{}, err
 	}
-	fallbackPoolKeys := []string{}
-	if len(fallbackChain) > 1 {
-		fallbackPoolKeys = fallbackChain[1:]
-	}
-
-	return TrafficDirectorEvaluation{
-		HomePoolKey:      homePoolKey,
-		FallbackPoolKeys: fallbackPoolKeys,
-	}, nil
+	return compiled.evaluate(groupID, routingKey)
 }
 
 // FollowFallback returns the configured chain in order, including startKey.
@@ -357,8 +405,15 @@ func FollowFallback(spec domain.TrafficDirectorSpec, startKey string) ([]string,
 		poolsByKey[pool.Key] = pool
 	}
 
-	chain := make([]string, 0, len(spec.Pools))
-	seen := make(map[string]struct{}, len(spec.Pools))
+	return followTrafficDirectorFallback(poolsByKey, startKey)
+}
+
+func followTrafficDirectorFallback(
+	poolsByKey map[string]domain.TrafficDirectorPool,
+	startKey string,
+) ([]string, error) {
+	chain := make([]string, 0, len(poolsByKey))
+	seen := make(map[string]struct{}, len(poolsByKey))
 	for poolKey := startKey; poolKey != ""; {
 		if _, visited := seen[poolKey]; visited {
 			return nil, invalidTrafficDirectorSpec("fallback cycle detected at pool %q", poolKey)

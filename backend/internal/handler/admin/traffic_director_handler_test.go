@@ -17,6 +17,8 @@ import (
 
 type trafficDirectorHandlerServiceStub struct {
 	state         *service.TrafficDirectorGroupState
+	versions      []service.TrafficDirectorVersionSummary
+	version       *service.TrafficDirectorVersion
 	previewResult *service.TrafficDirectorPreview
 	publishResult *service.TrafficDirectorPublishResult
 	previewErr    error
@@ -29,12 +31,12 @@ func (s *trafficDirectorHandlerServiceStub) Get(context.Context, int64) (*servic
 	return s.state, s.getErr
 }
 
-func (s *trafficDirectorHandlerServiceStub) ListVersions(context.Context, int64, int, int) ([]service.TrafficDirectorVersion, int64, error) {
-	return nil, 0, nil
+func (s *trafficDirectorHandlerServiceStub) ListVersions(context.Context, int64, int, int) ([]service.TrafficDirectorVersionSummary, int64, error) {
+	return s.versions, int64(len(s.versions)), nil
 }
 
 func (s *trafficDirectorHandlerServiceStub) GetVersion(context.Context, int64, int64) (*service.TrafficDirectorVersion, error) {
-	return nil, nil
+	return s.version, nil
 }
 
 func (s *trafficDirectorHandlerServiceStub) Preview(_ context.Context, input service.TrafficDirectorPreviewInput) (*service.TrafficDirectorPreview, error) {
@@ -68,6 +70,8 @@ func newTrafficDirectorTestRouter(s *trafficDirectorHandlerServiceStub) *gin.Eng
 	h := NewTrafficDirectorHandler(s)
 	router.POST("/groups/:id/traffic-director/preview", h.Preview)
 	router.POST("/groups/:id/traffic-director/publish", h.Publish)
+	router.GET("/groups/:id/traffic-director/versions", h.ListVersions)
+	router.GET("/groups/:id/traffic-director/versions/:version", h.GetVersion)
 	router.GET("/groups/:id/traffic-director/status", h.Status)
 	return router
 }
@@ -82,6 +86,63 @@ func trafficDirectorTestSpec() *domain.TrafficDirectorSpec {
 			AccountIDs: []int64{11},
 		}},
 	}
+}
+
+func TestTrafficDirectorHandlerVersionListOmitsSpecWhileDetailIncludesIt(t *testing.T) {
+	stub := &trafficDirectorHandlerServiceStub{
+		state: &service.TrafficDirectorGroupState{
+			GroupID:  9,
+			Platform: service.PlatformOpenAI,
+		},
+		versions: []service.TrafficDirectorVersionSummary{{
+			GroupID:  9,
+			Version:  3,
+			Mode:     domain.TrafficDirectorModeShadow,
+			Checksum: "summary-checksum",
+			Note:     "canary",
+		}},
+		version: &service.TrafficDirectorVersion{
+			GroupID:  9,
+			Version:  3,
+			Mode:     domain.TrafficDirectorModeShadow,
+			Spec:     trafficDirectorTestSpec(),
+			Checksum: "summary-checksum",
+			Note:     "canary",
+		},
+	}
+	router := newTrafficDirectorTestRouter(stub)
+
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(
+		http.MethodGet,
+		"/groups/9/traffic-director/versions?limit=10&offset=0",
+		nil,
+	))
+	require.Equal(t, http.StatusOK, listRecorder.Code)
+	var listEnvelope struct {
+		Data struct {
+			Items []map[string]json.RawMessage `json:"items"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(listRecorder.Body.Bytes(), &listEnvelope))
+	require.Len(t, listEnvelope.Data.Items, 1)
+	_, listContainsSpec := listEnvelope.Data.Items[0]["spec"]
+	require.False(t, listContainsSpec)
+
+	detailRecorder := httptest.NewRecorder()
+	router.ServeHTTP(detailRecorder, httptest.NewRequest(
+		http.MethodGet,
+		"/groups/9/traffic-director/versions/3",
+		nil,
+	))
+	require.Equal(t, http.StatusOK, detailRecorder.Code)
+	var detailEnvelope struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(detailRecorder.Body.Bytes(), &detailEnvelope))
+	specJSON, detailContainsSpec := detailEnvelope.Data["spec"]
+	require.True(t, detailContainsSpec)
+	require.NotEqual(t, "null", string(specJSON))
 }
 
 func TestTrafficDirectorHandlerPreviewPassesExpectedVersionAndSpec(t *testing.T) {
@@ -160,7 +221,10 @@ func TestTrafficDirectorHandlerStatusIncludesPoolAndHealthSummary(t *testing.T) 
 			Mode:    domain.TrafficDirectorModeEnforced,
 			Spec:    trafficDirectorTestSpec(),
 		},
-		Accounts: []service.TrafficDirectorAccount{{ID: 11, Schedulable: true}, {ID: 12, Schedulable: false}},
+		Accounts: []service.TrafficDirectorAccount{
+			{ID: 11, Status: service.StatusActive, Schedulable: true},
+			{ID: 12, Status: service.StatusDisabled, Schedulable: true},
+		},
 	}}
 	router := newTrafficDirectorTestRouter(stub)
 	req := httptest.NewRequest(http.MethodGet, "/groups/9/traffic-director/status", nil)
@@ -175,8 +239,11 @@ func TestTrafficDirectorHandlerStatusIncludesPoolAndHealthSummary(t *testing.T) 
 			HealthMode string `json:"health_mode"`
 			Checksum   string `json:"checksum"`
 			Pools      []struct {
-				Key string `json:"key"`
+				Key            string `json:"key"`
+				AvailableCount int    `json:"available_count"`
 			} `json:"pools"`
+			AvailableAccountCount int                                           `json:"available_account_count"`
+			RuntimeMetrics        service.TrafficDirectorRuntimeMetricsSnapshot `json:"runtime_metrics"`
 		} `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
@@ -185,4 +252,7 @@ func TestTrafficDirectorHandlerStatusIncludesPoolAndHealthSummary(t *testing.T) 
 	require.Equal(t, domain.TrafficDirectorHealthModeObserve, envelope.Data.HealthMode)
 	require.NotEmpty(t, envelope.Data.Checksum)
 	require.Equal(t, []string{"stable"}, []string{envelope.Data.Pools[0].Key})
+	require.Equal(t, 1, envelope.Data.Pools[0].AvailableCount)
+	require.Equal(t, 1, envelope.Data.AvailableAccountCount)
+	require.Equal(t, "process_lifetime", envelope.Data.RuntimeMetrics.Scope)
 }

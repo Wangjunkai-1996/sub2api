@@ -261,19 +261,24 @@ type OpenAIForwardResult struct {
 	// UpstreamTerminalEvent is the normalized terminal event observed on an
 	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
 	UpstreamTerminalEvent string
-	ResponseHeaders       http.Header
-	Duration              time.Duration
-	FirstTokenMs          *int
-	ClientDisconnect      bool
-	ImageCount            int
-	ImageSize             string
-	ImageInputSize        string
-	ImageOutputSize       string
-	ImageOutputSizes      []string
-	ImageSizeSource       string
-	ImageSizeBreakdown    map[string]int
-	VideoCount            int
-	VideoResolution       string
+	// UpstreamTerminalStatusCode is a synthetic HTTP-equivalent status derived
+	// from a WebSocket terminal payload. It lets health classification preserve
+	// request, auth, quota, and server-error semantics without retaining the
+	// complete upstream event body.
+	UpstreamTerminalStatusCode int
+	ResponseHeaders            http.Header
+	Duration                   time.Duration
+	FirstTokenMs               *int
+	ClientDisconnect           bool
+	ImageCount                 int
+	ImageSize                  string
+	ImageInputSize             string
+	ImageOutputSize            string
+	ImageOutputSizes           []string
+	ImageSizeSource            string
+	ImageSizeBreakdown         map[string]int
+	VideoCount                 int
+	VideoResolution            string
 	// VideoDurationSeconds 是提交时请求的生成时长（xAI 按输出秒数计费），已归一化到 1-15 秒。
 	VideoDurationSeconds int
 	// WebSearchCalls 是 Codex alpha/search 网页搜索调用次数（每次成功请求为 1）。
@@ -432,22 +437,28 @@ type OpenAIGatewayService struct {
 	liveAttestation       liveattestation.Provider
 	liveAttestationCipher SecretEncryptor
 
-	openaiWSPoolOnce               sync.Once
-	openaiWSStateStoreOnce         sync.Once
-	openaiSchedulerOnce            sync.Once
-	openaiSchedulerMu              sync.RWMutex
-	openaiProxyStreamCircuitOnce   sync.Once
-	openaiWSPassthroughDialerOnce  sync.Once
-	openaiModelTransientOnce       sync.Once
-	agentIdentityTaskMu            sync.Mutex
-	openaiWSPool                   *openAIWSConnPool
-	openaiWSStateStore             OpenAIWSStateStore
-	openaiScheduler                OpenAIAccountScheduler
-	openaiWSPassthroughDialer      openAIWSClientDialer
-	openaiAccountStats             *openAIAccountRuntimeStats
-	openaiModelTransient           *openAIAccountModelTransientState
-	openaiProxyStreamCircuit       *openAIProxyStreamCircuit
-	openaiProxyStreamFailOpenLogAt atomic.Int64
+	openaiWSPoolOnce              sync.Once
+	openaiWSStateStoreOnce        sync.Once
+	openaiSchedulerOnce           sync.Once
+	openaiSchedulerMu             sync.RWMutex
+	openaiProxyStreamCircuitOnce  sync.Once
+	openaiWSPassthroughDialerOnce sync.Once
+	openaiModelTransientOnce      sync.Once
+	agentIdentityTaskMu           sync.Mutex
+	openaiWSPool                  *openAIWSConnPool
+	openaiWSStateStore            OpenAIWSStateStore
+	openaiScheduler               OpenAIAccountScheduler
+	// Traffic Director dependencies are installed by application wiring after
+	// construction. They remain optional so legacy deployments retain the
+	// existing scheduler path until a policy resolver is configured.
+	openaiTrafficDirectorMu             sync.RWMutex
+	openaiTrafficDirectorResolver       OpenAITrafficDirectorResolver
+	openaiTrafficDirectorHealthResolver OpenAITrafficDirectorHealthResolver
+	openaiWSPassthroughDialer           openAIWSClientDialer
+	openaiAccountStats                  *openAIAccountRuntimeStats
+	openaiModelTransient                *openAIAccountModelTransientState
+	openaiProxyStreamCircuit            *openAIProxyStreamCircuit
+	openaiProxyStreamFailOpenLogAt      atomic.Int64
 
 	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
@@ -469,6 +480,31 @@ type OpenAIGatewayService struct {
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
 	openaiCodexTurnStateWrites  atomic.Uint64
+}
+
+// SetOpenAITrafficDirectorResolver installs the group policy resolver used by
+// PlatformOpenAI scheduling. Passing nil disables Traffic Director routing for
+// legacy/shadow requests; an authenticated Group explicitly marked enforced
+// fails closed with policy-unavailable until a resolver is installed.
+func (s *OpenAIGatewayService) SetOpenAITrafficDirectorResolver(resolver OpenAITrafficDirectorResolver) {
+	if s == nil {
+		return
+	}
+	s.openaiTrafficDirectorMu.Lock()
+	s.openaiTrafficDirectorResolver = resolver
+	s.openaiTrafficDirectorMu.Unlock()
+}
+
+// SetOpenAITrafficDirectorHealthResolver installs the optional account health
+// resolver used by enforced policies. A nil resolver means health enforcement
+// is unavailable and therefore fails open per the policy contract.
+func (s *OpenAIGatewayService) SetOpenAITrafficDirectorHealthResolver(resolver OpenAITrafficDirectorHealthResolver) {
+	if s == nil {
+		return
+	}
+	s.openaiTrafficDirectorMu.Lock()
+	s.openaiTrafficDirectorHealthResolver = resolver
+	s.openaiTrafficDirectorMu.Unlock()
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

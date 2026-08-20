@@ -785,6 +785,83 @@ func ProvideAPIKeyService(
 	return svc
 }
 
+func ProvideTrafficDirectorService(
+	repository TrafficDirectorRepository,
+	authCacheInvalidator APIKeyAuthCacheInvalidator,
+) *TrafficDirectorService {
+	return NewTrafficDirectorService(repository, authCacheInvalidator)
+}
+
+func ProvideTrafficDirectorPolicyCache(
+	store TrafficDirectorPolicyStore,
+	redisCache TrafficDirectorPolicyRedisCache,
+) TrafficDirectorPolicyCache {
+	return NewTrafficDirectorPolicyCache(
+		store,
+		redisCache,
+		defaultTrafficDirectorPolicyL1Capacity,
+		defaultTrafficDirectorPolicyRedisTTL,
+	)
+}
+
+func ProvideOpenAITrafficDirectorResolver(
+	repository TrafficDirectorRepository,
+	cache TrafficDirectorPolicyCache,
+) OpenAITrafficDirectorResolver {
+	return NewOpenAITrafficDirectorPolicyResolver(repository, cache)
+}
+
+func ProvideTrafficDirectorHealthService(store TrafficDirectorHealthStore) *TrafficDirectorHealthService {
+	return NewTrafficDirectorHealthService(store)
+}
+
+func ProvideOpenAITrafficDirectorHealthResolver(
+	healthService *TrafficDirectorHealthService,
+) OpenAITrafficDirectorHealthResolver {
+	return healthService
+}
+
+// ProvideConfiguredOpenAIGatewayService keeps the public constructor stable
+// for focused unit tests while installing optional Traffic Director ports in
+// the production dependency graph.
+func ProvideConfiguredOpenAIGatewayService(
+	accountRepo AccountRepository,
+	usageLogRepo UsageLogRepository,
+	usageBillingRepo UsageBillingRepository,
+	userRepo UserRepository,
+	userSubRepo UserSubscriptionRepository,
+	userGroupRateRepo UserGroupRateRepository,
+	cache GatewayCache,
+	cfg *config.Config,
+	schedulerSnapshot *SchedulerSnapshotService,
+	concurrencyService *ConcurrencyService,
+	billingService *BillingService,
+	rateLimitService *RateLimitService,
+	billingCacheService *BillingCacheService,
+	httpUpstream HTTPUpstream,
+	deferredService *DeferredService,
+	openAITokenProvider *OpenAITokenProvider,
+	grokTokenProvider *GrokTokenProvider,
+	resolver *ModelPricingResolver,
+	channelService *ChannelService,
+	balanceNotifyService *BalanceNotifyService,
+	settingService *SettingService,
+	userPlatformQuotaRepo UserPlatformQuotaRepository,
+	trafficResolver OpenAITrafficDirectorResolver,
+	healthResolver OpenAITrafficDirectorHealthResolver,
+) *OpenAIGatewayService {
+	svc := NewOpenAIGatewayService(
+		accountRepo, usageLogRepo, usageBillingRepo, userRepo, userSubRepo,
+		userGroupRateRepo, cache, cfg, schedulerSnapshot, concurrencyService,
+		billingService, rateLimitService, billingCacheService, httpUpstream,
+		deferredService, openAITokenProvider, grokTokenProvider, resolver,
+		channelService, balanceNotifyService, settingService, userPlatformQuotaRepo,
+	)
+	svc.SetOpenAITrafficDirectorResolver(trafficResolver)
+	svc.SetOpenAITrafficDirectorHealthResolver(healthResolver)
+	return svc
+}
+
 // ProviderSet is the Wire provider set for all services
 var ProviderSet = wire.NewSet(
 	// Core services
@@ -792,6 +869,11 @@ var ProviderSet = wire.NewSet(
 	NewPasskeyService,
 	NewUserService,
 	ProvideAPIKeyService,
+	ProvideTrafficDirectorService,
+	ProvideTrafficDirectorPolicyCache,
+	ProvideOpenAITrafficDirectorResolver,
+	ProvideTrafficDirectorHealthService,
+	ProvideOpenAITrafficDirectorHealthResolver,
 	ProvideAPIKeyAuthCacheInvalidator,
 	ProvideAuthCacheInvalidationWorker,
 	NewGroupService,
@@ -808,7 +890,7 @@ var ProviderSet = wire.NewSet(
 	NewAnnouncementService,
 	NewAdminService,
 	NewGatewayService,
-	NewOpenAIGatewayService,
+	ProvideConfiguredOpenAIGatewayService,
 	ProvideImageStorageSettingService,
 	ProvideImageTaskService,
 	ProvideBatchImageModelPricingResolver,

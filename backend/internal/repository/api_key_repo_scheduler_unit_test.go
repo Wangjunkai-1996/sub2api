@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +29,8 @@ func TestAPIKeyRepositoryGetByKeyForAuthPreservesSchedulerProjectionSQLite(t *te
 		SetRateMultiplier(1).
 		SetSchedulerType(service.GroupSchedulerTypeAdvanced).
 		SetAdvancedSchedulerOverrides(overrides).
+		SetTrafficDirectorMode(domain.TrafficDirectorModeShadow).
+		SetTrafficDirectorVersion(4).
 		Save(ctx)
 	require.NoError(t, err)
 
@@ -50,4 +53,6 @@ func TestAPIKeyRepositoryGetByKeyForAuthPreservesSchedulerProjectionSQLite(t *te
 	require.Zero(t, *got.Group.AdvancedSchedulerOverrides.WeightLoad)
 	require.NotNil(t, got.Group.AdvancedSchedulerOverrides.LBTopK)
 	require.Equal(t, 6, *got.Group.AdvancedSchedulerOverrides.LBTopK)
+	require.Equal(t, domain.TrafficDirectorModeShadow, got.Group.TrafficDirectorMode)
+	require.Equal(t, int64(4), got.Group.TrafficDirectorVersion)
 }

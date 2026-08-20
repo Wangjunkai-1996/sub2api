@@ -135,6 +135,9 @@ type APIKeyAuthGroupSnapshot struct {
 
 	SchedulerType              string                     `json:"scheduler_type"`
 	AdvancedSchedulerOverrides AdvancedSchedulerOverrides `json:"advanced_scheduler_overrides"`
+
+	TrafficDirectorMode    string `json:"traffic_director_mode"`
+	TrafficDirectorVersion int64  `json:"traffic_director_version"`
 }
 
 // APIKeyAuthCacheEntry 缓存条目，支持负缓存

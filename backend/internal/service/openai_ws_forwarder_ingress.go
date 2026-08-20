@@ -92,9 +92,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 				return fmt.Errorf("websocket ingress requires ws_v2 transport, got=%s", wsDecision.Transport)
 			}
-			// 透传 relay 通过 TurnStarted 记录每个 turn 的开始时刻，但不触发
-			// BeforeTurn；因此仍只有建连时的利润准入门，没有 turn 级复核。
-			// handler 计费在 turn 定价未冻结时回退到对应的 turn 开始时刻。
+			// 首轮已在建连前完成准入；后续 response.create 由 passthrough
+			// relay 触发 BeforeTurn 复核。TurnStarted 仍记录每轮开始时刻，
+			// 供 handler 在未冻结定价时回退。
 			return s.proxyResponsesWebSocketV2Passthrough(
 				ctx,
 				c,
@@ -1050,6 +1050,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					Stream:                        reqStream,
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         terminalEvent,
+					UpstreamTerminalStatusCode:    openAIWSTerminalHealthStatus(upstreamMessage),
 					ResponseHeaders:               lease.HandshakeHeaders(),
 					Duration:                      time.Since(turnStart),
 					FirstTokenMs:                  firstTokenMs,

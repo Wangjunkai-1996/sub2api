@@ -129,6 +129,11 @@ type Group struct {
 	SchedulerType              string
 	AdvancedSchedulerOverrides AdvancedSchedulerOverrides
 
+	// Traffic Director auth hot-path head. The full pool spec is deliberately
+	// excluded and resolved by immutable version through the policy cache.
+	TrafficDirectorMode    string
+	TrafficDirectorVersion int64
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 

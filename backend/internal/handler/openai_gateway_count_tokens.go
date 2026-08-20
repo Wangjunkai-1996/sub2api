@@ -1,11 +1,16 @@
 package handler
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
@@ -56,8 +61,7 @@ func (h *OpenAIGatewayHandler) GrokCountTokens(c *gin.Context) {
 }
 
 // CountTokens handles Anthropic-compatible POST /v1/messages/count_tokens for OpenAI groups.
-// It validates billing and routes to an OpenAI token-count bridge without taking concurrency slots
-// or recording usage.
+// It validates billing and routes to an OpenAI token-count bridge without recording usage.
 func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 	if !ok {
@@ -145,55 +149,283 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	requestStart := time.Now()
 	// count_tokens 不计费：显式豁免利润门，避免高倍率账号池被门排除后连
 	// token 计数都返回 no available accounts。
-	c.Request = c.Request.WithContext(service.WithOpenAIProfitControlSuppressed(c.Request.Context()))
+	requestCtx := service.WithOpenAIProfitControlSuppressed(c.Request.Context())
+	requestCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(requestCtx)
+	c.Request = c.Request.WithContext(requestCtx)
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	currentRoutingModel := routingModel
 	if preferredMappedModel != "" {
 		currentRoutingModel = preferredMappedModel
 	}
-	selection, _, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-		c.Request.Context(),
-		apiKey.GroupID,
-		"",
-		sessionHash,
-		currentRoutingModel,
-		nil,
-		service.OpenAIUpstreamTransportAny,
-		service.OpenAIEndpointCapabilityChatCompletions,
-		false,
-		false,
-		false,
-		openAICompatibleRequestPlatform(c.Request.Context(), apiKey),
-	)
-	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
-	if err != nil {
-		requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
-		reqLog.Warn("openai_count_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)))
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
-		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+	failedAccountIDs := make(map[int64]struct{})
+	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
+	for {
+		selection, _, selectErr := h.gatewayService.SelectAccountWithSchedulerForCapability(
+			c.Request.Context(),
+			apiKey.GroupID,
+			"",
+			sessionHash,
+			currentRoutingModel,
+			failedAccountIDs,
+			service.OpenAIUpstreamTransportAny,
+			service.OpenAIEndpointCapabilityChatCompletions,
+			false,
+			false,
+			false,
+			requestPlatform,
+		)
+		service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
+		if selectErr != nil {
+			reqLog.Warn("openai_count_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(selectErr, requestPlatform)))
+			cls := classifyOpenAICompatibleSelectionErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel, selectErr)
+			if !cls.ModelNotFound {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
+			}
+			h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			return
 		}
-		h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
+		if selection == nil || selection.Account == nil {
+			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+			if !cls.ModelNotFound {
+				markOpsRoutingCapacityLimited(c)
+			}
+			h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			return
+		}
+
+		account := selection.Account
+		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
+		setOpsSelectedAccount(c, account.ID, account.Platform)
+		accountRelease, retry, acquireErr := h.acquireCountTokensAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqLog)
+		if retry {
+			failedAccountIDs[account.ID] = struct{}{}
+			reqLog.Info("openai_count_tokens.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
+			continue
+		}
+		if acquireErr != nil {
+			status, errType, message := concurrencyErrorResponse(acquireErr, "account")
+			h.anthropicErrorResponse(c, status, errType, message)
+			return
+		}
+
+		account = selection.Account
+		forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
+		defaultMappedModel := preferredMappedModel
+		forwardErr := func() error {
+			if accountRelease != nil {
+				defer accountRelease()
+			}
+			selection.CommitTrafficDirectorAttempt()
+			return h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, defaultMappedModel)
+		}()
+		h.reportCountTokensTrafficDirectorOutcome(c, account, currentRoutingModel, forwardErr)
+		if forwardErr != nil {
+			reqLog.Error("openai_count_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(forwardErr))
+		}
 		return
 	}
+}
+
+var errCountTokensLocalFailure = errors.New("count_tokens local failure")
+
+// reportCountTokensTrafficDirectorOutcome keeps local request/conversion
+// failures out of the account circuit while preserving explicit upstream
+// HTTP and transport evidence. The probe is still consumed for ignored local
+// failures so a half-open token cannot leak into a later retry.
+func (h *OpenAIGatewayHandler) reportCountTokensTrafficDirectorOutcome(
+	c *gin.Context,
+	account *service.Account,
+	model string,
+	err error,
+) {
+	if h == nil || h.gatewayService == nil || account == nil {
+		return
+	}
+	statusValue, _ := getContextInt64(c, service.OpsUpstreamStatusCodeKey)
+	statusCode := int(statusValue)
+	hasUpstreamEvidence := countTokensHasUpstreamEvidence(c)
+	accountScoped := hasUpstreamEvidence
+	// Keep local parser/access-token/build errors out of the account circuit.
+	// The ignored marker still consumes an owned half-open probe.
+	reportErr := countTokensHealthReportError(c, err, accountScoped)
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	if _, reportErr := h.gatewayService.ReportOpenAITrafficDirectorOutcome(ctx, service.OpenAITrafficDirectorHealthOutcomeInput{
+		Account:          account,
+		Model:            model,
+		Err:              reportErr,
+		StatusCode:       statusCode,
+		AccountScoped:    accountScoped,
+		AccountScopedSet: true,
+	}); reportErr != nil && logger.L() != nil {
+		logger.L().Debug("openai.count_tokens.traffic_director_health_report_failed",
+			zap.Int64("account_id", account.ID), zap.Error(reportErr))
+	}
+}
+
+func countTokensHealthReportError(c *gin.Context, err error, accountScoped bool) error {
+	if !accountScoped {
+		return errCountTokensLocalFailure
+	}
+	if err == nil {
+		return nil
+	}
+	marker := countTokensUpstreamErrorMarker(c)
+	if marker == "" || strings.Contains(err.Error(), marker) {
+		return err
+	}
+	return fmt.Errorf("%s: %w", marker, err)
+}
+
+func countTokensUpstreamErrorMarker(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	for _, key := range []string{
+		service.OpsUpstreamErrorMessageKey,
+		service.OpsUpstreamErrorDetailKey,
+	} {
+		if value, ok := c.Get(key); ok {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+	}
+	if events, ok := c.Get(service.OpsUpstreamErrorsKey); ok {
+		if list, ok := events.([]*service.OpsUpstreamErrorEvent); ok {
+			for i := len(list) - 1; i >= 0; i-- {
+				if list[i] == nil {
+					continue
+				}
+				if marker := strings.TrimSpace(list[i].Message); marker != "" {
+					return marker
+				}
+				if marker := strings.TrimSpace(list[i].Detail); marker != "" {
+					return marker
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func countTokensHasUpstreamEvidence(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if status, ok := getContextInt64(c, service.OpsUpstreamStatusCodeKey); ok && status > 0 {
+		return true
+	}
+	for _, key := range []string{
+		service.OpsUpstreamErrorMessageKey,
+		service.OpsUpstreamErrorDetailKey,
+	} {
+		if value, ok := c.Get(key); ok {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				return true
+			}
+		}
+	}
+	if events, ok := c.Get(service.OpsUpstreamErrorsKey); ok {
+		if list, ok := events.([]*service.OpsUpstreamErrorEvent); ok && len(list) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// acquireCountTokensAccountSlot turns a scheduler WaitPlan into a real account
+// slot before Traffic Director health admission. A retry result is returned only
+// for enforced TD requests, allowing the caller to exclude this account and
+// advance through the configured pool chain without changing legacy errors.
+func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
+	c *gin.Context,
+	groupID *int64,
+	sessionHash string,
+	selection *service.AccountSelectionResult,
+	reqLog *zap.Logger,
+) (release func(), retry bool, err error) {
 	if selection == nil || selection.Account == nil {
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
-		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimited(c)
-		}
-		h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
-		return
+		return nil, false, service.ErrNoAvailableAccounts
 	}
-
+	ctx := service.ContextWithSelectionProfitGate(c.Request.Context(), selection)
 	account := selection.Account
-	setOpsSelectedAccount(c, account.ID, account.Platform)
-	if selection.Acquired && selection.ReleaseFunc != nil {
-		defer selection.ReleaseFunc()
+	if selection.Acquired {
+		if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, selection.ReleaseFunc, reqLog); recheckErr != nil {
+			return nil, h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx), recheckErr
+		}
+		return wrapReleaseOnDone(ctx, selection.ReleaseFunc), false, nil
 	}
-	forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
-	defaultMappedModel := preferredMappedModel
+	if selection.WaitPlan == nil {
+		return nil, false, service.ErrNoAvailableAccounts
+	}
 
-	if err := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, defaultMappedModel); err != nil {
-		reqLog.Error("openai_count_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+	accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(
+		ctx,
+		account.ID,
+		selection.WaitPlan.MaxConcurrency,
+	)
+	if acquireErr != nil {
+		return nil, false, acquireErr
 	}
+	if !acquired {
+		canWait, waitErr := h.concurrencyHelper.IncrementAccountWaitCount(ctx, account.ID, selection.WaitPlan.MaxWaiting)
+		if waitErr != nil {
+			reqLog.Warn("openai_count_tokens.account_wait_counter_increment_failed", zap.Int64("account_id", account.ID), zap.Error(waitErr))
+		} else if !canWait {
+			if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) {
+				return nil, true, nil
+			}
+			return nil, false, &WaitQueueFullError{SlotType: "account"}
+		}
+
+		waitCounted := waitErr == nil && canWait
+		releaseWait := func() {
+			if waitCounted {
+				h.concurrencyHelper.DecrementAccountWaitCount(ctx, account.ID)
+				waitCounted = false
+			}
+		}
+		defer releaseWait()
+
+		streamStarted := false
+		accountRelease, acquireErr = h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
+			c,
+			account.ID,
+			selection.WaitPlan.MaxConcurrency,
+			selection.WaitPlan.Timeout,
+			false,
+			&streamStarted,
+		)
+		if acquireErr != nil {
+			var concurrencyErr *ConcurrencyError
+			if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) &&
+				errors.As(acquireErr, &concurrencyErr) && concurrencyErr.IsTimeout {
+				return nil, true, nil
+			}
+			return nil, false, acquireErr
+		}
+		releaseWait()
+	}
+
+	if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, accountRelease, reqLog); recheckErr != nil {
+		return nil, h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx), recheckErr
+	}
+	selection.ReleaseFunc = accountRelease
+	if !selection.AdmitTrafficDirector(ctx, selection.ReleaseFunc) {
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) {
+			return nil, true, nil
+		}
+		return nil, false, service.ErrTrafficDirectorNoAvailablePool
+	}
+	accountRelease = selection.ReleaseFunc
+	if bindErr := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); bindErr != nil {
+		reqLog.Warn("openai_count_tokens.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(bindErr))
+	}
+	return wrapReleaseOnDone(ctx, accountRelease), false, nil
 }

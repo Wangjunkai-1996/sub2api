@@ -778,6 +778,15 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	if err != nil {
 		return nil, fmt.Errorf("query accounts failed: %w", err)
 	}
+	if allowed, ok := ctx.Value(openAITrafficDirectorAllowedIDsKey{}).(map[int64]struct{}); ok && allowed != nil {
+		filtered := accounts[:0]
+		for i := range accounts {
+			if _, exists := allowed[accounts[i].ID]; exists {
+				filtered = append(filtered, accounts[i])
+			}
+		}
+		accounts = filtered
+	}
 
 	// 3. 按优先级 + LRU 选择最佳账号
 	// Select by priority + LRU
@@ -823,6 +832,9 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 	}
 
 	if _, excluded := excludedIDs[accountID]; excluded {
+		return nil
+	}
+	if !openAITrafficDirectorAllowsAccount(ctx, accountID) {
 		return nil
 	}
 
@@ -1055,7 +1067,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	// ============ Layer 1: Sticky session ============
 	if sessionHash != "" {
 		accountID := stickyAccountID
-		if accountID > 0 && !isExcluded(accountID) {
+		if accountID > 0 && !isExcluded(accountID) && openAITrafficDirectorAllowsAccount(ctx, accountID) {
 			account, err := s.getSchedulableAccount(ctx, accountID)
 			if err == nil {
 				clearSticky := shouldClearStickySession(account, requestedModel)
@@ -1120,6 +1132,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	for i := range accounts {
 		acc := &accounts[i]
 		if isExcluded(acc.ID) {
+			continue
+		}
+		if !openAITrafficDirectorAllowsAccount(ctx, acc.ID) {
 			continue
 		}
 		// Scheduler snapshots can be temporarily stale (bucket rebuild is throttled);

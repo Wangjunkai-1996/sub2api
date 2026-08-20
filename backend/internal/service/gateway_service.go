@@ -565,11 +565,78 @@ type AccountSelectionResult struct {
 	// 局部 ctx 上，handler 必须经 ContextWithSelectionProfitGate 重放后才能在
 	// 调度栈之外做抢槽后终检与准入后粘性绑定。
 	profitGate *openAIProfitControlGate
+	// Traffic Director health admission is deliberately deferred for a WaitPlan
+	// result. The scheduler can identify a half-open candidate without taking
+	// the single real-request probe; the handler installs the actual slot release
+	// before invoking this callback after the slot has been acquired.
+	trafficDirectorAdmission      func(context.Context, *Account) (bool, func())
+	trafficDirectorAdmissionUsed  bool
+	trafficDirectorAttemptStarted atomic.Bool
 }
 
 // ProfitGateActive 报告本次选号是否处于利润门之下。
 func (r *AccountSelectionResult) ProfitGateActive() bool {
 	return r != nil && r.profitGate != nil
+}
+
+func (r *AccountSelectionResult) setTrafficDirectorAdmission(
+	fn func(context.Context, *Account) (bool, func()),
+) {
+	if r == nil {
+		return
+	}
+	r.trafficDirectorAdmission = fn
+	r.trafficDirectorAdmissionUsed = false
+	r.trafficDirectorAttemptStarted.Store(false)
+}
+
+// CommitTrafficDirectorAttempt transfers probe cleanup ownership from the
+// slot release path to outcome reporting. Callers must invoke it immediately
+// before starting the real upstream request. Releases before that point are
+// abandoned admissions and still consume the local probe token.
+func (r *AccountSelectionResult) CommitTrafficDirectorAttempt() {
+	if r == nil || !r.trafficDirectorAdmissionUsed {
+		return
+	}
+	r.trafficDirectorAttemptStarted.Store(true)
+}
+
+// AdmitTrafficDirector performs the one-shot health admission associated with
+// this selection. release, when supplied, is wrapped so a probe that never
+// reaches an upstream outcome still stops its renewal goroutine when the slot
+// is released (security rejection, profit veto, or client cancellation).
+func (r *AccountSelectionResult) AdmitTrafficDirector(ctx context.Context, release func()) bool {
+	if r == nil || r.trafficDirectorAdmission == nil {
+		return true
+	}
+	if r.trafficDirectorAdmissionUsed {
+		return true
+	}
+	r.trafficDirectorAdmissionUsed = true
+	allowed, cleanup := r.trafficDirectorAdmission(ctx, r.Account)
+	if cleanup == nil {
+		return allowed
+	}
+	var cleaned atomic.Bool
+	cleanupOnce := func() {
+		if !cleaned.CompareAndSwap(false, true) {
+			return
+		}
+		cleanup()
+	}
+	wrappedRelease := func() {
+		if release != nil {
+			release()
+		}
+		if !r.trafficDirectorAttemptStarted.Load() {
+			cleanupOnce()
+		}
+	}
+	// Keep the gated wrapper even without an underlying concurrency release.
+	// Some service-side selections own only the Traffic Director admission; a
+	// committed attempt must still leave its token for outcome reporting.
+	r.ReleaseFunc = wrappedRelease
+	return allowed
 }
 
 // ClaudeUsage 表示Claude API返回的usage信息

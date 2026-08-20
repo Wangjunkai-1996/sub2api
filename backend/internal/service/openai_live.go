@@ -144,6 +144,11 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 	}
 
 	excluded := make(map[int64]struct{})
+	// Live is deliberately outside Traffic Director V1. Its scheduler-owned
+	// request slot is atomically replaced by a long-lived Live lease, so a
+	// request-scoped health probe cannot represent the lifetime of the call.
+	// Keep all existing basic/advanced scheduling and lease behavior unchanged.
+	ctx = withOpenAITrafficDirectorV1Bypass(ctx)
 	// Live 按通话时长计费，不属于 token 利润门的语义范围：显式豁免，避免
 	// 防御性装门按文本 D 过滤 Live 账号池且门与计费时刻不同源。
 	ctx = WithOpenAIProfitControlSuppressed(ctx)

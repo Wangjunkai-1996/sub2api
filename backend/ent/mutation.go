@@ -22175,6 +22175,10 @@ type GroupMutation struct {
 	addprofit_safety_buffer                 *float64
 	scheduler_type                          *string
 	advanced_scheduler_overrides            *domain.AdvancedSchedulerOverrides
+	traffic_director_mode                   *string
+	traffic_director_version                *int64
+	addtraffic_director_version             *int64
+	traffic_director_spec                   **domain.TrafficDirectorSpec
 	clearedFields                           map[string]struct{}
 	api_keys                                map[int64]struct{}
 	removedapi_keys                         map[int64]struct{}
@@ -25489,6 +25493,147 @@ func (m *GroupMutation) ResetAdvancedSchedulerOverrides() {
 	m.advanced_scheduler_overrides = nil
 }
 
+// SetTrafficDirectorMode sets the "traffic_director_mode" field.
+func (m *GroupMutation) SetTrafficDirectorMode(s string) {
+	m.traffic_director_mode = &s
+}
+
+// TrafficDirectorMode returns the value of the "traffic_director_mode" field in the mutation.
+func (m *GroupMutation) TrafficDirectorMode() (r string, exists bool) {
+	v := m.traffic_director_mode
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldTrafficDirectorMode returns the old "traffic_director_mode" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldTrafficDirectorMode(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldTrafficDirectorMode is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldTrafficDirectorMode requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldTrafficDirectorMode: %w", err)
+	}
+	return oldValue.TrafficDirectorMode, nil
+}
+
+// ResetTrafficDirectorMode resets all changes to the "traffic_director_mode" field.
+func (m *GroupMutation) ResetTrafficDirectorMode() {
+	m.traffic_director_mode = nil
+}
+
+// SetTrafficDirectorVersion sets the "traffic_director_version" field.
+func (m *GroupMutation) SetTrafficDirectorVersion(i int64) {
+	m.traffic_director_version = &i
+	m.addtraffic_director_version = nil
+}
+
+// TrafficDirectorVersion returns the value of the "traffic_director_version" field in the mutation.
+func (m *GroupMutation) TrafficDirectorVersion() (r int64, exists bool) {
+	v := m.traffic_director_version
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldTrafficDirectorVersion returns the old "traffic_director_version" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldTrafficDirectorVersion(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldTrafficDirectorVersion is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldTrafficDirectorVersion requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldTrafficDirectorVersion: %w", err)
+	}
+	return oldValue.TrafficDirectorVersion, nil
+}
+
+// AddTrafficDirectorVersion adds i to the "traffic_director_version" field.
+func (m *GroupMutation) AddTrafficDirectorVersion(i int64) {
+	if m.addtraffic_director_version != nil {
+		*m.addtraffic_director_version += i
+	} else {
+		m.addtraffic_director_version = &i
+	}
+}
+
+// AddedTrafficDirectorVersion returns the value that was added to the "traffic_director_version" field in this mutation.
+func (m *GroupMutation) AddedTrafficDirectorVersion() (r int64, exists bool) {
+	v := m.addtraffic_director_version
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetTrafficDirectorVersion resets all changes to the "traffic_director_version" field.
+func (m *GroupMutation) ResetTrafficDirectorVersion() {
+	m.traffic_director_version = nil
+	m.addtraffic_director_version = nil
+}
+
+// SetTrafficDirectorSpec sets the "traffic_director_spec" field.
+func (m *GroupMutation) SetTrafficDirectorSpec(dds *domain.TrafficDirectorSpec) {
+	m.traffic_director_spec = &dds
+}
+
+// TrafficDirectorSpec returns the value of the "traffic_director_spec" field in the mutation.
+func (m *GroupMutation) TrafficDirectorSpec() (r *domain.TrafficDirectorSpec, exists bool) {
+	v := m.traffic_director_spec
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldTrafficDirectorSpec returns the old "traffic_director_spec" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldTrafficDirectorSpec(ctx context.Context) (v *domain.TrafficDirectorSpec, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldTrafficDirectorSpec is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldTrafficDirectorSpec requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldTrafficDirectorSpec: %w", err)
+	}
+	return oldValue.TrafficDirectorSpec, nil
+}
+
+// ClearTrafficDirectorSpec clears the value of the "traffic_director_spec" field.
+func (m *GroupMutation) ClearTrafficDirectorSpec() {
+	m.traffic_director_spec = nil
+	m.clearedFields[group.FieldTrafficDirectorSpec] = struct{}{}
+}
+
+// TrafficDirectorSpecCleared returns if the "traffic_director_spec" field was cleared in this mutation.
+func (m *GroupMutation) TrafficDirectorSpecCleared() bool {
+	_, ok := m.clearedFields[group.FieldTrafficDirectorSpec]
+	return ok
+}
+
+// ResetTrafficDirectorSpec resets all changes to the "traffic_director_spec" field.
+func (m *GroupMutation) ResetTrafficDirectorSpec() {
+	m.traffic_director_spec = nil
+	delete(m.clearedFields, group.FieldTrafficDirectorSpec)
+}
+
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by ids.
 func (m *GroupMutation) AddAPIKeyIDs(ids ...int64) {
 	if m.api_keys == nil {
@@ -25847,7 +25992,7 @@ func (m *GroupMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *GroupMutation) Fields() []string {
-	fields := make([]string, 0, 64)
+	fields := make([]string, 0, 67)
 	if m.created_at != nil {
 		fields = append(fields, group.FieldCreatedAt)
 	}
@@ -26040,6 +26185,15 @@ func (m *GroupMutation) Fields() []string {
 	if m.advanced_scheduler_overrides != nil {
 		fields = append(fields, group.FieldAdvancedSchedulerOverrides)
 	}
+	if m.traffic_director_mode != nil {
+		fields = append(fields, group.FieldTrafficDirectorMode)
+	}
+	if m.traffic_director_version != nil {
+		fields = append(fields, group.FieldTrafficDirectorVersion)
+	}
+	if m.traffic_director_spec != nil {
+		fields = append(fields, group.FieldTrafficDirectorSpec)
+	}
 	return fields
 }
 
@@ -26176,6 +26330,12 @@ func (m *GroupMutation) Field(name string) (ent.Value, bool) {
 		return m.SchedulerType()
 	case group.FieldAdvancedSchedulerOverrides:
 		return m.AdvancedSchedulerOverrides()
+	case group.FieldTrafficDirectorMode:
+		return m.TrafficDirectorMode()
+	case group.FieldTrafficDirectorVersion:
+		return m.TrafficDirectorVersion()
+	case group.FieldTrafficDirectorSpec:
+		return m.TrafficDirectorSpec()
 	}
 	return nil, false
 }
@@ -26313,6 +26473,12 @@ func (m *GroupMutation) OldField(ctx context.Context, name string) (ent.Value, e
 		return m.OldSchedulerType(ctx)
 	case group.FieldAdvancedSchedulerOverrides:
 		return m.OldAdvancedSchedulerOverrides(ctx)
+	case group.FieldTrafficDirectorMode:
+		return m.OldTrafficDirectorMode(ctx)
+	case group.FieldTrafficDirectorVersion:
+		return m.OldTrafficDirectorVersion(ctx)
+	case group.FieldTrafficDirectorSpec:
+		return m.OldTrafficDirectorSpec(ctx)
 	}
 	return nil, fmt.Errorf("unknown Group field %s", name)
 }
@@ -26770,6 +26936,27 @@ func (m *GroupMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetAdvancedSchedulerOverrides(v)
 		return nil
+	case group.FieldTrafficDirectorMode:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetTrafficDirectorMode(v)
+		return nil
+	case group.FieldTrafficDirectorVersion:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetTrafficDirectorVersion(v)
+		return nil
+	case group.FieldTrafficDirectorSpec:
+		v, ok := value.(*domain.TrafficDirectorSpec)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetTrafficDirectorSpec(v)
+		return nil
 	}
 	return fmt.Errorf("unknown Group field %s", name)
 }
@@ -26859,6 +27046,9 @@ func (m *GroupMutation) AddedFields() []string {
 	if m.addprofit_safety_buffer != nil {
 		fields = append(fields, group.FieldProfitSafetyBuffer)
 	}
+	if m.addtraffic_director_version != nil {
+		fields = append(fields, group.FieldTrafficDirectorVersion)
+	}
 	return fields
 }
 
@@ -26921,6 +27111,8 @@ func (m *GroupMutation) AddedField(name string) (ent.Value, bool) {
 		return m.AddedProfitMinMargin()
 	case group.FieldProfitSafetyBuffer:
 		return m.AddedProfitSafetyBuffer()
+	case group.FieldTrafficDirectorVersion:
+		return m.AddedTrafficDirectorVersion()
 	}
 	return nil, false
 }
@@ -27119,6 +27311,13 @@ func (m *GroupMutation) AddField(name string, value ent.Value) error {
 		}
 		m.AddProfitSafetyBuffer(v)
 		return nil
+	case group.FieldTrafficDirectorVersion:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddTrafficDirectorVersion(v)
+		return nil
 	}
 	return fmt.Errorf("unknown Group numeric field %s", name)
 }
@@ -27192,6 +27391,9 @@ func (m *GroupMutation) ClearedFields() []string {
 	}
 	if m.FieldCleared(group.FieldModelRouting) {
 		fields = append(fields, group.FieldModelRouting)
+	}
+	if m.FieldCleared(group.FieldTrafficDirectorSpec) {
+		fields = append(fields, group.FieldTrafficDirectorSpec)
 	}
 	return fields
 }
@@ -27272,6 +27474,9 @@ func (m *GroupMutation) ClearField(name string) error {
 		return nil
 	case group.FieldModelRouting:
 		m.ClearModelRouting()
+		return nil
+	case group.FieldTrafficDirectorSpec:
+		m.ClearTrafficDirectorSpec()
 		return nil
 	}
 	return fmt.Errorf("unknown Group nullable field %s", name)
@@ -27472,6 +27677,15 @@ func (m *GroupMutation) ResetField(name string) error {
 		return nil
 	case group.FieldAdvancedSchedulerOverrides:
 		m.ResetAdvancedSchedulerOverrides()
+		return nil
+	case group.FieldTrafficDirectorMode:
+		m.ResetTrafficDirectorMode()
+		return nil
+	case group.FieldTrafficDirectorVersion:
+		m.ResetTrafficDirectorVersion()
+		return nil
+	case group.FieldTrafficDirectorSpec:
+		m.ResetTrafficDirectorSpec()
 		return nil
 	}
 	return fmt.Errorf("unknown Group field %s", name)

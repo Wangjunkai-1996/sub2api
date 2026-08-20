@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -200,4 +201,23 @@ func TestClassifyNoAccountError_FromGin_NilContextStillSafe(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, cls.Status, "even with a nil gin context the classifier must still run and yield a coherent response")
 	require.True(t, cls.ModelNotFound)
+}
+
+func TestClassifyTrafficDirectorSelectionError(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		wantTyp string
+	}{
+		{name: "pool chain exhausted", err: service.ErrTrafficDirectorNoAvailablePool, wantTyp: "traffic_director_no_available_pool"},
+		{name: "policy unavailable", err: service.ErrTrafficDirectorPolicyUnavailable, wantTyp: "traffic_director_policy_unavailable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cls, ok := classifyTrafficDirectorSelectionError(errors.Join(errors.New("wrapped"), tt.err))
+			require.True(t, ok)
+			require.Equal(t, http.StatusServiceUnavailable, cls.Status)
+			require.Equal(t, tt.wantTyp, cls.ErrType)
+		})
+	}
 }

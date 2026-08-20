@@ -1,8 +1,13 @@
 package admin
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -14,12 +19,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const trafficDirectorMaxRequestBodyBytes int64 = domain.TrafficDirectorMaxCanonicalJSONBytes + 8*1024
+
 // TrafficDirectorServiceAPI is the narrow service contract used by the admin
 // handler. Keeping the HTTP layer on an interface makes it possible to test
 // request validation and error mapping without a database or Redis instance.
 type TrafficDirectorServiceAPI interface {
 	Get(ctx context.Context, groupID int64) (*service.TrafficDirectorGroupState, error)
-	ListVersions(ctx context.Context, groupID int64, limit, offset int) ([]service.TrafficDirectorVersion, int64, error)
+	ListVersions(ctx context.Context, groupID int64, limit, offset int) ([]service.TrafficDirectorVersionSummary, int64, error)
 	GetVersion(ctx context.Context, groupID, version int64) (*service.TrafficDirectorVersion, error)
 	Preview(ctx context.Context, input service.TrafficDirectorPreviewInput) (*service.TrafficDirectorPreview, error)
 	Publish(ctx context.Context, input service.TrafficDirectorPublishInput) (*service.TrafficDirectorPublishResult, error)
@@ -58,8 +65,9 @@ type TrafficDirectorPublishRequest struct {
 }
 
 type trafficDirectorRollbackRequest struct {
-	ExpectedVersion *int64 `json:"expected_version"`
-	Note            string `json:"note"`
+	ExpectedVersion           *int64 `json:"expected_version"`
+	ConfirmUnassignedAccounts bool   `json:"confirm_unassigned_accounts"`
+	Note                      string `json:"note"`
 }
 
 // Get returns the current policy head and the account inventory used by the
@@ -152,8 +160,8 @@ func (h *TrafficDirectorHandler) Preview(c *gin.Context) {
 		return
 	}
 	var req TrafficDirectorPreviewRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid request body: "+err.Error())
+	if err := bindTrafficDirectorJSON(c, &req); err != nil {
+		writeTrafficDirectorJSONError(c, err)
 		return
 	}
 	expected, ok := requiredExpectedVersion(c, req.ExpectedVersion)
@@ -187,8 +195,8 @@ func (h *TrafficDirectorHandler) Publish(c *gin.Context) {
 		return
 	}
 	var req TrafficDirectorPublishRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid request body: "+err.Error())
+	if err := bindTrafficDirectorJSON(c, &req); err != nil {
+		writeTrafficDirectorJSONError(c, err)
 		return
 	}
 	expected, ok := requiredExpectedVersion(c, req.ExpectedVersion)
@@ -237,8 +245,8 @@ func (h *TrafficDirectorHandler) Rollback(c *gin.Context) {
 		return
 	}
 	var req trafficDirectorRollbackRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid request body: "+err.Error())
+	if err := bindTrafficDirectorJSON(c, &req); err != nil {
+		writeTrafficDirectorJSONError(c, err)
 		return
 	}
 	expected, ok := requiredExpectedVersion(c, req.ExpectedVersion)
@@ -255,12 +263,13 @@ func (h *TrafficDirectorHandler) Rollback(c *gin.Context) {
 		return
 	}
 	result, err := h.service.Rollback(c.Request.Context(), service.TrafficDirectorRollbackInput{
-		GroupID:         groupID,
-		TargetVersion:   targetVersion,
-		ExpectedVersion: expected,
-		IdempotencyKey:  idempotencyKey,
-		OperatorID:      trafficDirectorOperatorID(c),
-		Note:            req.Note,
+		GroupID:                   groupID,
+		TargetVersion:             targetVersion,
+		ExpectedVersion:           expected,
+		ConfirmUnassignedAccounts: req.ConfirmUnassignedAccounts,
+		IdempotencyKey:            idempotencyKey,
+		OperatorID:                trafficDirectorOperatorID(c),
+		Note:                      req.Note,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)
@@ -337,7 +346,7 @@ func summarizeTrafficDirectorState(state *service.TrafficDirectorGroupState) gin
 			}
 			for _, account := range state.Accounts {
 				for _, accountID := range pool.AccountIDs {
-					if account.ID == accountID && account.Schedulable {
+					if account.ID == accountID && account.Status == service.StatusActive && account.Schedulable {
 						poolAvailable++
 						break
 					}
@@ -356,7 +365,7 @@ func summarizeTrafficDirectorState(state *service.TrafficDirectorGroupState) gin
 	unassigned := make([]int64, 0)
 	available := 0
 	for _, account := range state.Accounts {
-		if account.Schedulable {
+		if account.Status == service.StatusActive && account.Schedulable {
 			available++
 		}
 		if _, ok := assigned[account.ID]; !ok {
@@ -377,6 +386,7 @@ func summarizeTrafficDirectorState(state *service.TrafficDirectorGroupState) gin
 		"available_account_count": available,
 		"assigned_account_count":  len(assigned),
 		"unassigned_account_ids":  unassigned,
+		"runtime_metrics":         service.SnapshotTrafficDirectorRuntimeMetrics(),
 	}
 }
 
@@ -386,6 +396,41 @@ func requiredExpectedVersion(c *gin.Context, value *int64) (int64, bool) {
 		return 0, false
 	}
 	return *value, true
+}
+
+// bindTrafficDirectorJSON applies a bounded envelope before decoding. The
+// validator still enforces the canonical 64 KiB policy limit; this guard keeps
+// whitespace, duplicate fields, and malformed input from being unbounded at
+// the HTTP boundary and checks the raw spec payload before allocation-heavy
+// normalization.
+func bindTrafficDirectorJSON(c *gin.Context, destination any) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return errors.New("request body is required")
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, trafficDirectorMaxRequestBodyBytes)
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return err
+	}
+	var envelope struct {
+		Spec json.RawMessage `json:"spec"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(envelope.Spec)) > domain.TrafficDirectorMaxCanonicalJSONBytes {
+		return fmt.Errorf("traffic director spec exceeds %d bytes", domain.TrafficDirectorMaxCanonicalJSONBytes)
+	}
+	return json.Unmarshal(body, destination)
+}
+
+func writeTrafficDirectorJSONError(c *gin.Context, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		response.Error(c, http.StatusRequestEntityTooLarge, fmt.Sprintf("Request body too large, limit is %dB", maxErr.Limit))
+		return
+	}
+	response.BadRequest(c, "Invalid request body: "+err.Error())
 }
 
 func parseNonNegativeIDParam(c *gin.Context, name string) (int64, bool) {

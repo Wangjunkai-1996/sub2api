@@ -6,12 +6,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -45,6 +47,123 @@ func (s *GroupRepoSuite) SetupTest() {
 
 func TestGroupRepoSuite(t *testing.T) {
 	suite.Run(t, new(GroupRepoSuite))
+}
+
+func TestGroupRepositoryDeletesRollBackWhenSchedulerOutboxFails(t *testing.T) {
+	ctx := context.Background()
+	plainGroup := mustCreateGroup(t, integrationEntClient, &service.Group{
+		Name:           uniqueTestValue(t, "delete-outbox-plain"),
+		Platform:       service.PlatformOpenAI,
+		Status:         service.StatusActive,
+		RateMultiplier: 1,
+	})
+	cascadeGroup := mustCreateGroup(t, integrationEntClient, &service.Group{
+		Name:             uniqueTestValue(t, "delete-outbox-cascade"),
+		Platform:         service.PlatformOpenAI,
+		Status:           service.StatusActive,
+		RateMultiplier:   1,
+		SubscriptionType: service.SubscriptionTypeSubscription,
+	})
+	account := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name:        uniqueTestValue(t, "delete-outbox-account"),
+		Platform:    service.PlatformOpenAI,
+		Status:      service.StatusActive,
+		Schedulable: true,
+	})
+	user := mustCreateUser(t, integrationEntClient, &service.User{
+		Email:        uniqueTestValue(t, "delete-outbox-user") + "@example.com",
+		PasswordHash: "test-password-hash",
+		Role:         service.RoleUser,
+		Status:       service.StatusActive,
+	})
+
+	_, err := integrationDB.ExecContext(ctx, `
+		INSERT INTO account_groups (account_id, group_id, priority)
+		VALUES ($1, $2, 50)
+	`, account.ID, cascadeGroup.ID)
+	require.NoError(t, err)
+	_, err = integrationDB.ExecContext(ctx, `
+		INSERT INTO user_subscriptions (user_id, group_id, starts_at, expires_at, status)
+		VALUES ($1, $2, NOW(), NOW() + INTERVAL '1 day', 'active')
+	`, user.ID, cascadeGroup.ID)
+	require.NoError(t, err)
+	for _, groupID := range []int64{plainGroup.ID, cascadeGroup.ID} {
+		_, err = integrationDB.ExecContext(ctx, `
+			INSERT INTO traffic_director_versions (
+				group_id, version, mode, spec, checksum,
+				operation_key, request_fingerprint
+			) VALUES ($1, 1, 'shadow', '{}'::jsonb, $2, 'delete-atomicity', $3)
+		`, groupID, strings.Repeat("a", 64), strings.Repeat("b", 64))
+		require.NoError(t, err)
+	}
+	_, err = integrationDB.ExecContext(ctx,
+		"DELETE FROM scheduler_outbox WHERE group_id IN ($1, $2)",
+		plainGroup.ID,
+		cascadeGroup.ID,
+	)
+	require.NoError(t, err)
+
+	functionName := fmt.Sprintf("fail_group_delete_outbox_%d", plainGroup.ID)
+	triggerName := fmt.Sprintf("fail_group_delete_outbox_trigger_%d", plainGroup.ID)
+	_, err = integrationDB.ExecContext(ctx, fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.group_id IN (%d, %d) THEN
+				RAISE EXCEPTION 'forced group delete outbox failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$
+	`, functionName, plainGroup.ID, cascadeGroup.ID))
+	require.NoError(t, err)
+	_, err = integrationDB.ExecContext(ctx, fmt.Sprintf(
+		"CREATE TRIGGER %s BEFORE INSERT ON scheduler_outbox FOR EACH ROW EXECUTE FUNCTION %s()",
+		triggerName,
+		functionName,
+	))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON scheduler_outbox", triggerName))
+		_, _ = integrationDB.ExecContext(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM scheduler_outbox WHERE group_id IN ($1, $2)", plainGroup.ID, cascadeGroup.ID)
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM groups WHERE id IN ($1, $2)", plainGroup.ID, cascadeGroup.ID)
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM accounts WHERE id = $1", account.ID)
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM users WHERE id = $1", user.ID)
+	})
+
+	repo := newGroupRepositoryWithSQL(integrationEntClient, integrationDB)
+	err = repo.Delete(ctx, plainGroup.ID)
+	require.ErrorContains(t, err, "forced group delete outbox failure")
+	_, err = repo.DeleteCascade(ctx, cascadeGroup.ID)
+	require.ErrorContains(t, err, "forced group delete outbox failure")
+
+	for _, groupID := range []int64{plainGroup.ID, cascadeGroup.ID} {
+		var deletedAt sql.NullTime
+		var historyCount int
+		require.NoError(t, integrationDB.QueryRowContext(ctx,
+			"SELECT deleted_at FROM groups WHERE id = $1", groupID,
+		).Scan(&deletedAt))
+		require.False(t, deletedAt.Valid)
+		require.NoError(t, integrationDB.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM traffic_director_versions WHERE group_id = $1", groupID,
+		).Scan(&historyCount))
+		require.Equal(t, 1, historyCount)
+	}
+
+	var bindingCount int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM account_groups WHERE account_id = $1 AND group_id = $2",
+		account.ID,
+		cascadeGroup.ID,
+	).Scan(&bindingCount))
+	require.Equal(t, 1, bindingCount)
+	var subscriptionDeletedAt sql.NullTime
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT deleted_at
+		FROM user_subscriptions
+		WHERE user_id = $1 AND group_id = $2
+	`, user.ID, cascadeGroup.ID).Scan(&subscriptionDeletedAt))
+	require.False(t, subscriptionDeletedAt.Valid)
 }
 
 // --- Create / GetByID / Update / Delete ---
@@ -197,6 +316,79 @@ func (s *GroupRepoSuite) TestUpdate() {
 	got, err := s.repo.GetByID(s.ctx, group.ID)
 	s.Require().NoError(err, "GetByID after update")
 	s.Require().Equal("updated", got.Name)
+}
+
+func TestGroupRepositoryUpdateRejectsStaleTrafficDirectorVersion(t *testing.T) {
+	ctx := context.Background()
+	group := mustCreateGroup(t, integrationEntClient, &service.Group{
+		Name:             uniqueTestValue(t, "traffic-director-stale-update"),
+		Platform:         service.PlatformOpenAI,
+		RateMultiplier:   1.0,
+		Status:           service.StatusActive,
+		SubscriptionType: service.SubscriptionTypeStandard,
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM groups WHERE id = $1", group.ID)
+	})
+	repo := newGroupRepositoryWithSQL(integrationEntClient, integrationDB)
+
+	// Simulate a publication committed after the caller loaded its Group
+	// snapshot. Ordinary updates must not overwrite the new head.
+	_, err := integrationDB.ExecContext(ctx, `
+		UPDATE groups
+		SET traffic_director_mode = 'shadow',
+		    traffic_director_version = 1,
+		    traffic_director_spec = '{}'::jsonb
+		WHERE id = $1
+	`, group.ID)
+	require.NoError(t, err)
+
+	group.Name = "must-not-overwrite-published-head"
+	err = repo.Update(ctx, group)
+	require.ErrorIs(t, err, service.ErrGroupTrafficDirectorVersionConflict)
+
+	got, err := repo.GetByID(ctx, group.ID)
+	require.NoError(t, err)
+	require.NotEqual(t, "must-not-overwrite-published-head", got.Name)
+	require.Equal(t, int64(1), got.TrafficDirectorVersion)
+}
+
+func TestGroupRepositoryUpdateUsesCallerTransaction(t *testing.T) {
+	ctx := context.Background()
+	group := mustCreateGroup(t, integrationEntClient, &service.Group{
+		Name:             uniqueTestValue(t, "traffic-director-transactional-update"),
+		Platform:         service.PlatformOpenAI,
+		RateMultiplier:   1.0,
+		Status:           service.StatusActive,
+		SubscriptionType: service.SubscriptionTypeStandard,
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM groups WHERE id = $1", group.ID)
+	})
+
+	tx, err := integrationEntClient.Tx(ctx)
+	require.NoError(t, err)
+	txCtx := dbent.NewTxContext(ctx, tx)
+	repo := newGroupRepositoryWithSQL(integrationEntClient, integrationDB)
+	var initialOutboxCount int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM scheduler_outbox WHERE group_id = $1", group.ID,
+	).Scan(&initialOutboxCount))
+
+	group.Name = "transaction-must-roll-back"
+	require.NoError(t, repo.Update(txCtx, group))
+	require.NoError(t, tx.Rollback())
+
+	var persistedName string
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		"SELECT name FROM groups WHERE id = $1", group.ID,
+	).Scan(&persistedName))
+	require.NotEqual(t, group.Name, persistedName)
+	var persistedOutboxCount int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM scheduler_outbox WHERE group_id = $1", group.ID,
+	).Scan(&persistedOutboxCount))
+	require.Equal(t, initialOutboxCount, persistedOutboxCount)
 }
 
 func (s *GroupRepoSuite) TestGetByID_PreservesMessagesDispatchModelConfig() {
