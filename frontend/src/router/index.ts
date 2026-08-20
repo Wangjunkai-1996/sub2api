@@ -462,6 +462,18 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/admin/traffic-director',
+    name: 'AdminTrafficDirector',
+    component: () => import('@/views/admin/TrafficDirectorView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Traffic Director',
+      titleKey: 'admin.trafficDirector.title',
+      descriptionKey: 'admin.trafficDirector.description'
+    }
+  },
+  {
     path: '/admin/channels',
     redirect: '/admin/channels/pricing'
   },
@@ -927,6 +939,7 @@ router.beforeEach(async (to, _from, next) => {
   if (authStore.isSimpleMode) {
     const restrictedPaths = [
       '/admin/groups',
+      '/admin/traffic-director',
       '/admin/subscriptions',
       '/admin/redeem',
       '/subscriptions',
