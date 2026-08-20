@@ -90,6 +90,25 @@ func ProvideAdminHandlers(
 	}
 }
 
+// ProvideTrafficDirectorHandler keeps the Traffic Director dependency narrow
+// and independently wireable. The generated server graph can opt into this
+// provider once the repository/service pair is enabled; leaving it separate
+// prevents ordinary GroupHandler construction from gaining policy ownership.
+func ProvideTrafficDirectorHandler(trafficDirectorService *service.TrafficDirectorService) *admin.TrafficDirectorHandler {
+	return admin.NewTrafficDirectorHandler(trafficDirectorService)
+}
+
+// SetTrafficDirectorHandler attaches the independently wired handler to the
+// aggregate without changing the constructor contract of the legacy admin
+// handlers. It is useful for generated/manual graphs that stage providers in
+// separate sections.
+func SetTrafficDirectorHandler(handlers *AdminHandlers, trafficDirectorHandler *admin.TrafficDirectorHandler) *AdminHandlers {
+	if handlers != nil {
+		handlers.TrafficDirector = trafficDirectorHandler
+	}
+	return handlers
+}
+
 func ProvideGatewayHandler(
 	gatewayService *service.GatewayService,
 	openAIGatewayService *service.OpenAIGatewayService,
