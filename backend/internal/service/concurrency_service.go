@@ -51,7 +51,7 @@ type ConcurrencyCache interface {
 	CleanupExpiredAccountSlots(ctx context.Context, accountID int64) error
 	CleanupExpiredAccountSlotKeys(ctx context.Context) error
 
-	// 启动时清理旧进程遗留槽位与等待计数
+	// 保留用于兼容旧调用方；实现不得清理其他进程槽位或共享等待计数
 	CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error
 }
 
