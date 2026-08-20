@@ -79,6 +79,7 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 	setOpsRequestContext(c, requestedModel, false)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeSync))
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, requestedModel)
+	healthModel := openAITrafficDirectorHealthModel(requestedModel, channelMapping)
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
@@ -112,6 +113,7 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 	// 分组利润控制：alpha search 文本入口请求级装门并固定 pricingAt
 	//（记录路径经 service.OpenAIPricingAtFromContext 从请求 ctx 回读）。
 	asPricingCtx, _ := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
+	asPricingCtx = service.WithOpenAITrafficDirectorHealthModel(asPricingCtx, healthModel)
 	asPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(asPricingCtx)
 	c.Request = c.Request.WithContext(asPricingCtx)
 
@@ -175,6 +177,7 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
+		account = selection.Account
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		writerSizeBeforeForward := c.Writer.Size()
 		forwardStart := time.Now()
@@ -186,7 +189,7 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardAlphaSearch(c.Request.Context(), c, account, forwardBody)
 		}()
-		h.reportAlphaSearchTrafficDirectorOutcome(c, account, requestedModel, result, err, writerSizeBeforeForward)
+		h.reportAlphaSearchTrafficDirectorOutcome(c, account, healthModel, result, err, writerSizeBeforeForward)
 		service.SetOpsLatencyMs(c, service.OpsResponseLatencyMsKey, time.Since(forwardStart).Milliseconds())
 
 		if err == nil {

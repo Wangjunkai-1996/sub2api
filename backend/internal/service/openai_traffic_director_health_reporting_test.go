@@ -11,6 +11,71 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type openAITrafficDirectorCheckerOnlyStub struct {
+	releaseCalls int
+	lastRelease  TrafficDirectorHealthProbeReleaseInput
+}
+
+type openAITrafficDirectorReporterErrorStub struct {
+	releaseCalls int
+	releases     []TrafficDirectorHealthProbeReleaseInput
+}
+
+func (s *openAITrafficDirectorReporterErrorStub) AccountHealthy(context.Context, int64, string) (bool, error) {
+	return true, nil
+}
+
+func (s *openAITrafficDirectorReporterErrorStub) RecordSuccess(
+	context.Context,
+	TrafficDirectorHealthSuccessInput,
+) (bool, error) {
+	return false, errors.New("record success unavailable")
+}
+
+func (s *openAITrafficDirectorReporterErrorStub) RecordFailure(
+	context.Context,
+	TrafficDirectorHealthFailureInput,
+) (TrafficDirectorHealthFailureResult, error) {
+	return TrafficDirectorHealthFailureResult{}, errors.New("record failure unavailable")
+}
+
+func (s *openAITrafficDirectorReporterErrorStub) ReleaseProbe(
+	_ context.Context,
+	input TrafficDirectorHealthProbeReleaseInput,
+) (bool, error) {
+	s.releaseCalls++
+	s.releases = append(s.releases, input)
+	return true, nil
+}
+
+func (s *openAITrafficDirectorCheckerOnlyStub) AccountHealthy(context.Context, int64, string) (bool, error) {
+	return true, nil
+}
+
+func (s *openAITrafficDirectorCheckerOnlyStub) Check(
+	_ context.Context,
+	input TrafficDirectorHealthCheckInput,
+) (TrafficDirectorHealthDecision, error) {
+	return TrafficDirectorHealthDecision{
+		AccountID:     input.AccountID,
+		Model:         input.Model,
+		HealthMode:    input.HealthMode,
+		State:         TrafficDirectorHealthStateHalfOpen,
+		Allowed:       true,
+		HalfOpenProbe: true,
+		ProbeToken:    "checker-only-probe",
+	}, nil
+}
+
+func (s *openAITrafficDirectorCheckerOnlyStub) ReleaseProbe(
+	_ context.Context,
+	input TrafficDirectorHealthProbeReleaseInput,
+) (bool, error) {
+	s.releaseCalls++
+	s.lastRelease = input
+	return true, nil
+}
+
 func TestOpenAITrafficDirectorHealthReportingKeepsHalfOpenProbeToken(t *testing.T) {
 	store := &trafficDirectorHealthStoreStub{
 		checkSnapshot: TrafficDirectorHealthSnapshot{
@@ -59,6 +124,68 @@ func TestOpenAITrafficDirectorHealthReportingKeepsHalfOpenProbeToken(t *testing.
 	})
 	require.Equal(t, 1, store.successCalls)
 	require.Equal(t, "probe-1", store.lastSuccess.ProbeToken)
+}
+
+func TestOpenAITrafficDirectorHealthReportingReleasesCheckerOnlyProbe(t *testing.T) {
+	resolver := &openAITrafficDirectorCheckerOnlyStub{}
+	svc := &OpenAIGatewayService{}
+	svc.SetOpenAITrafficDirectorHealthResolver(resolver)
+	ctx := svc.WithOpenAITrafficDirectorHealthRequestContext(context.Background())
+	account := &Account{ID: 24, Platform: PlatformOpenAI}
+
+	decision, err := svc.CheckOpenAITrafficDirectorHealth(ctx, account, "gpt-5", domain.TrafficDirectorHealthModeEnforce)
+	require.NoError(t, err)
+	require.True(t, decision.HalfOpenProbe)
+
+	outcome, err := svc.ReportOpenAITrafficDirectorOutcome(ctx, OpenAITrafficDirectorHealthOutcomeInput{
+		Account: account,
+		Model:   "gpt-5",
+		Result:  &OpenAIForwardResult{Model: "gpt-5"},
+	})
+	require.NoError(t, err)
+	require.False(t, outcome.Recorded)
+	require.Equal(t, "health_reporting_unavailable_or_off", outcome.IgnoredReason)
+	require.Equal(t, "checker-only-probe", outcome.ProbeToken)
+	require.Equal(t, 1, resolver.releaseCalls)
+	require.Equal(t, int64(24), resolver.lastRelease.AccountID)
+	require.Equal(t, "gpt-5", resolver.lastRelease.Model)
+	require.Equal(t, "checker-only-probe", resolver.lastRelease.ProbeToken)
+
+	_, ok := takeOpenAITrafficDirectorHealthAttempt(ctx, account.ID, "gpt-5")
+	require.False(t, ok)
+}
+
+func TestOpenAITrafficDirectorHealthReportingReleasesProbeOnReporterError(t *testing.T) {
+	resolver := &openAITrafficDirectorReporterErrorStub{}
+	svc := &OpenAIGatewayService{}
+	svc.SetOpenAITrafficDirectorHealthResolver(resolver)
+	ctx := svc.WithOpenAITrafficDirectorHealthRequestContext(context.Background())
+	account := &Account{ID: 25, Platform: PlatformOpenAI}
+
+	storeOpenAITrafficDirectorHealthProbe(ctx, account.ID, "gpt-5", domain.TrafficDirectorHealthModeEnforce, "success-probe")
+	_, err := svc.ReportOpenAITrafficDirectorOutcome(ctx, OpenAITrafficDirectorHealthOutcomeInput{
+		Account:    account,
+		Model:      "gpt-5",
+		HealthMode: domain.TrafficDirectorHealthModeEnforce,
+		Result:     &OpenAIForwardResult{UpstreamModel: "gpt-5"},
+	})
+	require.EqualError(t, err, "record success unavailable")
+
+	storeOpenAITrafficDirectorHealthProbe(ctx, account.ID, "gpt-5", domain.TrafficDirectorHealthModeEnforce, "failure-probe")
+	_, err = svc.ReportOpenAITrafficDirectorOutcome(ctx, OpenAITrafficDirectorHealthOutcomeInput{
+		Account:          account,
+		Model:            "gpt-5",
+		HealthMode:       domain.TrafficDirectorHealthModeEnforce,
+		Err:              errors.New("connection reset by peer"),
+		AccountScoped:    true,
+		AccountScopedSet: true,
+	})
+	require.EqualError(t, err, "record failure unavailable")
+	require.Equal(t, 2, resolver.releaseCalls)
+	require.Equal(t, []string{"success-probe", "failure-probe"}, []string{
+		resolver.releases[0].ProbeToken,
+		resolver.releases[1].ProbeToken,
+	})
 }
 
 func TestOpenAITrafficDirectorCommittedAttemptKeepsProbeUntilOutcome(t *testing.T) {
@@ -136,6 +263,12 @@ func TestOpenAITrafficDirectorHealthProbeTokensDoNotOverwrite(t *testing.T) {
 
 	storeOpenAITrafficDirectorHealthProbe(ctx, 21, "gpt-5", domain.TrafficDirectorHealthModeEnforce, "probe-1")
 	storeOpenAITrafficDirectorHealthProbe(ctx, 21, "gpt-5", domain.TrafficDirectorHealthModeEnforce, "probe-2")
+	storeOpenAITrafficDirectorHealthProbe(ctx, 21, "gpt-5-mini", domain.TrafficDirectorHealthModeEnforce, "probe-mini")
+
+	_, ok := takeOpenAITrafficDirectorHealthAttempt(ctx, 21, "gpt-5.1")
+	require.False(t, ok, "a model miss must not consume another circuit's probe")
+	require.Empty(t, peekOpenAITrafficDirectorHealthAttemptMode(ctx, 21, "gpt-5.1"),
+		"a model miss must not inherit another circuit's mode")
 
 	first, ok := takeOpenAITrafficDirectorHealthAttempt(ctx, 21, "gpt-5")
 	require.True(t, ok)
@@ -145,6 +278,9 @@ func TestOpenAITrafficDirectorHealthProbeTokensDoNotOverwrite(t *testing.T) {
 	require.Equal(t, "probe-2", second.probeToken)
 	_, ok = takeOpenAITrafficDirectorHealthAttempt(ctx, 21, "gpt-5")
 	require.False(t, ok)
+	mini, ok := takeOpenAITrafficDirectorHealthAttempt(ctx, 21, "gpt-5-mini")
+	require.True(t, ok)
+	require.Equal(t, "probe-mini", mini.probeToken)
 }
 
 func TestOpenAITrafficDirectorHealthReportingFailureClassificationAndScope(t *testing.T) {
@@ -204,6 +340,64 @@ func TestOpenAITrafficDirectorHealthReportingFailureClassificationAndScope(t *te
 	require.Equal(t, 1, store.failureCalls)
 	require.Equal(t, int64(18), store.lastFailure.AccountID)
 	require.Equal(t, "gpt-5", store.lastFailure.NormalizedModel)
+}
+
+func TestOpenAITrafficDirectorHealthReportingUsesActualUpstreamModel(t *testing.T) {
+	t.Run("channel and account mapping", func(t *testing.T) {
+		store := &trafficDirectorHealthStoreStub{
+			failureSnapshot: TrafficDirectorHealthSnapshot{
+				State:           TrafficDirectorHealthStateSuspect,
+				FailureStreak:   1,
+				LastFailureAt:   time.Unix(1_800_000_000, 0),
+				MutationApplied: true,
+			},
+		}
+		svc := &OpenAIGatewayService{}
+		svc.SetOpenAITrafficDirectorHealthResolver(NewTrafficDirectorHealthService(store))
+		account := &Account{
+			ID:   17,
+			Type: AccountTypeOAuth,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"channel-model": "account-upstream-model"},
+			},
+		}
+		ctx := WithOpenAITrafficDirectorHealthModel(context.Background(), "channel-model")
+
+		outcome, err := svc.ReportOpenAITrafficDirectorOutcome(ctx, OpenAITrafficDirectorHealthOutcomeInput{
+			Account:          account,
+			Model:            "channel-model",
+			Err:              errors.New("connection reset by peer"),
+			AccountScoped:    true,
+			AccountScopedSet: true,
+			HealthMode:       domain.TrafficDirectorHealthModeObserve,
+		})
+		require.NoError(t, err)
+		require.Equal(t, "account-upstream-model", outcome.Model)
+		require.Equal(t, "account-upstream-model", store.lastFailure.NormalizedModel)
+	})
+
+	t.Run("forward result is already canonical", func(t *testing.T) {
+		store := &trafficDirectorHealthStoreStub{}
+		svc := &OpenAIGatewayService{}
+		svc.SetOpenAITrafficDirectorHealthResolver(NewTrafficDirectorHealthService(store))
+		account := &Account{
+			ID:   18,
+			Type: AccountTypeOAuth,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"actual-upstream-model": "must-not-remap"},
+			},
+		}
+
+		outcome, err := svc.ReportOpenAITrafficDirectorOutcome(context.Background(), OpenAITrafficDirectorHealthOutcomeInput{
+			Account:    account,
+			Model:      "public-alias",
+			Result:     &OpenAIForwardResult{UpstreamModel: "actual-upstream-model"},
+			HealthMode: domain.TrafficDirectorHealthModeObserve,
+		})
+		require.NoError(t, err)
+		require.Equal(t, "actual-upstream-model", outcome.Model)
+		require.Equal(t, "actual-upstream-model", store.lastSuccess.NormalizedModel)
+	})
 }
 
 func TestOpenAITrafficDirectorHealthReportingClassifiesWebSocketTerminals(t *testing.T) {

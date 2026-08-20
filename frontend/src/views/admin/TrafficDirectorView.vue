@@ -56,7 +56,7 @@
           </div>
           <div class="card p-4">
             <p class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{{ t('admin.trafficDirector.status.available') }}</p>
-            <p class="mt-1 text-lg font-semibold text-gray-900 dark:text-white">{{ status?.available_account_count ?? availableAccountCount }}</p>
+            <p class="mt-1 text-lg font-semibold text-gray-900 dark:text-white">{{ status?.available_account_count ?? schedulableAccountCount }}</p>
           </div>
         </section>
 
@@ -252,6 +252,20 @@
               </tbody>
             </table>
           </div>
+          <div v-if="versionsNextOffset < versionsTotal" class="mt-4 flex justify-center">
+            <button
+              type="button"
+              class="btn btn-secondary btn-sm"
+              :disabled="versionsLoading || operationInFlight"
+              data-testid="traffic-director-history-load-more"
+              @click="loadMoreVersions"
+            >
+              <Icon name="chevronDown" size="sm" class="mr-1.5" />
+              {{ versionsLoading
+                ? t('common.loading')
+                : t('admin.trafficDirector.history.loadMore', { remaining: versionsTotal - versionsNextOffset }) }}
+            </button>
+          </div>
         </section>
       </template>
 
@@ -261,17 +275,46 @@
     <BaseDialog
       :show="Boolean(rollbackVersion)"
       :title="t('admin.trafficDirector.history.rollback')"
-      width="narrow"
+      width="wide"
       :close-on-escape="!operationInFlight"
       :show-close-button="!operationInFlight"
       @close="closeRollback"
     >
       <p class="text-sm text-gray-600 dark:text-gray-300">{{ t('admin.trafficDirector.history.rollbackConfirm', { version: rollbackVersion?.version ?? 0 }) }}</p>
+      <div v-if="rollbackDetailsLoading" class="flex min-h-32 items-center justify-center gap-3 text-sm text-gray-500 dark:text-gray-400" role="status" aria-live="polite" data-testid="traffic-director-rollback-details-loading">
+        <LoadingSpinner size="sm" />
+        <span>{{ t('admin.trafficDirector.history.loadingDetails') }}</span>
+      </div>
+      <div v-else-if="rollbackDetailsError" class="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300" role="alert">
+        {{ rollbackDetailsError }}
+      </div>
+      <div v-else-if="rollbackDetails" class="mt-4 space-y-4" data-testid="traffic-director-rollback-details">
+        <dl class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div class="min-w-0">
+            <dt class="text-xs font-medium uppercase text-gray-500 dark:text-gray-400">{{ t('admin.trafficDirector.history.targetMode') }}</dt>
+            <dd class="mt-1 text-sm font-medium text-gray-900 dark:text-white">{{ modeLabel(rollbackDetails.mode) }}</dd>
+          </div>
+          <div class="min-w-0">
+            <dt class="text-xs font-medium uppercase text-gray-500 dark:text-gray-400">{{ t('admin.trafficDirector.history.targetChecksum') }}</dt>
+            <dd class="mt-1 break-all font-mono text-xs text-gray-700 dark:text-gray-300">{{ rollbackDetails.checksum }}</dd>
+          </div>
+        </dl>
+        <div>
+          <p class="text-xs font-medium uppercase text-gray-500 dark:text-gray-400">{{ t('admin.trafficDirector.history.targetUnassigned') }}</p>
+          <p class="mt-1 break-all font-mono text-xs text-gray-700 dark:text-gray-300" data-testid="traffic-director-rollback-unassigned">
+            {{ rollbackUnassignedAccountIds.length > 0 ? rollbackUnassignedAccountIds.join(', ') : t('admin.trafficDirector.history.none') }}
+          </p>
+        </div>
+        <div>
+          <p class="text-xs font-medium uppercase text-gray-500 dark:text-gray-400">{{ t('admin.trafficDirector.history.targetSpec') }}</p>
+          <pre class="mt-2 max-h-72 overflow-auto rounded-md bg-gray-50 p-3 text-xs text-gray-700 dark:bg-dark-800 dark:text-gray-300" data-testid="traffic-director-rollback-spec">{{ JSON.stringify(rollbackDetails.spec ?? null, null, 2) }}</pre>
+        </div>
+      </div>
       <div class="mt-4">
         <label class="input-label" for="traffic-director-rollback-note">{{ t('admin.trafficDirector.editor.note') }}</label>
-        <input id="traffic-director-rollback-note" v-model.trim="rollbackNote" class="input w-full" maxlength="2000" :disabled="operationInFlight" />
+        <input id="traffic-director-rollback-note" v-model.trim="rollbackNote" class="input w-full" maxlength="2000" :disabled="operationInFlight || rollbackDetailsLoading || Boolean(rollbackDetailsError)" />
       </div>
-      <label class="mt-4 flex items-start gap-2 text-sm text-gray-600 dark:text-gray-300">
+      <label v-if="rollbackRequiresUnassignedConfirmation" class="mt-4 flex items-start gap-2 text-sm text-gray-600 dark:text-gray-300">
         <input v-model="rollbackConfirmUnassigned" type="checkbox" class="mt-0.5" :disabled="operationInFlight" data-testid="traffic-director-rollback-confirm-unassigned" />
         <span>{{ t('admin.trafficDirector.history.confirmUnassigned') }}</span>
       </label>
@@ -304,9 +347,10 @@ import type {
   TrafficDirectorPreview,
   TrafficDirectorSpec,
   TrafficDirectorStatus,
+  TrafficDirectorVersion,
   TrafficDirectorVersionSummary
 } from '@/api/admin/trafficDirector'
-import { extractApiErrorMessage } from '@/utils/apiError'
+import { extractApiErrorCode, extractI18nErrorMessage } from '@/utils/apiError'
 
 const { t } = useI18n()
 const appStore = useAppStore()
@@ -316,12 +360,17 @@ const selectedGroupId = ref<number | null>(null)
 const state = ref<TrafficDirectorGroupState | null>(null)
 const status = ref<TrafficDirectorStatus | null>(null)
 const versions = ref<TrafficDirectorVersionSummary[]>([])
+const versionsTotal = ref(0)
+const versionsNextOffset = ref(0)
 const draftMode = ref<TrafficDirectorMode>('legacy')
 const draftSpec = ref<TrafficDirectorSpec>(emptySpec())
 const note = ref('')
 const confirmUnassigned = ref(false)
 const previewResult = ref<TrafficDirectorPreview | null>(null)
 const rollbackVersion = ref<TrafficDirectorVersionSummary | null>(null)
+const rollbackDetails = ref<TrafficDirectorVersion | null>(null)
+const rollbackDetailsLoading = ref(false)
+const rollbackDetailsError = ref('')
 const rollbackNote = ref('')
 const rollbackConfirmUnassigned = ref(false)
 const publishOperation = ref<{ key: string; fingerprint: string } | null>(null)
@@ -338,6 +387,7 @@ let versionsRequestRevision = 0
 let previewRequestRevision = 0
 let publishRequestRevision = 0
 let rollbackRequestRevision = 0
+let rollbackDetailsRequestRevision = 0
 const poolKeyBeforeEdit = new WeakMap<TrafficDirectorPool, string>()
 const poolRenderKeys = new WeakMap<TrafficDirectorPool, number>()
 let nextPoolRenderKey = 1
@@ -365,7 +415,7 @@ const assignedAccountIds = computed(() => {
   return ids
 })
 const unassignedAccountIds = computed(() => state.value?.accounts.filter((account) => !assignedAccountIds.value.has(account.id)).map((account) => account.id) ?? [])
-const availableAccountCount = computed(() => state.value?.accounts.filter(isAccountReady).length ?? 0)
+const schedulableAccountCount = computed(() => state.value?.accounts.filter(isAccountReady).length ?? 0)
 const operationInFlight = computed(() => previewing.value || publishing.value || rollingBack.value)
 const canPreview = computed(() => {
   if (!state.value || operationInFlight.value) return false
@@ -373,9 +423,23 @@ const canPreview = computed(() => {
   return draftSpec.value.pools.length > 0 && weightTotal.value === 10000
 })
 const canPublish = computed(() => canPreview.value && (draftMode.value !== 'enforced' || unassignedAccountIds.value.length === 0 || confirmUnassigned.value))
+const rollbackUnassignedAccountIds = computed(() => {
+  const details = rollbackDetails.value
+  const currentState = state.value
+  if (!details || !currentState || details.mode === 'legacy' || !details.spec) return []
+  const assigned = new Set(details.spec.pools.flatMap((pool) => pool.account_ids))
+  return currentState.accounts.filter((account) => !assigned.has(account.id)).map((account) => account.id)
+})
+const rollbackRequiresUnassignedConfirmation = computed(() => rollbackDetails.value?.mode === 'enforced'
+  && rollbackUnassignedAccountIds.value.length > 0)
 const canSubmitRollback = computed(() => Boolean(rollbackVersion.value)
+  && Boolean(rollbackDetails.value)
+  && rollbackDetails.value?.group_id === rollbackVersion.value?.group_id
+  && rollbackDetails.value?.version === rollbackVersion.value?.version
+  && !rollbackDetailsLoading.value
+  && !rollbackDetailsError.value
   && !operationInFlight.value
-  && (rollbackVersion.value?.mode !== 'enforced' || rollbackConfirmUnassigned.value))
+  && (!rollbackRequiresUnassignedConfirmation.value || rollbackConfirmUnassigned.value))
 
 watch([draftMode, draftSpec], () => {
   previewResult.value = null
@@ -531,9 +595,22 @@ function closeRollback(): void {
 }
 
 function resetRollback(): void {
+  ++rollbackDetailsRequestRevision
   rollbackVersion.value = null
+  rollbackDetails.value = null
+  rollbackDetailsLoading.value = false
+  rollbackDetailsError.value = ''
   rollbackNote.value = ''
   rollbackConfirmUnassigned.value = false
+}
+
+function trafficDirectorError(error: unknown, fallbackKey: string): string {
+  return extractI18nErrorMessage(
+    error,
+    t,
+    'admin.trafficDirector.errors',
+    t(fallbackKey)
+  )
 }
 
 async function loadGroups(): Promise<void> {
@@ -544,14 +621,14 @@ async function loadGroups(): Promise<void> {
     if (!selectedGroupId.value && groups.value.length > 0) selectedGroupId.value = groups.value[0].id
     if (selectedGroupId.value) await loadGroup(selectedGroupId.value)
   } catch (error) {
-    errorMessage.value = extractApiErrorMessage(error, t('admin.trafficDirector.errors.loadGroups'))
+    errorMessage.value = trafficDirectorError(error, 'admin.trafficDirector.errors.loadGroups')
   } finally {
     groupsLoading.value = false
   }
 }
 
-async function loadGroup(groupId: number | null = selectedGroupId.value): Promise<void> {
-  if (!groupId) return
+async function loadGroup(groupId: number | null = selectedGroupId.value): Promise<boolean> {
+  if (!groupId) return false
   const normalizedGroupId = Number(groupId)
   const contextRevision = ++groupContextRevision
   ++versionsRequestRevision
@@ -560,6 +637,10 @@ async function loadGroup(groupId: number | null = selectedGroupId.value): Promis
   errorMessage.value = ''
   previewResult.value = null
   resetRollback()
+  versions.value = []
+  versionsTotal.value = 0
+  versionsNextOffset.value = 0
+  versionsLoading.value = false
   publishOperation.value = null
   rollbackOperation.value = null
   try {
@@ -567,7 +648,7 @@ async function loadGroup(groupId: number | null = selectedGroupId.value): Promis
       adminAPI.trafficDirector.get(normalizedGroupId),
       adminAPI.trafficDirector.getStatus(normalizedGroupId)
     ])
-    if (!isCurrentGroupContext(normalizedGroupId, contextRevision)) return
+    if (!isCurrentGroupContext(normalizedGroupId, contextRevision)) return false
     state.value = nextState
     status.value = nextStatus.group_id === nextState.group_id && nextStatus.version === nextState.head.version
       ? nextStatus
@@ -577,31 +658,55 @@ async function loadGroup(groupId: number | null = selectedGroupId.value): Promis
     if (draftMode.value !== 'legacy' && draftSpec.value.pools.length === 0) draftSpec.value = defaultSpec(nextState.accounts)
     confirmUnassigned.value = false
     note.value = ''
-    await loadVersions(normalizedGroupId, contextRevision)
+    return await loadVersions(normalizedGroupId, contextRevision)
   } catch (error) {
-    if (!isCurrentGroupContext(normalizedGroupId, contextRevision)) return
+    if (!isCurrentGroupContext(normalizedGroupId, contextRevision)) return false
     state.value = null
     status.value = null
-    errorMessage.value = extractApiErrorMessage(error, t('admin.trafficDirector.errors.loadGroup'))
+    errorMessage.value = trafficDirectorError(error, 'admin.trafficDirector.errors.loadGroup')
+    return false
   } finally {
     if (isCurrentGroupContext(normalizedGroupId, contextRevision)) loading.value = false
   }
 }
 
-async function loadVersions(groupId: number | null = selectedGroupId.value, contextRevision = groupContextRevision): Promise<void> {
-  if (!groupId) return
+async function loadVersions(
+  groupId: number | null = selectedGroupId.value,
+  contextRevision = groupContextRevision,
+  append = false
+): Promise<boolean> {
+  if (!groupId) return false
   const requestRevision = ++versionsRequestRevision
   versionsLoading.value = true
   try {
-    const result = await adminAPI.trafficDirector.listVersions(groupId, { limit: 100 })
-    if (!isCurrentGroupContext(groupId, contextRevision) || requestRevision !== versionsRequestRevision) return
-    versions.value = result.items
+    const offset = append ? versionsNextOffset.value : 0
+    const result = await adminAPI.trafficDirector.listVersions(groupId, { limit: 100, offset })
+    if (!isCurrentGroupContext(groupId, contextRevision) || requestRevision !== versionsRequestRevision) return false
+    if (append) {
+      const loadedVersions = new Set(versions.value.map((version) => version.version))
+      versions.value = [
+        ...versions.value,
+        ...result.items.filter((version) => !loadedVersions.has(version.version))
+      ]
+    } else {
+      versions.value = result.items
+    }
+    versionsTotal.value = result.total
+    const consumed = result.items.length > 0 ? result.items.length : result.limit
+    versionsNextOffset.value = Math.min(result.total, result.offset + consumed)
+    return true
   } catch (error) {
-    if (!isCurrentGroupContext(groupId, contextRevision) || requestRevision !== versionsRequestRevision) return
-    errorMessage.value = extractApiErrorMessage(error, t('admin.trafficDirector.errors.loadVersions'))
+    if (!isCurrentGroupContext(groupId, contextRevision) || requestRevision !== versionsRequestRevision) return false
+    errorMessage.value = trafficDirectorError(error, 'admin.trafficDirector.errors.loadVersions')
+    return false
   } finally {
     if (isCurrentGroupContext(groupId, contextRevision) && requestRevision === versionsRequestRevision) versionsLoading.value = false
   }
+}
+
+async function loadMoreVersions(): Promise<void> {
+  if (versionsLoading.value || operationInFlight.value || versionsNextOffset.value >= versionsTotal.value) return
+  await loadVersions(selectedGroupId.value, groupContextRevision, true)
 }
 
 function requestPayload(expectedVersion: number) {
@@ -643,7 +748,7 @@ async function previewPolicy(context: GroupOperationContext, payload: ReturnType
     return result
   } catch (error) {
     if (!isCurrentOperationContext(context) || requestRevision !== previewRequestRevision) return null
-    errorMessage.value = extractApiErrorMessage(error, t('admin.trafficDirector.errors.preview'))
+    errorMessage.value = trafficDirectorError(error, 'admin.trafficDirector.errors.preview')
     return null
   } finally {
     if (requestRevision === previewRequestRevision) previewing.value = false
@@ -683,23 +788,40 @@ async function publishPolicy(): Promise<void> {
     await loadGroup(context.groupId)
   } catch (error) {
     if (!isCurrentOperationContext(context) || requestRevision !== publishRequestRevision) return
-    errorMessage.value = extractApiErrorMessage(error, t('admin.trafficDirector.errors.publish'))
+    if (await refreshAfterVersionConflict(error, context)) return
+    errorMessage.value = trafficDirectorError(error, 'admin.trafficDirector.errors.publish')
   } finally {
     if (requestRevision === publishRequestRevision) publishing.value = false
   }
 }
 
-function openRollback(version: TrafficDirectorVersionSummary): void {
+async function openRollback(version: TrafficDirectorVersionSummary): Promise<void> {
   if (operationInFlight.value) return
+  resetRollback()
   rollbackVersion.value = version
-  rollbackNote.value = ''
-  rollbackConfirmUnassigned.value = false
+  rollbackDetailsLoading.value = true
+  const contextRevision = groupContextRevision
+  const requestRevision = ++rollbackDetailsRequestRevision
+  try {
+    const details = await adminAPI.trafficDirector.getVersion(version.group_id, version.version)
+    if (!isCurrentGroupContext(version.group_id, contextRevision)
+      || requestRevision !== rollbackDetailsRequestRevision
+      || rollbackVersion.value?.version !== version.version) return
+    rollbackDetails.value = details
+  } catch (error) {
+    if (!isCurrentGroupContext(version.group_id, contextRevision)
+      || requestRevision !== rollbackDetailsRequestRevision
+      || rollbackVersion.value?.version !== version.version) return
+    rollbackDetailsError.value = trafficDirectorError(error, 'admin.trafficDirector.errors.loadVersion')
+  } finally {
+    if (requestRevision === rollbackDetailsRequestRevision) rollbackDetailsLoading.value = false
+  }
 }
 
 function openLegacyRollback(): void {
   const currentState = state.value
   if (!currentState || currentState.head.mode === 'legacy' || operationInFlight.value) return
-  openRollback({
+  void openRollback({
     group_id: currentState.group_id,
     version: 0,
     mode: 'legacy',
@@ -739,10 +861,21 @@ async function rollbackPolicy(): Promise<void> {
     await loadGroup(context.groupId)
   } catch (error) {
     if (!isCurrentOperationContext(context) || requestRevision !== rollbackRequestRevision) return
-    errorMessage.value = extractApiErrorMessage(error, t('admin.trafficDirector.errors.rollback'))
+    if (await refreshAfterVersionConflict(error, context)) return
+    errorMessage.value = trafficDirectorError(error, 'admin.trafficDirector.errors.rollback')
   } finally {
     if (requestRevision === rollbackRequestRevision) rollingBack.value = false
   }
+}
+
+async function refreshAfterVersionConflict(error: unknown, context: GroupOperationContext): Promise<boolean> {
+  if (extractApiErrorCode(error) !== 'TRAFFIC_DIRECTOR_VERSION_CONFLICT') return false
+  const conflictMessage = trafficDirectorError(error, 'admin.trafficDirector.errors.versionConflict')
+  publishOperation.value = null
+  rollbackOperation.value = null
+  const refreshed = await loadGroup(context.groupId)
+  if (refreshed && selectedGroupId.value === context.groupId) errorMessage.value = conflictMessage
+  return true
 }
 
 async function refresh(): Promise<void> {

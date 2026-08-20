@@ -169,29 +169,6 @@ func (c *trafficDirectorPolicyCache) GetTrafficDirectorCompiledPolicy(
 		c.l1.remove(key)
 	}
 
-	if c.redis != nil {
-		redisCtx, cancel := context.WithTimeout(ctx, defaultTrafficDirectorPolicyRedisTimeout)
-		cached, err := c.redis.GetTrafficDirectorPolicyVersion(redisCtx, head.GroupID, head.Version)
-		cancel()
-		if err == nil && cached != nil {
-			validated, compiled, validationErr := compileValidatedTrafficDirectorPolicy(
-				*cached,
-				head.GroupID,
-				head.Version,
-				mode,
-			)
-			if validationErr == nil {
-				c.l1.add(key, validated, compiled)
-				c.l2Hits.Add(1)
-				return TrafficDirectorResolvedPolicy{
-					Version:  validated,
-					Source:   TrafficDirectorPolicySourceL2,
-					compiled: compiled,
-				}, nil
-			}
-		}
-	}
-
 	loadResult := c.loads.DoChan(trafficDirectorPolicySingleflightKey(key, mode), func() (any, error) {
 		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTrafficDirectorPolicyLoadTimeout)
 		defer cancel()
@@ -206,6 +183,28 @@ func (c *trafficDirectorPolicyCache) GetTrafficDirectorCompiledPolicy(
 				}, nil
 			}
 			c.l1.remove(key)
+		}
+		if c.redis != nil {
+			redisCtx, redisCancel := context.WithTimeout(loadCtx, defaultTrafficDirectorPolicyRedisTimeout)
+			cached, redisErr := c.redis.GetTrafficDirectorPolicyVersion(redisCtx, head.GroupID, head.Version)
+			redisCancel()
+			if redisErr == nil && cached != nil {
+				validated, compiled, validationErr := compileValidatedTrafficDirectorPolicy(
+					*cached,
+					head.GroupID,
+					head.Version,
+					mode,
+				)
+				if validationErr == nil {
+					c.l1.add(key, validated, compiled)
+					c.l2Hits.Add(1)
+					return trafficDirectorPolicyLoadResult{
+						version:  validated,
+						compiled: compiled,
+						source:   TrafficDirectorPolicySourceL2,
+					}, nil
+				}
+			}
 		}
 		if c.store == nil {
 			return nil, fmt.Errorf("traffic director policy store is unavailable")

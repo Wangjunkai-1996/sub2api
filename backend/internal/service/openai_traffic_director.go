@@ -231,6 +231,167 @@ type openAITrafficDirectorRequestStateContextKey struct{}
 type openAITrafficDirectorRetryLoopContextKey struct{}
 type openAITrafficDirectorV1BypassContextKey struct{}
 type openAITrafficDirectorPoolAdvanceSuppressedContextKey struct{}
+type openAITrafficDirectorHealthModelContextKey struct{}
+
+type openAITrafficDirectorHealthModelKind uint8
+
+const (
+	openAITrafficDirectorHealthModelAccountMapped openAITrafficDirectorHealthModelKind = iota
+	openAITrafficDirectorHealthModelResponses
+	openAITrafficDirectorHealthModelMessages
+	openAITrafficDirectorHealthModelCountTokens
+	openAITrafficDirectorHealthModelImages
+)
+
+type openAITrafficDirectorHealthModelContext struct {
+	model              string
+	defaultMappedModel string
+	requireCompact     bool
+	kind               openAITrafficDirectorHealthModelKind
+}
+
+func withOpenAITrafficDirectorHealthModel(
+	ctx context.Context,
+	modelContext openAITrafficDirectorHealthModelContext,
+) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	modelContext.model = strings.TrimSpace(modelContext.model)
+	modelContext.defaultMappedModel = strings.TrimSpace(modelContext.defaultMappedModel)
+	if modelContext.model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, openAITrafficDirectorHealthModelContextKey{}, modelContext)
+}
+
+// WithOpenAITrafficDirectorHealthModel records the channel-mapped model for
+// endpoints that always apply ordinary account mapping before forwarding.
+func WithOpenAITrafficDirectorHealthModel(ctx context.Context, model string) context.Context {
+	return withOpenAITrafficDirectorHealthModel(ctx, openAITrafficDirectorHealthModelContext{
+		model: model,
+		kind:  openAITrafficDirectorHealthModelAccountMapped,
+	})
+}
+
+// WithOpenAIResponsesTrafficDirectorHealthModel preserves the raw/passthrough
+// and legacy compact branches used specifically by Forward.
+func WithOpenAIResponsesTrafficDirectorHealthModel(ctx context.Context, model string, requireCompact bool) context.Context {
+	return withOpenAITrafficDirectorHealthModel(ctx, openAITrafficDirectorHealthModelContext{
+		model:          model,
+		requireCompact: requireCompact,
+		kind:           openAITrafficDirectorHealthModelResponses,
+	})
+}
+
+// WithOpenAIMessagesTrafficDirectorHealthModel preserves the Messages dispatch
+// fallback without reversing its account-mapping-first precedence.
+func WithOpenAIMessagesTrafficDirectorHealthModel(ctx context.Context, model, defaultMappedModel string) context.Context {
+	return withOpenAITrafficDirectorHealthModel(ctx, openAITrafficDirectorHealthModelContext{
+		model:              model,
+		defaultMappedModel: defaultMappedModel,
+		kind:               openAITrafficDirectorHealthModelMessages,
+	})
+}
+
+func WithOpenAICountTokensTrafficDirectorHealthModel(ctx context.Context, model, defaultMappedModel string) context.Context {
+	return withOpenAITrafficDirectorHealthModel(ctx, openAITrafficDirectorHealthModelContext{
+		model:              model,
+		defaultMappedModel: defaultMappedModel,
+		kind:               openAITrafficDirectorHealthModelCountTokens,
+	})
+}
+
+func WithOpenAIImagesTrafficDirectorHealthModel(ctx context.Context, model string) context.Context {
+	return withOpenAITrafficDirectorHealthModel(ctx, openAITrafficDirectorHealthModelContext{
+		model: model,
+		kind:  openAITrafficDirectorHealthModelImages,
+	})
+}
+
+func openAITrafficDirectorHealthModelContextForRequest(
+	ctx context.Context,
+	requestedModel string,
+	requireCompact bool,
+) openAITrafficDirectorHealthModelContext {
+	if ctx != nil {
+		if healthModel, ok := ctx.Value(openAITrafficDirectorHealthModelContextKey{}).(openAITrafficDirectorHealthModelContext); ok {
+			if model := strings.TrimSpace(healthModel.model); model != "" {
+				healthModel.model = model
+				return healthModel
+			}
+		}
+	}
+	kind := openAITrafficDirectorHealthModelAccountMapped
+	if requireCompact {
+		kind = openAITrafficDirectorHealthModelResponses
+	}
+	return openAITrafficDirectorHealthModelContext{
+		model:          strings.TrimSpace(requestedModel),
+		requireCompact: requireCompact,
+		kind:           kind,
+	}
+}
+
+func resolveOpenAITrafficDirectorHealthModel(
+	account *Account,
+	healthModel openAITrafficDirectorHealthModelContext,
+) string {
+	model := strings.TrimSpace(healthModel.model)
+	if model == "" {
+		return ""
+	}
+
+	switch healthModel.kind {
+	case openAITrafficDirectorHealthModelResponses:
+		if account != nil && account.IsAnthropicProtocol() {
+			billingModel := resolveOpenAIForwardModel(account, model, "")
+			return strings.TrimSpace(normalizeOpenAIModelForUpstream(account, billingModel))
+		}
+		upstreamModel := resolveOpenAIAccountUpstreamModelForRequest(account, model, healthModel.requireCompact)
+		if healthModel.requireCompact || account == nil ||
+			shouldForwardOpenAIResponsesViaRawChatCompletions(account) || account.IsOpenAIPassthroughEnabled() {
+			return strings.TrimSpace(upstreamModel)
+		}
+		if isOpenAIImageGenerationModel(upstreamModel) {
+			return openAIImagesResponsesMainModel
+		}
+		return strings.TrimSpace(upstreamModel)
+	case openAITrafficDirectorHealthModelMessages:
+		if account == nil || !account.IsAnthropicProtocol() {
+			model = NormalizeOpenAICompatRequestedModel(model)
+		}
+		billingModel := resolveOpenAIForwardModel(account, model, healthModel.defaultMappedModel)
+		return strings.TrimSpace(normalizeOpenAIModelForUpstream(account, billingModel))
+	case openAITrafficDirectorHealthModelCountTokens:
+		model = NormalizeOpenAICompatRequestedModel(model)
+		billingModel := resolveOpenAIForwardModel(account, model, healthModel.defaultMappedModel)
+		return strings.TrimSpace(normalizeOpenAIModelForUpstream(account, billingModel))
+	case openAITrafficDirectorHealthModelImages:
+		if account == nil || account.Type == AccountTypeOAuth {
+			return model
+		}
+		if account.Type == AccountTypeAPIKey {
+			return strings.TrimSpace(account.GetMappedModel(model))
+		}
+		return model
+	default:
+		billingModel := resolveOpenAIForwardModel(account, model, "")
+		return strings.TrimSpace(normalizeOpenAIModelForUpstream(account, billingModel))
+	}
+}
+
+func openAITrafficDirectorHealthModelForRequest(
+	ctx context.Context,
+	account *Account,
+	requestedModel string,
+	requireCompact bool,
+) string {
+	return resolveOpenAITrafficDirectorHealthModel(
+		account,
+		openAITrafficDirectorHealthModelContextForRequest(ctx, requestedModel, requireCompact),
+	)
+}
 
 // withOpenAITrafficDirectorV1Bypass keeps an endpoint on the existing OpenAI
 // scheduler while explicitly excluding it from Traffic Director V1 policy
@@ -599,7 +760,7 @@ func (s *OpenAIGatewayService) trafficDirectorAccountHealthDecision(
 	if mode != domain.TrafficDirectorHealthModeEnforce {
 		return true
 	}
-	decision, err := s.checkOpenAITrafficDirectorHealth(ctx, &Account{ID: accountID}, normalizedModel, mode, acquireProbe)
+	decision, err := s.checkOpenAITrafficDirectorHealthCanonical(ctx, accountID, normalizedModel, mode, acquireProbe)
 	if err != nil {
 		slog.Warn("openai.traffic_director.health_unavailable",
 			"group_id", policy.key.groupID,
@@ -622,9 +783,9 @@ func (s *OpenAIGatewayService) trafficDirectorAccountEligibleForPool(
 		return true
 	}
 	noProbe := false
-	decision, err := s.checkOpenAITrafficDirectorHealth(
+	decision, err := s.checkOpenAITrafficDirectorHealthCanonical(
 		ctx,
-		&Account{ID: accountID},
+		accountID,
 		normalizedModel,
 		policy.policy.Spec.HealthMode,
 		&noProbe,
@@ -694,13 +855,64 @@ func (s *OpenAIGatewayService) trafficDirectorEligibleAccountIDs(
 		if vetoed, _ := openAIProfitControlVetoReason(ctx, fresh); vetoed {
 			continue
 		}
-		healthModel := canonicalOpenAIAccountSchedulingModel(fresh, requestedModel)
+		healthModel := openAITrafficDirectorHealthModelForRequest(ctx, fresh, requestedModel, requireCompact)
 		if !s.trafficDirectorAccountEligibleForPool(ctx, policy, fresh.ID, healthModel) {
 			continue
 		}
 		allowed[fresh.ID] = struct{}{}
 	}
 	return allowed, nil
+}
+
+func (s *OpenAIGatewayService) trafficDirectorHardPreviousAccount(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+	requestedModel string,
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requiredImageCapability OpenAIImagesCapability,
+	requireCompact bool,
+	policy *openAITrafficDirectorRequestPlan,
+	account *Account,
+) *Account {
+	if policy == nil || account == nil {
+		return nil
+	}
+	if _, configured := policy.poolByAccount[account.ID]; !configured {
+		return nil
+	}
+	if !isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability) {
+		return nil
+	}
+	if !accountSupportsOpenAICapabilities(account, requiredCapability, requiredImageCapability) ||
+		!s.isOpenAIAccountTransportCompatible(account, requiredTransport) {
+		return nil
+	}
+	requirePrivacy := false
+	if groupID != nil && s.schedulerSnapshot != nil {
+		group, _ := s.schedulerSnapshot.GetGroupByID(ctx, *groupID)
+		requirePrivacy = group != nil && group.RequirePrivacySet
+	}
+	fresh := s.resolveFreshSchedulableOpenAIAccountBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
+	if fresh == nil || !trafficDirectorAccountBelongsToGroup(fresh, groupID) {
+		return nil
+	}
+	if requirePrivacy && !fresh.IsPrivacySet() {
+		return nil
+	}
+	if s.needsUpstreamChannelRestrictionCheck(ctx, groupID) && groupID != nil &&
+		s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
+		return nil
+	}
+	if vetoed, _ := openAIProfitControlVetoReason(ctx, fresh); vetoed {
+		return nil
+	}
+	healthModel := openAITrafficDirectorHealthModelForRequest(ctx, fresh, requestedModel, requireCompact)
+	if !s.trafficDirectorAccountEligibleForPool(ctx, policy, fresh.ID, healthModel) {
+		return nil
+	}
+	return fresh
 }
 
 // openAITrafficDirectorAllowedIDsKey is used by both legacy and advanced
@@ -834,6 +1046,7 @@ func (s *OpenAIGatewayService) trafficDirectorHealthAdmission(
 	ctx context.Context,
 	account *Account,
 	requestedModel string,
+	requireCompact bool,
 ) (bool, func()) {
 	if account == nil || !s.OpenAITrafficDirectorEnforcedInContext(ctx) {
 		return true, nil
@@ -842,7 +1055,8 @@ func (s *OpenAIGatewayService) trafficDirectorHealthAdmission(
 	if mode != domain.TrafficDirectorHealthModeEnforce {
 		return true, nil
 	}
-	decision, err := s.CheckOpenAITrafficDirectorHealth(ctx, account, requestedModel, mode)
+	healthModel := openAITrafficDirectorHealthModelForRequest(ctx, account, requestedModel, requireCompact)
+	decision, err := s.checkOpenAITrafficDirectorHealthCanonical(ctx, account.ID, healthModel, mode, nil)
 	if err != nil {
 		// Check is fail-open by contract. Keep the account inside the already
 		// evaluated pool and leave the diagnostic to the health helper.
@@ -869,7 +1083,7 @@ func (s *OpenAIGatewayService) admitOpenAITrafficDirectorAccount(
 	account *Account,
 	requestedModel string,
 ) bool {
-	allowed, _ := s.trafficDirectorHealthAdmission(ctx, account, requestedModel)
+	allowed, _ := s.trafficDirectorHealthAdmission(ctx, account, requestedModel, false)
 	return allowed
 }
 

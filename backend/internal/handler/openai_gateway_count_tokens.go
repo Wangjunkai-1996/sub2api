@@ -147,9 +147,11 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	}
 
 	requestStart := time.Now()
+	healthModel := openAITrafficDirectorHealthModel(reqModel, channelMapping)
 	// count_tokens 不计费：显式豁免利润门，避免高倍率账号池被门排除后连
 	// token 计数都返回 no available accounts。
 	requestCtx := service.WithOpenAIProfitControlSuppressed(c.Request.Context())
+	requestCtx = service.WithOpenAICountTokensTrafficDirectorHealthModel(requestCtx, healthModel, preferredMappedModel)
 	requestCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(requestCtx)
 	c.Request = c.Request.WithContext(requestCtx)
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
@@ -218,7 +220,7 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, defaultMappedModel)
 		}()
-		h.reportCountTokensTrafficDirectorOutcome(c, account, currentRoutingModel, forwardErr)
+		h.reportCountTokensTrafficDirectorOutcome(c, account, healthModel, forwardErr)
 		if forwardErr != nil {
 			reqLog.Error("openai_count_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(forwardErr))
 		}

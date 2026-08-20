@@ -318,6 +318,49 @@ func (s *GroupRepoSuite) TestUpdate() {
 	s.Require().Equal("updated", got.Name)
 }
 
+func TestGroupRepositoryUpdateRejectsStaleOrdinarySnapshot(t *testing.T) {
+	ctx := context.Background()
+	created := mustCreateGroup(t, integrationEntClient, &service.Group{
+		Name:             uniqueTestValue(t, "stale-ordinary-update"),
+		Platform:         service.PlatformOpenAI,
+		RateMultiplier:   1.0,
+		Status:           service.StatusActive,
+		SubscriptionType: service.SubscriptionTypeStandard,
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM groups WHERE id = $1", created.ID)
+	})
+	repo := newGroupRepositoryWithSQL(integrationEntClient, integrationDB)
+
+	schedulerUpdate, err := repo.GetByIDLite(ctx, created.ID)
+	require.NoError(t, err)
+	staleNameUpdate, err := repo.GetByIDLite(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, schedulerUpdate.UpdatedAt, staleNameUpdate.UpdatedAt)
+
+	stickyWeighted := false
+	weightLoad := 0.25
+	schedulerUpdate.SchedulerType = service.GroupSchedulerTypeAdvanced
+	schedulerUpdate.AdvancedSchedulerOverrides = service.AdvancedSchedulerOverrides{
+		StickyWeightedEnabled: &stickyWeighted,
+		WeightLoad:            &weightLoad,
+	}
+	require.NoError(t, repo.Update(ctx, schedulerUpdate))
+
+	staleNameUpdate.Name = uniqueTestValue(t, "must-not-overwrite-scheduler")
+	err = repo.Update(ctx, staleNameUpdate)
+	require.ErrorIs(t, err, service.ErrGroupUpdateConflict)
+
+	got, err := repo.GetByIDLite(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, created.Name, got.Name)
+	require.Equal(t, service.GroupSchedulerTypeAdvanced, got.SchedulerType)
+	require.NotNil(t, got.AdvancedSchedulerOverrides.StickyWeightedEnabled)
+	require.False(t, *got.AdvancedSchedulerOverrides.StickyWeightedEnabled)
+	require.NotNil(t, got.AdvancedSchedulerOverrides.WeightLoad)
+	require.InDelta(t, weightLoad, *got.AdvancedSchedulerOverrides.WeightLoad, 1e-12)
+}
+
 func TestGroupRepositoryUpdateRejectsStaleTrafficDirectorVersion(t *testing.T) {
 	ctx := context.Background()
 	group := mustCreateGroup(t, integrationEntClient, &service.Group{

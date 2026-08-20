@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/group"
@@ -297,11 +298,21 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
 	}
+	updatedAt := time.Now()
+	if minimum := groupIn.UpdatedAt.Add(time.Microsecond); updatedAt.Before(minimum) {
+		// PostgreSQL timestamps have microsecond precision. Ensure every successful
+		// compare-and-set advances the token even under a fast update or clock skew.
+		updatedAt = minimum
+	}
 	builder := client.Group.UpdateOneID(groupIn.ID).
-		// Traffic Director head/version is owned by the dedicated publication
-		// repository. Keep ordinary updates conditional on the snapshot they
-		// loaded, so a concurrent publish cannot be overwritten here.
-		Where(group.TrafficDirectorVersionEQ(groupIn.TrafficDirectorVersion)).
+		// Keep the whole-row write conditional on the snapshot it was built from.
+		// The Traffic Director version preserves its dedicated conflict semantics;
+		// updated_at also rejects concurrent ordinary Group updates.
+		Where(
+			group.TrafficDirectorVersionEQ(groupIn.TrafficDirectorVersion),
+			group.UpdatedAtEQ(groupIn.UpdatedAt),
+		).
+		SetUpdatedAt(updatedAt).
 		SetName(groupIn.Name).
 		SetDescription(groupIn.Description).
 		SetPlatform(groupIn.Platform).
@@ -452,18 +463,24 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	if err != nil {
 		if dbent.IsNotFound(err) {
 			// Ent reports a conditional UPDATE with zero affected rows as
-			// NotFoundError. Distinguish a deleted/missing Group from a stale
-			// Traffic Director head for callers and HTTP clients.
+			// NotFoundError. Distinguish deletion, a stale Traffic Director head,
+			// and a stale ordinary Group snapshot for callers and HTTP clients.
 			current, lookupErr := client.Group.Query().
 				Where(group.IDEQ(groupIn.ID)).
-				Select(group.FieldTrafficDirectorVersion).
+				Select(group.FieldTrafficDirectorVersion, group.FieldUpdatedAt).
 				Only(ctx)
 			if lookupErr != nil {
 				return translatePersistenceError(lookupErr, service.ErrGroupNotFound, service.ErrGroupExists)
 			}
-			return service.ErrGroupTrafficDirectorVersionConflict.WithMetadata(map[string]string{
-				"expected_version": fmt.Sprintf("%d", groupIn.TrafficDirectorVersion),
-				"actual_version":   fmt.Sprintf("%d", current.TrafficDirectorVersion),
+			if current.TrafficDirectorVersion != groupIn.TrafficDirectorVersion {
+				return service.ErrGroupTrafficDirectorVersionConflict.WithMetadata(map[string]string{
+					"expected_version": fmt.Sprintf("%d", groupIn.TrafficDirectorVersion),
+					"actual_version":   fmt.Sprintf("%d", current.TrafficDirectorVersion),
+				})
+			}
+			return service.ErrGroupUpdateConflict.WithMetadata(map[string]string{
+				"expected_updated_at": groupIn.UpdatedAt.UTC().Format(time.RFC3339Nano),
+				"actual_updated_at":   current.UpdatedAt.UTC().Format(time.RFC3339Nano),
 			})
 		}
 		return translatePersistenceError(err, service.ErrGroupNotFound, service.ErrGroupExists)

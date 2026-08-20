@@ -154,6 +154,65 @@ func TestTrafficDirectorHealthRedisStore_OnlyOneHalfOpenProbeAcrossClients(t *te
 	require.Equal(t, 1, acquired)
 }
 
+func TestTrafficDirectorHealthRedisStore_RenewedProbeSurvivesFailureStreakTTL(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	store := NewTrafficDirectorHealthRedisStore(client)
+	ctx := context.Background()
+	base := time.UnixMilli(1_800_125_000_000).UTC()
+
+	for i := 0; i < 2; i++ {
+		_, err := store.RecordTrafficDirectorHealthFailure(ctx, trafficDirectorHealthFailureRequest(
+			98,
+			"gpt-5",
+			base.Add(time.Duration(i)*time.Second),
+			"",
+		))
+		require.NoError(t, err)
+	}
+
+	server.FastForward(29 * time.Minute)
+	check := trafficDirectorHealthCheckRequest(98, "gpt-5", base.Add(29*time.Minute), true, "long-probe")
+	check.ProbeLease = 10 * time.Minute
+	probe, err := store.CheckTrafficDirectorHealth(ctx, check)
+	require.NoError(t, err)
+	require.True(t, probe.ProbeAcquired)
+
+	for _, elapsed := range []time.Duration{38 * time.Minute, 47 * time.Minute, 56 * time.Minute} {
+		server.FastForward(9 * time.Minute)
+		renewed, renewErr := store.RenewTrafficDirectorHealthProbe(ctx, service.TrafficDirectorHealthStoreProbeRequest{
+			AccountID:       98,
+			NormalizedModel: "gpt-5",
+			Now:             base.Add(elapsed),
+			ProbeToken:      "long-probe",
+			ProbeLease:      10 * time.Minute,
+		})
+		require.NoError(t, renewErr)
+		require.True(t, renewed)
+	}
+
+	server.FastForward(3 * time.Minute)
+	other := trafficDirectorHealthCheckRequest(98, "gpt-5", base.Add(59*time.Minute), true, "other-probe")
+	other.ProbeLease = 10 * time.Minute
+	blocked, err := store.CheckTrafficDirectorHealth(ctx, other)
+	require.NoError(t, err)
+	require.Equal(t, service.TrafficDirectorHealthStateHalfOpen, blocked.State)
+	require.False(t, blocked.ProbeAcquired, "a renewed long-running probe must retain unique ownership")
+	require.Equal(t, base.Add(66*time.Minute), blocked.ProbeUntil)
+
+	failure, err := store.RecordTrafficDirectorHealthFailure(ctx, trafficDirectorHealthFailureRequest(
+		98,
+		"gpt-5",
+		base.Add(59*time.Minute+time.Second),
+		"long-probe",
+	))
+	require.NoError(t, err)
+	require.True(t, failure.MutationApplied)
+	require.Equal(t, service.TrafficDirectorHealthStateOpen, failure.State)
+	require.Equal(t, 3, failure.FailureStreak)
+}
+
 func TestTrafficDirectorHealthRedisStore_ProbeOwnerCanReleaseImmediately(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})

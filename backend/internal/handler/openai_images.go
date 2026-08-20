@@ -111,6 +111,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(parsed.Stream, false)))
 
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, routingModel)
+	healthModel := openAITrafficDirectorHealthModel(routingModel, channelMapping)
 
 	if h.errorPassthroughService != nil {
 		service.BindErrorPassthroughService(c, h.errorPassthroughService)
@@ -141,6 +142,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 
 	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, body)
 	requestCtx := service.WithOpenAIImagesEndpoint(service.WithOpenAIImageGenerationIntent(c.Request.Context()))
+	requestCtx = service.WithOpenAIImagesTrafficDirectorHealthModel(requestCtx, healthModel)
 	requestCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(requestCtx)
 	c.Request = c.Request.WithContext(requestCtx)
 
@@ -259,7 +261,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardImages(requestCtx, c, account, body, parsed, channelMapping.MappedModel)
 		}()
-		h.reportOpenAITrafficDirectorOutcome(requestCtx, account, requestModel, result, err)
+		h.reportOpenAITrafficDirectorOutcome(requestCtx, account, healthModel, result, err)
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
 		responseLatencyMs := forwardDurationMs

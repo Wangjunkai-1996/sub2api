@@ -167,26 +167,6 @@ func takeOpenAITrafficDirectorHealthAttempt(
 		}
 		return attempt, true
 	}
-	// The scheduler records the mapped/canonical model, while a handler may
-	// report the public alias. There should normally be one attempt per account
-	// in a request; use it as a compatibility fallback and consume it once.
-	for candidate, attempts := range state.healthAttempts {
-		if candidate.accountID == accountID && len(attempts) > 0 {
-			attempt := attempts[0]
-			if attempt.model == "" {
-				attempt.model = candidate.model
-			}
-			if len(attempts) == 1 {
-				delete(state.healthAttempts, candidate)
-			} else {
-				state.healthAttempts[candidate] = attempts[1:]
-			}
-			if attempt.stopRenew != nil {
-				attempt.stopRenew()
-			}
-			return attempt, true
-		}
-	}
 	return openAITrafficDirectorHealthAttempt{}, false
 }
 
@@ -206,9 +186,21 @@ func (s *OpenAIGatewayService) abandonOpenAITrafficDirectorHealthAttempt(
 	if !ok || attempt.probeToken == "" {
 		return attempt, ok
 	}
+	s.releaseOpenAITrafficDirectorHealthProbe(ctx, accountID, attempt)
+	return attempt, ok
+}
+
+func (s *OpenAIGatewayService) releaseOpenAITrafficDirectorHealthProbe(
+	ctx context.Context,
+	accountID int64,
+	attempt openAITrafficDirectorHealthAttempt,
+) {
+	if accountID <= 0 || attempt.probeToken == "" {
+		return
+	}
 	releaser, supportsRelease := s.trafficDirectorHealthResolver().(openAITrafficDirectorHealthProbeReleaser)
 	if !supportsRelease {
-		return attempt, ok
+		return
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -227,7 +219,6 @@ func (s *OpenAIGatewayService) abandonOpenAITrafficDirectorHealthAttempt(
 			"error", err,
 		)
 	}
-	return attempt, ok
 }
 
 func trafficDirectorHealthAttemptCoordinates(
@@ -254,11 +245,6 @@ func peekOpenAITrafficDirectorHealthAttemptMode(ctx context.Context, accountID i
 	defer state.mu.Unlock()
 	if attempts, ok := state.healthAttempts[openAITrafficDirectorHealthAttemptKey{accountID: accountID, model: model}]; ok && len(attempts) > 0 {
 		return attempts[0].mode
-	}
-	for key, attempts := range state.healthAttempts {
-		if key.accountID == accountID && len(attempts) > 0 {
-			return attempts[0].mode
-		}
 	}
 	return ""
 }
@@ -317,6 +303,23 @@ func (s *OpenAIGatewayService) CheckOpenAITrafficDirectorHealth(
 	return s.checkOpenAITrafficDirectorHealth(ctx, account, model, healthMode, nil)
 }
 
+func canonicalOpenAITrafficDirectorHealthModel(ctx context.Context, account *Account, model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	if ctx != nil {
+		if healthModel, ok := ctx.Value(openAITrafficDirectorHealthModelContextKey{}).(openAITrafficDirectorHealthModelContext); ok &&
+			strings.EqualFold(strings.TrimSpace(healthModel.model), model) {
+			return NormalizeTrafficDirectorHealthModel(resolveOpenAITrafficDirectorHealthModel(account, healthModel))
+		}
+	}
+	return NormalizeTrafficDirectorHealthModel(resolveOpenAITrafficDirectorHealthModel(account, openAITrafficDirectorHealthModelContext{
+		model: model,
+		kind:  openAITrafficDirectorHealthModelAccountMapped,
+	}))
+}
+
 func (s *OpenAIGatewayService) checkOpenAITrafficDirectorHealth(
 	ctx context.Context,
 	account *Account,
@@ -327,10 +330,18 @@ func (s *OpenAIGatewayService) checkOpenAITrafficDirectorHealth(
 	accountID := int64(0)
 	if account != nil {
 		accountID = account.ID
-		if mapped := strings.TrimSpace(account.GetMappedModel(model)); mapped != "" {
-			model = mapped
-		}
 	}
+	model = canonicalOpenAITrafficDirectorHealthModel(ctx, account, model)
+	return s.checkOpenAITrafficDirectorHealthCanonical(ctx, accountID, model, healthMode, acquireProbe)
+}
+
+func (s *OpenAIGatewayService) checkOpenAITrafficDirectorHealthCanonical(
+	ctx context.Context,
+	accountID int64,
+	model string,
+	healthMode string,
+	acquireProbe *bool,
+) (TrafficDirectorHealthDecision, error) {
 	model = NormalizeTrafficDirectorHealthModel(model)
 	if healthMode == "" {
 		healthMode = peekOpenAITrafficDirectorHealthMode(ctx, accountID)
@@ -466,18 +477,20 @@ func (s *OpenAIGatewayService) ReportOpenAITrafficDirectorOutcome(
 		accountID = input.Account.ID
 	}
 	model := strings.TrimSpace(input.Model)
-	if model == "" && input.Result != nil {
-		model = strings.TrimSpace(input.Result.UpstreamModel)
-		if model == "" {
+	modelIsUpstream := false
+	if input.Result != nil {
+		if upstreamModel := strings.TrimSpace(input.Result.UpstreamModel); upstreamModel != "" {
+			model = upstreamModel
+			modelIsUpstream = true
+		} else if model == "" {
 			model = strings.TrimSpace(input.Result.Model)
 		}
 	}
-	if input.Account != nil {
-		if mapped := strings.TrimSpace(input.Account.GetMappedModel(model)); mapped != "" {
-			model = mapped
-		}
+	if modelIsUpstream {
+		model = NormalizeTrafficDirectorHealthModel(model)
+	} else {
+		model = canonicalOpenAITrafficDirectorHealthModel(ctx, input.Account, model)
 	}
-	model = NormalizeTrafficDirectorHealthModel(model)
 	mode := strings.ToLower(strings.TrimSpace(input.HealthMode))
 	if mode == "" {
 		mode = peekOpenAITrafficDirectorHealthMode(ctx, accountID)
@@ -500,6 +513,14 @@ func (s *OpenAIGatewayService) ReportOpenAITrafficDirectorOutcome(
 	resolver := s.trafficDirectorHealthResolver()
 	reporter := healthReporterFromResolver(resolver)
 	if reporter == nil || mode == domain.TrafficDirectorHealthModeOff {
+		// A checker-only deployment may still acquire and renew half-open probes.
+		// Once an upstream attempt finishes without a reporter, consume the local
+		// attempt and release its lease instead of delaying recovery until TTL.
+		attempt, _ := s.abandonOpenAITrafficDirectorHealthAttempt(ctx, accountID, model)
+		model, mode = trafficDirectorHealthAttemptCoordinates(attempt, model, mode)
+		outcome.Model = model
+		outcome.HealthMode = mode
+		outcome.ProbeToken = attempt.probeToken
 		outcome.IgnoredReason = "health_reporting_unavailable_or_off"
 		return outcome, nil
 	}
@@ -573,6 +594,9 @@ func (s *OpenAIGatewayService) ReportOpenAITrafficDirectorOutcome(
 			HealthMode: mode,
 			ProbeToken: attempt.probeToken,
 		})
+		if err != nil {
+			s.releaseOpenAITrafficDirectorHealthProbe(ctx, accountID, attempt)
+		}
 		outcome.Recorded = err == nil
 		if !restored && err == nil {
 			outcome.IgnoredReason = "success_not_probe_owner"
@@ -615,6 +639,9 @@ func (s *OpenAIGatewayService) ReportOpenAITrafficDirectorOutcome(
 			AccountScoped: accountScoped,
 		},
 	})
+	if err != nil {
+		s.releaseOpenAITrafficDirectorHealthProbe(ctx, accountID, attempt)
+	}
 	outcome.Recorded = err == nil && recorded.Recorded
 	outcome.FailureResult = &recorded
 	return outcome, err

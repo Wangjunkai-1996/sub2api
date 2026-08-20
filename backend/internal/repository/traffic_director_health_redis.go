@@ -48,7 +48,8 @@ end
 if streak < 1 or last_failure < 1 then
   return redis.error_reply('invalid traffic director health streak')
 end
-if now < last_failure or now - last_failure >= streak_ttl then
+local active_probe = state == 'half_open' and stored_probe_token ~= '' and probe_until > now
+if not active_probe and (now < last_failure or now - last_failure >= streak_ttl) then
   redis.call('DEL', key)
   return {0, 0, 0, 0, 0, 0}
 end
@@ -74,6 +75,10 @@ end
 
 probe_until = now + probe_lease
 redis.call('HSET', key, 'state', 'half_open', 'probe_token', probe_token, 'probe_until', probe_until)
+local key_ttl = redis.call('PTTL', key)
+if key_ttl >= 0 and key_ttl < probe_lease then
+  redis.call('PEXPIRE', key, probe_lease)
+end
 return {3, streak, last_failure, open_until, 1, probe_until}
 `
 
@@ -121,7 +126,9 @@ if streak < 1 or last_failure < 1 then
   return redis.error_reply('invalid traffic director health streak')
 end
 
-if now < last_failure or now - last_failure >= streak_ttl then
+local active_probe = state == 'half_open' and stored_probe_token ~= '' and probe_until > now
+local owned_probe = state == 'half_open' and probe_token ~= '' and probe_token == stored_probe_token
+if not active_probe and not owned_probe and (now < last_failure or now - last_failure >= streak_ttl) then
   state = 'healthy'
   streak = 0
   open_until = 0
@@ -242,6 +249,10 @@ if probe_token == '' or probe_lease < 1 then
   return redis.error_reply('invalid traffic director health probe lease')
 end
 redis.call('HSET', key, 'probe_until', now + probe_lease)
+local key_ttl = redis.call('PTTL', key)
+if key_ttl >= 0 and key_ttl < probe_lease then
+  redis.call('PEXPIRE', key, probe_lease)
+end
 return 1
 `
 

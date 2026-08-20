@@ -2,10 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
-const { getAllIncludingInactive, get, getStatus, listVersions, preview, publish, rollback, showSuccess } = vi.hoisted(() => ({
+const { getAllIncludingInactive, get, getStatus, getVersion, listVersions, preview, publish, rollback, showSuccess } = vi.hoisted(() => ({
   getAllIncludingInactive: vi.fn(),
   get: vi.fn(),
   getStatus: vi.fn(),
+  getVersion: vi.fn(),
   listVersions: vi.fn(),
   preview: vi.fn(),
   publish: vi.fn(),
@@ -16,7 +17,7 @@ const { getAllIncludingInactive, get, getStatus, listVersions, preview, publish,
 vi.mock('@/api/admin', () => ({
   adminAPI: {
     groups: { getAllIncludingInactive },
-    trafficDirector: { get, getStatus, listVersions, preview, publish, rollback }
+    trafficDirector: { get, getStatus, getVersion, listVersions, preview, publish, rollback }
   }
 }))
 
@@ -79,6 +80,18 @@ const version = (number: number, mode: 'legacy' | 'shadow') => ({
   note: '',
   created_at: '2026-08-20T00:00:00Z'
 })
+const versionDetails = (number: number, mode: 'legacy' | 'shadow' | 'enforced', accountIds: number[] = [1]) => ({
+  ...version(number, mode === 'enforced' ? 'shadow' : mode),
+  mode,
+  checksum: `checksum-${number}`,
+  spec: mode === 'legacy'
+    ? null
+    : {
+        schema_version: 1 as const,
+        health_mode: 'off' as const,
+        pools: [{ key: 'stable', weight_bps: 10000, account_ids: accountIds, min_available: 1 }]
+      }
+})
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -94,6 +107,9 @@ describe('TrafficDirectorView', () => {
     getAllIncludingInactive.mockReset().mockResolvedValue([{ id: 7, name: 'OpenAI Stable', platform: 'openai' }])
     get.mockReset().mockResolvedValueOnce(legacyState()).mockResolvedValueOnce(shadowState()).mockResolvedValueOnce(shadowState())
     getStatus.mockReset().mockResolvedValueOnce(status(0, 'legacy')).mockResolvedValueOnce(status(1, 'shadow')).mockResolvedValueOnce(status(1, 'shadow'))
+    getVersion.mockReset().mockImplementation((_groupId: number, targetVersion: number) => Promise.resolve(
+      versionDetails(targetVersion, targetVersion === 0 ? 'legacy' : 'shadow')
+    ))
     listVersions.mockReset().mockResolvedValueOnce({ items: [version(0, 'legacy')], total: 1, limit: 100, offset: 0 }).mockResolvedValueOnce({ items: [version(1, 'shadow'), version(0, 'legacy')], total: 2, limit: 100, offset: 0 }).mockResolvedValueOnce({ items: [version(1, 'shadow'), version(0, 'legacy')], total: 2, limit: 100, offset: 0 })
     preview.mockReset().mockResolvedValue({
       group_id: 7,
@@ -149,6 +165,8 @@ describe('TrafficDirectorView', () => {
     expect(rollbackButton).toBeDefined()
     await rollbackButton!.trigger('click')
     await flushPromises()
+    expect(getVersion).toHaveBeenCalledWith(7, 0)
+    expect(wrapper.get('[data-testid="traffic-director-rollback-details"]').text()).toContain('admin.trafficDirector.history.targetMode')
     const dialogButtons = wrapper.findAll('button')
     const confirmRollbackButton = dialogButtons[dialogButtons.length - 1]
     expect(confirmRollbackButton).toBeDefined()
@@ -290,6 +308,271 @@ describe('TrafficDirectorView', () => {
     expect(wrapper.get('[data-testid="traffic-director-publish"]').attributes('disabled')).toBeDefined()
   })
 
+  it('loads the immutable target policy for review before enabling rollback', async () => {
+    const currentState = {
+      ...shadowState(),
+      head: { ...shadowState().head, version: 2 },
+      accounts: [account(1), account(2)]
+    }
+    const targetSummary = { ...version(1, 'shadow'), mode: 'enforced' as const }
+    const detailsResult = deferred<ReturnType<typeof versionDetails>>()
+    get.mockReset().mockResolvedValue(currentState)
+    getStatus.mockReset().mockResolvedValue({
+      ...status(2, 'shadow'),
+      head: { group_id: 7, version: 2, mode: 'shadow' as const },
+      version: 2,
+      account_count: 2,
+      available_account_count: 2
+    })
+    listVersions.mockReset().mockResolvedValue({
+      items: [version(2, 'shadow'), targetSummary],
+      total: 2,
+      limit: 100,
+      offset: 0
+    })
+    getVersion.mockReset().mockReturnValueOnce(detailsResult.promise)
+
+    const wrapper = mount(TrafficDirectorView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          BaseDialog: { props: ['show'], template: '<div v-if="show" data-testid="rollback-dialog"><slot /><slot name="footer" /></div>' },
+          Select: { template: '<div />' },
+          Icon: true,
+          LoadingSpinner: true,
+          EmptyState: true
+        }
+      }
+    })
+
+    await flushPromises()
+    const rollbackButton = wrapper.findAll('button[title="admin.trafficDirector.history.rollback"]').find((button) => button.attributes('disabled') === undefined)
+    expect(rollbackButton).toBeDefined()
+    await rollbackButton!.trigger('click')
+    await Promise.resolve()
+
+    expect(getVersion).toHaveBeenCalledWith(7, 1)
+    const loadingStatus = wrapper.get('[data-testid="traffic-director-rollback-details-loading"]')
+    expect(loadingStatus.attributes('role')).toBe('status')
+    expect(loadingStatus.attributes('aria-live')).toBe('polite')
+    expect(wrapper.get('[data-testid="traffic-director-rollback-submit"]').attributes('disabled')).toBeDefined()
+
+    detailsResult.resolve(versionDetails(1, 'enforced', [1]))
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="traffic-director-rollback-details"]').text()).toContain('checksum-1')
+    expect(wrapper.get('[data-testid="traffic-director-rollback-spec"]').text()).toContain('stable')
+    expect(wrapper.get('[data-testid="traffic-director-rollback-unassigned"]').text()).toContain('2')
+    expect(wrapper.get('[data-testid="traffic-director-rollback-submit"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="traffic-director-rollback-confirm-unassigned"]').setValue(true)
+    expect(wrapper.get('[data-testid="traffic-director-rollback-submit"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('refreshes the head and replaces the publish operation key after a version conflict', async () => {
+    const refreshedState = {
+      ...shadowState(),
+      head: { ...shadowState().head, version: 2 }
+    }
+    get.mockReset()
+      .mockResolvedValueOnce(legacyState())
+      .mockResolvedValueOnce(refreshedState)
+      .mockResolvedValueOnce(refreshedState)
+    getStatus.mockReset()
+      .mockResolvedValueOnce(status(0, 'legacy'))
+      .mockResolvedValueOnce({ ...status(2, 'shadow'), head: { group_id: 7, version: 2, mode: 'shadow' as const } })
+      .mockResolvedValueOnce({ ...status(2, 'shadow'), head: { group_id: 7, version: 2, mode: 'shadow' as const } })
+    listVersions.mockReset().mockResolvedValue({
+      items: [version(2, 'shadow'), version(1, 'shadow')],
+      total: 2,
+      limit: 100,
+      offset: 0
+    })
+    preview.mockReset().mockImplementation((_groupId: number, payload: { expected_version: number }) => Promise.resolve({
+      group_id: 7,
+      expected_version: payload.expected_version,
+      mode: 'shadow' as const,
+      normalized_spec: shadowState().head.spec,
+      checksum: `preview-${payload.expected_version}`,
+      unassigned_account_ids: [],
+      accounts: [account(1)]
+    }))
+    publish.mockReset()
+      .mockRejectedValueOnce({
+        reason: 'TRAFFIC_DIRECTOR_VERSION_CONFLICT',
+        message: 'traffic director policy version changed',
+        metadata: { expected_version: '0', actual_version: '2' }
+      })
+      .mockResolvedValueOnce({ version: versionDetails(3, 'shadow'), replayed: false, unassigned_account_ids: [] })
+
+    const wrapper = mount(TrafficDirectorView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /><slot name="footer" /></div>' },
+          Select: { template: '<div />' },
+          Icon: true,
+          LoadingSpinner: true,
+          EmptyState: true
+        }
+      }
+    })
+
+    await flushPromises()
+    await wrapper.get('[data-testid="traffic-director-mode-shadow"]').trigger('click')
+    await wrapper.get('[data-testid="traffic-director-publish"]').trigger('click')
+    await flushPromises()
+
+    expect(get).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('v2')
+    expect(wrapper.text()).toContain('admin.trafficDirector.errors.TRAFFIC_DIRECTOR_VERSION_CONFLICT')
+    const conflictedOperationKey = publish.mock.calls[0][2]
+
+    await wrapper.get('[data-testid="traffic-director-publish"]').trigger('click')
+    await flushPromises()
+
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(publish.mock.calls[1][2]).not.toBe(conflictedOperationKey)
+  })
+
+  it('preserves the refresh error when reloading after a version conflict fails', async () => {
+    get.mockReset()
+      .mockResolvedValueOnce(legacyState())
+      .mockRejectedValueOnce({ message: 'failed to refresh latest policy' })
+    getStatus.mockReset()
+      .mockResolvedValueOnce(status(0, 'legacy'))
+      .mockResolvedValueOnce(status(2, 'shadow'))
+    listVersions.mockReset().mockResolvedValue({
+      items: [version(0, 'legacy')],
+      total: 1,
+      limit: 100,
+      offset: 0
+    })
+    publish.mockReset().mockRejectedValueOnce({
+      reason: 'TRAFFIC_DIRECTOR_VERSION_CONFLICT',
+      message: 'traffic director policy version changed',
+      metadata: { expected_version: '0', actual_version: '2' }
+    })
+
+    const wrapper = mount(TrafficDirectorView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /><slot name="footer" /></div>' },
+          Select: { template: '<div />' },
+          Icon: true,
+          LoadingSpinner: true,
+          EmptyState: true
+        }
+      }
+    })
+
+    await flushPromises()
+    await wrapper.get('[data-testid="traffic-director-mode-shadow"]').trigger('click')
+    await wrapper.get('[data-testid="traffic-director-publish"]').trigger('click')
+    await flushPromises()
+
+    expect(get).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('failed to refresh latest policy')
+    expect(wrapper.text()).not.toContain('admin.trafficDirector.errors.TRAFFIC_DIRECTOR_VERSION_CONFLICT')
+  })
+
+  it('refreshes the head and replaces the rollback operation key after a version conflict', async () => {
+    const refreshedState = {
+      ...shadowState(),
+      head: { ...shadowState().head, version: 2 }
+    }
+    get.mockReset()
+      .mockResolvedValueOnce(shadowState())
+      .mockResolvedValueOnce(refreshedState)
+      .mockResolvedValueOnce(refreshedState)
+    getStatus.mockReset()
+      .mockResolvedValueOnce(status(1, 'shadow'))
+      .mockResolvedValueOnce({ ...status(2, 'shadow'), head: { group_id: 7, version: 2, mode: 'shadow' as const } })
+      .mockResolvedValueOnce({ ...status(2, 'shadow'), head: { group_id: 7, version: 2, mode: 'shadow' as const } })
+    listVersions.mockReset().mockResolvedValue({
+      items: [version(2, 'shadow'), version(1, 'shadow')],
+      total: 2,
+      limit: 100,
+      offset: 0
+    })
+    rollback.mockReset()
+      .mockRejectedValueOnce({
+        reason: 'TRAFFIC_DIRECTOR_VERSION_CONFLICT',
+        message: 'traffic director policy version changed',
+        metadata: { expected_version: '1', actual_version: '2' }
+      })
+      .mockResolvedValueOnce({ version: versionDetails(3, 'legacy'), replayed: false, unassigned_account_ids: [] })
+
+    const wrapper = mount(TrafficDirectorView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          BaseDialog: { props: ['show'], template: '<div v-if="show" data-testid="rollback-dialog"><slot /><slot name="footer" /></div>' },
+          Select: { template: '<div />' },
+          Icon: true,
+          LoadingSpinner: true,
+          EmptyState: true
+        }
+      }
+    })
+
+    await flushPromises()
+    await wrapper.get('[data-testid="traffic-director-rollback-legacy"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="traffic-director-rollback-submit"]').trigger('click')
+    await flushPromises()
+
+    expect(get).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('v2')
+    const conflictedOperationKey = rollback.mock.calls[0][3]
+
+    await wrapper.get('[data-testid="traffic-director-rollback-legacy"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="traffic-director-rollback-submit"]').trigger('click')
+    await flushPromises()
+
+    expect(rollback).toHaveBeenCalledTimes(2)
+    expect(rollback.mock.calls[1][3]).not.toBe(conflictedOperationKey)
+  })
+
+  it('loads history beyond the first 100 versions', async () => {
+    const firstPage = Array.from({ length: 100 }, (_item, index) => version(101 - index, 'shadow'))
+    const currentState = {
+      ...shadowState(),
+      head: { ...shadowState().head, version: 101 }
+    }
+    get.mockReset().mockResolvedValue(currentState)
+    getStatus.mockReset().mockResolvedValue({
+      ...status(101, 'shadow'),
+      head: { group_id: 7, version: 101, mode: 'shadow' as const }
+    })
+    listVersions.mockReset()
+      .mockResolvedValueOnce({ items: firstPage, total: 101, limit: 100, offset: 0 })
+      .mockResolvedValueOnce({ items: [version(1, 'shadow')], total: 101, limit: 100, offset: 100 })
+
+    const wrapper = mount(TrafficDirectorView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          BaseDialog: { props: ['show'], template: '<div v-if="show"><slot /><slot name="footer" /></div>' },
+          Select: { template: '<div />' },
+          Icon: true,
+          LoadingSpinner: true,
+          EmptyState: true
+        }
+      }
+    })
+
+    await flushPromises()
+    expect(listVersions).toHaveBeenNthCalledWith(1, 7, { limit: 100, offset: 0 })
+    await wrapper.get('[data-testid="traffic-director-history-load-more"]').trigger('click')
+    await flushPromises()
+
+    expect(listVersions).toHaveBeenNthCalledWith(2, 7, { limit: 100, offset: 100 })
+    expect(wrapper.find('[data-testid="traffic-director-history-load-more"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('v1')
+  })
+
   it('keeps inactive OpenAI groups available and locks the editor while rolling back to legacy v0 outside history', async () => {
     const rollbackResult = deferred<Awaited<ReturnType<typeof rollback>>>()
     getAllIncludingInactive.mockResolvedValue([
@@ -327,6 +610,7 @@ describe('TrafficDirectorView', () => {
 
     await wrapper.get('[data-testid="traffic-director-rollback-legacy"]').trigger('click')
     expect(wrapper.get('[data-testid="rollback-dialog"]').exists()).toBe(true)
+    await flushPromises()
     await wrapper.get('[data-testid="traffic-director-rollback-submit"]').trigger('click')
     await Promise.resolve()
 
@@ -346,9 +630,9 @@ describe('TrafficDirectorView', () => {
       '[data-testid="traffic-director-preview"]',
       '[data-testid="traffic-director-publish"]',
       '[data-testid="traffic-director-history-refresh"]',
+      '[data-testid="traffic-director-history-load-more"]',
       '[data-testid="traffic-director-rollback-legacy"]',
       '#traffic-director-rollback-note',
-      '[data-testid="traffic-director-rollback-confirm-unassigned"]',
       '[data-testid="traffic-director-rollback-cancel"]',
       '[data-testid="traffic-director-rollback-submit"]'
     ]) {

@@ -80,6 +80,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 	setOpsRequestContext(c, reqModel, false)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeSync))
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	healthModel := openAITrafficDirectorHealthModel(reqModel, channelMapping)
 
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
@@ -114,6 +115,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 
 	// 分组利润控制：embeddings 文本入口请求级装门并固定 pricingAt。
 	embPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
+	embPricingCtx = service.WithOpenAITrafficDirectorHealthModel(embPricingCtx, healthModel)
 	embPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(embPricingCtx)
 	c.Request = c.Request.WithContext(embPricingCtx)
 
@@ -188,6 +190,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
+		account = selection.Account
 
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		forwardStart := time.Now()
@@ -206,7 +209,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardEmbeddings(c.Request.Context(), c, account, forwardBody, "")
 		}()
-		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, reqModel, result, err)
+		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)

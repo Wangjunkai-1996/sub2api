@@ -2330,15 +2330,15 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 
 		cooldownErr := s.RecheckOpenAICyberAccountCooldown(ctx, selection.Account)
 		if cooldownErr == nil {
-			// Immediate selections already own a real concurrency slot, so health
-			// admission may acquire the single half-open probe now. A WaitPlan is
-			// only a candidate reservation; defer the probe until the handler has
-			// actually acquired its slot.
+			// Immediate selections normally acquire the half-open probe here. When
+			// profit control is active, the handler must first replace the selected
+			// account with the latest post-slot snapshot; defer admission so its
+			// model key matches the account that will actually be forwarded.
 			if selection.Acquired {
 				selection.setTrafficDirectorAdmission(func(admitCtx context.Context, account *Account) (bool, func()) {
-					return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel)
+					return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel, requireCompact)
 				})
-				if !selection.AdmitTrafficDirector(ctx, selection.ReleaseFunc) {
+				if !selection.ProfitGateActive() && !selection.AdmitTrafficDirector(ctx, selection.ReleaseFunc) {
 					if selection.ReleaseFunc != nil {
 						selection.ReleaseFunc()
 					}
@@ -2354,7 +2354,7 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 				}
 			} else {
 				selection.setTrafficDirectorAdmission(func(admitCtx context.Context, account *Account) (bool, func()) {
-					return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel)
+					return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel, requireCompact)
 				})
 			}
 			s.logTrafficDirectorShadowSelectionOnce(ctx, groupID, requestedModel, selection.Account.ID)
@@ -2551,33 +2551,33 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				return nil, decision, previousErr
 			}
 			if previousSelection != nil && previousSelection.Account != nil {
-				if !s.isOpenAIAccountTransportCompatible(previousSelection.Account, requiredTransport) ||
-					!accountSupportsOpenAICapabilities(previousSelection.Account, requiredCapability, requiredImageCapability) ||
-					!trafficDirectorAccountBelongsToGroup(previousSelection.Account, groupID) ||
-					!s.trafficDirectorAccountEligibleForPool(ctx, trafficPlan, previousSelection.Account.ID, canonicalOpenAIAccountSchedulingModel(previousSelection.Account, requestedModel)) {
+				eligibleAccount := s.trafficDirectorHardPreviousAccount(
+					ctx,
+					groupID,
+					platform,
+					requestedModel,
+					requiredTransport,
+					requiredCapability,
+					requiredImageCapability,
+					requireCompact,
+					trafficPlan,
+					previousSelection.Account,
+				)
+				if eligibleAccount == nil {
 					if previousSelection.ReleaseFunc != nil {
 						previousSelection.ReleaseFunc()
 					}
 				} else {
-					previousSelection.setTrafficDirectorAdmission(func(admitCtx context.Context, account *Account) (bool, func()) {
-						return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel)
-					})
-					if previousSelection.Acquired && !previousSelection.AdmitTrafficDirector(ctx, previousSelection.ReleaseFunc) {
-						if previousSelection.ReleaseFunc != nil {
-							previousSelection.ReleaseFunc()
-						}
-						previousSelection = nil
-					} else {
-						s.logTrafficDirectorPreviousOverride(ctx, trafficPlan, previousSelection.Account.ID, requestedModel)
-						if sessionHash != "" {
-							_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, previousSelection.Account.ID)
-						}
-						decision.Layer = openAIAccountScheduleLayerPreviousResponse
-						decision.StickyPreviousHit = true
-						decision.SelectedAccountID = previousSelection.Account.ID
-						decision.SelectedAccountType = previousSelection.Account.Type
-						return previousSelection, decision, nil
+					previousSelection.Account = eligibleAccount
+					s.logTrafficDirectorPreviousOverride(ctx, trafficPlan, previousSelection.Account.ID, requestedModel)
+					if sessionHash != "" {
+						_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, previousSelection.Account.ID)
 					}
+					decision.Layer = openAIAccountScheduleLayerPreviousResponse
+					decision.StickyPreviousHit = true
+					decision.SelectedAccountID = previousSelection.Account.ID
+					decision.SelectedAccountType = previousSelection.Account.Type
+					return previousSelection, decision, nil
 				}
 			}
 		}

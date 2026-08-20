@@ -118,6 +118,103 @@ func TestTrafficDirectorPolicyCache_RedisLatencyCannotConsumeDBFallbackBudget(t 
 	require.Equal(t, int64(1), redisCache.setCalls.Load())
 }
 
+func TestTrafficDirectorPolicyCache_RedisHitUsesSingleflight(t *testing.T) {
+	policy := newTrafficDirectorPolicyCacheTestVersion(t, 431, 9, domain.TrafficDirectorModeEnforced)
+	store := newTrafficDirectorPolicyStoreStub()
+	store.defaultErr = errors.New("database must not be called on a Redis hit")
+	redisCache := newTrafficDirectorPolicyRedisStub(policy)
+	redisCache.getDelay = 80 * time.Millisecond
+	cache := NewTrafficDirectorPolicyCache(store, redisCache, 8, time.Hour)
+	head := TrafficDirectorHead{GroupID: 431, Version: 9, Mode: domain.TrafficDirectorModeEnforced}
+
+	results := getTrafficDirectorPoliciesConcurrently(t, cache, head, 24)
+	for _, resolved := range results {
+		require.Equal(t, int64(9), resolved.Version.Version)
+	}
+	require.Equal(t, int64(1), redisCache.getCalls.Load())
+	require.Zero(t, store.totalCalls.Load())
+	require.Zero(t, redisCache.setCalls.Load())
+	require.Equal(t, uint64(1), cache.Stats().L2Hits)
+}
+
+func TestTrafficDirectorPolicyCache_RedisMissUsesSingleflight(t *testing.T) {
+	policy := newTrafficDirectorPolicyCacheTestVersion(t, 432, 9, domain.TrafficDirectorModeEnforced)
+	store := newTrafficDirectorPolicyStoreStub(policy)
+	store.delay = 40 * time.Millisecond
+	redisCache := newTrafficDirectorPolicyRedisStub()
+	redisCache.getDelay = 80 * time.Millisecond
+	cache := NewTrafficDirectorPolicyCache(store, redisCache, 8, time.Hour)
+	head := TrafficDirectorHead{GroupID: 432, Version: 9, Mode: domain.TrafficDirectorModeEnforced}
+
+	results := getTrafficDirectorPoliciesConcurrently(t, cache, head, 24)
+	for _, resolved := range results {
+		require.Equal(t, int64(9), resolved.Version.Version)
+	}
+	require.Equal(t, int64(1), redisCache.getCalls.Load())
+	require.Equal(t, int64(1), store.totalCalls.Load())
+	require.Equal(t, int64(1), redisCache.setCalls.Load())
+	require.Equal(t, uint64(1), cache.Stats().DBLoads)
+}
+
+func TestTrafficDirectorPolicyCache_RedisTimeoutUsesSingleflight(t *testing.T) {
+	policy := newTrafficDirectorPolicyCacheTestVersion(t, 433, 9, domain.TrafficDirectorModeEnforced)
+	store := newTrafficDirectorPolicyStoreStub(policy)
+	redisCache := newTrafficDirectorPolicyRedisStub()
+	redisCache.blockGet = true
+	cache := NewTrafficDirectorPolicyCache(store, redisCache, 8, time.Hour)
+	head := TrafficDirectorHead{GroupID: 433, Version: 9, Mode: domain.TrafficDirectorModeEnforced}
+
+	results := getTrafficDirectorPoliciesConcurrently(t, cache, head, 24)
+	for _, resolved := range results {
+		require.Equal(t, int64(9), resolved.Version.Version)
+	}
+	require.Equal(t, int64(1), redisCache.getCalls.Load())
+	require.Equal(t, int64(1), store.totalCalls.Load())
+	require.Equal(t, int64(1), redisCache.setCalls.Load())
+	require.Equal(t, uint64(1), cache.Stats().DBLoads)
+}
+
+func getTrafficDirectorPoliciesConcurrently(
+	t *testing.T,
+	cache TrafficDirectorPolicyCache,
+	head TrafficDirectorHead,
+	callers int,
+) []TrafficDirectorResolvedPolicy {
+	t.Helper()
+	start := make(chan struct{})
+	results := make(chan TrafficDirectorResolvedPolicy, callers)
+	errorsCh := make(chan error, callers)
+	var ready sync.WaitGroup
+	var wg sync.WaitGroup
+	ready.Add(callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			<-start
+			resolved, err := cache.GetTrafficDirectorPolicy(context.Background(), head)
+			results <- resolved
+			errorsCh <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errorsCh)
+
+	for err := range errorsCh {
+		require.NoError(t, err)
+	}
+	resolved := make([]TrafficDirectorResolvedPolicy, 0, callers)
+	for result := range results {
+		resolved = append(resolved, result)
+	}
+	require.Len(t, resolved, callers)
+	return resolved
+}
+
 func TestTrafficDirectorPolicyCache_DBLoadUsesSingleflight(t *testing.T) {
 	policy := newTrafficDirectorPolicyCacheTestVersion(t, 44, 10, domain.TrafficDirectorModeEnforced)
 	store := newTrafficDirectorPolicyStoreStub(policy)
@@ -537,6 +634,7 @@ type trafficDirectorPolicyRedisStub struct {
 	policies map[trafficDirectorPolicyKey]TrafficDirectorVersion
 	getErr   error
 	setErr   error
+	getDelay time.Duration
 	blockGet bool
 	blockSet bool
 	getCalls atomic.Int64
@@ -559,6 +657,13 @@ func (s *trafficDirectorPolicyRedisStub) GetTrafficDirectorPolicyVersion(
 	version int64,
 ) (*TrafficDirectorVersion, error) {
 	s.getCalls.Add(1)
+	if s.getDelay > 0 {
+		select {
+		case <-time.After(s.getDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.blockGet {
 		<-ctx.Done()
 		return nil, ctx.Err()

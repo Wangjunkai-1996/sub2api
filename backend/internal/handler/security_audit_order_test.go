@@ -90,6 +90,39 @@ func TestOpenAISelectedAccountAuditRunsAfterSlotBeforeForward(t *testing.T) {
 	}
 }
 
+func TestOpenAINonAuditEntryPointsForwardRefreshedAccountSnapshot(t *testing.T) {
+	tests := []struct {
+		file         string
+		function     string
+		forwardToken string
+	}{
+		{file: "openai_embeddings.go", function: "Embeddings", forwardToken: "h.gatewayService.ForwardEmbeddings("},
+		{file: "openai_alpha_search.go", function: "AlphaSearch", forwardToken: "h.gatewayService.ForwardAlphaSearch("},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file+"/"+tt.function, func(t *testing.T) {
+			source := stripGoComments(goFunctionSource(t, tt.file, tt.function))
+			slotIndex := strings.Index(source, "acquireResponsesAccountSlot(")
+			slotSuccessIndex := strings.Index(source, "if slotResult != openAISlotAcquireOK")
+			refreshedAccountIndex := -1
+			if slotSuccessIndex >= 0 {
+				if offset := strings.Index(source[slotSuccessIndex:], "account = selection.Account"); offset >= 0 {
+					refreshedAccountIndex = slotSuccessIndex + offset
+				}
+			}
+			forwardIndex := strings.Index(source, tt.forwardToken)
+
+			require.NotEqual(t, -1, slotIndex, "missing account concurrency acquisition")
+			require.NotEqual(t, -1, slotSuccessIndex, "missing successful account-slot gate")
+			require.NotEqual(t, -1, refreshedAccountIndex, "missing final account snapshot refresh")
+			require.NotEqual(t, -1, forwardIndex, "missing upstream forward")
+			require.Less(t, slotIndex, slotSuccessIndex, "slot acquisition must precede its success gate")
+			require.Less(t, slotSuccessIndex, refreshedAccountIndex, "final account snapshot must be read only after the account slot is held")
+			require.Less(t, refreshedAccountIndex, forwardIndex, "upstream forwarding must use the final account snapshot")
+		})
+	}
+}
+
 func TestOtherOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 	tests := []struct {
 		file     string
