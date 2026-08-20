@@ -14,7 +14,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 20 // v20: group long-context and model pricing fields (force refresh of pre-fix snapshots)
+const apiKeyAuthSnapshotVersion = 21 // v21: group scheduler mode and sparse advanced overrides
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -430,6 +430,8 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			ProfitControlEnabled:            apiKey.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 apiKey.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              apiKey.Group.ProfitSafetyBuffer,
+			SchedulerType:                   apiKey.Group.SchedulerType,
+			AdvancedSchedulerOverrides:      apiKey.Group.AdvancedSchedulerOverrides.Clone(),
 		}
 	}
 	return snapshot
@@ -527,6 +529,8 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			ProfitControlEnabled:            snapshot.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 snapshot.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              snapshot.Group.ProfitSafetyBuffer,
+			SchedulerType:                   snapshot.Group.SchedulerType,
+			AdvancedSchedulerOverrides:      snapshot.Group.AdvancedSchedulerOverrides.Clone(),
 		}
 	}
 	s.compileAPIKeyIPRules(apiKey)

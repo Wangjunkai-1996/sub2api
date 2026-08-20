@@ -225,6 +225,8 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldProfitControlEnabled,
 				group.FieldProfitMinMargin,
 				group.FieldProfitSafetyBuffer,
+				group.FieldSchedulerType,
+				group.FieldAdvancedSchedulerOverrides,
 			)
 		}).
 		Only(ctx)
@@ -1020,6 +1022,8 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		ProfitControlEnabled:            g.ProfitControlEnabled,
 		ProfitMinMargin:                 g.ProfitMinMargin,
 		ProfitSafetyBuffer:              g.ProfitSafetyBuffer,
+		SchedulerType:                   g.SchedulerType,
+		AdvancedSchedulerOverrides:      g.AdvancedSchedulerOverrides.Clone(),
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}

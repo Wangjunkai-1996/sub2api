@@ -22173,6 +22173,8 @@ type GroupMutation struct {
 	addprofit_min_margin                    *float64
 	profit_safety_buffer                    *float64
 	addprofit_safety_buffer                 *float64
+	scheduler_type                          *string
+	advanced_scheduler_overrides            *domain.AdvancedSchedulerOverrides
 	clearedFields                           map[string]struct{}
 	api_keys                                map[int64]struct{}
 	removedapi_keys                         map[int64]struct{}
@@ -25415,6 +25417,78 @@ func (m *GroupMutation) ResetProfitSafetyBuffer() {
 	m.addprofit_safety_buffer = nil
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (m *GroupMutation) SetSchedulerType(s string) {
+	m.scheduler_type = &s
+}
+
+// SchedulerType returns the value of the "scheduler_type" field in the mutation.
+func (m *GroupMutation) SchedulerType() (r string, exists bool) {
+	v := m.scheduler_type
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldSchedulerType returns the old "scheduler_type" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldSchedulerType(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldSchedulerType is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldSchedulerType requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldSchedulerType: %w", err)
+	}
+	return oldValue.SchedulerType, nil
+}
+
+// ResetSchedulerType resets all changes to the "scheduler_type" field.
+func (m *GroupMutation) ResetSchedulerType() {
+	m.scheduler_type = nil
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (m *GroupMutation) SetAdvancedSchedulerOverrides(dso domain.AdvancedSchedulerOverrides) {
+	m.advanced_scheduler_overrides = &dso
+}
+
+// AdvancedSchedulerOverrides returns the value of the "advanced_scheduler_overrides" field in the mutation.
+func (m *GroupMutation) AdvancedSchedulerOverrides() (r domain.AdvancedSchedulerOverrides, exists bool) {
+	v := m.advanced_scheduler_overrides
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldAdvancedSchedulerOverrides returns the old "advanced_scheduler_overrides" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldAdvancedSchedulerOverrides(ctx context.Context) (v domain.AdvancedSchedulerOverrides, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldAdvancedSchedulerOverrides is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldAdvancedSchedulerOverrides requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldAdvancedSchedulerOverrides: %w", err)
+	}
+	return oldValue.AdvancedSchedulerOverrides, nil
+}
+
+// ResetAdvancedSchedulerOverrides resets all changes to the "advanced_scheduler_overrides" field.
+func (m *GroupMutation) ResetAdvancedSchedulerOverrides() {
+	m.advanced_scheduler_overrides = nil
+}
+
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by ids.
 func (m *GroupMutation) AddAPIKeyIDs(ids ...int64) {
 	if m.api_keys == nil {
@@ -25773,7 +25847,7 @@ func (m *GroupMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *GroupMutation) Fields() []string {
-	fields := make([]string, 0, 62)
+	fields := make([]string, 0, 64)
 	if m.created_at != nil {
 		fields = append(fields, group.FieldCreatedAt)
 	}
@@ -25960,6 +26034,12 @@ func (m *GroupMutation) Fields() []string {
 	if m.profit_safety_buffer != nil {
 		fields = append(fields, group.FieldProfitSafetyBuffer)
 	}
+	if m.scheduler_type != nil {
+		fields = append(fields, group.FieldSchedulerType)
+	}
+	if m.advanced_scheduler_overrides != nil {
+		fields = append(fields, group.FieldAdvancedSchedulerOverrides)
+	}
 	return fields
 }
 
@@ -26092,6 +26172,10 @@ func (m *GroupMutation) Field(name string) (ent.Value, bool) {
 		return m.ProfitMinMargin()
 	case group.FieldProfitSafetyBuffer:
 		return m.ProfitSafetyBuffer()
+	case group.FieldSchedulerType:
+		return m.SchedulerType()
+	case group.FieldAdvancedSchedulerOverrides:
+		return m.AdvancedSchedulerOverrides()
 	}
 	return nil, false
 }
@@ -26225,6 +26309,10 @@ func (m *GroupMutation) OldField(ctx context.Context, name string) (ent.Value, e
 		return m.OldProfitMinMargin(ctx)
 	case group.FieldProfitSafetyBuffer:
 		return m.OldProfitSafetyBuffer(ctx)
+	case group.FieldSchedulerType:
+		return m.OldSchedulerType(ctx)
+	case group.FieldAdvancedSchedulerOverrides:
+		return m.OldAdvancedSchedulerOverrides(ctx)
 	}
 	return nil, fmt.Errorf("unknown Group field %s", name)
 }
@@ -26667,6 +26755,20 @@ func (m *GroupMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetProfitSafetyBuffer(v)
+		return nil
+	case group.FieldSchedulerType:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetSchedulerType(v)
+		return nil
+	case group.FieldAdvancedSchedulerOverrides:
+		v, ok := value.(domain.AdvancedSchedulerOverrides)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetAdvancedSchedulerOverrides(v)
 		return nil
 	}
 	return fmt.Errorf("unknown Group field %s", name)
@@ -27364,6 +27466,12 @@ func (m *GroupMutation) ResetField(name string) error {
 		return nil
 	case group.FieldProfitSafetyBuffer:
 		m.ResetProfitSafetyBuffer()
+		return nil
+	case group.FieldSchedulerType:
+		m.ResetSchedulerType()
+		return nil
+	case group.FieldAdvancedSchedulerOverrides:
+		m.ResetAdvancedSchedulerOverrides()
 		return nil
 	}
 	return fmt.Errorf("unknown Group field %s", name)

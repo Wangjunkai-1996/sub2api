@@ -850,6 +850,34 @@ func (_c *GroupCreate) SetNillableProfitSafetyBuffer(v *float64) *GroupCreate {
 	return _c
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (_c *GroupCreate) SetSchedulerType(v string) *GroupCreate {
+	_c.mutation.SetSchedulerType(v)
+	return _c
+}
+
+// SetNillableSchedulerType sets the "scheduler_type" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableSchedulerType(v *string) *GroupCreate {
+	if v != nil {
+		_c.SetSchedulerType(*v)
+	}
+	return _c
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (_c *GroupCreate) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupCreate {
+	_c.mutation.SetAdvancedSchedulerOverrides(v)
+	return _c
+}
+
+// SetNillableAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableAdvancedSchedulerOverrides(v *domain.AdvancedSchedulerOverrides) *GroupCreate {
+	if v != nil {
+		_c.SetAdvancedSchedulerOverrides(*v)
+	}
+	return _c
+}
+
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by IDs.
 func (_c *GroupCreate) AddAPIKeyIDs(ids ...int64) *GroupCreate {
 	_c.mutation.AddAPIKeyIDs(ids...)
@@ -1139,6 +1167,14 @@ func (_c *GroupCreate) defaults() error {
 		v := group.DefaultProfitSafetyBuffer
 		_c.mutation.SetProfitSafetyBuffer(v)
 	}
+	if _, ok := _c.mutation.SchedulerType(); !ok {
+		v := group.DefaultSchedulerType
+		_c.mutation.SetSchedulerType(v)
+	}
+	if _, ok := _c.mutation.AdvancedSchedulerOverrides(); !ok {
+		v := group.DefaultAdvancedSchedulerOverrides
+		_c.mutation.SetAdvancedSchedulerOverrides(v)
+	}
 	return nil
 }
 
@@ -1328,6 +1364,17 @@ func (_c *GroupCreate) check() error {
 	}
 	if _, ok := _c.mutation.ProfitSafetyBuffer(); !ok {
 		return &ValidationError{Name: "profit_safety_buffer", err: errors.New(`ent: missing required field "Group.profit_safety_buffer"`)}
+	}
+	if _, ok := _c.mutation.SchedulerType(); !ok {
+		return &ValidationError{Name: "scheduler_type", err: errors.New(`ent: missing required field "Group.scheduler_type"`)}
+	}
+	if v, ok := _c.mutation.SchedulerType(); ok {
+		if err := group.SchedulerTypeValidator(v); err != nil {
+			return &ValidationError{Name: "scheduler_type", err: fmt.Errorf(`ent: validator failed for field "Group.scheduler_type": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.AdvancedSchedulerOverrides(); !ok {
+		return &ValidationError{Name: "advanced_scheduler_overrides", err: errors.New(`ent: missing required field "Group.advanced_scheduler_overrides"`)}
 	}
 	return nil
 }
@@ -1603,6 +1650,14 @@ func (_c *GroupCreate) createSpec() (*Group, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ProfitSafetyBuffer(); ok {
 		_spec.SetField(group.FieldProfitSafetyBuffer, field.TypeFloat64, value)
 		_node.ProfitSafetyBuffer = value
+	}
+	if value, ok := _c.mutation.SchedulerType(); ok {
+		_spec.SetField(group.FieldSchedulerType, field.TypeString, value)
+		_node.SchedulerType = value
+	}
+	if value, ok := _c.mutation.AdvancedSchedulerOverrides(); ok {
+		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
+		_node.AdvancedSchedulerOverrides = value
 	}
 	if nodes := _c.mutation.APIKeysIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -2765,6 +2820,30 @@ func (u *GroupUpsert) UpdateProfitSafetyBuffer() *GroupUpsert {
 // AddProfitSafetyBuffer adds v to the "profit_safety_buffer" field.
 func (u *GroupUpsert) AddProfitSafetyBuffer(v float64) *GroupUpsert {
 	u.Add(group.FieldProfitSafetyBuffer, v)
+	return u
+}
+
+// SetSchedulerType sets the "scheduler_type" field.
+func (u *GroupUpsert) SetSchedulerType(v string) *GroupUpsert {
+	u.Set(group.FieldSchedulerType, v)
+	return u
+}
+
+// UpdateSchedulerType sets the "scheduler_type" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateSchedulerType() *GroupUpsert {
+	u.SetExcluded(group.FieldSchedulerType)
+	return u
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (u *GroupUpsert) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpsert {
+	u.Set(group.FieldAdvancedSchedulerOverrides, v)
+	return u
+}
+
+// UpdateAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateAdvancedSchedulerOverrides() *GroupUpsert {
+	u.SetExcluded(group.FieldAdvancedSchedulerOverrides)
 	return u
 }
 
@@ -3989,6 +4068,34 @@ func (u *GroupUpsertOne) AddProfitSafetyBuffer(v float64) *GroupUpsertOne {
 func (u *GroupUpsertOne) UpdateProfitSafetyBuffer() *GroupUpsertOne {
 	return u.Update(func(s *GroupUpsert) {
 		s.UpdateProfitSafetyBuffer()
+	})
+}
+
+// SetSchedulerType sets the "scheduler_type" field.
+func (u *GroupUpsertOne) SetSchedulerType(v string) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetSchedulerType(v)
+	})
+}
+
+// UpdateSchedulerType sets the "scheduler_type" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateSchedulerType() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateSchedulerType()
+	})
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (u *GroupUpsertOne) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetAdvancedSchedulerOverrides(v)
+	})
+}
+
+// UpdateAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateAdvancedSchedulerOverrides() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateAdvancedSchedulerOverrides()
 	})
 }
 
@@ -5379,6 +5486,34 @@ func (u *GroupUpsertBulk) AddProfitSafetyBuffer(v float64) *GroupUpsertBulk {
 func (u *GroupUpsertBulk) UpdateProfitSafetyBuffer() *GroupUpsertBulk {
 	return u.Update(func(s *GroupUpsert) {
 		s.UpdateProfitSafetyBuffer()
+	})
+}
+
+// SetSchedulerType sets the "scheduler_type" field.
+func (u *GroupUpsertBulk) SetSchedulerType(v string) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetSchedulerType(v)
+	})
+}
+
+// UpdateSchedulerType sets the "scheduler_type" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateSchedulerType() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateSchedulerType()
+	})
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (u *GroupUpsertBulk) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetAdvancedSchedulerOverrides(v)
+	})
+}
+
+// UpdateAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateAdvancedSchedulerOverrides() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateAdvancedSchedulerOverrides()
 	})
 }
 

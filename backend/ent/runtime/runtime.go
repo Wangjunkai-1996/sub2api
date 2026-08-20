@@ -1205,6 +1205,16 @@ func init() {
 	groupDescProfitSafetyBuffer := groupFields[58].Descriptor()
 	// group.DefaultProfitSafetyBuffer holds the default value on creation for the profit_safety_buffer field.
 	group.DefaultProfitSafetyBuffer = groupDescProfitSafetyBuffer.Default.(float64)
+	// groupDescSchedulerType is the schema descriptor for scheduler_type field.
+	groupDescSchedulerType := groupFields[59].Descriptor()
+	// group.DefaultSchedulerType holds the default value on creation for the scheduler_type field.
+	group.DefaultSchedulerType = groupDescSchedulerType.Default.(string)
+	// group.SchedulerTypeValidator is a validator for the "scheduler_type" field. It is called by the builders before save.
+	group.SchedulerTypeValidator = groupDescSchedulerType.Validators[0].(func(string) error)
+	// groupDescAdvancedSchedulerOverrides is the schema descriptor for advanced_scheduler_overrides field.
+	groupDescAdvancedSchedulerOverrides := groupFields[60].Descriptor()
+	// group.DefaultAdvancedSchedulerOverrides holds the default value on creation for the advanced_scheduler_overrides field.
+	group.DefaultAdvancedSchedulerOverrides = groupDescAdvancedSchedulerOverrides.Default.(domain.AdvancedSchedulerOverrides)
 	idempotencyrecordMixin := schema.IdempotencyRecord{}.Mixin()
 	idempotencyrecordMixinFields0 := idempotencyrecordMixin[0].Fields()
 	_ = idempotencyrecordMixinFields0

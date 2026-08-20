@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -61,7 +62,17 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
 	weightOverrides                map[string]float64
+	groupWeightOverridesApplied    bool
 }
+
+type openAIAdvancedSchedulerRequestSettings struct {
+	groupID    int64
+	hasGroupID bool
+	platform   string
+	settings   openAIAdvancedSchedulerRuntimeSettings
+}
+
+type openAIAdvancedSchedulerRequestSettingsContextKey struct{}
 
 var openAIAdvancedSchedulerSettingCache atomic.Value // *cachedOpenAIAdvancedSchedulerSetting
 var openAIAdvancedSchedulerSettingSF singleflight.Group
@@ -1919,26 +1930,140 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 	return settings
 }
 
+func cloneOpenAIAdvancedSchedulerRuntimeSettings(settings openAIAdvancedSchedulerRuntimeSettings) openAIAdvancedSchedulerRuntimeSettings {
+	settings.weightOverrides = cloneOpenAIAdvancedSchedulerWeightOverrides(settings.weightOverrides)
+	return settings
+}
+
+func (s *OpenAIGatewayService) openAIAdvancedSchedulerEffectiveRuntimeSettings(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+) openAIAdvancedSchedulerRuntimeSettings {
+	settings := cloneOpenAIAdvancedSchedulerRuntimeSettings(s.openAIAdvancedSchedulerRuntimeSettings(ctx))
+	if platform != PlatformOpenAI || groupID == nil || *groupID <= 0 {
+		return settings
+	}
+
+	var group *Group
+	if ctxGroup, ok := ctx.Value(ctxkey.Group).(*Group); ok && IsGroupContextValid(ctxGroup) && ctxGroup.ID == *groupID {
+		group = ctxGroup
+	} else if s != nil && s.schedulerSnapshot != nil {
+		loaded, err := s.schedulerSnapshot.GetGroupByIDLite(ctx, *groupID)
+		if err != nil {
+			slog.Warn("openai_group_scheduler_settings_load_failed", "group_id", *groupID, "error", err)
+			return settings
+		}
+		group = loaded
+	}
+	if group == nil || group.Platform != PlatformOpenAI {
+		return settings
+	}
+
+	schedulerType, err := NormalizeGroupSchedulerType(group.SchedulerType)
+	if err != nil {
+		slog.Warn("openai_group_scheduler_type_invalid", "group_id", group.ID, "scheduler_type", group.SchedulerType, "error", err)
+		return settings
+	}
+	switch schedulerType {
+	case GroupSchedulerTypeBasic:
+		settings.enabled = false
+		return settings
+	case GroupSchedulerTypeAdvanced:
+		settings.enabled = true
+	case GroupSchedulerTypeInherit:
+		if !settings.enabled {
+			return settings
+		}
+	}
+
+	overrides := group.AdvancedSchedulerOverrides
+	if err := ValidateAdvancedSchedulerOverrides(overrides); err != nil {
+		slog.Warn("openai_group_scheduler_overrides_invalid", "group_id", group.ID, "error", err)
+		return settings
+	}
+	if overrides.StickyWeightedEnabled != nil {
+		settings.stickyWeightedEnabled = *overrides.StickyWeightedEnabled
+	}
+	if overrides.SubscriptionPriorityEnabled != nil {
+		settings.subscriptionPriorityEnabled = *overrides.SubscriptionPriorityEnabled
+	}
+	if overrides.LBTopK != nil {
+		settings.lbTopKOverride = *overrides.LBTopK
+	}
+	groupWeightOverrides := []struct {
+		name  string
+		value *float64
+	}{
+		{name: "priority", value: overrides.WeightPriority},
+		{name: "load", value: overrides.WeightLoad},
+		{name: "queue", value: overrides.WeightQueue},
+		{name: "error_rate", value: overrides.WeightErrorRate},
+		{name: "ttft", value: overrides.WeightTTFT},
+		{name: "reset", value: overrides.WeightReset},
+		{name: "quota_headroom", value: overrides.WeightQuotaHeadroom},
+		{name: "upstream_cost", value: overrides.WeightUpstreamCost},
+		{name: "previous_response", value: overrides.WeightPreviousResponse},
+		{name: "session_sticky", value: overrides.WeightSessionSticky},
+	}
+	for _, override := range groupWeightOverrides {
+		if override.value == nil {
+			continue
+		}
+		if settings.weightOverrides == nil {
+			settings.weightOverrides = make(map[string]float64)
+		}
+		settings.weightOverrides[override.name] = *override.value
+		settings.groupWeightOverridesApplied = true
+	}
+	return settings
+}
+
+func (s *OpenAIGatewayService) withOpenAIAdvancedSchedulerRequestSettings(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+) context.Context {
+	requestSettings := openAIAdvancedSchedulerRequestSettings{platform: platform}
+	if groupID != nil && *groupID > 0 {
+		requestSettings.groupID = *groupID
+		requestSettings.hasGroupID = true
+	}
+	if existing, ok := ctx.Value(openAIAdvancedSchedulerRequestSettingsContextKey{}).(*openAIAdvancedSchedulerRequestSettings); ok &&
+		existing != nil && existing.groupID == requestSettings.groupID && existing.hasGroupID == requestSettings.hasGroupID && existing.platform == platform {
+		return ctx
+	}
+	requestSettings.settings = s.openAIAdvancedSchedulerEffectiveRuntimeSettings(ctx, groupID, platform)
+	return context.WithValue(ctx, openAIAdvancedSchedulerRequestSettingsContextKey{}, &requestSettings)
+}
+
+func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx context.Context) openAIAdvancedSchedulerRuntimeSettings {
+	if requestSettings, ok := ctx.Value(openAIAdvancedSchedulerRequestSettingsContextKey{}).(*openAIAdvancedSchedulerRequestSettings); ok && requestSettings != nil {
+		return cloneOpenAIAdvancedSchedulerRuntimeSettings(requestSettings.settings)
+	}
+	return s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+}
+
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerEnabled(ctx context.Context) bool {
-	return s.openAIAdvancedSchedulerRuntimeSettings(ctx).enabled
+	return s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx).enabled
 }
 
 func (s *OpenAIGatewayService) isOpenAILowUpstreamRatePriorityEnabled(ctx context.Context) bool {
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	return !settings.enabled && settings.lowUpstreamRatePriorityEnabled
 }
 
 func (s *OpenAIGatewayService) openAIOAuthSchedulingRateMultiplier(ctx context.Context) float64 {
-	return s.openAIAdvancedSchedulerRuntimeSettings(ctx).oauthSchedulingRateMultiplier
+	return s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx).oauthSchedulingRateMultiplier
 }
 
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx context.Context) bool {
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	return settings.enabled && settings.stickyWeightedEnabled
 }
 
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx context.Context) bool {
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	return settings.enabled && settings.subscriptionPriorityEnabled
 }
 
@@ -2027,11 +2152,22 @@ func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) Op
 		if s.openaiAccountStats == nil {
 			s.openaiAccountStats = newOpenAIAccountRuntimeStats()
 		}
-		if s.openaiScheduler == nil {
-			s.openaiScheduler = newDefaultOpenAIAccountScheduler(s, s.openaiAccountStats)
-		}
+		scheduler := newDefaultOpenAIAccountScheduler(s, s.openaiAccountStats)
+		s.openaiSchedulerMu.Lock()
+		s.openaiScheduler = scheduler
+		s.openaiSchedulerMu.Unlock()
 	})
-	return s.openaiScheduler
+	return s.initializedOpenAIAccountScheduler()
+}
+
+func (s *OpenAIGatewayService) initializedOpenAIAccountScheduler() OpenAIAccountScheduler {
+	if s == nil {
+		return nil
+	}
+	s.openaiSchedulerMu.RLock()
+	scheduler := s.openaiScheduler
+	s.openaiSchedulerMu.RUnlock()
+	return scheduler
 }
 
 func resetOpenAIAdvancedSchedulerSettingCacheForTest() {
@@ -2228,6 +2364,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		ctx = s.withOpenAIProfitControlGate(ctx, groupID)
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
+	ctx = s.withOpenAIAdvancedSchedulerRequestSettings(ctx, groupID, platform)
 	decision := OpenAIAccountScheduleDecision{}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
@@ -2371,6 +2508,9 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(accountID int64
 	}
 	scheduler := s.getOpenAIAccountScheduler(context.Background())
 	if scheduler == nil {
+		scheduler = s.initializedOpenAIAccountScheduler()
+	}
+	if scheduler == nil {
 		return
 	}
 	scheduler.ReportResult(accountID, success, firstTokenMs)
@@ -2379,6 +2519,9 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(accountID int64
 func (s *OpenAIGatewayService) RecordOpenAIAccountSwitch() {
 	scheduler := s.getOpenAIAccountScheduler(context.Background())
 	if scheduler == nil {
+		scheduler = s.initializedOpenAIAccountScheduler()
+	}
+	if scheduler == nil {
 		return
 	}
 	scheduler.ReportSwitch()
@@ -2386,6 +2529,9 @@ func (s *OpenAIGatewayService) RecordOpenAIAccountSwitch() {
 
 func (s *OpenAIGatewayService) SnapshotOpenAIAccountSchedulerMetrics() OpenAIAccountSchedulerMetricsSnapshot {
 	scheduler := s.getOpenAIAccountScheduler(context.Background())
+	if scheduler == nil {
+		scheduler = s.initializedOpenAIAccountScheduler()
+	}
 	if scheduler == nil {
 		return OpenAIAccountSchedulerMetricsSnapshot{}
 	}
@@ -2408,7 +2554,7 @@ func (s *OpenAIGatewayService) openAIWSLBTopK() int {
 
 func (s *OpenAIGatewayService) openAIWSLBTopKForRequest(ctx context.Context) int {
 	base := s.openAIWSLBTopK()
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	// DB 覆盖值与 stickyWeighted/subscriptionPriority 一样受总开关门控：
 	// 关闭高级调度器后所有调用方（含管理页分数快照）都应回到配置/默认行为。
 	if !settings.enabled {
@@ -2482,16 +2628,40 @@ func (s *OpenAIGatewayService) openAIWSSchedulerWeights() GatewayOpenAIWSSchedul
 
 func (s *OpenAIGatewayService) openAIWSSchedulerWeightsForRequest(ctx context.Context) GatewayOpenAIWSSchedulerScoreWeightsView {
 	weights := s.openAIWSSchedulerWeights()
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	// 同 openAIWSLBTopKForRequest：总开关关闭时不应用 DB 覆盖值。
 	if !settings.enabled {
 		return weights
 	}
 	overridden := applyOpenAIAdvancedSchedulerWeightOverrides(weights, settings.weightOverrides)
 	if !overridden.configWeights().IsValid() {
-		return weights
+		if !settings.groupWeightOverridesApplied || !openAIAdvancedSchedulerWeightsAllowingZeroAreValid(overridden) {
+			return weights
+		}
 	}
 	return overridden
+}
+
+func openAIAdvancedSchedulerWeightsAllowingZeroAreValid(weights GatewayOpenAIWSSchedulerScoreWeightsView) bool {
+	configWeights := weights.configWeights()
+	for _, weight := range []float64{
+		configWeights.Priority,
+		configWeights.Load,
+		configWeights.Queue,
+		configWeights.ErrorRate,
+		configWeights.TTFT,
+		configWeights.Reset,
+		configWeights.QuotaHeadroom,
+		configWeights.UpstreamCost,
+		configWeights.PreviousResponse,
+		configWeights.SessionSticky,
+	} {
+		if weight < 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+			return false
+		}
+	}
+	total := configWeights.TotalWeightSum()
+	return !math.IsNaN(total) && !math.IsInf(total, 0)
 }
 
 func applyOpenAIAdvancedSchedulerWeightOverrides(

@@ -57,6 +57,14 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 	if groupIn == nil {
 		return errors.New("group is nil")
 	}
+	schedulerType, err := service.NormalizeGroupSchedulerType(groupIn.SchedulerType)
+	if err != nil {
+		return err
+	}
+	if err := service.ValidateAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides); err != nil {
+		return err
+	}
+	groupIn.SchedulerType = schedulerType
 	modelPricing, err := json.Marshal(groupIn.ModelPricing)
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
@@ -117,7 +125,9 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 		SetPeakRateMultiplier(groupIn.PeakRateMultiplier).
 		SetProfitControlEnabled(groupIn.ProfitControlEnabled).
 		SetProfitMinMargin(groupIn.ProfitMinMargin).
-		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer)
+		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer).
+		SetSchedulerType(groupIn.SchedulerType).
+		SetAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides.Clone())
 	if groupIn.DuplicateOperationID != "" {
 		builder = builder.SetDuplicateOperationID(groupIn.DuplicateOperationID)
 	}
@@ -241,6 +251,14 @@ func (r *groupRepository) GetByIDLite(ctx context.Context, id int64) (*service.G
 }
 
 func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) error {
+	schedulerType, err := service.NormalizeGroupSchedulerType(groupIn.SchedulerType)
+	if err != nil {
+		return err
+	}
+	if err := service.ValidateAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides); err != nil {
+		return err
+	}
+	groupIn.SchedulerType = schedulerType
 	modelPricing, err := json.Marshal(groupIn.ModelPricing)
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
@@ -293,7 +311,9 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		SetPeakRateMultiplier(groupIn.PeakRateMultiplier).
 		SetProfitControlEnabled(groupIn.ProfitControlEnabled).
 		SetProfitMinMargin(groupIn.ProfitMinMargin).
-		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer)
+		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer).
+		SetSchedulerType(groupIn.SchedulerType).
+		SetAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides.Clone())
 
 	// 显式处理可空字段：nil 需要 clear，非 nil 需要 set。
 	if groupIn.DailyLimitUSD != nil {

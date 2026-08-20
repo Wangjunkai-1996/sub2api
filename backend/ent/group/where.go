@@ -330,6 +330,11 @@ func ProfitSafetyBuffer(v float64) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldProfitSafetyBuffer, v))
 }
 
+// SchedulerType applies equality check predicate on the "scheduler_type" field. It's identical to SchedulerTypeEQ.
+func SchedulerType(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldSchedulerType, v))
+}
+
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.
 func CreatedAtEQ(v time.Time) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldCreatedAt, v))
@@ -2548,6 +2553,71 @@ func ProfitSafetyBufferLT(v float64) predicate.Group {
 // ProfitSafetyBufferLTE applies the LTE predicate on the "profit_safety_buffer" field.
 func ProfitSafetyBufferLTE(v float64) predicate.Group {
 	return predicate.Group(sql.FieldLTE(FieldProfitSafetyBuffer, v))
+}
+
+// SchedulerTypeEQ applies the EQ predicate on the "scheduler_type" field.
+func SchedulerTypeEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldSchedulerType, v))
+}
+
+// SchedulerTypeNEQ applies the NEQ predicate on the "scheduler_type" field.
+func SchedulerTypeNEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldSchedulerType, v))
+}
+
+// SchedulerTypeIn applies the In predicate on the "scheduler_type" field.
+func SchedulerTypeIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldSchedulerType, vs...))
+}
+
+// SchedulerTypeNotIn applies the NotIn predicate on the "scheduler_type" field.
+func SchedulerTypeNotIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldSchedulerType, vs...))
+}
+
+// SchedulerTypeGT applies the GT predicate on the "scheduler_type" field.
+func SchedulerTypeGT(v string) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldSchedulerType, v))
+}
+
+// SchedulerTypeGTE applies the GTE predicate on the "scheduler_type" field.
+func SchedulerTypeGTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldSchedulerType, v))
+}
+
+// SchedulerTypeLT applies the LT predicate on the "scheduler_type" field.
+func SchedulerTypeLT(v string) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldSchedulerType, v))
+}
+
+// SchedulerTypeLTE applies the LTE predicate on the "scheduler_type" field.
+func SchedulerTypeLTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldSchedulerType, v))
+}
+
+// SchedulerTypeContains applies the Contains predicate on the "scheduler_type" field.
+func SchedulerTypeContains(v string) predicate.Group {
+	return predicate.Group(sql.FieldContains(FieldSchedulerType, v))
+}
+
+// SchedulerTypeHasPrefix applies the HasPrefix predicate on the "scheduler_type" field.
+func SchedulerTypeHasPrefix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasPrefix(FieldSchedulerType, v))
+}
+
+// SchedulerTypeHasSuffix applies the HasSuffix predicate on the "scheduler_type" field.
+func SchedulerTypeHasSuffix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasSuffix(FieldSchedulerType, v))
+}
+
+// SchedulerTypeEqualFold applies the EqualFold predicate on the "scheduler_type" field.
+func SchedulerTypeEqualFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldEqualFold(FieldSchedulerType, v))
+}
+
+// SchedulerTypeContainsFold applies the ContainsFold predicate on the "scheduler_type" field.
+func SchedulerTypeContainsFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldContainsFold(FieldSchedulerType, v))
 }
 
 // HasAPIKeys applies the HasEdge predicate on the "api_keys" edge.

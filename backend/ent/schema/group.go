@@ -289,6 +289,15 @@ func (Group) Fields() []ent.Field {
 			SchemaType(map[string]string{dialect.Postgres: "decimal(10,4)"}).
 			Default(0).
 			Comment("安全缓冲，小数；与 margin 相加后从下游倍率中扣除，默认 0"),
+
+		field.String("scheduler_type").
+			MaxLen(16).
+			Default(domain.GroupSchedulerTypeInherit).
+			Comment("分组调度模式：inherit 沿用全局开关，basic 强制旧调度，advanced 强制高级调度"),
+		field.JSON("advanced_scheduler_overrides", domain.AdvancedSchedulerOverrides{}).
+			Default(domain.AdvancedSchedulerOverrides{}).
+			SchemaType(map[string]string{dialect.Postgres: "jsonb"}).
+			Comment("分组级高级调度稀疏覆盖；缺失字段继承全局值，显式 false/0 必须保留"),
 	}
 }
 
