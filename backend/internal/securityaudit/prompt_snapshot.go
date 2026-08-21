@@ -9,10 +9,15 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 )
 
 var (
 	ErrNoPromptText = errors.New("prompt audit request contains no user text")
+	// ErrCanonicalUninspectable is intentionally distinct from ErrNoPromptText:
+	// an uninspectable request must never be folded into an empty-input allow.
+	ErrCanonicalUninspectable = errors.New("canonical request is uninspectable")
 
 	bearerPattern = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+\-/]+=*`)
 	apiKeyPattern = regexp.MustCompile(`(?i)\b(sk|rk|pk|api[_-]?key|token|secret|password)[-_:=\s]+[A-Za-z0-9._~+\-/]{8,}`)
@@ -21,13 +26,13 @@ var (
 	phonePattern  = regexp.MustCompile(`(?:\+?\d[\d\s().-]{8,}\d)`)
 )
 
-const promptAuditPrioritySeparator = "\x00SUB2API_PROMPT_AUDIT_PRIORITY_END\x00"
-
 type promptSegment struct {
 	text string
 	user bool
 	role string
 }
+
+const promptSegmentJoiner = "\n\n"
 
 func ExtractPromptSnapshot(req Request) (PromptSnapshot, error) {
 	return extractPromptSnapshot(req, false)
@@ -41,6 +46,9 @@ func ExtractBlockingPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnap
 }
 
 func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
+	if req.Admission != nil {
+		return extractCanonicalPromptSnapshot(req, latestTurnOnly)
+	}
 	var document any
 	if err := json.Unmarshal(req.Body, &document); err != nil {
 		return PromptSnapshot{}, errors.New("prompt audit request JSON is invalid")
@@ -53,7 +61,8 @@ func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, er
 	if len(segments) == 0 {
 		return PromptSnapshot{}, ErrNoPromptText
 	}
-	scanText, metadataText := buildPrioritizedScanText(segments)
+	scanText, priorityPrefixRunes := buildPrioritizedScanText(segments)
+	metadataText := scanText
 	digest := sha256.Sum256([]byte(metadataText))
 	stage := strings.TrimSpace(req.Stage)
 	if stage == "" {
@@ -67,7 +76,66 @@ func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, er
 		PromptHash: hex.EncodeToString(digest[:]), RedactedPreview: BuildPromptPreview(metadataText, DefaultPromptPreviewMaxRunes),
 		FullPrompt:   BuildFullPrompt(metadataText, DefaultFullPromptMaxRunes),
 		PromptLength: utf8.RuneCountInString(metadataText), MessageCount: len(segments), Stage: stage,
-		ScanText: scanText,
+		ScanText: scanText, PriorityPrefixRunes: priorityPrefixRunes,
+	}, nil
+}
+
+func extractCanonicalPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
+	admission := req.Admission
+	if admission == nil {
+		return PromptSnapshot{}, ErrCanonicalUninspectable
+	}
+	switch admission.Class() {
+	case securityadmission.RequestKnownNoText:
+		return PromptSnapshot{}, ErrNoPromptText
+	case securityadmission.RequestUninspectable:
+		return PromptSnapshot{}, ErrCanonicalUninspectable
+	case securityadmission.RequestKnownViolation:
+		return PromptSnapshot{}, ErrCanonicalUninspectable
+	case securityadmission.RequestAuditableText:
+		// continue
+	default:
+		return PromptSnapshot{}, ErrCanonicalUninspectable
+	}
+	scope := securityadmission.TextScopeFullTranscript
+	if latestTurnOnly {
+		scope = securityadmission.TextScopeCurrentTurn
+	}
+	document, err := admission.MaterializeDocument(req.Body, scope)
+	if err != nil {
+		return PromptSnapshot{}, ErrCanonicalUninspectable
+	}
+	if strings.TrimSpace(document.Text) == "" {
+		// An auditable admission always contains at least one classified span.
+		// A trusted current-turn narrowing can nevertheless be empty when the
+		// latest item is an explicit null/empty tool result. That is not proof
+		// that the request has no prompt text: fall back to the immutable full
+		// transcript so a Pro request still reaches the blocking scanner.
+		if latestTurnOnly {
+			document, err = admission.MaterializeDocument(req.Body, securityadmission.TextScopeFullTranscript)
+			if err != nil {
+				return PromptSnapshot{}, ErrCanonicalUninspectable
+			}
+		}
+		if strings.TrimSpace(document.Text) == "" {
+			return PromptSnapshot{}, ErrCanonicalUninspectable
+		}
+	}
+	metadataText := document.Text
+	digest := sha256.Sum256([]byte(metadataText))
+	stage := strings.TrimSpace(req.Stage)
+	if stage == "" {
+		stage = "http"
+	}
+	return PromptSnapshot{
+		RequestID: req.RequestID, UserID: req.UserID, UsernameSnapshot: req.Username,
+		UserEmailSnapshot: req.UserEmail, APIKeyID: req.APIKeyID, APIKeyNameSnapshot: req.APIKeyName,
+		GroupID: cloneInt64Ptr(req.GroupID), GroupName: req.GroupName, Provider: req.Provider,
+		Endpoint: req.Endpoint, Protocol: req.Protocol, Model: req.Model,
+		PromptHash: hex.EncodeToString(digest[:]), RedactedPreview: BuildPromptPreview(metadataText, DefaultPromptPreviewMaxRunes),
+		FullPrompt:   BuildFullPrompt(metadataText, DefaultFullPromptMaxRunes),
+		PromptLength: document.TextRunes, MessageCount: document.SegmentCount, Stage: stage,
+		ScanText: document.Text,
 	}, nil
 }
 
@@ -536,12 +604,12 @@ func promptSegmentTexts(values []promptSegment) []string {
 	return result
 }
 
-func buildPrioritizedScanText(segments []string) (scanText string, metadataText string) {
-	metadataText = strings.Join(segments, "\n\n")
+func buildPrioritizedScanText(segments []string) (scanText string, priorityPrefixRunes int) {
+	scanText = strings.Join(segments, promptSegmentJoiner)
 	if len(segments) <= 1 {
-		return metadataText, metadataText
+		return scanText, 0
 	}
-	return segments[0] + promptAuditPrioritySeparator + strings.Join(segments[1:], "\n\n"), metadataText
+	return scanText, utf8.RuneCountInString(segments[0])
 }
 
 func promptSegmentsForRole(texts []string, role string) []promptSegment {
@@ -561,6 +629,10 @@ func systemPromptSegments(texts []string) []promptSegment {
 }
 
 func RedactPreview(value string, maxRunes int) string {
+	// PostgreSQL TEXT and JSONB cannot persist NUL. ScanText deliberately keeps
+	// the original bytes for the guard; only persistence-bound previews and
+	// evidence are sanitized here.
+	value = strings.ReplaceAll(value, "\x00", "")
 	value = bearerPattern.ReplaceAllString(value, "Bearer ***")
 	value = apiKeyPattern.ReplaceAllStringFunc(value, func(match string) string {
 		if index := strings.IndexAny(match, ":= \t"); index >= 0 {
@@ -627,11 +699,10 @@ func BuildFullPrompt(value string, maxRunes int) string {
 }
 
 // FullPromptFromScanText reconstructs the display prompt from the worker scan
-// payload. buildPrioritizedScanText inserts exactly one priority separator
-// between the prioritized segment and the remainder, so replacing it with the
-// metadata joiner yields the original multi-segment text.
+// payload. Chunk priority is stored as trusted snapshot metadata, so scanText
+// never contains an in-band delimiter that client input could collide with.
 func FullPromptFromScanText(scanText string) string {
-	return BuildFullPrompt(strings.ReplaceAll(scanText, promptAuditPrioritySeparator, "\n\n"), DefaultFullPromptMaxRunes)
+	return BuildFullPrompt(scanText, DefaultFullPromptMaxRunes)
 }
 
 func TrimRunes(value string, limit int) string {

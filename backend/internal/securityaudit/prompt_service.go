@@ -143,22 +143,42 @@ func (s *PromptService) Evaluate(ctx context.Context, req Request) (*PromptDecis
 	if s == nil || s.config == nil || s.evaluator == nil {
 		return nil, &GuardError{Code: ErrorCodeUnavailable}
 	}
+	// A Pro request reaches this method only as an explicit blocking proof
+	// obligation. Any degraded, async, disabled, or out-of-scope state is a
+	// failed proof and must be surfaced to the caller for controlled reselection.
+	if req.RequireBlocking {
+		if s.EffectiveMode() != ModeBlocking {
+			return nil, &GuardError{Code: ErrorCodeUnavailable}
+		}
+	}
 	if s.config.BlockingActivationDegraded() {
 		return nil, &GuardError{Code: ErrorCodeUnavailable}
 	}
 	cfg, ok := s.config.Active()
 	if !ok {
-		if s.config.EffectiveMode() == ModeBlocking {
+		if req.RequireBlocking || s.config.EffectiveMode() == ModeBlocking {
 			return nil, &GuardError{Code: ErrorCodeUnavailable}
 		}
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
-	if cfg.EffectiveMode() != ModeBlocking || !cfg.IncludesGroup(req.GroupID) {
+	if cfg.EffectiveMode() != ModeBlocking {
+		if req.RequireBlocking {
+			return nil, &GuardError{Code: ErrorCodeUnavailable}
+		}
+		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+	}
+	if !cfg.IncludesGroup(req.GroupID) {
+		if req.RequireBlocking {
+			return nil, &GuardError{Code: ErrorCodeUnavailable}
+		}
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
 	snapshot, err := ExtractBlockingPromptSnapshot(req, cfg.BlockingLatestTurnOnly)
 	if errors.Is(err, ErrNoPromptText) {
 		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+	}
+	if errors.Is(err, ErrCanonicalUninspectable) {
+		return nil, &GuardError{Code: ErrorCodeUnavailable, Cause: err}
 	}
 	if err != nil {
 		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}

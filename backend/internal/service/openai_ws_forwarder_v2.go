@@ -188,11 +188,16 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 
 	acquireCtx, acquireCancel := context.WithTimeout(ctx, s.openAIWSAcquireTimeout())
 	defer acquireCancel()
+	credentialProof, proofErr := openAIWSFinalizedCredentialProofFromContext(ctx, account)
+	if proofErr != nil {
+		return nil, fmt.Errorf("resolve ws credential proof: %w", proofErr)
+	}
 
 	lease, err := s.getOpenAIWSConnPool().Acquire(acquireCtx, openAIWSAcquireRequest{
-		Account: account,
-		WSURL:   wsURL,
-		Headers: wsHeaders,
+		Account:         account,
+		WSURL:           wsURL,
+		Headers:         wsHeaders,
+		CredentialProof: credentialProof,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},

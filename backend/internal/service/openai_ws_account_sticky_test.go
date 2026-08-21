@@ -347,7 +347,8 @@ func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_CapabilityMismat
 		OpenAIEndpointCapabilityEmbeddings,
 		false,
 	)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrOpenAIPreviousResponseBindingUnavailable)
+	require.ErrorIs(t, err, ErrNoAvailableAccounts)
 	require.Nil(t, selection)
 	boundAccountID, getErr := store.GetResponseAccount(ctx, groupID, "resp_prev_capability")
 	require.NoError(t, getErr)

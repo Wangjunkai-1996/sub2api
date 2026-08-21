@@ -319,6 +319,11 @@ type ContentModerationCheckInput struct {
 	Model      string
 	Protocol   string
 	Body       []byte
+	// CanonicalText is supplied by the bounded security admission parser for
+	// covered protocols. When present, Check must not re-parse Body with a
+	// protocol-specific extractor.
+	CanonicalText  string
+	CanonicalClass string
 }
 
 type ContentModerationInput struct {
@@ -909,7 +914,22 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"configured_models", cfg.ModelFilter.Models)
 		return allow, nil
 	}
-	content := ExtractContentModerationInput(input.Protocol, input.Body)
+	content := ContentModerationInput{}
+	if strings.TrimSpace(input.CanonicalClass) != "" {
+		if input.CanonicalClass == "auditable_text" {
+			content.Text = input.CanonicalText
+			content.Normalize()
+		} else if input.CanonicalClass == "known_no_text" {
+			content = ContentModerationInput{}
+		} else {
+			// Canonical uninspectable/violation inputs are never silently reduced
+			// to an empty legacy moderation request. The strict prompt path owns
+			// the controlled unavailable/block decision.
+			return nil, errors.New("canonical content is not auditable")
+		}
+	} else {
+		content = ExtractContentModerationInput(input.Protocol, input.Body)
+	}
 	if content.IsEmpty() {
 		slog.Info("content_moderation.skip_empty_input",
 			"user_id", input.UserID,

@@ -71,12 +71,14 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 	evalCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	inputLimit := minimumInputLimit(endpoints)
-	chunks := SplitRunes(snapshot.ScanText, inputLimit)
+	chunks := splitRunesAtPriorityBoundary(snapshot.ScanText, inputLimit, snapshot.PriorityPrefixRunes)
 	if len(chunks) == 0 {
 		if g.metrics != nil {
-			g.metrics.Observe(DecisionAllow, g.clock.Now().Sub(start))
+			g.metrics.Observe(DecisionInvalid, g.clock.Now().Sub(start))
 		}
-		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
+		err := errors.New("prompt guard input produced no chunks")
+		logGuardFailure(snapshot, cfg, DecisionInvalid, ErrorCodeInvalidResponse, "", g.clock.Now().Sub(start))
+		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
 	}
 	LogInfo(EventEvaluationStarted, mergeLogFields(baseFields, map[string]any{"chunk_total": len(chunks), "status": "started"}))
 	results := make([]*NormalizedResult, 0, len(chunks))
@@ -206,6 +208,9 @@ func (g *GuardEvaluator) scanChunk(ctx context.Context, cfg ActiveConfig, endpoi
 			continue
 		}
 		result, err := callPromptScanner(ctx, g.scanner, endpoint, chunk, cfg.Scanners)
+		if g.metrics != nil {
+			g.metrics.ObserveScannerCall(err == nil && result != nil)
+		}
 		<-semaphore
 		if err == nil && result != nil {
 			return result, nil

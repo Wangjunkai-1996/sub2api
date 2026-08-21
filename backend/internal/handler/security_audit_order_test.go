@@ -131,7 +131,6 @@ func TestOtherOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 		{file: "openai_images.go", function: "Images"},
 		{file: "openai_embeddings.go", function: "Embeddings"},
 		{file: "openai_alpha_search.go", function: "AlphaSearch"},
-		{file: "openai_gateway_handler.go", function: "ResponsesWebSocket"},
 		{file: "image_task_handler.go", function: "Submit"},
 		{file: "batch_image_handler.go", function: "Submit"},
 	}
@@ -148,6 +147,15 @@ func TestOtherOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResponsesWebSocketSelectedAccountAuditPrecedesProxy(t *testing.T) {
+	source := stripGoComments(goFunctionSource(t, "openai_gateway_handler.go", "ResponsesWebSocket"))
+	auditIndex := strings.Index(source, "checkSecurityAuditForSelectedOpenAIProAccount(")
+	proxyIndex := strings.Index(source, "ProxyResponsesWebSocketFromClient(")
+	require.NotEqual(t, -1, auditIndex, "WS must run the selected-account blocking audit")
+	require.NotEqual(t, -1, proxyIndex, "WS must have an upstream proxy boundary")
+	require.Less(t, auditIndex, proxyIndex, "WS blocking audit must precede any upstream proxy dispatch")
 }
 
 func stripGoComments(source string) string {

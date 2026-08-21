@@ -842,6 +842,12 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 	if err != nil {
 		return nil
 	}
+	if account != nil {
+		s.preloadOpenAIRequirementParents(ctx, []Account{*account})
+	}
+	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, account, ""); !compatible {
+		return nil
+	}
 
 	// 检查账号是否需要清理粘性会话
 	// Check if sticky session should be cleared
@@ -1120,10 +1126,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if a, ok := parentCacheL2[id]; ok {
 			return a
 		}
-		if s.accountRepo == nil {
-			return nil
-		}
-		a, _ := s.accountRepo.GetByID(ctx, id)
+		a := s.lookupOpenAIRequirementParent(ctx, id)
 		parentCacheL2[id] = a
 		return a
 	}
@@ -1141,6 +1144,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		// re-check schedulability here so recently rate-limited/overloaded accounts
 		// are not selected again before the bucket is rebuilt.
 		if !isOpenAICompatibleAccountEligibleForRequest(ctx, acc, platform, requestedModel, false, requiredCapability) {
+			continue
+		}
+		if compatible, _ := s.openAIAccountRequirementCompatible(ctx, acc, ""); !compatible {
 			continue
 		}
 		if !parentHealthyForShadow(acc, parentLookupL2) {
@@ -1362,6 +1368,7 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 		if platform == PlatformGrok {
 			accounts = s.filterGrokFreeQuotaAccountsForOpenAI(ctx, accounts)
 		}
+		s.preloadOpenAIRequirementParents(ctx, accounts)
 		return accounts, nil
 	}
 	var accounts []Account
@@ -1380,6 +1387,7 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 	if platform == PlatformGrok {
 		accounts = s.filterGrokFreeQuotaAccountsForOpenAI(ctx, accounts)
 	}
+	s.preloadOpenAIRequirementParents(ctx, accounts)
 	return accounts, nil
 }
 
@@ -1422,6 +1430,9 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(
 	if !parentHealthyForShadow(fresh, s.parentAccountLookup(ctx)) {
 		return nil
 	}
+	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, fresh, ""); !compatible {
+		return nil
+	}
 	if s.isOpenAIAccountRequestRuntimeBlocked(fresh, requestedModel) {
 		return nil
 	}
@@ -1440,11 +1451,7 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(
 // L2 候选循环改用带 per-pass 缓存的 parentLookupL2,不走此方法。
 func (s *OpenAIGatewayService) parentAccountLookup(ctx context.Context) func(int64) *Account {
 	return func(id int64) *Account {
-		if s.accountRepo == nil {
-			return nil
-		}
-		a, _ := s.accountRepo.GetByID(ctx, id)
-		return a
+		return s.lookupOpenAIRequirementParent(ctx, id)
 	}
 }
 
@@ -1474,6 +1481,9 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 		if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
 			return nil
 		}
+		if compatible, _ := s.openAIAccountRequirementCompatible(ctx, account, ""); !compatible {
+			return nil
+		}
 		if s.isOpenAIProxyStreamQuarantined(ctx, account) {
 			return nil
 		}
@@ -1491,6 +1501,9 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 		return nil
 	}
 	if !parentHealthyForShadow(latest, s.parentAccountLookup(ctx)) {
+		return nil
+	}
+	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, latest, ""); !compatible {
 		return nil
 	}
 	if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel) {

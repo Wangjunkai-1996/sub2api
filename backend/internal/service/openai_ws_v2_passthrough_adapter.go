@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
@@ -43,6 +44,45 @@ type openAIWSPolicyEnforcingFrameConn struct {
 	inner   openaiwsv2.FrameConn
 	filter  func(msgType coderws.MessageType, payload []byte) ([]byte, *OpenAIFastBlockedError, error)
 	onBlock func(blocked *OpenAIFastBlockedError)
+}
+
+type openAIWSClientFrameKind uint8
+
+const (
+	openAIWSClientFrameKindUnknown openAIWSClientFrameKind = iota
+	openAIWSClientFrameKindResponseCreate
+	openAIWSClientFrameKindNonTurn
+)
+
+type openAIWSClientFramePreflight struct {
+	kind      openAIWSClientFrameKind
+	eventType string
+	oversize  bool
+}
+
+// openAIWSPreflightClientFrame preserves the legacy gjson lookup for normal
+// frames. Oversized frames inspect at most the routing-envelope window so a
+// late or truncated type field cannot trigger an O(body) scan before security
+// admission.
+func openAIWSPreflightClientFrame(payload []byte) openAIWSClientFramePreflight {
+	if len(payload) <= securityadmission.CurrentLimits().BodyCapBytes {
+		eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+		kind := openAIWSClientFrameKindNonTurn
+		if eventType == "response.create" {
+			kind = openAIWSClientFrameKindResponseCreate
+		}
+		return openAIWSClientFramePreflight{kind: kind, eventType: eventType}
+	}
+
+	eventType, ok := securityadmission.ExtractBoundedWebSocketFrameType(payload)
+	if !ok {
+		return openAIWSClientFramePreflight{kind: openAIWSClientFrameKindUnknown, oversize: true}
+	}
+	kind := openAIWSClientFrameKindNonTurn
+	if eventType == "response.create" {
+		kind = openAIWSClientFrameKindResponseCreate
+	}
+	return openAIWSClientFramePreflight{kind: kind, eventType: eventType, oversize: true}
 }
 
 var _ openaiwsv2.FrameConn = (*openAIWSPolicyEnforcingFrameConn)(nil)
@@ -940,8 +980,35 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 				return payload, nil, nil
 			}
-			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-			isResponseCreate := eventType == "response.create"
+			framePreflight := openAIWSPreflightClientFrame(payload)
+			if framePreflight.oversize {
+				turnNo := int(completedTurns.Load()) + 1
+				if turnNo < 2 {
+					turnNo = 2
+				}
+				if framePreflight.kind == openAIWSClientFrameKindResponseCreate {
+					if hooks != nil && hooks.BeforeRequest != nil {
+						if err := hooks.BeforeRequest(turnNo, payload, ""); err != nil {
+							return payload, nil, err
+						}
+					}
+				} else if hooks != nil && hooks.BeforeNonTurnFrame != nil {
+					if err := hooks.BeforeNonTurnFrame(payload); err != nil {
+						return payload, nil, err
+					}
+				}
+				reason := "oversized websocket request requires unsupported preprocessing"
+				if framePreflight.kind == openAIWSClientFrameKindUnknown {
+					reason = "oversized websocket frame type is unavailable"
+				}
+				return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, reason, nil)
+			}
+			isResponseCreate := framePreflight.kind == openAIWSClientFrameKindResponseCreate
+			if !isResponseCreate && hooks != nil && hooks.BeforeNonTurnFrame != nil {
+				if err := hooks.BeforeNonTurnFrame(payload); err != nil {
+					return payload, nil, err
+				}
+			}
 			responseCreateAt := time.Time{}
 			acceptedTurn := false
 			if isResponseCreate {
@@ -1042,6 +1109,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 						return out, nil, err
 					}
 				}
+				if hooks != nil && hooks.BeforeDispatch != nil {
+					if err := hooks.BeforeDispatch(turnNo); err != nil {
+						return out, nil, err
+					}
+				}
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				responseCreateAtCopy := responseCreateAt
 				acceptedTurnStartedAt.Store(&responseCreateAtCopy)
@@ -1064,7 +1136,21 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		},
 	}
 	upstreamFirstMessageSent := false
+	// The upstream handshake can outlive the credential proof captured by the
+	// handler. Revalidate the first turn after dial and immediately before the
+	// first business frame, matching the per-turn boundary used by pooled modes.
+	if hooks != nil && hooks.BeforeTurn != nil {
+		if err := hooks.BeforeTurn(1); err != nil {
+			return err
+		}
+	}
+	if hooks != nil && hooks.BeforeDispatch != nil {
+		if err := hooks.BeforeDispatch(1); err != nil {
+			return err
+		}
+	}
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
+	notifyOpenAIUpstreamDispatch(firstWriteCtx)
 	firstWriteErr := relayUpstreamFrameConn.WriteFrame(firstWriteCtx, coderws.MessageText, firstClientMessage)
 	cancelFirstWrite()
 	if firstWriteErr != nil {

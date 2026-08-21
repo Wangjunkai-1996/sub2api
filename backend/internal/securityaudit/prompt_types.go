@@ -3,6 +3,8 @@ package securityaudit
 import (
 	"context"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 )
 
 const (
@@ -67,24 +69,49 @@ const (
 )
 
 type Request struct {
-	RequestID  string
-	UserID     int64
-	Username   string
-	UserEmail  string
-	APIKeyID   int64
-	APIKeyName string
-	GroupID    *int64
-	GroupName  string
-	Provider   string
-	Endpoint   string
-	Protocol   string
-	Model      string
-	Body       []byte
-	Stage      string
+	RequestID    string
+	UserID       int64
+	Username     string
+	UserEmail    string
+	APIKeyID     int64
+	APIKeyName   string
+	GroupID      *int64
+	GroupName    string
+	Provider     string
+	Endpoint     string
+	Protocol     string
+	Model        string
+	Body         []byte
+	Stage        string
+	AccountID    int64
+	AccountClass string
+
+	// Admission is the canonical, immutable request document produced before
+	// account selection. It stores body offsets rather than a second body copy.
+	// The pointer is safe to share with a cloned request because Admission is
+	// immutable after classification.
+	Admission *securityadmission.Admission
+	// RequireBlocking makes this request a proof obligation for the blocking
+	// scanner. ModeOff/async and out-of-scope configuration are unavailable,
+	// never an implicit allow for a Pro account.
+	RequireBlocking bool
 }
 
 func (r Request) Clone() Request {
 	r.Body = append([]byte(nil), r.Body...)
+	if r.GroupID != nil {
+		id := *r.GroupID
+		r.GroupID = &id
+	}
+	return r
+}
+
+// CloneForBlocking copies request metadata while retaining the immutable body
+// owned by the active handler. Blocking evaluation is synchronous and cannot
+// outlive that request, so copying the full payload here would add a second
+// O(body-size) allocation on the Pro hot path. Admission offsets remain safe to
+// share because Admission is immutable after classification.
+func (r Request) CloneForBlocking() Request {
 	if r.GroupID != nil {
 		id := *r.GroupID
 		r.GroupID = &id
@@ -111,6 +138,11 @@ type PromptSnapshot struct {
 	PromptLength       int    `json:"prompt_length"`
 	MessageCount       int    `json:"message_count"`
 	Stage              string `json:"stage"`
+	// PriorityPrefixRunes is a trusted chunking boundary produced by the
+	// snapshot extractor. Keeping it out-of-band prevents client text from
+	// being interpreted as an internal delimiter. Zero means no priority
+	// boundary, including jobs created before this field existed.
+	PriorityPrefixRunes int `json:"-"`
 
 	ScanText string `json:"-"`
 }
@@ -196,22 +228,25 @@ type ProbeResult struct {
 }
 
 type GuardMetricsSnapshot struct {
-	Total        int64 `json:"total"`
-	Allowed      int64 `json:"allowed"`
-	Flagged      int64 `json:"flagged"`
-	Blocked      int64 `json:"blocked"`
-	Unavailable  int64 `json:"unavailable"`
-	Invalid      int64 `json:"invalid"`
-	Timeouts     int64 `json:"timeouts"`
-	Failovers    int64 `json:"failovers"`
-	BulkheadFull int64 `json:"bulkhead_full"`
-	RecordFailed int64 `json:"record_failed"`
-	LatencyCount int64 `json:"latency_count"`
-	LatencyAvgMS int64 `json:"latency_avg_ms"`
-	LatencyP50MS int64 `json:"latency_p50_ms"`
-	LatencyP95MS int64 `json:"latency_p95_ms"`
-	LatencyP99MS int64 `json:"latency_p99_ms"`
-	LatencyMaxMS int64 `json:"latency_max_ms"`
+	Total            int64 `json:"total"`
+	Allowed          int64 `json:"allowed"`
+	Flagged          int64 `json:"flagged"`
+	Blocked          int64 `json:"blocked"`
+	Unavailable      int64 `json:"unavailable"`
+	Invalid          int64 `json:"invalid"`
+	Timeouts         int64 `json:"timeouts"`
+	Failovers        int64 `json:"failovers"`
+	BulkheadFull     int64 `json:"bulkhead_full"`
+	RecordFailed     int64 `json:"record_failed"`
+	ScannerCalls     int64 `json:"scanner_calls"`
+	ScannerSucceeded int64 `json:"scanner_succeeded"`
+	ScannerFailed    int64 `json:"scanner_failed"`
+	LatencyCount     int64 `json:"latency_count"`
+	LatencyAvgMS     int64 `json:"latency_avg_ms"`
+	LatencyP50MS     int64 `json:"latency_p50_ms"`
+	LatencyP95MS     int64 `json:"latency_p95_ms"`
+	LatencyP99MS     int64 `json:"latency_p99_ms"`
+	LatencyMaxMS     int64 `json:"latency_max_ms"`
 }
 
 type AuditMetricsSnapshot struct {
@@ -272,6 +307,7 @@ type Metrics interface {
 	IncFailover()
 	IncBulkheadFull()
 	IncRecordFailed()
+	ObserveScannerCall(succeeded bool)
 }
 
 type PromptScanner interface {

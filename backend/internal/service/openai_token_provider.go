@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"strings"
@@ -132,12 +134,21 @@ func (p *OpenAITokenProvider) ensureMetrics() {
 
 // GetAccessToken returns a valid access_token.
 func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
+	token, _, err := p.getAccessTokenWithSnapshot(ctx, account, false)
+	return token, err
+}
+
+// getAccessTokenWithSnapshot obtains a token and returns the credential-owner
+// snapshot that produced it. Admission-bound requests accept a cache hit only
+// when it matches the terminal credential document. The shared cache is keyed
+// by account ID and cannot establish credential lineage by itself.
+func (p *OpenAITokenProvider) getAccessTokenWithSnapshot(ctx context.Context, account *Account, secureAdmission bool) (string, *Account, error) {
 	p.ensureMetrics()
 	if account == nil {
-		return "", errors.New("account is nil")
+		return "", nil, errors.New("account is nil")
 	}
 	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
-		return "", errors.New("not an openai oauth account")
+		return "", nil, errors.New("not an openai oauth account")
 	}
 
 	cacheKey := OpenAITokenCacheKey(account)
@@ -145,8 +156,11 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	// 1) Try cache first.
 	if p.tokenCache != nil {
 		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil && strings.TrimSpace(token) != "" {
-			slog.Debug("openai_token_cache_hit", "account_id", account.ID)
-			return token, nil
+			if !secureAdmission || secureOpenAITokenEqual(token, account.GetOpenAIAccessToken()) {
+				slog.Debug("openai_token_cache_hit", "account_id", account.ID)
+				return token, account, nil
+			}
+			slog.Warn("openai_token_cache_credential_mismatch", "account_id", account.ID)
 		} else if err != nil {
 			slog.Warn("openai_token_cache_get_failed", "account_id", account.ID, "error", err)
 		}
@@ -163,7 +177,7 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 			// 永久故障：缺失 refresh_token 时账号无法自愈，必须立即从调度池剔除，
 			// 否则会被反复选中、每次都在 token 阶段直接返回错误，对用户呈现持续 502。
 			p.disableAccountMissingRefreshToken(account, reason)
-			return "", errors.New(reason)
+			return "", nil, errors.New(reason)
 		}
 		needsRefresh = false
 	}
@@ -176,24 +190,34 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
 		if err != nil {
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
-				return "", err
+				return "", nil, err
+			}
+			if secureAdmission {
+				return "", nil, fmt.Errorf("secure OAuth credential refresh failed: %w", err)
 			}
 			slog.Warn("openai_token_refresh_failed", "account_id", account.ID, "error", err)
 			p.metrics.refreshFailure.Add(1)
 			refreshFailed = true
+		} else if result == nil {
+			return "", nil, errors.New("oauth token refresh returned no credential snapshot")
 		} else if result.LockHeld {
+			if secureAdmission {
+				return "", nil, errors.New("oauth token refresh is in progress; secure credential snapshot unavailable")
+			}
 			if p.refreshPolicy.OnLockHeld == ProviderLockHeldWaitForCache {
 				p.metrics.lockContention.Add(1)
 				p.metrics.touchNow()
 				token, waitErr := p.waitForTokenAfterLockRace(ctx, cacheKey)
 				if waitErr != nil {
-					return "", waitErr
+					return "", nil, waitErr
 				}
 				if strings.TrimSpace(token) != "" {
 					slog.Debug("openai_token_cache_hit_after_wait", "account_id", account.ID)
-					return token, nil
+					return token, account, nil
 				}
 			}
+		} else if result.Account == nil {
+			return "", nil, errors.New("oauth token refresh returned an empty credential snapshot")
 		} else if result.Refreshed {
 			p.metrics.refreshSuccess.Add(1)
 			account = result.Account
@@ -202,7 +226,7 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 			account = result.Account
 			expiresAt = account.GetCredentialAsTime("expires_at")
 		}
-	} else if needsRefresh && p.tokenCache != nil {
+	} else if needsRefresh && !secureAdmission && p.tokenCache != nil {
 		// Backward-compatible test path when refreshAPI is not injected.
 		p.metrics.refreshRequests.Add(1)
 		p.metrics.touchNow()
@@ -218,28 +242,31 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 			p.metrics.touchNow()
 			token, waitErr := p.waitForTokenAfterLockRace(ctx, cacheKey)
 			if waitErr != nil {
-				return "", waitErr
+				return "", nil, waitErr
 			}
 			if strings.TrimSpace(token) != "" {
 				slog.Debug("openai_token_cache_hit_after_wait", "account_id", account.ID)
-				return token, nil
+				return token, account, nil
 			}
 		}
+	}
+	if secureAdmission && needsRefresh && (p.refreshAPI == nil || p.executor == nil) {
+		return "", nil, errors.New("secure OAuth credential refresh is unavailable")
 	}
 
 	accessToken := account.GetCredential("access_token")
 	if strings.TrimSpace(accessToken) == "" {
-		return "", errors.New("access_token not found in credentials")
+		return "", nil, errors.New("access_token not found in credentials")
 	}
 
 	// 3) Populate cache with TTL.
-	if p.tokenCache != nil {
+	if !secureAdmission && p.tokenCache != nil {
 		latestAccount, isStale := CheckTokenVersion(ctx, account, p.accountRepo)
 		if isStale && latestAccount != nil {
 			slog.Debug("openai_token_version_stale_use_latest", "account_id", account.ID)
 			accessToken = latestAccount.GetOpenAIAccessToken()
 			if strings.TrimSpace(accessToken) == "" {
-				return "", errors.New("access_token not found after version check")
+				return "", nil, errors.New("access_token not found after version check")
 			}
 		} else {
 			ttl := 30 * time.Minute
@@ -267,7 +294,41 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		}
 	}
 
-	return accessToken, nil
+	return accessToken, account, nil
+}
+
+// GetAccessTokenWithAccount returns the token together with the effective
+// credential-owner snapshot observed after cache/refresh processing. The
+// legacy two-return API remains available for non-admission callers.
+func (p *OpenAITokenProvider) GetAccessTokenWithAccount(ctx context.Context, account *Account) (string, *Account, error) {
+	terminal := OpenAIAccountTerminalAdmissionFromContext(ctx)
+	input := account
+	if terminal != nil {
+		// Terminal admission is already the fresh pre-token boundary. Reuse its
+		// effective owner as the refresh input; finalizeOpenAISecurityCredential
+		// performs the sole authoritative DB read after token acquisition.
+		if terminal.EffectiveCredentialOwner == nil || terminal.EffectiveCredentialOwner.ID <= 0 {
+			return "", nil, errors.New("effective credential owner unavailable before refresh")
+		}
+		input = terminal.EffectiveCredentialOwner
+	}
+	token, effective, err := p.getAccessTokenWithSnapshot(ctx, input, terminal != nil)
+	if err != nil {
+		return "", nil, err
+	}
+	if terminal == nil && account != nil && p != nil && p.accountRepo != nil {
+		if latest, readErr := p.accountRepo.GetByID(ctx, account.ID); readErr == nil && latest != nil {
+			effective = latest
+		}
+	}
+	return token, effective, nil
+}
+
+func secureOpenAITokenEqual(left, right string) bool {
+	if left == "" || right == "" || len(left) != len(right) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
 }
 
 // disableAccountMissingRefreshToken 在请求路径上发现 OpenAI OAuth 账号

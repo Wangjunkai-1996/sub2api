@@ -197,6 +197,34 @@ func TestEnsureAgentIdentityTaskSharesLockAcrossServicesForSameAccount(t *testin
 	require.Equal(t, "task-shared", repo.account.GetCredential("task_id"))
 }
 
+func TestEnsureAgentIdentityTaskInvalidatesOwnerAndSelectedShadowPools(t *testing.T) {
+	key, privateKey := newTestAgentIdentityKey(t)
+	parentID := int64(9011)
+	parent := &Account{ID: parentID, Type: AccountTypeOAuth, Platform: PlatformOpenAI, Credentials: map[string]any{
+		"auth_mode":          OpenAIAuthModeAgentIdentity,
+		"agent_runtime_id":   key.runtimeID,
+		"agent_private_key":  privateKey,
+		"chatgpt_account_id": "tenant-shadow-recovery",
+	}}
+	shadow := &Account{ID: 9012, Type: AccountTypeOAuth, Platform: PlatformOpenAI, ParentAccountID: &parentID, Credentials: map[string]any{
+		"auth_mode": OpenAIAuthModeAgentIdentity,
+	}}
+	repo := &agentIdentityCredentialsRepo{account: parent}
+	invalidator := &agentIdentityWSInvalidationRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"task_id":"task-shadow-recovered"}`))
+	}))
+	defer server.Close()
+	oldBase := openAIAgentIdentityAuthAPIBaseURL
+	openAIAgentIdentityAuthAPIBaseURL = server.URL
+	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
+
+	require.NoError(t, ensureAgentIdentityTaskForAccount(
+		context.Background(), repo, invalidator, &sync.Mutex{}, shadow, "",
+	))
+	require.Equal(t, []int64{parentID, shadow.ID}, invalidator.accountIDs)
+}
+
 func cloneAgentIdentityTestAccount(account *Account) *Account {
 	copy := *account
 	copy.Credentials = shallowCopyMap(account.Credentials)

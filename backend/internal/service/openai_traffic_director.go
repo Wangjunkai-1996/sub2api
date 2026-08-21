@@ -835,6 +835,9 @@ func (s *OpenAIGatewayService) trafficDirectorEligibleAccountIDs(
 		if _, excluded := excludedIDs[account.ID]; excluded {
 			continue
 		}
+		if compatible, _ := s.openAIAccountRequirementCompatible(ctx, account, ""); !compatible {
+			continue
+		}
 		if !isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability) {
 			continue
 		}
@@ -847,6 +850,9 @@ func (s *OpenAIGatewayService) trafficDirectorEligibleAccountIDs(
 		}
 		fresh := s.resolveFreshSchedulableOpenAIAccountBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
 		if fresh == nil || !trafficDirectorAccountBelongsToGroup(fresh, groupID) {
+			continue
+		}
+		if compatible, _ := s.openAIAccountRequirementCompatible(ctx, fresh, ""); !compatible {
 			continue
 		}
 		if needsUpstreamCheck && groupID != nil && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
@@ -882,6 +888,10 @@ func (s *OpenAIGatewayService) trafficDirectorHardPreviousAccount(
 	if _, configured := policy.poolByAccount[account.ID]; !configured {
 		return nil
 	}
+	s.preloadOpenAIRequirementParents(ctx, []Account{*account})
+	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, account, ""); !compatible {
+		return nil
+	}
 	if !isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability) {
 		return nil
 	}
@@ -896,6 +906,9 @@ func (s *OpenAIGatewayService) trafficDirectorHardPreviousAccount(
 	}
 	fresh := s.resolveFreshSchedulableOpenAIAccountBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
 	if fresh == nil || !trafficDirectorAccountBelongsToGroup(fresh, groupID) {
+		return nil
+	}
+	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, fresh, ""); !compatible {
 		return nil
 	}
 	if requirePrivacy && !fresh.IsPrivacySet() {

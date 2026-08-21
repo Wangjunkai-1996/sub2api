@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/stretchr/testify/require"
 )
 
@@ -154,6 +155,178 @@ func TestOpenAITokenProvider_CacheHit(t *testing.T) {
 	require.Equal(t, "cached-token", token)
 	require.Equal(t, int32(1), atomic.LoadInt32(&cache.getCalled))
 	require.Equal(t, int32(0), atomic.LoadInt32(&cache.setCalled))
+}
+
+func TestOpenAITokenProvider_TerminalAdmissionRejectsMismatchedUnversionedCache(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	expiresAt := time.Now().Add(time.Hour).Format(time.RFC3339)
+	account := &Account{
+		ID:       109,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "fresh-plus-token",
+			"expires_at":   expiresAt,
+			"plan_type":    "plus",
+		},
+	}
+	cache.tokens[OpenAITokenCacheKey(account)] = "stale-pro-token"
+	repo := &admissionTestAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+	ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
+	ctx = WithOpenAIAccountTerminalAdmission(ctx, &OpenAIAccountRequirementAdmission{
+		Selected:                 account,
+		EffectiveCredentialOwner: account,
+		Requirement:              securityadmission.AccountRequirementAuditExempt,
+		AccountClass:             securityadmission.AccountAuditExemptVerified,
+	})
+
+	token, effective, err := provider.GetAccessTokenWithAccount(ctx, account)
+	require.NoError(t, err)
+	require.Equal(t, "fresh-plus-token", token)
+	require.Equal(t, account.ID, effective.ID)
+	require.Equal(t, "plus", effective.GetCredential("plan_type"))
+	require.Zero(t, repo.calls(account.ID), "the terminal owner snapshot is the token starting point; final admission belongs to the gateway")
+	require.Equal(t, int32(1), atomic.LoadInt32(&cache.getCalled), "terminal admission may read but must verify an account-id-only cache hit")
+	require.Zero(t, atomic.LoadInt32(&cache.setCalled), "terminal admission should not publish an unversioned token")
+}
+
+func TestOpenAIGatewayService_TerminalAdmissionUsesSingleFinalDBBoundary(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour).Format(time.RFC3339)
+	parentID := int64(110)
+	shadowID := int64(111)
+	parent := &Account{
+		ID: parentID, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true,
+		Credentials: map[string]any{
+			"access_token": "stable-plus-token",
+			"expires_at":   expiresAt,
+			"plan_type":    "plus",
+		},
+	}
+	shadow := &Account{
+		ID: shadowID, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, ParentAccountID: &parentID,
+	}
+	repo := &admissionTestAccountRepo{accounts: map[int64]*Account{
+		shadowID: shadow,
+		parentID: parent,
+	}}
+	provider := NewOpenAITokenProvider(repo, nil, nil)
+	svc := &OpenAIGatewayService{accountRepo: repo, openAITokenProvider: provider}
+	ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
+	ctx = WithOpenAIAccountTerminalAdmission(ctx, &OpenAIAccountRequirementAdmission{
+		Selected: shadow, EffectiveCredentialOwner: parent,
+		Requirement:  securityadmission.AccountRequirementAuditExempt,
+		AccountClass: securityadmission.AccountAuditExemptVerified,
+	})
+
+	token, authMode, err := svc.GetAccessToken(ctx, shadow)
+	require.NoError(t, err)
+	require.Equal(t, "stable-plus-token", token)
+	require.Equal(t, "oauth", authMode)
+	require.Equal(t, 1, repo.calls(shadowID), "final admission must freshly reload the selected shadow once")
+	require.Equal(t, 1, repo.calls(parentID), "final admission must freshly reload the effective parent once")
+}
+
+func TestOpenAIGatewayService_FinalDBBoundaryRejectsCredentialDrift(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour).Format(time.RFC3339)
+	baseOwner := func(id int64) *Account {
+		return &Account{
+			ID: id, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+			Status: StatusActive, Schedulable: true,
+			Credentials: map[string]any{
+				"access_token": "terminal-plus-token",
+				"expires_at":   expiresAt,
+				"plan_type":    "plus",
+			},
+		}
+	}
+
+	t.Run("plan changes from plus to pro", func(t *testing.T) {
+		terminalOwner := baseOwner(120)
+		freshOwner := baseOwner(120)
+		freshOwner.Credentials["plan_type"] = "pro"
+		repo := &admissionTestAccountRepo{accounts: map[int64]*Account{freshOwner.ID: freshOwner}}
+		svc := &OpenAIGatewayService{
+			accountRepo:         repo,
+			openAITokenProvider: NewOpenAITokenProvider(repo, nil, nil),
+		}
+		ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
+		ctx = WithOpenAIAccountTerminalAdmission(ctx, &OpenAIAccountRequirementAdmission{
+			Selected: terminalOwner, EffectiveCredentialOwner: terminalOwner,
+			Requirement:  securityadmission.AccountRequirementAuditExempt,
+			AccountClass: securityadmission.AccountAuditExemptVerified,
+		})
+
+		token, _, err := svc.GetAccessToken(ctx, terminalOwner)
+		require.Error(t, err)
+		require.Empty(t, token)
+		require.Equal(t, 1, repo.calls(terminalOwner.ID))
+	})
+
+	t.Run("token changes after acquisition", func(t *testing.T) {
+		terminalOwner := baseOwner(121)
+		freshOwner := baseOwner(121)
+		freshOwner.Credentials["access_token"] = "rotated-plus-token"
+		repo := &admissionTestAccountRepo{accounts: map[int64]*Account{freshOwner.ID: freshOwner}}
+		svc := &OpenAIGatewayService{
+			accountRepo:         repo,
+			openAITokenProvider: NewOpenAITokenProvider(repo, nil, nil),
+		}
+		ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
+		ctx = WithOpenAIAccountTerminalAdmission(ctx, &OpenAIAccountRequirementAdmission{
+			Selected: terminalOwner, EffectiveCredentialOwner: terminalOwner,
+			Requirement:  securityadmission.AccountRequirementAuditExempt,
+			AccountClass: securityadmission.AccountAuditExemptVerified,
+		})
+
+		token, _, err := svc.GetAccessToken(ctx, terminalOwner)
+		require.Error(t, err)
+		require.Empty(t, token)
+		var failoverErr *UpstreamFailoverError
+		require.ErrorAs(t, err, &failoverErr)
+		require.Equal(t, GatewayFailureReason("security_credential_owner_changed"), failoverErr.Reason)
+		require.Contains(t, failoverErr.ClientMessage, "credential token changed")
+		require.Equal(t, 1, repo.calls(terminalOwner.ID))
+	})
+
+	t.Run("shadow binding changes owner", func(t *testing.T) {
+		terminalParent := baseOwner(122)
+		newParent := baseOwner(123)
+		shadowID := int64(124)
+		terminalShadow := &Account{
+			ID: shadowID, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+			Status: StatusActive, Schedulable: true, ParentAccountID: &terminalParent.ID,
+		}
+		freshShadow := *terminalShadow
+		freshShadow.ParentAccountID = &newParent.ID
+		repo := &admissionTestAccountRepo{accounts: map[int64]*Account{
+			shadowID:     &freshShadow,
+			newParent.ID: newParent,
+		}}
+		svc := &OpenAIGatewayService{
+			accountRepo:         repo,
+			openAITokenProvider: NewOpenAITokenProvider(repo, nil, nil),
+		}
+		ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
+		ctx = WithOpenAIAccountTerminalAdmission(ctx, &OpenAIAccountRequirementAdmission{
+			Selected: terminalShadow, EffectiveCredentialOwner: terminalParent,
+			Requirement:  securityadmission.AccountRequirementAuditExempt,
+			AccountClass: securityadmission.AccountAuditExemptVerified,
+		})
+
+		token, _, err := svc.GetAccessToken(ctx, terminalShadow)
+		require.Error(t, err)
+		require.Empty(t, token)
+		var failoverErr *UpstreamFailoverError
+		require.ErrorAs(t, err, &failoverErr)
+		require.Equal(t, GatewayFailureReason("security_credential_owner_changed"), failoverErr.Reason)
+		require.Contains(t, failoverErr.ClientMessage, "selected credential binding changed")
+		require.Equal(t, 1, repo.calls(shadowID))
+		require.Equal(t, 1, repo.calls(newParent.ID))
+		require.Zero(t, repo.calls(terminalParent.ID), "token acquisition must not reread the old parent before final admission")
+	})
 }
 
 func TestOpenAITokenProvider_CacheMiss_FromCredentials(t *testing.T) {

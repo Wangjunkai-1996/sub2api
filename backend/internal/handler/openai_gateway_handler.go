@@ -17,6 +17,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -328,15 +329,55 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	// Classify before any body walk. Oversized Responses requests use only a
+	// fixed 4KiB routing envelope and fail closed because their opaque suffix
+	// may require permission, capability, concurrency, or billing preprocessing.
+	var admissionState *openAISecurityAdmissionState
+	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
+		state, classifyErr := classifyOpenAISecurityAdmission(string(securityadmission.ProtocolOpenAIResponses), body, securityadmission.LineageUntrusted)
+		if classifyErr != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+			h.errorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
+			return
+		}
+		admissionState = state
+		installOpenAISecurityAdmission(c, admissionState)
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
+	}
+	oversizeRequest := isOpenAIOversizeAdmission(admissionState)
+	var oversizeEnvelope securityadmission.RoutingEnvelope
+	if oversizeRequest {
+		oversizeEnvelope, err = extractOpenAIOversizeRoutingEnvelope(
+			admissionState, securityadmission.ProtocolOpenAIResponses, body,
+		)
+		if err != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_envelope_unavailable", admissionState, 0,
+				securityadmission.AccountUnknown, "oversize_envelope_unavailable", "upstream_not_dispatched", zap.Error(err))
+			h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request routing metadata is unavailable")
+			return
+		}
+		if reason := openAIOversizeResponsesPreprocessingReason(c, apiKey, oversizeEnvelope.Model); reason != "" {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
+				securityadmission.AccountUnknown, reason, "upstream_not_dispatched")
+			h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request requires unsupported gateway preprocessing")
+			return
+		}
+	}
 
 	setOpsRequestContext(c, "", false)
-	sessionHashBody := body
-	body, ok = h.normalizeOpenAIResponsesCompactRequest(c, reqLog, body)
-	if !ok {
-		return
+	auditBody := body
+	sessionAffinityBody := body
+	if oversizeRequest {
+		sessionAffinityBody = nil
+	} else {
+		body, ok = h.normalizeOpenAIResponsesCompactRequest(c, reqLog, body)
+		if !ok {
+			return
+		}
 	}
 	legacyCompact := service.IsOpenAIResponsesCompactPath(c)
-	nativeV2 := isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(body)
+	nativeV2 := !oversizeRequest && isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(body)
 	if nativeV2 {
 		// 原生 v2 压缩出站前补注 x-codex-beta-features: remote_compaction_v2，
 		// 与真实 Codex 线型一致（网关链剥头后本级负责恢复，#5586）。
@@ -348,36 +389,50 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	stopCompactKeepalive := service.StartOpenAICompactSSEKeepalive(c, h.openAICompactKeepaliveInterval())
 	defer stopCompactKeepalive()
 
-	// 校验请求体 JSON 合法性
-	if !gjson.ValidBytes(body) {
+	// Normal-sized requests retain complete JSON validation. An oversized body
+	// was deliberately classified as opaque and must not be walked here.
+	if !oversizeRequest && !gjson.ValidBytes(body) {
 		logRequestBodyParseFailure(reqLog, body, nil)
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return
 	}
 
-	// 使用 gjson 只读提取字段做校验，避免完整 Unmarshal
-	modelResult := gjson.GetBytes(body, "model")
-	if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
-		return
+	var reqModel string
+	if oversizeRequest {
+		reqModel = oversizeEnvelope.Model
+	} else {
+		// 使用 gjson 只读提取字段做校验，避免完整 Unmarshal
+		modelResult := gjson.GetBytes(body, "model")
+		if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
+			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+			return
+		}
+		reqModel = modelResult.String()
 	}
-	reqModel := modelResult.String()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	if !compositeTargetPlatformAllowed(c, apiKey, reqModel, service.PlatformOpenAI, service.PlatformGrok) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
-	if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
-		body = cappedBody
+	if !oversizeRequest {
+		if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
+			body = cappedBody
+		}
 	}
 
-	reqStream, ok := parseOpenAICompatibleStream(body)
-	if !ok {
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
-		return
+	reqStream := oversizeEnvelope.Stream
+	if !oversizeRequest {
+		reqStream, ok = parseOpenAICompatibleStream(body)
+		if !ok {
+			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
+			return
+		}
 	}
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
-	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+	previousResponseID := ""
+	if !oversizeRequest {
+		previousResponseID = strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+	}
 	if previousResponseID != "" {
 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
 		reqLog = reqLog.With(
@@ -399,13 +454,36 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	if admissionState == nil {
+		state, classifyErr := classifyOpenAISecurityAdmission(
+			string(securityadmission.ProtocolOpenAIResponses), auditBody, securityadmission.LineageUntrusted,
+		)
+		if classifyErr != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+			h.errorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
+			return
+		}
+		admissionState = state
+		installOpenAISecurityAdmission(c, admissionState)
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "classified")
+	}
+	if openAIAdmissionShouldRejectBeforeRouting(admissionState) {
+		h.errorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
+		return
+	}
+
 	setOpsRequestContext(c, reqModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
 
 	// 使用 IsExplicitImageGenerationIntent 排除被动 image_gen namespace 声明。
 	// Codex 在所有请求中被动声明 image_gen namespace，宽泛检测会导致禁了生图的
 	// 分组中所有 Codex 请求被 403（#4447），并误占生图并发槽位。
-	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, body)
+	imageIntentBody := body
+	if oversizeRequest {
+		imageIntentBody = nil
+	}
+	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, imageIntentBody)
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", service.ImageGenerationPermissionMessage())
 		return
@@ -424,8 +502,16 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	if oversizeRequest && channelMapping.Mapped {
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
+			securityadmission.AccountUnknown, "oversize_channel_model_mapping_required", "upstream_not_dispatched")
+		h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request requires unsupported gateway preprocessing")
+		return
+	}
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
-	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
+	if !oversizeRequest {
+		seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
+	}
 	forwardModel := reqModel
 	if channelMapping.Mapped {
 		forwardModel = channelMapping.MappedModel
@@ -435,11 +521,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		forwardModel,
 		legacyCompact,
 	)
+	forwardCtx = withOpenAIRemoteModelRequirement(forwardCtx, forwardModel)
 	forwardCtx = service.WithOpenAIResponsesTrafficDirectorHealthModel(forwardCtx, forwardModel, legacyCompact)
 	c.Request = c.Request.WithContext(forwardCtx)
 
 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
-	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
+	if !oversizeRequest && !h.validateFunctionCallOutputRequest(c, body, reqLog) {
 		return
 	}
 
@@ -476,7 +563,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 
 	// Generate session hash (header first; fallback to prompt_cache_key)
-	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionHashBody)
+	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionAffinityBody)
 	requireCompact := legacyCompact
 
 	maxAccountSwitches := h.maxAccountSwitches
@@ -542,6 +629,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 				return
 			}
+			if openAIAuditFallbackExhausted(c, admissionState) {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
 			if len(failedAccountIDs) == 0 {
 				if legacyCompact && errors.Is(err, service.ErrNoAvailableCompactAccounts) {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
@@ -563,6 +655,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 		if selection == nil || selection.Account == nil {
+			if openAIAuditFallbackExhausted(c, admissionState) {
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
@@ -606,6 +702,27 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 		account = selection.Account
+		terminalAdmission, terminalErr := h.gatewayService.AdmitOpenAIAccountRequirement(c.Request.Context(), account)
+		if terminalErr != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+				accountReleaseFunc = nil
+			}
+			if openAITerminalAdmissionCanReselect(terminalErr) {
+				failedAccountIDs[account.ID] = struct{}{}
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.terminal_rejected", admissionState, account.ID,
+					securityadmission.AccountUnknown, "terminal_admission_reselect", "upstream_not_dispatched", zap.Error(terminalErr))
+				continue
+			}
+			errorOpenAISecurityAdmission(c, reqLog, "security_admission.terminal_unavailable", admissionState, account.ID,
+				securityadmission.AccountUnknown, "terminal_admission_unavailable", "upstream_not_dispatched", zap.Error(terminalErr))
+			h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", "Account security admission is temporarily unavailable", streamStarted)
+			return
+		}
+		account = terminalAdmission.Selected
+		selection.Account = account
+		terminalCtx := service.WithOpenAIAccountTerminalAdmission(c.Request.Context(), terminalAdmission)
+		c.Request = c.Request.WithContext(terminalCtx)
 		releaseAccount := func() {
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()
@@ -620,8 +737,18 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			account,
 			service.ContentModerationProtocolOpenAIResponses,
 			reqModel,
-			sessionHashBody,
+			auditBody,
 		); decision != nil && !decision.AllowNextStage {
+			if securityAuditCanReselect(decision) && h.selectedOpenAIAccountMayUseAuditFallback(c, account) && admissionState != nil &&
+				admissionState.admission.Class() == securityadmission.RequestAuditableText && !admissionState.fallback {
+				admissionState.fallback = true
+				releaseAccount()
+				failedAccountIDs[account.ID] = struct{}{}
+				setOpenAIAccountRequirement(c, securityadmission.AccountRequirementAuditExempt)
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.pro_audit_unavailable_reselect", admissionState, account.ID,
+					securityadmission.AccountUnknown, string(decision.Kind), "upstream_not_dispatched")
+				continue
+			}
 			releaseAccount()
 			h.handleStreamingAwareErrorWithCode(
 				c,
@@ -648,7 +775,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
 			selection.CommitTrafficDirectorAttempt()
-			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
+			forwardCtx := withOpenAISecurityDispatchObserver(c.Request.Context(), c, reqLog, account)
+			return h.gatewayService.Forward(forwardCtx, c, account, attemptBody)
 		}()
 		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, forwardModel, result, err)
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
@@ -1025,28 +1153,89 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	var admissionState *openAISecurityAdmissionState
+	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
+		state, classifyErr := classifyOpenAISecurityAdmission(string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted)
+		if classifyErr != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+			h.anthropicErrorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
+			return
+		}
+		admissionState = state
+		installOpenAISecurityAdmission(c, admissionState)
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
+	}
+	oversizeRequest := isOpenAIOversizeAdmission(admissionState)
+	var oversizeEnvelope securityadmission.RoutingEnvelope
+	if oversizeRequest {
+		oversizeEnvelope, err = extractOpenAIOversizeRoutingEnvelope(
+			admissionState, securityadmission.ProtocolAnthropicMessages, body,
+		)
+		if err != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_envelope_unavailable", admissionState, 0,
+				securityadmission.AccountUnknown, "oversize_envelope_unavailable", "upstream_not_dispatched", zap.Error(err))
+			h.anthropicErrorResponse(c, http.StatusServiceUnavailable, "api_error", "Oversized request routing metadata is unavailable")
+			return
+		}
+		if openAIOversizeReasoningPolicyConfigured(c, apiKey) {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
+				securityadmission.AccountUnknown, "oversize_reasoning_policy_required", "upstream_not_dispatched")
+			h.anthropicErrorResponse(c, http.StatusServiceUnavailable, "api_error", "Oversized request requires unsupported gateway preprocessing")
+			return
+		}
+	}
 
-	if !gjson.ValidBytes(body) {
+	if !oversizeRequest && !gjson.ValidBytes(body) {
 		logRequestBodyParseFailure(reqLog, body, nil)
 		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return
 	}
 
-	modelResult := gjson.GetBytes(body, "model")
-	if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
-		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
-		return
+	var reqModel string
+	if oversizeRequest {
+		reqModel = oversizeEnvelope.Model
+	} else {
+		modelResult := gjson.GetBytes(body, "model")
+		if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
+			h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+			return
+		}
+		reqModel = modelResult.String()
 	}
-	reqModel := modelResult.String()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	if !openAICompatibleTextTargetAllowed(c, apiKey, reqModel) {
 		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
-	bindOpenAIReasoningEffortPolicyForMessagesRequest(c, apiKey, body)
+	if !oversizeRequest {
+		bindOpenAIReasoningEffortPolicyForMessagesRequest(c, apiKey, body)
+	}
 	routingModel := service.NormalizeOpenAICompatRequestedModel(reqModel)
 	preferredMappedModel := resolveOpenAIMessagesDispatchMappedModel(apiKey, reqModel)
-	reqStream := gjson.GetBytes(body, "stream").Bool()
+	reqStream := oversizeEnvelope.Stream
+	if !oversizeRequest {
+		reqStream = gjson.GetBytes(body, "stream").Bool()
+	}
+
+	if admissionState == nil {
+		state, classifyErr := classifyOpenAISecurityAdmission(
+			string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted,
+		)
+		if classifyErr != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+			h.anthropicErrorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
+			return
+		}
+		admissionState = state
+		installOpenAISecurityAdmission(c, admissionState)
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "classified")
+	}
+	if openAIAdmissionShouldRejectBeforeRouting(admissionState) {
+		h.anthropicErrorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
+		return
+	}
 
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
 
@@ -1055,7 +1244,21 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 
 	// 解析渠道级模型映射
 	channelMappingMsg, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	if oversizeRequest && channelMappingMsg.Mapped {
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
+			securityadmission.AccountUnknown, "oversize_channel_model_mapping_required", "upstream_not_dispatched")
+		h.anthropicErrorResponse(c, http.StatusServiceUnavailable, "api_error", "Oversized request requires unsupported gateway preprocessing")
+		return
+	}
 	mappedBodyForMessages := newOpenAIModelMappedBodyCache(body, h.gatewayService.ReplaceModelInBody)
+	forwardModelMsg := reqModel
+	if channelMappingMsg.Mapped {
+		forwardModelMsg = channelMappingMsg.MappedModel
+	}
+	messagesCtx := service.WithOpenAIMessagesForwardModel(c.Request.Context(), forwardModelMsg, preferredMappedModel)
+	messagesCtx = withOpenAIRemoteModelRequirement(messagesCtx, forwardModelMsg)
+	messagesCtx = withOpenAIRemoteModelRequirement(messagesCtx, preferredMappedModel)
+	c.Request = c.Request.WithContext(messagesCtx)
 
 	// 绑定错误透传服务，允许 service 层在非 failover 错误场景复用规则。
 	if h.errorPassthroughService != nil {
@@ -1086,9 +1289,15 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
-	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
-	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
-	sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel, body)
+	sessionMetadataBody := body
+	if oversizeRequest {
+		sessionMetadataBody = nil
+	}
+	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionMetadataBody)
+	promptCacheKey := h.gatewayService.ExtractSessionID(c, sessionMetadataBody)
+	if !oversizeRequest {
+		sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel, body)
+	}
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	profitVetoCount := 0
@@ -1142,6 +1351,11 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 				h.anthropicStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 				return
 			}
+			if openAIAuditFallbackExhausted(c, admissionState) {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
 			if len(failedAccountIDs) == 0 {
 				if err != nil {
 					cls := classifyOpenAICompatibleSelectionErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel, err)
@@ -1161,6 +1375,10 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}
 		}
 		if selection == nil || selection.Account == nil {
+			if openAIAuditFallbackExhausted(c, admissionState) {
+				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
 			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
@@ -1193,6 +1411,27 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			return
 		}
 		account = selection.Account
+		terminalAdmission, terminalErr := h.gatewayService.AdmitOpenAIAccountRequirement(c.Request.Context(), account)
+		if terminalErr != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+				accountReleaseFunc = nil
+			}
+			if openAITerminalAdmissionCanReselect(terminalErr) {
+				failedAccountIDs[account.ID] = struct{}{}
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.terminal_rejected", admissionState, account.ID,
+					securityadmission.AccountUnknown, "terminal_admission_reselect", "upstream_not_dispatched", zap.Error(terminalErr))
+				continue
+			}
+			errorOpenAISecurityAdmission(c, reqLog, "security_admission.terminal_unavailable", admissionState, account.ID,
+				securityadmission.AccountUnknown, "terminal_admission_unavailable", "upstream_not_dispatched", zap.Error(terminalErr))
+			h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
+			return
+		}
+		account = terminalAdmission.Selected
+		selection.Account = account
+		terminalCtx := service.WithOpenAIAccountTerminalAdmission(c.Request.Context(), terminalAdmission)
+		c.Request = c.Request.WithContext(terminalCtx)
 		releaseAccount := func() {
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()
@@ -1209,6 +1448,16 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			reqModel,
 			body,
 		); decision != nil && !decision.AllowNextStage {
+			if securityAuditCanReselect(decision) && h.selectedOpenAIAccountMayUseAuditFallback(c, account) && admissionState != nil &&
+				admissionState.admission.Class() == securityadmission.RequestAuditableText && !admissionState.fallback {
+				admissionState.fallback = true
+				releaseAccount()
+				failedAccountIDs[account.ID] = struct{}{}
+				setOpenAIAccountRequirement(c, securityadmission.AccountRequirementAuditExempt)
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.pro_audit_unavailable_reselect", admissionState, account.ID,
+					securityadmission.AccountUnknown, string(decision.Kind), "upstream_not_dispatched")
+				continue
+			}
 			releaseAccount()
 			h.anthropicStreamingAwareError(
 				c,
@@ -1230,7 +1479,8 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
 			selection.CommitTrafficDirectorAttempt()
-			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
+			forwardCtx := withOpenAISecurityDispatchObserver(c.Request.Context(), c, reqLog, account)
+			return h.gatewayService.ForwardAsAnthropic(forwardCtx, c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
 		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMappingMsg, reqModel, ""), service.HashUsageRequestPayload(body))
@@ -1933,11 +2183,61 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "unsupported websocket message type")
 		return
 	}
-	if !gjson.ValidBytes(firstMessage) {
+	admissionState, classifyErr := classifyOpenAISecurityAdmission(
+		string(securityadmission.ProtocolResponsesWebSocket), firstMessage, securityadmission.LineageUntrusted,
+	)
+	if classifyErr != nil {
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+			securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched",
+			zap.Error(classifyErr), zap.Int("body_bytes", len(firstMessage)))
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "invalid JSON payload")
 		return
 	}
-	reqModel := strings.TrimSpace(gjson.GetBytes(firstMessage, "model").String())
+	installOpenAISecurityAdmission(c, admissionState)
+	logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "ws_first_turn_classified")
+	if openAIAdmissionShouldRejectBeforeRouting(admissionState) {
+		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "Request blocked by content policy")
+		return
+	}
+	oversizeRequest := isOpenAIOversizeAdmission(admissionState)
+	var oversizeEnvelope securityadmission.RoutingEnvelope
+	if oversizeRequest {
+		oversizeEnvelope, err = extractOpenAIOversizeRoutingEnvelope(
+			admissionState, securityadmission.ProtocolResponsesWebSocket, firstMessage,
+		)
+		if err != nil {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_oversize_envelope_unavailable", admissionState, 0,
+				securityadmission.AccountUnknown, "oversize_envelope_unavailable", "upstream_not_dispatched", zap.Error(err))
+			closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "oversized websocket routing metadata is unavailable")
+			return
+		}
+		if reason := openAIOversizeResponsesPreprocessingReason(c, apiKey, oversizeEnvelope.Model); reason != "" {
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_oversize_preprocessing_required", admissionState, 0,
+				securityadmission.AccountUnknown, reason, "upstream_not_dispatched")
+			closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "oversized websocket request requires unsupported preprocessing")
+			return
+		}
+	}
+	if !oversizeRequest && !gjson.ValidBytes(firstMessage) {
+		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "invalid JSON payload")
+		return
+	}
+	firstFrameType := oversizeEnvelope.Type
+	if !oversizeRequest {
+		firstFrameType = strings.TrimSpace(gjson.GetBytes(firstMessage, "type").String())
+	}
+	if firstFrameType != "" && firstFrameType != "response.create" {
+		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "first message must be response.create")
+		return
+	}
+	if admissionState.admission.Class() == securityadmission.RequestKnownNoText && firstFrameType != "response.create" {
+		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "first message must be response.create")
+		return
+	}
+	reqModel := oversizeEnvelope.Model
+	if !oversizeRequest {
+		reqModel = strings.TrimSpace(gjson.GetBytes(firstMessage, "model").String())
+	}
 	if reqModel == "" {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "model is required in first response.create payload")
 		return
@@ -1951,14 +2251,20 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return
 		}
 	}
-	previousResponseID := strings.TrimSpace(gjson.GetBytes(firstMessage, "previous_response_id").String())
+	previousResponseID := oversizeEnvelope.PreviousResponseID
+	if !oversizeRequest {
+		previousResponseID = strings.TrimSpace(gjson.GetBytes(firstMessage, "previous_response_id").String())
+	}
 	previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
 	if previousResponseID != "" && previousResponseIDKind == service.OpenAIPreviousResponseIDKindMessageID {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "previous_response_id must be a response.id (resp_*), not a message id")
 		return
 	}
-	firstMessageToolCoverage := service.AnalyzeToolCallOutputContextCoverageBytes(firstMessage)
-	previousResponseCanMove := !firstMessageToolCoverage.HasFunctionCallOutput || firstMessageToolCoverage.ContextCoversAllCallIDs
+	previousResponseCanMove := false
+	if !oversizeRequest {
+		firstMessageToolCoverage := service.AnalyzeToolCallOutputContextCoverageBytes(firstMessage)
+		previousResponseCanMove = !firstMessageToolCoverage.HasFunctionCallOutput || firstMessageToolCoverage.ContextCoversAllCallIDs
+	}
 	reqLog = reqLog.With(
 		zap.Bool("ws_ingress", true),
 		zap.String("session_initial_model", reqModel),
@@ -1968,7 +2274,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	setOpsRequestContext(c, reqModel, true)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeWSV2))
 
-	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
+	imageIntentBody := firstMessage
+	if oversizeRequest {
+		imageIntentBody = nil
+	}
+	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, imageIntentBody)
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, service.ImageGenerationPermissionMessage())
 		return
@@ -1976,6 +2286,19 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 	// 解析渠道级模型映射
 	channelMappingWS, _ := h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, reqModel)
+	if oversizeRequest && channelMappingWS.Mapped {
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_oversize_preprocessing_required", admissionState, 0,
+			securityadmission.AccountUnknown, "oversize_channel_model_mapping_required", "upstream_not_dispatched")
+		closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "oversized websocket request requires unsupported preprocessing")
+		return
+	}
+	forwardModelWS := reqModel
+	if channelMappingWS.Mapped {
+		forwardModelWS = channelMappingWS.MappedModel
+	}
+	ctx = service.WithOpenAIDirectForwardModel(ctx, forwardModelWS)
+	ctx = withOpenAIRemoteModelRequirement(ctx, forwardModelWS)
+	c.Request = c.Request.WithContext(ctx)
 	healthModelWS := openAITrafficDirectorHealthModel(reqModel, channelMappingWS)
 
 	var currentUserRelease func()
@@ -2037,9 +2360,13 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
+	sessionHashBody := firstMessage
+	if oversizeRequest {
+		sessionHashBody = nil
+	}
 	sessionHash := h.gatewayService.GenerateSessionHashWithFallback(
 		c,
-		firstMessage,
+		sessionHashBody,
 		openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID),
 	)
 	maxAccountSwitches := h.maxAccountSwitches
@@ -2048,6 +2375,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	failedAccountIDs := make(map[int64]struct{})
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
+	// A Pro blocking-audit outage may select a verified non-Pro account once.
+	// The bit is connection-local: a WS session must never repeatedly wash the
+	// same turn through new accounts, and a scanner block is never retryable.
+	wsAuditFallbackUsed := false
 	handleWSFailover := func(account *service.Account, failoverErr *service.UpstreamFailoverError) bool {
 		if ctx.Err() != nil {
 			return false
@@ -2091,7 +2422,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// WSv2 传输本身已隐含 Responses 支持，此处为防御性对齐。
 	// 使用 IsExplicitImageGenerationIntent 排除被动 namespace 声明（#4476）。
 	requiredCapability := service.OpenAIEndpointCapabilityChatCompletions
-	if service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage) && requestPlatform == service.PlatformOpenAI {
+	if imageIntent && requestPlatform == service.PlatformOpenAI {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
 
@@ -2270,6 +2601,91 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			fastReleaseFunc = selection.ReleaseFunc
 			accountReleaseFunc = fastReleaseFunc
 		}
+		// Fresh terminal account admission is the last scheduler boundary. It
+		// resolves shadow parents from the selected row and installs the exact
+		// owner snapshot used by token refresh validation before any upstream
+		// connection or request is created.
+		terminalAdmission, terminalErr := h.gatewayService.AdmitOpenAIAccountRequirement(admissionCtx, account)
+		if terminalErr != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+				accountReleaseFunc = nil
+			}
+			if openAITerminalAdmissionCanReselect(terminalErr) {
+				failedAccountIDs[account.ID] = struct{}{}
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_terminal_rejected", admissionState, account.ID,
+					securityadmission.AccountUnknown, "terminal_admission_reselect", "upstream_not_dispatched", zap.Error(terminalErr))
+				if previousResponseID != "" && !previousResponseCanMove {
+					closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "previous_response_id cannot migrate to an audit-exempt account")
+					return
+				}
+				continue
+			}
+			errorOpenAISecurityAdmission(c, reqLog, "security_admission.ws_terminal_unavailable", admissionState, account.ID,
+				securityadmission.AccountUnknown, "terminal_admission_unavailable", "upstream_not_dispatched", zap.Error(terminalErr))
+			closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "Account security admission is temporarily unavailable")
+			return
+		}
+		if terminalAdmission == nil || terminalAdmission.Selected == nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+				accountReleaseFunc = nil
+			}
+			warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_terminal_unavailable", admissionState, account.ID,
+				securityadmission.AccountUnknown, "terminal_admission_missing", "upstream_not_dispatched")
+			failedAccountIDs[account.ID] = struct{}{}
+			if previousResponseID != "" && !previousResponseCanMove {
+				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "previous_response_id cannot migrate to another account")
+				return
+			}
+			continue
+		}
+		account = terminalAdmission.Selected
+		selection.Account = account
+		admissionCtx = service.WithOpenAIAccountTerminalAdmission(admissionCtx, terminalAdmission)
+		ctx = admissionCtx
+		c.Request = c.Request.WithContext(ctx)
+		c.Set(securityAuditWSTurnContextKey, 1)
+		firstTurnAuditDecision := h.checkSecurityAuditForSelectedOpenAIProAccount(
+			c,
+			reqLog,
+			apiKey,
+			subject,
+			account,
+			string(securityadmission.ProtocolResponsesWebSocket),
+			reqModel,
+			firstMessage,
+		)
+		if firstTurnAuditDecision != nil && !firstTurnAuditDecision.AllowNextStage {
+			if securityAuditCanReselect(firstTurnAuditDecision) && h.selectedOpenAIAccountMayUseAuditFallback(c, account) &&
+				admissionState != nil &&
+				admissionState.admission.Class() == securityadmission.RequestAuditableText &&
+				!wsAuditFallbackUsed &&
+				(previousResponseID == "" || previousResponseCanMove) {
+				wsAuditFallbackUsed = true
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+					accountReleaseFunc = nil
+				}
+				failedAccountIDs[account.ID] = struct{}{}
+				setOpenAIAccountRequirement(c, securityadmission.AccountRequirementAuditExempt)
+				ctx = c.Request.Context()
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_pro_audit_unavailable_reselect", admissionState, account.ID,
+					securityadmission.AccountUnknown, string(firstTurnAuditDecision.Kind), "upstream_not_dispatched")
+				continue
+			}
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+				accountReleaseFunc = nil
+			}
+			if securityAuditCanReselect(firstTurnAuditDecision) {
+				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, securityAuditMessage(firstTurnAuditDecision))
+			} else {
+				closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, securityAuditMessage(firstTurnAuditDecision))
+			}
+			return
+		}
+		firstTurnBlockingScanPassed := firstTurnAuditDecision != nil && firstTurnAuditDecision.AllowNextStage
 		// 准入完成：门并入连接 ctx，turn 级复核与 failover 重选共用。
 		ctx = admissionCtx
 		currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
@@ -2277,7 +2693,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			reqLog.Warn("openai.websocket_bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
 
-		token, _, err := h.gatewayService.GetRequestCredential(ctx, c, account)
+		token, authMode, err := h.gatewayService.GetRequestCredential(ctx, c, account)
+		var credentialProof *service.OpenAICredentialProof
+		if err == nil {
+			credentialProof, err = h.gatewayService.CaptureOpenAICredentialProof(ctx, account, token, authMode)
+		}
 		if err != nil {
 			reqLog.Warn("openai.websocket_get_access_token_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 			if ctx.Err() != nil {
@@ -2293,6 +2713,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to get access token")
 			return
 		}
+		lineageTracker := newOpenAIWSLineageTracker()
+		lineageTracker.MarkTurnAdmitted(1, admissionState, terminalAdmission, firstTurnBlockingScanPassed)
 
 		reqLog.Debug("openai.websocket_account_selected",
 			zap.Int64("account_id", account.ID),
@@ -2338,8 +2760,38 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// turn-tagged slot preserves the exact mapping used for the in-flight request.
 		var turnChannelMapping atomic.Pointer[openAIWSTurnChannelMappingSnapshot]
 		turnChannelMapping.Store(&openAIWSTurnChannelMappingSnapshot{turn: 1, mapping: channelMappingWS})
+		type pendingWSTurnAdmission struct {
+			state *openAISecurityAdmissionState
+			body  []byte
+		}
+		var pendingWSTurnAdmissionsMu sync.Mutex
+		pendingWSTurnAdmissions := make(map[int]pendingWSTurnAdmission, 4)
+		validateWSDispatchCredential := func(turn int) error {
+			dispatchState := openAISecurityAdmissionFromContext(c)
+			dispatchAdmission, admissionErr := h.gatewayService.AdmitOpenAIAccountRequirement(ctx, account)
+			accountClass := securityadmission.AccountUnknown
+			if dispatchAdmission != nil {
+				accountClass = dispatchAdmission.AccountClass
+			}
+			if admissionErr != nil || dispatchAdmission == nil || dispatchAdmission.Selected == nil ||
+				dispatchAdmission.Selected.ID != account.ID {
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_dispatch_terminal_rejected",
+					dispatchState, account.ID, accountClass, "terminal_admission_rejected", "upstream_not_dispatched",
+					zap.Int("turn", turn), zap.Error(admissionErr))
+				return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater,
+					"Account security admission is temporarily unavailable", admissionErr)
+			}
+			if proofErr := service.ValidateOpenAICredentialProof(dispatchAdmission, credentialProof); proofErr != nil {
+				warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_dispatch_credential_drift",
+					dispatchState, account.ID, accountClass, "credential_proof_changed", "upstream_not_dispatched",
+					zap.Int("turn", turn), zap.Error(proofErr))
+				return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater,
+					"Account credentials changed; please reconnect", proofErr)
+			}
+			return nil
+		}
 		// turn 级定价：BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号；
-		// 首轮 passthrough 不重复准入，AfterTurn 回退到 TurnStarted 的时刻。
+		// BeforeDispatch 在连接等待/重连后只复核凭据，不重复扫描或抢槽。
 		var turnPricing openAIWSTurnPricing
 		hooks := &service.OpenAIWSIngressHooks{
 			ClientLifecycleContext:  clientLifecycleCtx,
@@ -2353,11 +2805,138 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if turn == 1 {
 					return nil
 				}
-				if !gjson.ValidBytes(payload) {
-					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", errors.New("invalid json"))
+				state, classifyErr := classifyOpenAISecurityAdmissionWithOptions(
+					string(securityadmission.ProtocolResponsesWebSocket),
+					payload,
+					securityadmission.Options{ResolveLineage: func(previousResponseID string) securityadmission.LineageTrust {
+						return lineageTracker.ResolvePreviousResponseID(previousResponseID, account.ID)
+					}},
+				)
+				if classifyErr != nil {
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_classification_failed", nil, account.ID,
+						securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched",
+						zap.Int("turn", turn), zap.Error(classifyErr))
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", classifyErr)
 				}
+				installOpenAISecurityAdmission(c, state)
+				logOpenAISecurityAdmission(c, reqLog, state, securityadmission.AccountUnknown, "ws_turn_classified")
+				if openAIAdmissionShouldRejectBeforeRouting(state) {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "Request blocked by content policy", nil)
+				}
+				if isOpenAIOversizeAdmission(state) {
+					envelope, envelopeErr := extractOpenAIOversizeRoutingEnvelope(
+						state, securityadmission.ProtocolResponsesWebSocket, payload,
+					)
+					if envelopeErr != nil {
+						warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_oversize_envelope_unavailable", state, account.ID,
+							securityadmission.AccountUnknown, "oversize_envelope_unavailable", "upstream_not_dispatched",
+							zap.Int("turn", turn), zap.Error(envelopeErr))
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "oversized websocket routing metadata is unavailable", envelopeErr)
+					}
+					if reason := openAIOversizeResponsesPreprocessingReason(c, apiKey, envelope.Model); reason != "" {
+						warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_oversize_preprocessing_required", state, account.ID,
+							securityadmission.AccountUnknown, reason, "upstream_not_dispatched", zap.Int("turn", turn))
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "oversized websocket request requires unsupported preprocessing", nil)
+					}
+				}
+				pendingWSTurnAdmissionsMu.Lock()
+				pendingWSTurnAdmissions[turn] = pendingWSTurnAdmission{state: state, body: payload}
+				pendingWSTurnAdmissionsMu.Unlock()
 				return nil
 			},
+			BeforeNonTurnFrame: func(payload []byte) error {
+				state, classifyErr := classifyOpenAISecurityAdmission(
+					string(securityadmission.ProtocolResponsesWebSocket),
+					payload,
+					securityadmission.LineageUntrusted,
+				)
+				if classifyErr != nil {
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_classification_failed", nil, account.ID,
+						securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", classifyErr)
+				}
+
+				currentAccountClass := securityadmission.AccountUnknown
+				if terminalAdmission != nil {
+					currentAccountClass = terminalAdmission.AccountClass
+				}
+				switch state.admission.Class() {
+				case securityadmission.RequestKnownNoText:
+					if state.admission.Reason() == securityadmission.ReasonKnownControlFrame {
+						frameAdmission, admissionErr := h.gatewayService.AdmitOpenAIAccountRequirement(ctx, account)
+						if admissionErr != nil || frameAdmission == nil || frameAdmission.Selected == nil || frameAdmission.Selected.ID != account.ID {
+							warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_terminal_rejected", state, account.ID,
+								currentAccountClass, "terminal_admission_rejected", "upstream_not_dispatched", zap.Error(admissionErr))
+							return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account security admission is temporarily unavailable", admissionErr)
+						}
+						currentAccountClass = frameAdmission.AccountClass
+						if proofErr := service.ValidateOpenAICredentialProof(frameAdmission, credentialProof); proofErr != nil {
+							warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_credential_drift", state, account.ID,
+								currentAccountClass, "credential_proof_changed", "upstream_not_dispatched", zap.Error(proofErr))
+							return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account credentials changed; please reconnect", proofErr)
+						}
+						logOpenAISecurityAdmission(c, reqLog, state, currentAccountClass, "ws_non_turn_control_allowed")
+						return nil
+					}
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_unsupported_no_text", state, account.ID,
+						currentAccountClass, "unsupported_non_turn_no_text", "upstream_not_dispatched")
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "unsupported websocket frame", nil)
+				case securityadmission.RequestKnownViolation:
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_known_violation", state, account.ID,
+						currentAccountClass, "known_violation", "upstream_not_dispatched")
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "Request blocked by content policy", nil)
+				case securityadmission.RequestUninspectable:
+					frameCtx := service.WithOpenAIAccountRequirement(ctx, securityadmission.AccountRequirementAuditExempt)
+					frameAdmission, admissionErr := h.gatewayService.AdmitOpenAIAccountRequirement(frameCtx, account)
+					if frameAdmission != nil {
+						currentAccountClass = frameAdmission.AccountClass
+					}
+					if admissionErr != nil || frameAdmission == nil || frameAdmission.Selected == nil || frameAdmission.Selected.ID != account.ID {
+						warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_terminal_rejected", state, account.ID,
+							currentAccountClass, "audit_exempt_account_required", "upstream_not_dispatched", zap.Error(admissionErr))
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account security admission is temporarily unavailable", admissionErr)
+					}
+					if proofErr := service.ValidateOpenAICredentialProof(frameAdmission, credentialProof); proofErr != nil {
+						warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_credential_drift", state, account.ID,
+							currentAccountClass, "credential_proof_changed", "upstream_not_dispatched", zap.Error(proofErr))
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account credentials changed; please reconnect", proofErr)
+					}
+					logOpenAISecurityAdmission(c, reqLog, state, currentAccountClass, "ws_non_turn_frame_admitted")
+					return nil
+				case securityadmission.RequestAuditableText:
+					// No supported non-turn frame currently carries auditable text. If the
+					// protocol adds one, it must gain a blocking Pro scan before dispatch.
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_auditable_unsupported", state, account.ID,
+						currentAccountClass, "non_turn_blocking_audit_unavailable", "upstream_not_dispatched")
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "WebSocket frame security audit is temporarily unavailable", nil)
+				default:
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_non_turn_unknown_class", state, account.ID,
+						currentAccountClass, "unknown_request_class", "upstream_not_dispatched")
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "unsupported websocket frame", nil)
+				}
+			},
+			BeforeRetry: func(turn int) error {
+				// The turn's scanner result and concurrency slots remain valid across
+				// the single transport retry. The account row and connection-bound
+				// credential proof do not: refresh both before another upstream write.
+				retryAdmission, retryErr := h.gatewayService.AdmitOpenAIAccountRequirement(ctx, account)
+				if retryErr != nil || retryAdmission == nil || retryAdmission.Selected == nil || retryAdmission.Selected.ID != account.ID {
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_retry_terminal_rejected",
+						openAISecurityAdmissionFromContext(c), account.ID, securityadmission.AccountUnknown,
+						"terminal_admission_rejected", "upstream_not_dispatched", zap.Int("turn", turn), zap.Error(retryErr))
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account security admission is temporarily unavailable", retryErr)
+				}
+				if proofErr := service.ValidateOpenAICredentialProof(retryAdmission, credentialProof); proofErr != nil {
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_retry_credential_drift",
+						openAISecurityAdmissionFromContext(c), account.ID, securityadmission.AccountUnknown,
+						"credential_proof_changed", "upstream_not_dispatched", zap.Int("turn", turn), zap.Error(proofErr))
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account credentials changed; please reconnect", proofErr)
+				}
+				account = retryAdmission.Selected
+				terminalAdmission = retryAdmission
+				return nil
+			},
+			BeforeDispatch: validateWSDispatchCredential,
 			MapRequestModel: func(turn int, originalModel string) (string, error) {
 				model := strings.TrimSpace(originalModel)
 				if model == "" {
@@ -2378,7 +2957,27 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// 长连接跨峰谷/倍率刷新防护：每个 turn 按当前时刻重装门并复核
 				// 当前账号，越线即要求客户端重连重选（连接绑定单一上游账号，
 				// 无法中途换号）。本 turn 的准入与计费共用同一 pricingAt。
-				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(ctx, apiKey.GroupID)
+				var pending pendingWSTurnAdmission
+				if turn > 1 {
+					pendingWSTurnAdmissionsMu.Lock()
+					pending = pendingWSTurnAdmissions[turn]
+					delete(pendingWSTurnAdmissions, turn)
+					pendingWSTurnAdmissionsMu.Unlock()
+					if pending.state == nil || len(pending.body) == 0 {
+						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "missing websocket security admission", nil)
+					}
+				}
+				turnBaseCtx := ctx
+				if pending.state != nil {
+					turnBaseCtx = service.WithOpenAIAccountRequirement(turnBaseCtx, pending.state.admission.Requirement())
+				}
+				turnForwardModel := reqModel
+				if snapshot := turnChannelMapping.Load(); snapshot != nil && strings.TrimSpace(snapshot.mapping.MappedModel) != "" {
+					turnForwardModel = snapshot.mapping.MappedModel
+				}
+				turnBaseCtx = service.WithOpenAIDirectForwardModel(turnBaseCtx, turnForwardModel)
+				turnBaseCtx = withOpenAIRemoteModelRequirement(turnBaseCtx, turnForwardModel)
+				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(turnBaseCtx, apiKey.GroupID)
 				if _, vetoed, reason := h.gatewayService.ProfitControlVetoLatest(turnCtx, account); vetoed {
 					reqLog.Info("openai.websocket_turn_profit_vetoed",
 						zap.Int("turn", turn),
@@ -2388,19 +2987,40 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				turnPricing.freeze(turnAt)
 				if turn == 1 {
+					// Passthrough dials before this hook, while pooled modes may spend
+					// time waiting for a connection after it. In either case, refresh the
+					// selected/effective-owner snapshot and bind the first dispatch to
+					// the immutable credential proof captured after token acquisition.
+					firstAdmission, terminalErr := h.gatewayService.AdmitOpenAIAccountRequirement(turnCtx, account)
+					if terminalErr != nil || firstAdmission == nil || firstAdmission.Selected == nil || firstAdmission.Selected.ID != account.ID {
+						warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_first_turn_terminal_rejected", admissionState, account.ID,
+							securityadmission.AccountUnknown, "terminal_admission_rejected", "upstream_not_dispatched", zap.Int("turn", turn), zap.Error(terminalErr))
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account security admission is temporarily unavailable", terminalErr)
+					}
+					if proofErr := service.ValidateOpenAICredentialProof(firstAdmission, credentialProof); proofErr != nil {
+						warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_first_turn_credential_drift", admissionState, account.ID,
+							securityadmission.AccountUnknown, "credential_proof_changed", "upstream_not_dispatched", zap.Int("turn", turn), zap.Error(proofErr))
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account credentials changed; please reconnect", proofErr)
+					}
+					account = firstAdmission.Selected
+					terminalAdmission = firstAdmission
+					// Keep the terminal context state created before credential capture.
+					// Rebinding it here would discard the finalized credential proof.
+					ctx = turnCtx
+					c.Request = c.Request.WithContext(turnCtx)
 					return nil
 				}
 				// 防御式清理：避免异常路径下旧槽位覆盖导致泄漏。
 				releaseTurnSlots()
 				// 非首轮 turn 需要重新抢占并发槽位，避免长连接空闲占槽。
-				userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
+				userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(turnCtx, subject.UserID, subject.Concurrency, apiKey.ID)
 				if err != nil {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire user concurrency slot", err)
 				}
 				if !userAcquired {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "too many concurrent requests, please retry later", nil)
 				}
-				accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+				accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(turnCtx, account.ID, accountMaxConcurrency)
 				if err != nil {
 					if userReleaseFunc != nil {
 						userReleaseFunc()
@@ -2440,12 +3060,81 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					reqLog.Info("openai.websocket_turn_health_rejected", zap.Int("turn", turn), zap.Int64("account_id", account.ID), zap.String("state", string(healthDecision.State)))
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer healthy, please reconnect", nil)
 				}
+				// Re-read the selected row and its effective credential owner after
+				// the turn slot is held. This is the terminal security boundary for
+				// long-lived connections; a plan/parent change cannot be hidden by
+				// the account snapshot captured during the handshake.
+				turnAdmission, terminalErr := h.gatewayService.AdmitOpenAIAccountRequirement(turnCtx, account)
+				if terminalErr != nil || turnAdmission == nil || turnAdmission.Selected == nil || turnAdmission.Selected.ID != account.ID {
+					if accountReleaseFunc != nil {
+						accountReleaseFunc()
+					}
+					if userReleaseFunc != nil {
+						userReleaseFunc()
+					}
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_terminal_rejected", pending.state, account.ID,
+						securityadmission.AccountUnknown, "terminal_admission_rejected", "upstream_not_dispatched",
+						zap.Int("turn", turn), zap.Error(terminalErr))
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account security admission is temporarily unavailable", terminalErr)
+				}
+				if proofErr := service.ValidateOpenAICredentialProof(turnAdmission, credentialProof); proofErr != nil {
+					if accountReleaseFunc != nil {
+						accountReleaseFunc()
+					}
+					if userReleaseFunc != nil {
+						userReleaseFunc()
+					}
+					warnOpenAISecurityAdmission(c, reqLog, "security_admission.ws_turn_credential_drift", pending.state, account.ID,
+						securityadmission.AccountUnknown, "credential_proof_changed", "upstream_not_dispatched",
+						zap.Int("turn", turn), zap.Error(proofErr))
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "Account credentials changed; please reconnect", proofErr)
+				}
+				account = turnAdmission.Selected
+				if account.Concurrency > 0 {
+					accountMaxConcurrency = account.Concurrency
+				}
+				terminalAdmission = turnAdmission
+				ctx = turnCtx
+				c.Request = c.Request.WithContext(turnCtx)
+				turnAuditDecision := (*securityaudit.Decision)(nil)
+				if pending.state != nil {
+					turnAuditDecision = h.checkSecurityAuditForSelectedOpenAIAccount(
+						c,
+						reqLog,
+						apiKey,
+						subject,
+						account,
+						string(securityadmission.ProtocolResponsesWebSocket),
+						reqModel,
+						pending.body,
+						true,
+					)
+					if turnAuditDecision != nil && !turnAuditDecision.AllowNextStage {
+						if accountReleaseFunc != nil {
+							accountReleaseFunc()
+						}
+						if userReleaseFunc != nil {
+							userReleaseFunc()
+						}
+						if securityAuditCanReselect(turnAuditDecision) {
+							return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, securityAuditMessage(turnAuditDecision), nil)
+						}
+						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, securityAuditMessage(turnAuditDecision), nil)
+					}
+				}
+				lineageTracker.MarkTurnAdmitted(
+					turn,
+					pending.state,
+					turnAdmission,
+					turnAuditDecision != nil && turnAuditDecision.AllowNextStage,
+				)
 				pendingTurnHealthProbes.track(turn, healthModel, healthDecision)
-				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
-				currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
+				currentUserRelease = wrapReleaseOnDone(turnCtx, userReleaseFunc)
+				currentAccountRelease = wrapReleaseOnDone(turnCtx, accountReleaseFunc)
 				return nil
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
+				lineageTracker.CompleteTurn(turn, result, turnErr)
 				pendingProbeModel, pendingProbe := pendingTurnHealthProbes.finish(turn)
 				turnStart := getTurnStart(turn)
 				// F1: cyber 标记按 turn 生命周期清理——defer 保证任意早返回路径都执行；
@@ -2567,7 +3256,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		// WebSocket 首包可能很大，hash 必须在 hooks 外算成字符串，避免 AfterTurn 闭包保活请求体。
-		requestPayloadHash = service.HashUsageRequestPayload(wsFirstMessage)
+		if oversizeRequest {
+			requestPayloadHash = ""
+		} else {
+			requestPayloadHash = service.HashUsageRequestPayload(wsFirstMessage)
+		}
 
 		selection.CommitTrafficDirectorAttempt()
 		proxyErr := func() error {
@@ -2578,7 +3271,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					h.reportOpenAITrafficDirectorOutcome(ctx, account, pendingProbeModel, nil, context.Canceled)
 				}
 			}()
-			return h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
+			dispatchCtx := withOpenAISecurityDispatchObserver(ctx, c, reqLog, account)
+			return h.gatewayService.ProxyResponsesWebSocketFromClient(dispatchCtx, c, wsConn, account, token, wsFirstMessage, hooks)
 		}()
 		reportFirstTurnHealthOutcome(healthModelWS, nil, proxyErr)
 		if proxyErr != nil {

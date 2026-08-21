@@ -386,6 +386,29 @@ func TestWorkerCompletesPassWithoutEventRefreshesEveryChunkAndDeletesPayload(t *
 	require.Equal(t, int64(1), metrics.Snapshot().Allowed)
 }
 
+func TestWorkerLegacyPayloadTreatsFormerPrioritySeparatorAsText(t *testing.T) {
+	const input = "\x00SUB2API_PROMPT_AUDIT_PRIORITY_END\x00"
+	job := workerJob(1, 3)
+	job.Snapshot.PromptLength = len([]rune(input))
+	// Jobs created before the structured boundary field default to zero.
+	require.Zero(t, job.Snapshot.PriorityPrefixRunes)
+	payload := &fakePayloadStore{values: map[int64]string{job.ID: input}}
+	seen := make([]string, 0, 1)
+	scanner := PromptScannerFunc(func(_ context.Context, endpoint ActiveEndpoint, chunk string, _ []string) (*NormalizedResult, error) {
+		seen = append(seen, chunk)
+		return &NormalizedResult{
+			Decision: EventPass, RiskLevel: RiskLow, Action: ActionAllow, Safety: "Safe",
+			ScannerScores: map[string]float64{}, ScannerEvidence: map[string]string{}, GuardEndpointID: endpoint.ID,
+		}, nil
+	})
+	cfg := asyncConfig()
+	cfg.Endpoints[0].InputLimit = 100
+	runner := NewRunner(&fakeConfigStore{cfg: cfg, active: true}, &fakeJobRepository{}, payload, scanner, NewAtomicMetrics())
+
+	require.NoError(t, runner.processJob(context.Background(), 0, cfg, job))
+	require.Equal(t, []string{input}, seen)
+}
+
 func TestWorkerRetryBackoffTerminalFailureAndFailover(t *testing.T) {
 	now := time.Unix(200, 0).UTC()
 	for _, tt := range []struct {

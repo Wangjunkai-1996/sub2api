@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -58,6 +59,17 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		h.chatCompletionsErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
+		admissionState, classifyErr := classifyOpenAISecurityAdmission(
+			string(securityadmission.ProtocolOpenAIChat), body, securityadmission.LineageUntrusted,
+		)
+		if classifyErr == nil {
+			installOpenAISecurityAdmission(c, admissionState)
+			logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
+		}
+		h.chatCompletionsErrorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Request cannot be inspected by the security admission gate")
+		return
+	}
 
 	setOpsRequestContext(c, "", false)
 
@@ -65,6 +77,25 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	if !gjson.ValidBytes(body) {
 		logRequestBodyParseFailure(reqLog, body, nil)
 		h.chatCompletionsErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
+	}
+	admissionState, classifyErr := classifyOpenAISecurityAdmission(
+		string(securityadmission.ProtocolOpenAIChat), body, securityadmission.LineageUntrusted,
+	)
+	if classifyErr != nil {
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+			securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+		h.chatCompletionsErrorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
+		return
+	}
+	installOpenAISecurityAdmission(c, admissionState)
+	logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "classified")
+	switch admissionState.admission.Class() {
+	case securityadmission.RequestKnownViolation:
+		h.chatCompletionsErrorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
+		return
+	case securityadmission.RequestUninspectable:
+		h.chatCompletionsErrorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Request cannot be inspected by the security admission gate")
 		return
 	}
 
@@ -106,7 +137,9 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIChat, reqModel, body); decision != nil && !decision.AllowNextStage {
+	if admissionState.admission.Class() == securityadmission.RequestKnownNoText {
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "known_no_text_skip")
+	} else if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIChat, reqModel, body); decision != nil && !decision.AllowNextStage {
 		h.openAISecurityAuditError(c, decision)
 		return
 	}
@@ -282,9 +315,11 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 				return
 			}
 			setActualUpstreamEndpoint(c, EndpointAntigravityGenerateContent)
-			result, err = h.antigravityGatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, parsedReq)
+			forwardCtx := withOpenAISecurityDispatchObserver(c.Request.Context(), c, reqLog, account)
+			result, err = h.antigravityGatewayService.ForwardAsChatCompletions(forwardCtx, c, account, forwardBody, parsedReq)
 		} else {
-			result, err = h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, parsedReq)
+			forwardCtx := withOpenAISecurityDispatchObserver(c.Request.Context(), c, reqLog, account)
+			result, err = h.gatewayService.ForwardAsChatCompletions(forwardCtx, c, account, forwardBody, parsedReq)
 		}
 
 		if accountReleaseFunc != nil {

@@ -23,6 +23,14 @@ func setOpenAIChatGPTAccountHeaders(headers http.Header, account *Account) {
 // 再调用 setOpenAIChatGPTAccountHeaders 写入 chatgpt-account-id / x-openai-fedramp 头。
 // 普通账号（非影子）为直通，行为与直接调用 setOpenAIChatGPTAccountHeaders 一致。
 func resolveAndSetOpenAIChatGPTAccountHeaders(ctx context.Context, repo AccountRepository, headers http.Header, account *Account) error {
+	if OpenAIAccountTerminalAdmissionFromContext(ctx) != nil {
+		credential, err := openAIFinalizedCredentialFromContext(ctx, account)
+		if err != nil {
+			return err
+		}
+		setOpenAIChatGPTAccountHeaders(headers, credential.admission.EffectiveCredentialOwner)
+		return nil
+	}
 	credAccount, err := resolveCredentialAccount(ctx, repo, account)
 	if err != nil {
 		return err

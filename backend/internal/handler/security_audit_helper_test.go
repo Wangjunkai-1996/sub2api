@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -24,6 +25,126 @@ func TestCachesSecurityAuditCompletionSkipsWebSocketStages(t *testing.T) {
 	require.True(t, isSecurityAuditWebSocketStage("first_turn"))
 	require.True(t, isSecurityAuditWebSocketStage("subsequent_turn"))
 	require.False(t, isSecurityAuditWebSocketStage("http"))
+}
+
+func TestBlockingAuditFailsClosedWithoutCoordinator(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(securityAuditCompletedContextKey, true)
+
+	decision := runSecurityAuditWithAdmission(
+		c,
+		nil,
+		nil,
+		nil,
+		nil,
+		middleware2.AuthSubject{UserID: 7},
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-test",
+		[]byte(`{"input":"must be scanned"}`),
+		"http",
+		nil,
+		true,
+	)
+
+	require.NotNil(t, decision)
+	require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
+	require.Equal(t, securityaudit.ErrorCodeUnavailable, decision.ErrorCode)
+	require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
+	require.False(t, decision.AllowNextStage)
+}
+
+func TestBlockingAuditDoesNotReuseNonBlockingCompletion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{mode: securityaudit.ModeAsync}
+	coordinator := securityaudit.NewCoordinator(nil, engine)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := []byte(`{"input":"must reach blocking scanner"}`)
+
+	nonBlocking := runSecurityAudit(
+		c,
+		nil,
+		coordinator,
+		nil,
+		nil,
+		middleware2.AuthSubject{UserID: 7},
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-test",
+		body,
+		"http",
+	)
+	require.NotNil(t, nonBlocking)
+	require.True(t, nonBlocking.AllowNextStage)
+
+	blocking := runSecurityAuditWithAdmission(
+		c,
+		nil,
+		coordinator,
+		nil,
+		nil,
+		middleware2.AuthSubject{UserID: 7},
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-test",
+		body,
+		"http",
+		nil,
+		true,
+	)
+	require.NotNil(t, blocking)
+	require.Equal(t, securityaudit.DecisionUnavailable, blocking.Kind)
+	require.False(t, blocking.AllowNextStage)
+	require.Equal(t, int64(1), engine.enqueues.Load(), "the non-blocking path may enqueue once")
+	require.Zero(t, engine.evaluates.Load(), "async mode must never be treated as a completed blocking scan")
+}
+
+func TestSecurityAdmissionDoesNotReuseEqualLengthDifferentBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	protocol := service.ContentModerationProtocolOpenAIResponses
+	firstBody := []byte(`{"input":"safe"}`)
+	secondBody := []byte(`{"input":"evil"}`)
+	require.Len(t, secondBody, len(firstBody))
+
+	firstState, err := classifyOpenAISecurityAdmission(protocol, firstBody, "untrusted")
+	require.NoError(t, err)
+	installOpenAISecurityAdmission(c, firstState)
+	require.True(t, firstState.matchesBody(protocol, firstBody))
+	require.False(t, firstState.matchesBody(protocol, secondBody))
+	require.Nil(t, buildSecurityAuditRequest(
+		c, nil, middleware2.AuthSubject{UserID: 7}, protocol, "gpt-test", secondBody, "subsequent_turn",
+	).Admission, "equal length must not reuse offsets from another allocation")
+
+	account := &service.Account{
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"plan_type": "pro",
+		},
+	}
+	h := &OpenAIGatewayHandler{
+		securityAuditCoordinator: securityaudit.NewCoordinator(nil, &turnCountingEngine{mode: securityaudit.ModeBlocking}),
+	}
+	c.Set(securityAuditWSTurnContextKey, 2)
+	decision := h.checkSecurityAuditForSelectedOpenAIAccount(
+		c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
+		protocol, "gpt-test", secondBody, true,
+	)
+	require.NotNil(t, decision)
+	require.True(t, decision.AllowNextStage)
+
+	secondState := openAISecurityAdmissionFromContext(c)
+	require.NotSame(t, firstState, secondState)
+	require.True(t, secondState.matchesBody(protocol, secondBody))
+	materialized, err := secondState.admission.MaterializeText(secondBody)
+	require.NoError(t, err)
+	require.Contains(t, materialized, "evil")
+	require.NotContains(t, materialized, "safe")
 }
 
 func TestSelectedOpenAIProAccountAuditEligibility(t *testing.T) {
@@ -175,6 +296,8 @@ func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
 		},
 	}
 	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	core, logs := observer.New(zap.InfoLevel)
+	reqLog := zap.New(core)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -188,7 +311,7 @@ func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
 
 	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
 		c,
-		nil,
+		reqLog,
 		nil,
 		middleware2.AuthSubject{UserID: 7},
 		account,
@@ -200,7 +323,17 @@ func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
 	require.NotNil(t, decision)
 	require.Equal(t, securityaudit.DecisionBlock, decision.Kind)
 	require.False(t, decision.AllowNextStage)
+	require.False(t, securityAuditCanReselect(decision), "an explicit block must never trigger account fallback")
 	require.Equal(t, int64(1), engine.evaluates.Load())
+	state := openAISecurityAdmissionFromContext(c)
+	require.NotNil(t, state)
+	require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class(),
+		"the canonical routing/audit admission must remain immutable")
+	doneLogs := logs.FilterMessage("security_audit.gateway_check_done").All()
+	require.Len(t, doneLogs, 1)
+	require.Equal(t, string(securityadmission.RequestKnownViolation), doneLogs[0].ContextMap()["request_class"])
+	require.Equal(t, securityaudit.ErrorCodeBlocked, doneLogs[0].ContextMap()["reason"])
+	require.Equal(t, "upstream_not_dispatched", doneLogs[0].ContextMap()["dispatch"])
 	_, cached := c.Get(securityAuditCompletedContextKey)
 	require.False(t, cached, "blocking decisions must never populate the request cache")
 }

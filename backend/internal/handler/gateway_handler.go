@@ -25,6 +25,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -157,6 +158,22 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
+	// Classify before any request-body tree or downstream routing work. The
+	// generic gateway scheduler does not carry the OpenAI account requirement
+	// through its candidate filters, so an oversized body must fail closed here
+	// rather than fall through to the legacy empty-input allow path.
+	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
+		admissionState, classifyErr := classifyOpenAISecurityAdmission(
+			string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted,
+		)
+		if classifyErr == nil {
+			installOpenAISecurityAdmission(c, admissionState)
+			logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
+		}
+		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Request cannot be inspected by the security admission gate")
+		return
+	}
+
 	setOpsRequestContext(c, "", false)
 
 	bodyRef := service.NewRequestBodyRef(body)
@@ -167,6 +184,25 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 	body = parsedReq.Body.Bytes()
+	admissionState, classifyErr := classifyOpenAISecurityAdmission(
+		string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted,
+	)
+	if classifyErr != nil {
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
+			securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
+		h.errorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
+		return
+	}
+	installOpenAISecurityAdmission(c, admissionState)
+	logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "classified")
+	if admissionState.admission.Class() == securityadmission.RequestKnownViolation {
+		h.errorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
+		return
+	}
+	if admissionState.admission.Class() == securityadmission.RequestUninspectable {
+		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Request cannot be inspected by the security admission gate")
+		return
+	}
 	reqModel := parsedReq.Model
 	reqStream := parsedReq.Stream
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
@@ -209,7 +245,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
-	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolAnthropicMessages, reqModel, body); decision != nil && !decision.AllowNextStage {
+	if admissionState.admission.Class() == securityadmission.RequestKnownNoText {
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "known_no_text_skip")
+	} else if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolAnthropicMessages, reqModel, body); decision != nil && !decision.AllowNextStage {
 		h.anthropicSecurityAuditError(c, decision)
 		return
 	}
@@ -854,6 +892,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
+			requestCtx = withOpenAISecurityDispatchObserver(requestCtx, c, reqLog, account)
 			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
 				result, err = h.antigravityGatewayService.Forward(requestCtx, c, account, attemptBody, hasBoundSession)
 			} else {

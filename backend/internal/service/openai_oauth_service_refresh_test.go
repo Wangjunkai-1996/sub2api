@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,12 +12,15 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/imroc/req/v3"
 	"github.com/stretchr/testify/require"
 )
 
 type openaiOAuthClientRefreshStub struct {
-	refreshCalls int32
+	refreshCalls    int32
+	refreshResponse *openai.TokenResponse
+	refreshErr      error
 }
 
 func (s *openaiOAuthClientRefreshStub) ExchangeCode(ctx context.Context, code, codeVerifier, redirectURI, proxyURL, clientID string) (*openai.TokenResponse, error) {
@@ -24,12 +29,34 @@ func (s *openaiOAuthClientRefreshStub) ExchangeCode(ctx context.Context, code, c
 
 func (s *openaiOAuthClientRefreshStub) RefreshToken(ctx context.Context, refreshToken, proxyURL string) (*openai.TokenResponse, error) {
 	atomic.AddInt32(&s.refreshCalls, 1)
-	return nil, errors.New("not implemented")
+	return s.refreshResult()
 }
 
 func (s *openaiOAuthClientRefreshStub) RefreshTokenWithClientID(ctx context.Context, refreshToken, proxyURL string, clientID string) (*openai.TokenResponse, error) {
 	atomic.AddInt32(&s.refreshCalls, 1)
+	return s.refreshResult()
+}
+
+func (s *openaiOAuthClientRefreshStub) refreshResult() (*openai.TokenResponse, error) {
+	if s.refreshErr != nil {
+		return nil, s.refreshErr
+	}
+	if s.refreshResponse != nil {
+		return s.refreshResponse, nil
+	}
 	return nil, errors.New("not implemented")
+}
+
+func openAIRefreshTestIDToken(t *testing.T, planType string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type": planType,
+		},
+	})
+	require.NoError(t, err)
+	return "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".test"
 }
 
 func TestOpenAIOAuthService_RefreshAccountToken_NoRefreshTokenUsesExistingAccessToken(t *testing.T) {
@@ -142,6 +169,119 @@ func TestOpenAITokenRefresher_NeedsRefresh_SkipsAccountWithoutRefreshToken(t *te
 		},
 	}
 	require.False(t, refresher.NeedsRefresh(patWithStaleRT, 5*time.Minute))
+}
+
+func TestOpenAITokenRefresher_RefreshDropsUnprovenPreviousPlan(t *testing.T) {
+	tests := []struct {
+		name    string
+		idToken string
+	}{
+		{name: "missing id token"},
+		{name: "blank plan claim", idToken: openAIRefreshTestIDToken(t, "   ")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &openaiOAuthClientRefreshStub{refreshResponse: &openai.TokenResponse{
+				AccessToken:  "fresh-access-token",
+				RefreshToken: "fresh-refresh-token",
+				IDToken:      tt.idToken,
+				ExpiresIn:    3600,
+			}}
+			svc := NewOpenAIOAuthService(nil, client)
+			defer svc.Stop()
+			var enrichCalls int32
+			svc.SetPrivacyClientFactory(func(string) (*req.Client, error) {
+				atomic.AddInt32(&enrichCalls, 1)
+				return nil, errors.New("enrichment unavailable")
+			})
+			refresher := NewOpenAITokenRefresher(svc, nil)
+			account := &Account{
+				ID: 91, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+				Credentials: map[string]any{
+					"access_token":  "old-access-token",
+					"refresh_token": "old-refresh-token",
+					"plan_type":     "plus",
+					"model_mapping": map[string]any{"gpt-5": "gpt-5-codex"},
+				},
+			}
+
+			credentials, err := refresher.Refresh(context.Background(), account)
+			require.NoError(t, err)
+			require.Equal(t, int32(1), atomic.LoadInt32(&client.refreshCalls))
+			require.Positive(t, atomic.LoadInt32(&enrichCalls))
+			require.Equal(t, "fresh-access-token", credentials["access_token"])
+			require.Equal(t, "fresh-refresh-token", credentials["refresh_token"])
+			require.NotContains(t, credentials, "plan_type")
+			require.Equal(t, map[string]any{"gpt-5": "gpt-5-codex"}, credentials["model_mapping"])
+			require.Equal(t, "plus", account.Credentials["plan_type"], "refresh must not mutate the caller's credential snapshot")
+
+			effective := *account
+			effective.Credentials = credentials
+			require.Equal(t, securityadmission.AccountUnknown, ClassifyOpenAIEffectiveCredentialOwner(&effective))
+		})
+	}
+}
+
+func TestOpenAITokenRefresher_RefreshAppliesFreshPlan(t *testing.T) {
+	tests := []struct {
+		name      string
+		oldPlan   string
+		freshPlan string
+		wantClass securityadmission.AccountClass
+	}{
+		{name: "fresh plus replaces pro", oldPlan: "pro", freshPlan: "plus", wantClass: securityadmission.AccountAuditExemptVerified},
+		{name: "fresh pro replaces plus", oldPlan: "plus", freshPlan: "pro", wantClass: securityadmission.AccountAuditRequired},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &openaiOAuthClientRefreshStub{refreshResponse: &openai.TokenResponse{
+				AccessToken:  "fresh-access-token",
+				RefreshToken: "fresh-refresh-token",
+				IDToken:      openAIRefreshTestIDToken(t, tt.freshPlan),
+				ExpiresIn:    3600,
+			}}
+			svc := NewOpenAIOAuthService(nil, client)
+			defer svc.Stop()
+			refresher := NewOpenAITokenRefresher(svc, nil)
+			account := &Account{
+				ID: 92, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+				Credentials: map[string]any{
+					"access_token":  "old-access-token",
+					"refresh_token": "old-refresh-token",
+					"plan_type":     tt.oldPlan,
+				},
+			}
+
+			credentials, err := refresher.Refresh(context.Background(), account)
+			require.NoError(t, err)
+			require.Equal(t, tt.freshPlan, credentials["plan_type"])
+			effective := *account
+			effective.Credentials = credentials
+			require.Equal(t, tt.wantClass, ClassifyOpenAIEffectiveCredentialOwner(&effective))
+		})
+	}
+}
+
+func TestOpenAITokenRefresher_RefreshFailureReturnsNoCredentials(t *testing.T) {
+	client := &openaiOAuthClientRefreshStub{refreshErr: errors.New("refresh unavailable")}
+	svc := NewOpenAIOAuthService(nil, client)
+	defer svc.Stop()
+	refresher := NewOpenAITokenRefresher(svc, nil)
+	account := &Account{
+		ID: 93, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "old-refresh-token",
+			"plan_type":     "plus",
+		},
+	}
+
+	credentials, err := refresher.Refresh(context.Background(), account)
+	require.ErrorContains(t, err, "refresh unavailable")
+	require.Nil(t, credentials)
+	require.Equal(t, "plus", account.Credentials["plan_type"])
 }
 
 func TestOpenAITokenRefresher_Refresh_PATRemovesStaleOAuthFields(t *testing.T) {

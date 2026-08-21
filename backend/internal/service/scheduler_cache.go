@@ -119,3 +119,14 @@ type SchedulerCache interface {
 	// SetOutboxWatermark 保存 outbox 水位。
 	SetOutboxWatermark(ctx context.Context, id int64) error
 }
+
+// SchedulerAccountMetadataBatchReader is an optional SchedulerCache capability
+// for request-path policy checks that only need scheduler metadata. Callers
+// must treat a present key with a nil account as an unresolved ID and fail
+// closed where the metadata is security-sensitive.
+//
+// Keeping this separate from SchedulerCache avoids forcing every cache stub or
+// alternate implementation to provide the batch optimization.
+type SchedulerAccountMetadataBatchReader interface {
+	GetAccountMetadataByIDs(ctx context.Context, accountIDs []int64) (map[int64]*Account, error)
+}
