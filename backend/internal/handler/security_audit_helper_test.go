@@ -209,6 +209,43 @@ func TestSelectedOpenAIProAccountAuditEligibility(t *testing.T) {
 	}
 }
 
+func TestSelectedOpenAIProAccountAuditModeOffUsesLegacyModeration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{mode: securityaudit.ModeOff}
+	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
+		Blocked: true, StatusCode: http.StatusForbidden, ErrorCode: "content_policy_violation", Message: "legacy block",
+	}}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	account := &service.Account{
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"plan_type": "pro",
+		},
+	}
+
+	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
+		c,
+		nil,
+		nil,
+		middleware2.AuthSubject{UserID: 7},
+		account,
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-test",
+		[]byte(`{"input":"hello"}`),
+	)
+
+	require.NotNil(t, decision)
+	require.Equal(t, securityaudit.DecisionBlock, decision.Kind)
+	require.False(t, decision.AllowNextStage)
+	require.Equal(t, int64(1), legacy.calls.Load(), "mode off must retain the existing content moderation audit")
+	require.Zero(t, engine.evaluates.Load(), "mode off must not invoke the blocking scanner")
+	require.Zero(t, engine.enqueues.Load(), "mode off must not enqueue an async audit")
+}
+
 func TestSelectedOpenAIProAccountAuditCachesSuccessfulRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := &turnCountingEngine{mode: securityaudit.ModeBlocking}
@@ -479,6 +516,16 @@ type turnCountingEngine struct {
 	enqueues  atomic.Int64
 	evaluates atomic.Int64
 	decisions []*securityaudit.PromptDecision
+}
+
+type handlerLegacyModerationEngine struct {
+	decision *securityaudit.LegacyDecision
+	calls    atomic.Int64
+}
+
+func (e *handlerLegacyModerationEngine) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
+	e.calls.Add(1)
+	return e.decision, nil
 }
 
 func (e *turnCountingEngine) EffectiveMode() securityaudit.Mode { return e.mode }

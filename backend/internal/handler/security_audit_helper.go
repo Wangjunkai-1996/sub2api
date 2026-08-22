@@ -74,10 +74,11 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIProAccount(
 	return h.checkSecurityAuditForSelectedOpenAIAccount(c, reqLog, apiKey, subject, account, protocol, model, body, false)
 }
 
-// checkSecurityAuditForSelectedOpenAIAccount performs the only Pro proof
-// obligation. The request-local admission is reused across failover attempts;
-// a missing admission is classified here for compatibility with focused unit
-// callers, but production handlers classify immediately after reading body.
+// checkSecurityAuditForSelectedOpenAIAccount audits the selected account when
+// its effective credential owner is not already verified. The request-local
+// admission is reused across failover attempts; a missing admission is
+// classified here for compatibility with focused unit callers, but production
+// handlers classify immediately after reading body.
 func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIAccount(
 	c *gin.Context,
 	reqLog *zap.Logger,
@@ -123,7 +124,7 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIAccount(
 		logOpenAISecurityAdmission(c, reqLog, state, accountClass, "reject_uninspectable_pro")
 		return securityAuditUnavailableDecision()
 	}
-	logOpenAISecurityAdmission(c, reqLog, state, accountClass, "blocking_scan")
+	logOpenAISecurityAdmission(c, reqLog, state, accountClass, "selected_account_scan")
 	stage := admissionStage(forceCurrentTurn)
 	if turn, ok := securityAuditWSTurn(c); ok {
 		if turn <= 1 {
@@ -133,7 +134,7 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIAccount(
 		}
 	}
 	return runSecurityAuditWithAdmission(c, reqLog, h.securityAuditCoordinator, h.contentModerationService,
-		apiKey, subject, protocol, model, body, stage, &state.admission, true)
+		apiKey, subject, protocol, model, body, stage, &state.admission, false)
 }
 
 func (h *OpenAIGatewayHandler) selectedOpenAIAccountAuditClass(c *gin.Context, account *service.Account) securityadmission.AccountClass {
