@@ -176,12 +176,22 @@ type PromptDecision struct {
 	ErrorCode      string            `json:"error_code,omitempty"`
 	Result         *NormalizedResult `json:"result,omitempty"`
 	AllowNextStage bool              `json:"allow_next_stage"`
+	// Audited is true only when the configured scanner actually evaluated the
+	// canonical text. Configuration skips, out-of-scope allows, and no-op
+	// compatibility paths deliberately leave it false; callers that require an
+	// audit proof must not infer one from AllowNextStage alone.
+	Audited bool `json:"audited"`
 }
 
 type LegacyDecision struct {
-	Allowed    bool   `json:"allowed"`
-	Blocked    bool   `json:"blocked"`
-	Flagged    bool   `json:"flagged"`
+	Allowed bool `json:"allowed"`
+	Blocked bool `json:"blocked"`
+	Flagged bool `json:"flagged"`
+	// Audited is an explicit proof bit for audit-required account routing. A
+	// legacy adapter may return Allowed=true when its feature is disabled,
+	// sampled out, queued asynchronously, or otherwise skipped; those results
+	// are not sufficient to admit a Pro credential when Prompt Guard is down.
+	Audited    bool   `json:"audited"`
 	Message    string `json:"message"`
 	StatusCode int    `json:"status_code"`
 	ErrorCode  string `json:"error_code"`

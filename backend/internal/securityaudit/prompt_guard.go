@@ -139,7 +139,12 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 	if aggregated.Action == ActionBlock {
 		kind = DecisionBlock
 	}
-	decision := &PromptDecision{Kind: kind, Result: aggregated, AllowNextStage: kind == DecisionAllow || kind == DecisionFlag}
+	decision := &PromptDecision{
+		Kind:           kind,
+		Result:         aggregated,
+		AllowNextStage: kind == DecisionAllow || kind == DecisionFlag,
+		Audited:        true,
+	}
 	if kind == DecisionBlock {
 		decision.ErrorCode = ErrorCodeBlocked
 	}
