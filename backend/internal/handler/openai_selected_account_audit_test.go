@@ -400,9 +400,13 @@ func (r *selectedAccountAuditPlusToProRefresher) Refresh(_ context.Context, _ *s
 }
 
 func selectedAccountAuditHTTPContext(t *testing.T, path string, body string) (*gin.Context, *httptest.ResponseRecorder) {
+	return selectedAccountAuditHTTPBytesContext(t, path, []byte(body))
+}
+
+func selectedAccountAuditHTTPBytesContext(t *testing.T, path string, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
 	c, recorder := newOpenAIResponsesFailoverTestContext(t, nil)
-	c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	c.Request = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 	require.True(t, ok)
@@ -960,7 +964,7 @@ func TestOpenAIGatewayHandler_EffectiveSearchModelMappingsWithoutVerifiedNonProR
 	}
 }
 
-func TestOpenAIGatewayHandler_OversizeChatAndMessagesRouteOnlyToVerifiedNonProWithoutScanning(t *testing.T) {
+func TestOpenAIGatewayHandler_OversizeOpenAIHTTPRoutesOnlyToVerifiedNonProWithoutScanning(t *testing.T) {
 	oversize := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
 	tests := []struct {
 		name   string
@@ -968,6 +972,27 @@ func TestOpenAIGatewayHandler_OversizeChatAndMessagesRouteOnlyToVerifiedNonProWi
 		body   string
 		invoke func(*OpenAIGatewayHandler, *gin.Context)
 	}{
+		{
+			name: "Responses routing before input", path: "/v1/responses",
+			body: `{"model":"gpt-5.1","stream":true,"input":"` + oversize + `"}`,
+			invoke: func(h *OpenAIGatewayHandler, c *gin.Context) {
+				h.Responses(c)
+			},
+		},
+		{
+			name: "Responses routing after input", path: "/v1/responses",
+			body: `{"input":"` + oversize + `","model":"gpt-5.1","stream":true}`,
+			invoke: func(h *OpenAIGatewayHandler, c *gin.Context) {
+				h.Responses(c)
+			},
+		},
+		{
+			name: "Responses omitted stream defaults false", path: "/v1/responses",
+			body: `{"input":"` + oversize + `","model":"gpt-5.1"}`,
+			invoke: func(h *OpenAIGatewayHandler, c *gin.Context) {
+				h.Responses(c)
+			},
+		},
 		{
 			name: "Chat Completions", path: "/v1/chat/completions",
 			body: `{"model":"gpt-5.1","stream":true,"messages":[{"role":"user","content":"` + oversize + `"}]}`,
@@ -1008,7 +1033,40 @@ func TestOpenAIGatewayHandler_OversizeChatAndMessagesRouteOnlyToVerifiedNonProWi
 	}
 }
 
-func TestOpenAIGatewayHandler_ChatAndMessagesRejectInvalidCompleteRoutingEnvelope(t *testing.T) {
+func TestOpenAIGatewayHandler_MaxObservedOversizeResponsesLateRoutingFieldsSucceeds(t *testing.T) {
+	const bodyBytes = 54_628_726
+	prefix := []byte(`{"input":"`)
+	suffix := []byte(`","model":"gpt-5.1","stream":true}`)
+	body := make([]byte, bodyBytes)
+	start := copy(body, prefix)
+	end := len(body) - len(suffix)
+	for index := start; index < end; index++ {
+		body[index] = 'x'
+	}
+	copy(body[end:], suffix)
+
+	upstream := &selectedAccountAuditResponsesUpstream{}
+	engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine,
+		selectedAccountAuditFallbackAccounts(service.AccountTypeOAuth, map[string]any{
+			"access_token": "verified-plus-token", "plan_type": "plus",
+		}))
+	c, recorder := selectedAccountAuditHTTPBytesContext(t, "/v1/responses", body)
+	body = nil
+
+	handler.Responses(c)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, []int64{4}, upstream.calls(), "maximum observed oversize request must use only an audit-exempt account")
+	require.Empty(t, scannerCalls(), "oversize classification must not invoke the prompt scanner")
+	state := openAISecurityAdmissionFromContext(c)
+	require.NotNil(t, state)
+	require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
+	require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
+	require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
+}
+
+func TestOpenAIGatewayHandler_OpenAIHTTPRejectsInvalidCompleteRoutingEnvelope(t *testing.T) {
 	oversize := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
 	payloads := []struct {
 		name    string
@@ -1024,6 +1082,12 @@ func TestOpenAIGatewayHandler_ChatAndMessagesRejectInvalidCompleteRoutingEnvelop
 		bodyClose string
 		invoke    func(*OpenAIGatewayHandler, *gin.Context)
 	}{
+		{
+			name: "Responses", path: "/v1/responses",
+			prefix:    `{"model":"gpt-5.1","stream":false,"input":"`,
+			bodyClose: `"`,
+			invoke:    func(h *OpenAIGatewayHandler, c *gin.Context) { h.Responses(c) },
+		},
 		{
 			name: "Chat Completions", path: "/v1/chat/completions",
 			prefix:    `{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"`,
@@ -1073,7 +1137,7 @@ func TestOpenAIGatewayHandler_ChatAndMessagesRejectInvalidCompleteRoutingEnvelop
 	}
 }
 
-func TestOpenAIGatewayHandler_OversizeChatAndMessagesKeepUnavailableRoutingEnvelopeAs503(t *testing.T) {
+func TestOpenAIGatewayHandler_OversizeChatAndMessagesLateRoutingFieldsSucceed(t *testing.T) {
 	padding := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
 	tests := []struct {
 		name   string
@@ -1105,15 +1169,112 @@ func TestOpenAIGatewayHandler_OversizeChatAndMessagesKeepUnavailableRoutingEnvel
 
 			test.invoke(handler, c)
 
-			require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
-			require.Contains(t, recorder.Body.String(), "routing metadata is unavailable")
-			require.Empty(t, upstream.calls())
-			require.Empty(t, scannerCalls())
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.Equal(t, []int64{4}, upstream.calls(), "oversize must exclude Pro and unknown accounts")
+			require.Empty(t, scannerCalls(), "oversize classification must not invoke the prompt scanner")
+			state := openAISecurityAdmissionFromContext(c)
+			require.NotNil(t, state)
+			require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
+			require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
+			require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
 		})
 	}
 }
 
-func TestOpenAIGatewayHandler_OversizeResponsesRejectsOpaqueImageIntentBeforeDispatch(t *testing.T) {
+func TestOpenAIGatewayHandler_ResponsesRejectsAmbiguousPolicyKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "top-level previous response id",
+			body: `{"model":"gpt-5.1","stream":false,"previous_response_id":null,"input":"hello",` +
+				`"previous_response_id":"resp_late"}`,
+		},
+		{
+			name: "top-level tools",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello","tools":[],` +
+				`"tools":[{"type":"image_generation"}]}`,
+		},
+		{
+			name: "top-level reasoning",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello","reasoning":{"effort":"low"},` +
+				`"reasoning":{"effort":"high"}}`,
+		},
+		{
+			name: "nested tool type",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello",` +
+				`"tools":[{"type":"function","type":"image_generation"}]}`,
+		},
+		{
+			name: "nested reasoning effort",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello",` +
+				`"reasoning":{"effort":"low","effort":"high"}}`,
+		},
+		{
+			name: "nested input content",
+			body: `{"model":"gpt-5.1","stream":false,"input":[{"type":"message","role":"user",` +
+				`"content":"safe","content":"late"}]}`,
+		},
+		{
+			name: "single reasoning alias",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello",` +
+				`"reasoning":{"Effort":"max"}}`,
+		},
+		{
+			name: "single tools alias",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello",` +
+				`"Tools":[{"type":"image_generation"}]}`,
+		},
+		{
+			name: "single tool type alias",
+			body: `{"model":"gpt-5.1","stream":false,"input":"hello",` +
+				`"tools":[{"Type":"image_generation"}]}`,
+		},
+		{
+			name: "single input type alias",
+			body: `{"model":"gpt-5.1","stream":false,"input":[` +
+				`{"Type":"function_call_output","call_id":"call_1","output":"result"}]}`,
+		},
+	}
+	payloads := []struct {
+		name   string
+		prefix string
+	}{
+		{name: "normal"},
+		{
+			name:   "oversized",
+			prefix: `"padding":"` + strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1) + `",`,
+		},
+	}
+
+	for _, payload := range payloads {
+		for _, test := range cases {
+			t.Run(payload.name+"/"+test.name, func(t *testing.T) {
+				upstream := &selectedAccountAuditResponsesUpstream{}
+				engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+				handler, _ := newSelectedAccountAuditHandler(t, upstream, engine,
+					selectedAccountAuditFallbackAccounts(service.AccountTypeOAuth, map[string]any{
+						"access_token": "verified-plus-token", "plan_type": "plus",
+					}))
+				body := test.body
+				if payload.prefix != "" {
+					body = "{" + payload.prefix + strings.TrimPrefix(body, "{")
+				}
+				c, recorder := selectedAccountAuditHTTPContext(t, "/v1/responses", body)
+
+				handler.Responses(c)
+
+				require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+				require.Contains(t, recorder.Body.String(), "invalid_request_error")
+				require.Empty(t, upstream.calls(), "ambiguous policy fields must be rejected before dispatch")
+				require.Empty(t, scannerCalls(), "ambiguous policy fields must be rejected before scanning")
+			})
+		}
+	}
+}
+
+func TestOpenAIGatewayHandler_OversizeResponsesRejectsExplicitImageIntentBeforeDispatch(t *testing.T) {
 	padding := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
 	body := `{"model":"gpt-5.1","stream":true,"input":"` + padding +
 		`","tools":[{"type":"image_generation"}]}`
@@ -1130,8 +1291,9 @@ func TestOpenAIGatewayHandler_OversizeResponsesRejectsOpaqueImageIntentBeforeDis
 
 	handler.Responses(c)
 
-	require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
-	require.Empty(t, upstream.calls(), "opaque image intent must be rejected before upstream dispatch")
+	require.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+	require.Contains(t, recorder.Body.String(), service.ImageGenerationPermissionMessage())
+	require.Empty(t, upstream.calls(), "forbidden image intent must be rejected before upstream dispatch")
 	require.Empty(t, scannerCalls(), "oversize classification must not scan the body")
 	state := openAISecurityAdmissionFromContext(c)
 	require.NotNil(t, state)

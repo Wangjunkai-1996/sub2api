@@ -2338,6 +2338,20 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
 		var selection *AccountSelectionResult
 		var decision OpenAIAccountScheduleDecision
 		var err error
+		expectedPoolIndex := -1
+		trafficPlan, trafficPlanErr := s.resolveOpenAITrafficDirectorPlan(poolLocalCtx, groupID, PlatformOpenAI, sessionHash)
+		if trafficPlanErr != nil {
+			return nil, decision, trafficPlanErr
+		}
+		if trafficPlan != nil && trafficPlan.mode == domain.TrafficDirectorModeEnforced {
+			if state := openAITrafficDirectorRequestStateFromContext(poolLocalCtx); state != nil {
+				state.mu.Lock()
+				expectedPoolIndex = trafficPlan.currentIndex
+				state.mu.Unlock()
+			} else {
+				expectedPoolIndex = trafficPlan.currentIndex
+			}
+		}
 		for _, capability := range capabilities {
 			selection, decision, err = s.selectAccountWithScheduler(poolLocalCtx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", capability, false, PlatformOpenAI, false, false)
 			if err == nil && selection != nil && selection.Account != nil {
@@ -2353,7 +2367,7 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
 		if !poolExhausted {
 			return selection, decision, err
 		}
-		enforced, advanced, advanceErr := s.advanceOpenAITrafficDirectorPool(poolLocalCtx, groupID, PlatformOpenAI, sessionHash)
+		enforced, advanced, advanceErr := s.advanceOpenAITrafficDirectorPool(poolLocalCtx, groupID, PlatformOpenAI, sessionHash, expectedPoolIndex)
 		if advanceErr != nil {
 			return nil, decision, advanceErr
 		}

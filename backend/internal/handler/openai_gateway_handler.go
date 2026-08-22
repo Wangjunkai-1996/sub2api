@@ -329,9 +329,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
-	// Classify before any body walk. Oversized Responses requests use only a
-	// fixed 4KiB routing envelope and fail closed because their opaque suffix
-	// may require permission, capability, concurrency, or billing preprocessing.
+	// Classify before the content walk. Oversized requests remain opaque to the
+	// prompt classifier (and therefore use audit-exempt account admission), but
+	// their complete body is already resident and still must be parsed for
+	// routing, capability, and request-shaping decisions.
 	var admissionState *openAISecurityAdmissionState
 	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
 		state, classifyErr := classifyOpenAISecurityAdmission(string(securityadmission.ProtocolOpenAIResponses), body, securityadmission.LineageUntrusted)
@@ -345,39 +346,25 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		installOpenAISecurityAdmission(c, admissionState)
 		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
 	}
-	oversizeRequest := isOpenAIOversizeAdmission(admissionState)
-	var oversizeEnvelope securityadmission.RoutingEnvelope
-	if oversizeRequest {
-		oversizeEnvelope, err = extractOpenAIOversizeRoutingEnvelope(
-			admissionState, securityadmission.ProtocolOpenAIResponses, body,
-		)
-		if err != nil {
-			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_envelope_unavailable", admissionState, 0,
-				securityadmission.AccountUnknown, "oversize_envelope_unavailable", "upstream_not_dispatched", zap.Error(err))
-			h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request routing metadata is unavailable")
+	if validateErr := securityadmission.ValidateCompleteResponsesJSON(body); validateErr != nil {
+		logRequestBodyParseFailure(reqLog, body, validateErr)
+		if errors.Is(validateErr, securityadmission.ErrRoutingEnvelopeResourceLimit) {
+			h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Request structure exceeds gateway validation capacity")
 			return
 		}
-		if reason := openAIOversizeResponsesPreprocessingReason(c, apiKey, oversizeEnvelope.Model); reason != "" {
-			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
-				securityadmission.AccountUnknown, reason, "upstream_not_dispatched")
-			h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request requires unsupported gateway preprocessing")
-			return
-		}
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
 	}
 
 	setOpsRequestContext(c, "", false)
 	auditBody := body
 	sessionAffinityBody := body
-	if oversizeRequest {
-		sessionAffinityBody = nil
-	} else {
-		body, ok = h.normalizeOpenAIResponsesCompactRequest(c, reqLog, body)
-		if !ok {
-			return
-		}
+	body, ok = h.normalizeOpenAIResponsesCompactRequest(c, reqLog, body)
+	if !ok {
+		return
 	}
 	legacyCompact := service.IsOpenAIResponsesCompactPath(c)
-	nativeV2 := !oversizeRequest && isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(body)
+	nativeV2 := isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(body)
 	if nativeV2 {
 		// 原生 v2 压缩出站前补注 x-codex-beta-features: remote_compaction_v2，
 		// 与真实 Codex 线型一致（网关链剥头后本级负责恢复，#5586）。
@@ -389,50 +376,31 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	stopCompactKeepalive := service.StartOpenAICompactSSEKeepalive(c, h.openAICompactKeepaliveInterval())
 	defer stopCompactKeepalive()
 
-	// Normal-sized requests retain complete JSON validation. An oversized body
-	// was deliberately classified as opaque and must not be walked here.
-	if !oversizeRequest && !gjson.ValidBytes(body) {
-		logRequestBodyParseFailure(reqLog, body, nil)
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+	// 使用 gjson 只读提取字段做校验，避免完整 Unmarshal。完整 JSON
+	// 结构和对象键已由 ValidateCompleteResponsesJSON 校验；这也保证
+	// 网关策略读取值不会与下游 JSON 解码语义分叉。
+	modelResult := gjson.GetBytes(body, "model")
+	if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
-
-	var reqModel string
-	if oversizeRequest {
-		reqModel = oversizeEnvelope.Model
-	} else {
-		// 使用 gjson 只读提取字段做校验，避免完整 Unmarshal
-		modelResult := gjson.GetBytes(body, "model")
-		if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
-			return
-		}
-		reqModel = modelResult.String()
-	}
+	reqModel := modelResult.String()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	if !compositeTargetPlatformAllowed(c, apiKey, reqModel, service.PlatformOpenAI, service.PlatformGrok) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
-	if !oversizeRequest {
-		if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
-			body = cappedBody
-		}
+	if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
+		body = cappedBody
 	}
 
-	reqStream := oversizeEnvelope.Stream
-	if !oversizeRequest {
-		reqStream, ok = parseOpenAICompatibleStream(body)
-		if !ok {
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
-			return
-		}
+	reqStream, ok := parseOpenAICompatibleStream(body)
+	if !ok {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
+		return
 	}
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
-	previousResponseID := ""
-	if !oversizeRequest {
-		previousResponseID = strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
-	}
+	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
 	if previousResponseID != "" {
 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
 		reqLog = reqLog.With(
@@ -479,11 +447,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 使用 IsExplicitImageGenerationIntent 排除被动 image_gen namespace 声明。
 	// Codex 在所有请求中被动声明 image_gen namespace，宽泛检测会导致禁了生图的
 	// 分组中所有 Codex 请求被 403（#4447），并误占生图并发槽位。
-	imageIntentBody := body
-	if oversizeRequest {
-		imageIntentBody = nil
-	}
-	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, imageIntentBody)
+	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, body)
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", service.ImageGenerationPermissionMessage())
 		return
@@ -502,16 +466,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
-	if oversizeRequest && channelMapping.Mapped {
-		warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
-			securityadmission.AccountUnknown, "oversize_channel_model_mapping_required", "upstream_not_dispatched")
-		h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request requires unsupported gateway preprocessing")
-		return
-	}
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
-	if !oversizeRequest {
-		seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
-	}
+	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
 	forwardModel := reqModel
 	if channelMapping.Mapped {
 		forwardModel = channelMapping.MappedModel
@@ -526,7 +482,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	c.Request = c.Request.WithContext(forwardCtx)
 
 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
-	if !oversizeRequest && !h.validateFunctionCallOutputRequest(c, body, reqLog) {
+	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
 		return
 	}
 

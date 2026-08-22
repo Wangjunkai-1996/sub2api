@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
@@ -16,6 +18,20 @@ import (
 type openAITrafficDirectorResolverStub struct {
 	policy TrafficDirectorResolvedPolicy
 	calls  atomic.Int64
+}
+
+type blockingOpenAITrafficDirectorResolverStub struct {
+	policy  TrafficDirectorResolvedPolicy
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+type blockingTrafficDirectorAccountRepo struct {
+	schedulerTestOpenAIAccountRepo
+	firstListStarted chan struct{}
+	releaseFirstList chan struct{}
+	listCalls        atomic.Int64
 }
 
 type trafficDirectorEligibilityGroupRepoStub struct {
@@ -96,6 +112,25 @@ func (r trafficDirectorEligibilityGroupRepoStub) GetByID(context.Context, int64)
 func (r *openAITrafficDirectorResolverStub) ResolveOpenAITrafficDirector(context.Context, int64) (TrafficDirectorResolvedPolicy, error) {
 	r.calls.Add(1)
 	return r.policy, nil
+}
+
+func (r *blockingOpenAITrafficDirectorResolverStub) ResolveOpenAITrafficDirector(context.Context, int64) (TrafficDirectorResolvedPolicy, error) {
+	r.calls.Add(1)
+	r.entered <- struct{}{}
+	<-r.release
+	return r.policy, nil
+}
+
+func (r *blockingTrafficDirectorAccountRepo) ListSchedulableByGroupIDAndPlatform(
+	ctx context.Context,
+	groupID int64,
+	platform string,
+) ([]Account, error) {
+	if r.listCalls.Add(1) == 1 {
+		close(r.firstListStarted)
+		<-r.releaseFirstList
+	}
+	return r.schedulerTestOpenAIAccountRepo.ListSchedulableByGroupIDAndPlatform(ctx, groupID, platform)
 }
 
 type openAITrafficDirectorHeadReaderStub struct {
@@ -212,6 +247,49 @@ func TestOpenAITrafficDirectorPlanIsResolvedOncePerRequest(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, first, second)
 	require.Equal(t, int64(1), resolver.calls.Load())
+}
+
+func TestOpenAITrafficDirectorConcurrentPlanResolutionSharesOnePlan(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		spec := testOpenAITrafficDirectorSpec()
+		resolver := &blockingOpenAITrafficDirectorResolverStub{
+			policy: TrafficDirectorResolvedPolicy{
+				Version: TrafficDirectorVersion{GroupID: 42, Version: 7, Mode: domain.TrafficDirectorModeEnforced, Spec: &spec},
+			},
+			entered: make(chan struct{}, 2),
+			release: make(chan struct{}),
+		}
+		svc := &OpenAIGatewayService{}
+		svc.SetOpenAITrafficDirectorResolver(resolver)
+		groupID := int64(42)
+		ctx := context.WithValue(context.Background(), ctxkey.RequestID, "request-concurrent-plan")
+		ctx = svc.WithOpenAITrafficDirectorRequestContext(ctx)
+
+		type result struct {
+			plan *openAITrafficDirectorRequestPlan
+			err  error
+		}
+		results := make(chan result, 2)
+		for range 2 {
+			go func() {
+				plan, err := svc.resolveOpenAITrafficDirectorPlan(ctx, &groupID, PlatformOpenAI, "")
+				results <- result{plan: plan, err: err}
+			}()
+		}
+
+		<-resolver.entered
+		synctest.Wait()
+		resolverCalls := resolver.calls.Load()
+		close(resolver.release)
+
+		first := <-results
+		second := <-results
+		require.Equal(t, int64(1), resolverCalls, "one request must not fork independent plans")
+		require.NoError(t, first.err)
+		require.NoError(t, second.err)
+		require.NotNil(t, first.plan)
+		require.Same(t, first.plan, second.plan)
+	})
 }
 
 func TestOpenAITrafficDirectorPlatformBoundary(t *testing.T) {
@@ -671,6 +749,116 @@ func TestOpenAITrafficDirectorPoolLocalSelectionDoesNotAdvanceFallback(t *testin
 	require.NotNil(t, plan)
 	require.Zero(t, plan.currentIndex,
 		"a pool-local capability probe must not consume the explicit fallback")
+}
+
+func TestOpenAITrafficDirectorDiscardsEligibleResultFromStalePool(t *testing.T) {
+	spec := testOpenAITrafficDirectorSpec()
+	resolver := &openAITrafficDirectorResolverStub{policy: TrafficDirectorResolvedPolicy{
+		Version: TrafficDirectorVersion{GroupID: 42, Version: 1, Mode: domain.TrafficDirectorModeEnforced, Spec: &spec},
+	}}
+	repo := &blockingTrafficDirectorAccountRepo{
+		schedulerTestOpenAIAccountRepo: schedulerTestOpenAIAccountRepo{accounts: []Account{
+			testOpenAIAccountForTrafficDirector(101, 42),
+			testOpenAIAccountForTrafficDirector(202, 42),
+		}},
+		firstListStarted: make(chan struct{}),
+		releaseFirstList: make(chan struct{}),
+	}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc.SetOpenAITrafficDirectorResolver(resolver)
+	groupID := int64(42)
+	ctx := context.WithValue(context.Background(), ctxkey.RequestID, "request-stale-primary")
+	ctx = svc.WithOpenAITrafficDirectorRequestContext(ctx)
+
+	type result struct {
+		plan    *openAITrafficDirectorRequestPlan
+		allowed map[int64]struct{}
+		err     error
+	}
+	firstResult := make(chan result, 1)
+	go func() {
+		plan, allowed, err := svc.trafficDirectorSelectPool(
+			ctx, &groupID, PlatformOpenAI, "", "gpt-5",
+			OpenAIUpstreamTransportAny, "", "", false, nil,
+		)
+		firstResult <- result{plan: plan, allowed: allowed, err: err}
+	}()
+
+	<-repo.firstListStarted
+	secondPlan, secondAllowed, err := svc.trafficDirectorSelectPool(
+		ctx, &groupID, PlatformOpenAI, "", "gpt-5",
+		OpenAIUpstreamTransportAny, "", "", false, map[int64]struct{}{101: {}},
+	)
+	close(repo.releaseFirstList)
+	require.NoError(t, err)
+	require.Equal(t, map[int64]struct{}{202: {}}, secondAllowed)
+
+	first := <-firstResult
+	require.NoError(t, first.err)
+	require.Same(t, secondPlan, first.plan)
+	require.Equal(t, map[int64]struct{}{202: {}}, first.allowed,
+		"a slow primary result must be re-evaluated after another selector advances the plan")
+}
+
+func TestOpenAITrafficDirectorConcurrentExplicitAdvanceConsumesOneFallbackEdge(t *testing.T) {
+	spec := domain.TrafficDirectorSpec{
+		SchemaVersion: domain.TrafficDirectorSchemaVersion,
+		HealthMode:    domain.TrafficDirectorHealthModeEnforce,
+		Pools: []domain.TrafficDirectorPool{
+			{Key: "primary", WeightBPS: 10000, AccountIDs: []int64{101}, MinAvailable: 1, FallbackPoolKey: "backup"},
+			{Key: "backup", WeightBPS: 0, AccountIDs: []int64{202}, MinAvailable: 1, FallbackPoolKey: "last"},
+			{Key: "last", WeightBPS: 0, AccountIDs: []int64{303}, MinAvailable: 1},
+		},
+	}
+	resolver := &openAITrafficDirectorResolverStub{policy: TrafficDirectorResolvedPolicy{
+		Version: TrafficDirectorVersion{GroupID: 42, Version: 1, Mode: domain.TrafficDirectorModeEnforced, Spec: &spec},
+	}}
+	svc := &OpenAIGatewayService{}
+	svc.SetOpenAITrafficDirectorResolver(resolver)
+	groupID := int64(42)
+	ctx := context.WithValue(context.Background(), ctxkey.RequestID, "request-concurrent-explicit-advance")
+	ctx = svc.WithOpenAITrafficDirectorRequestContext(ctx)
+	plan, err := svc.resolveOpenAITrafficDirectorPlan(ctx, &groupID, PlatformOpenAI, "")
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	type result struct {
+		enforced bool
+		advanced bool
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			enforced, advanced, err := svc.advanceOpenAITrafficDirectorPool(
+				ctx, &groupID, PlatformOpenAI, "", 0,
+			)
+			results <- result{enforced: enforced, advanced: advanced, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		require.NoError(t, got.err)
+		require.True(t, got.enforced)
+		require.True(t, got.advanced)
+	}
+
+	state := openAITrafficDirectorRequestStateFromContext(ctx)
+	require.NotNil(t, state)
+	state.mu.Lock()
+	pool, ok := plan.currentPool()
+	currentIndex := plan.currentIndex
+	state.mu.Unlock()
+	require.True(t, ok)
+	require.Equal(t, 1, currentIndex)
+	require.Equal(t, "backup", pool.Key, "concurrent retries from primary must not skip the first fallback")
 }
 
 func TestOpenAITrafficDirectorPoolEligibilityExcludesOwnedHalfOpenProbe(t *testing.T) {

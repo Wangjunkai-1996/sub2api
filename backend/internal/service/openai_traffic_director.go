@@ -208,6 +208,10 @@ type openAITrafficDirectorRequestPlan struct {
 type openAITrafficDirectorPlanEntry struct {
 	plan *openAITrafficDirectorRequestPlan
 	err  error
+	// ready is non-nil while the first caller is resolving this request plan.
+	// Concurrent callers wait for the same immutable result instead of creating
+	// independent mutable pool chains for one request.
+	ready chan struct{}
 }
 
 // The state is a mutable pointer held by the request context. This makes pool
@@ -605,41 +609,71 @@ func (s *OpenAIGatewayService) resolveOpenAITrafficDirectorPlan(
 	state := openAITrafficDirectorRequestStateFromContext(ctx)
 	routingKey := trafficDirectorRoutingKey(ctx, sessionHash, state)
 	key := openAITrafficDirectorPlanKey{groupID: *groupID, platform: PlatformOpenAI, routingKey: routingKey}
+	var resolutionReady chan struct{}
 	if state != nil {
 		state.mu.Lock()
-		if entry, ok := state.plans[key]; ok {
-			state.mu.Unlock()
-			return entry.plan, entry.err
-		}
+		cachedKey := key
+		entry, cached := state.plans[key]
 		// A few OpenAI endpoints materialize a pool-mode session hash only
 		// after the first account is selected. Keep the request's original
 		// evaluated plan in that case; changing the routing-key representation
 		// must never reset a request that has already advanced its pool chain.
-		for existingKey, entry := range state.plans {
-			if existingKey.groupID == key.groupID && existingKey.platform == key.platform {
-				state.mu.Unlock()
-				return entry.plan, entry.err
+		if !cached {
+			for existingKey, existingEntry := range state.plans {
+				if existingKey.groupID == key.groupID && existingKey.platform == key.platform {
+					cachedKey = existingKey
+					entry = existingEntry
+					cached = true
+					break
+				}
 			}
+		}
+		if cached {
+			ready := entry.ready
+			state.mu.Unlock()
+			if ready != nil {
+				if ctx == nil {
+					<-ready
+				} else {
+					select {
+					case <-ready:
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				state.mu.Lock()
+				entry = state.plans[cachedKey]
+				state.mu.Unlock()
+			}
+			return entry.plan, entry.err
+		}
+		if state.plans == nil {
+			state.plans = make(map[openAITrafficDirectorPlanKey]openAITrafficDirectorPlanEntry)
+		}
+		resolutionReady = make(chan struct{})
+		state.plans[key] = openAITrafficDirectorPlanEntry{ready: resolutionReady}
+		state.mu.Unlock()
+	}
+	publishResolution := func(plan *openAITrafficDirectorRequestPlan, resolveErr error) {
+		if state == nil {
+			return
+		}
+		state.mu.Lock()
+		state.plans[key] = openAITrafficDirectorPlanEntry{plan: plan, err: resolveErr}
+		if resolutionReady != nil {
+			close(resolutionReady)
 		}
 		state.mu.Unlock()
 	}
 
 	resolved, err := resolver.ResolveOpenAITrafficDirector(ctx, *groupID)
 	if err != nil {
-		if state != nil {
-			state.mu.Lock()
-			state.plans[key] = openAITrafficDirectorPlanEntry{err: err}
-			state.mu.Unlock()
-		}
+		publishResolution(nil, err)
 		recordTrafficDirectorPolicyUnavailable(state)
 		return nil, err
 	}
 	if err = validateOpenAITrafficDirectorResolvedHead(ctx, *groupID, resolved); err != nil {
-		if state != nil {
-			state.mu.Lock()
-			state.plans[key] = openAITrafficDirectorPlanEntry{err: err}
-			state.mu.Unlock()
-		}
+		publishResolution(nil, err)
 		recordTrafficDirectorPolicyUnavailable(state)
 		return nil, err
 	}
@@ -680,19 +714,11 @@ func (s *OpenAIGatewayService) resolveOpenAITrafficDirectorPlan(
 		}
 	}
 	if err != nil {
-		if state != nil {
-			state.mu.Lock()
-			state.plans[key] = openAITrafficDirectorPlanEntry{err: err}
-			state.mu.Unlock()
-		}
+		publishResolution(nil, err)
 		recordTrafficDirectorPolicyUnavailable(state)
 		return nil, err
 	}
-	if state != nil {
-		state.mu.Lock()
-		state.plans[key] = openAITrafficDirectorPlanEntry{plan: plan}
-		state.mu.Unlock()
-	}
+	publishResolution(plan, nil)
 	recordTrafficDirectorResolvedPolicy(state, mode, resolved)
 	return plan, nil
 }
@@ -993,6 +1019,7 @@ func (s *OpenAIGatewayService) trafficDirectorSelectPool(
 		// rechecked under the mutex before every advancement so concurrent
 		// failover callers still observe a monotonic chain.
 		state.mu.Lock()
+		poolIndex := plan.currentIndex
 		pool, ok := plan.currentPool()
 		state.mu.Unlock()
 		if !ok {
@@ -1000,28 +1027,25 @@ func (s *OpenAIGatewayService) trafficDirectorSelectPool(
 			return plan, nil, ErrTrafficDirectorNoAvailablePool
 		}
 		allowed, eligibilityErr := s.trafficDirectorEligibleAccountIDs(ctx, groupID, platform, requestedModel, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, excludedIDs, plan, pool)
+		state.mu.Lock()
+		if plan.currentIndex != poolIndex {
+			// Eligibility was computed outside the lock. A newer pool has already
+			// become authoritative, so discard the stale result and re-evaluate.
+			state.mu.Unlock()
+			continue
+		}
 		if eligibilityErr != nil {
+			state.mu.Unlock()
 			return plan, nil, eligibilityErr
 		}
 		if len(allowed) >= pool.MinAvailable {
+			state.mu.Unlock()
 			return plan, allowed, nil
 		}
 		recordTrafficDirectorPoolExhausted(plan, pool.Key)
 		if openAITrafficDirectorPoolAdvanceSuppressed(ctx) {
+			state.mu.Unlock()
 			return plan, nil, ErrNoAvailableAccounts
-		}
-		state.mu.Lock()
-		current, currentOK := plan.currentPool()
-		if !currentOK {
-			state.mu.Unlock()
-			recordTrafficDirectorNoAvailablePool(plan)
-			return plan, nil, ErrTrafficDirectorNoAvailablePool
-		}
-		if current.Key != pool.Key {
-			// Another concurrent selector already advanced the request. Re-run
-			// eligibility against that newer pool instead of moving twice.
-			state.mu.Unlock()
-			continue
 		}
 		advanced := plan.advancePool()
 		state.mu.Unlock()
@@ -1037,6 +1061,7 @@ func (s *OpenAIGatewayService) advanceOpenAITrafficDirectorPool(
 	groupID *int64,
 	platform string,
 	sessionHash string,
+	expectedPoolIndex int,
 ) (enforced bool, advanced bool, err error) {
 	plan, err := s.resolveOpenAITrafficDirectorPlan(ctx, groupID, platform, sessionHash)
 	if err != nil || plan == nil || plan.mode != domain.TrafficDirectorModeEnforced {
@@ -1044,6 +1069,9 @@ func (s *OpenAIGatewayService) advanceOpenAITrafficDirectorPool(
 	}
 	state := openAITrafficDirectorRequestStateFromContext(ctx)
 	if state == nil {
+		if expectedPoolIndex >= 0 && plan.currentIndex != expectedPoolIndex {
+			return true, true, nil
+		}
 		pool, _ := plan.currentPool()
 		recordTrafficDirectorPoolExhausted(plan, pool.Key)
 		advanced = plan.advancePool()
@@ -1053,6 +1081,13 @@ func (s *OpenAIGatewayService) advanceOpenAITrafficDirectorPool(
 		return true, advanced, nil
 	}
 	state.mu.Lock()
+	if expectedPoolIndex >= 0 && plan.currentIndex != expectedPoolIndex {
+		// Another selector already consumed this pool transition. Treat that as
+		// forward progress so the caller re-evaluates the now-current pool, but do
+		// not consume a second fallback edge from the same stale observation.
+		state.mu.Unlock()
+		return true, true, nil
+	}
 	pool, _ := plan.currentPool()
 	recordTrafficDirectorPoolExhausted(plan, pool.Key)
 	advanced = plan.advancePool()
