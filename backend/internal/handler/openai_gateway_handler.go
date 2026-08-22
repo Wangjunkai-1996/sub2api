@@ -358,13 +358,20 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 	setOpsRequestContext(c, "", false)
 	auditBody := body
-	sessionAffinityBody := body
 	body, ok = h.normalizeOpenAIResponsesCompactRequest(c, reqLog, body)
 	if !ok {
 		return
 	}
 	legacyCompact := service.IsOpenAIResponsesCompactPath(c)
-	nativeV2 := isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(body)
+	nativeV2 := false
+	if isBareOpenAIResponsesPath(c) {
+		checked, checkedOK := c.Get(openAICompactionSignalCheckedKey)
+		if checkedValue, checkedTypeOK := checked.(bool); !checkedOK || !checkedTypeOK || !checkedValue {
+			nativeV2 = isOpenAIRemoteCompactionV2Request(body)
+		} else if nativeValue, exists := c.Get(openAICompactionSignalNativeKey); exists {
+			nativeV2, _ = nativeValue.(bool)
+		}
+	}
 	if nativeV2 {
 		// 原生 v2 压缩出站前补注 x-codex-beta-features: remote_compaction_v2，
 		// 与真实 Codex 线型一致（网关链剥头后本级负责恢复，#5586）。
@@ -519,7 +526,17 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 
 	// Generate session hash (header first; fallback to prompt_cache_key)
-	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionAffinityBody)
+	// Oversized requests are intentionally opaque to content-derived sticky
+	// hashing. The complete body is already retained for routing/validation;
+	// hashing it again would scan and copy tens of megabytes before admission.
+	// Keep explicit headers and prompt-cache keys, but never derive affinity
+	// from the opaque content itself.
+	var sessionHash string
+	if isOpenAIOversizeAdmission(admissionState) {
+		sessionHash = h.gatewayService.GenerateExplicitSessionHash(c, auditBody)
+	} else {
+		sessionHash = h.gatewayService.GenerateSessionHash(c, auditBody)
+	}
 	requireCompact := legacyCompact
 
 	maxAccountSwitches := h.maxAccountSwitches
@@ -679,6 +696,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		selection.Account = account
 		terminalCtx := service.WithOpenAIAccountTerminalAdmission(c.Request.Context(), terminalAdmission)
 		c.Request = c.Request.WithContext(terminalCtx)
+		if service.OpenAIAccountRequirementFromContext(terminalCtx) == securityadmission.AccountRequirementAuditExempt {
+			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(terminalCtx, apiKey.GroupID, sessionHash, account.ID); err != nil {
+				reqLog.Warn("openai.bind_security_sticky_session_after_terminal_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			}
+		}
 		releaseAccount := func() {
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()
@@ -939,9 +961,22 @@ func isBareOpenAIResponsesPath(c *gin.Context) bool {
 	}
 }
 
+const (
+	openAICompactionSignalCheckedKey = "openai.compaction_signal_checked"
+	openAICompactionSignalNativeKey  = "openai.compaction_signal_native"
+)
+
 func isOpenAIRemoteCompactionV2Request(body []byte) bool {
 	stream, valid := parseOpenAICompatibleStream(body)
 	return valid && stream && service.HasCompactionTriggerInInput(body)
+}
+
+func isOpenAIRemoteCompactionV2RequestWithTrigger(body []byte, hasTrigger bool) bool {
+	if !hasTrigger {
+		return false
+	}
+	stream, valid := parseOpenAICompatibleStream(body)
+	return valid && stream
 }
 
 // normalizeOpenAIResponsesCompactRequest keeps Codex remote compaction v2 on
@@ -950,11 +985,22 @@ func isOpenAIRemoteCompactionV2Request(body []byte) bool {
 // 返回归一化后的 body；ok=false 表示错误响应已写出，调用方应直接 return。
 func (h *OpenAIGatewayHandler) normalizeOpenAIResponsesCompactRequest(c *gin.Context, reqLog *zap.Logger, body []byte) ([]byte, bool) {
 	isCompactRequest := isOpenAILegacyCompactPath(c)
-	if !isCompactRequest && isBareOpenAIResponsesPath(c) && service.HasCompactionTriggerInInput(body) {
-		if isOpenAIRemoteCompactionV2Request(body) {
+	if !isCompactRequest && isBareOpenAIResponsesPath(c) {
+		hasTrigger := service.HasCompactionTriggerInInput(body)
+		nativeV2 := isOpenAIRemoteCompactionV2RequestWithTrigger(body, hasTrigger)
+		if c != nil {
+			c.Set(openAICompactionSignalCheckedKey, true)
+			c.Set(openAICompactionSignalNativeKey, nativeV2)
+		}
+		if nativeV2 {
 			return body, true
 		}
-		c.Request.URL.Path = strings.TrimRight(c.Request.URL.Path, "/") + "/compact"
+		if hasTrigger {
+			c.Request.URL.Path = strings.TrimRight(c.Request.URL.Path, "/") + "/compact"
+		}
+		if !hasTrigger {
+			return body, true
+		}
 		isCompactRequest = true
 		clientStream := gjson.GetBytes(body, "stream").Bool()
 		if clientStream {
@@ -1402,6 +1448,11 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		selection.Account = account
 		terminalCtx := service.WithOpenAIAccountTerminalAdmission(c.Request.Context(), terminalAdmission)
 		c.Request = c.Request.WithContext(terminalCtx)
+		if service.OpenAIAccountRequirementFromContext(terminalCtx) == securityadmission.AccountRequirementAuditExempt {
+			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(terminalCtx, apiKey.GroupID, sessionHash, account.ID); err != nil {
+				reqLog.Warn("openai.bind_security_sticky_session_after_terminal_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			}
+		}
 		releaseAccount := func() {
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()

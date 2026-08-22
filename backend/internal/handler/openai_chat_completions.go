@@ -357,6 +357,11 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		selection.Account = account
 		terminalCtx := service.WithOpenAIAccountTerminalAdmission(c.Request.Context(), terminalAdmission)
 		c.Request = c.Request.WithContext(terminalCtx)
+		if service.OpenAIAccountRequirementFromContext(terminalCtx) == securityadmission.AccountRequirementAuditExempt {
+			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(terminalCtx, apiKey.GroupID, sessionHash, account.ID); err != nil {
+				reqLog.Warn("openai_chat_completions.bind_security_sticky_session_after_terminal_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			}
+		}
 		releaseAccount := func() {
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -413,6 +414,114 @@ func selectedAccountAuditHTTPBytesContext(t *testing.T, path string, body []byte
 	apiKey.Group.AllowMessagesDispatch = true
 	c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: 100, Concurrency: 1})
 	return c, recorder
+}
+
+func selectedAccountAuditProductionOversizeFixture(t *testing.T, path string, bodyBytes int) []byte {
+	t.Helper()
+	prefix := `{"input":"`
+	suffix := `","model":"gpt-5.1","stream":true}`
+	if path == "/v1/chat/completions" {
+		prefix = `{"messages":[{"role":"user","content":"`
+		suffix = `"}],"model":"gpt-5.1","stream":true}`
+	}
+	require.GreaterOrEqual(t, bodyBytes, len(prefix)+len(suffix))
+	body := make([]byte, bodyBytes)
+	start := copy(body, prefix)
+	end := bodyBytes - len(suffix)
+	for index := start; index < end; index++ {
+		body[index] = 'x'
+	}
+	copy(body[end:], suffix)
+	return body
+}
+
+func TestOpenAIGatewayHandler_ReplaysObservedOversizeRoutingSignatures(t *testing.T) {
+	// Production retained structured metadata (endpoint, body length, and
+	// occurrence count), but intentionally did not retain request bodies. Replay
+	// every observed length signature through the real handler with equivalent
+	// routing envelopes; the lower-level corpus accounts for all 346 occurrences.
+	type replayBucket struct {
+		path          string
+		bodyBytes     int
+		observedCount int
+	}
+	buckets := []replayBucket{
+		{path: "/v1/chat/completions", bodyBytes: 1_080_553, observedCount: 3},
+		{path: "/v1/chat/completions", bodyBytes: 1_080_588, observedCount: 2},
+		{path: "/v1/responses", bodyBytes: 1_054_736, observedCount: 13},
+		{path: "/v1/responses", bodyBytes: 1_067_809, observedCount: 25},
+		{path: "/v1/responses", bodyBytes: 1_080_318, observedCount: 25},
+		{path: "/v1/responses", bodyBytes: 1_083_823, observedCount: 15},
+		{path: "/v1/responses", bodyBytes: 1_087_873, observedCount: 7},
+		{path: "/v1/responses", bodyBytes: 1_109_158, observedCount: 14},
+		{path: "/v1/responses", bodyBytes: 1_113_353, observedCount: 25},
+		{path: "/v1/responses", bodyBytes: 1_122_511, observedCount: 16},
+		{path: "/v1/responses", bodyBytes: 1_195_035, observedCount: 16},
+		{path: "/v1/responses", bodyBytes: 1_219_549, observedCount: 25},
+		{path: "/v1/responses", bodyBytes: 1_282_968, observedCount: 21},
+		{path: "/v1/responses", bodyBytes: 1_380_452, observedCount: 30},
+		{path: "/v1/responses", bodyBytes: 1_398_267, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 1_418_890, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 1_421_472, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 1_431_098, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 1_438_595, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 1_583_870, observedCount: 20},
+		{path: "/v1/responses", bodyBytes: 1_843_661, observedCount: 10},
+		{path: "/v1/responses", bodyBytes: 2_180_976, observedCount: 15},
+		{path: "/v1/responses", bodyBytes: 2_487_111, observedCount: 6},
+		{path: "/v1/responses", bodyBytes: 2_887_113, observedCount: 7},
+		{path: "/v1/responses", bodyBytes: 3_092_453, observedCount: 3},
+		{path: "/v1/responses", bodyBytes: 3_137_110, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 3_515_313, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 4_390_371, observedCount: 18},
+		{path: "/v1/responses", bodyBytes: 4_668_875, observedCount: 5},
+		{path: "/v1/responses", bodyBytes: 5_220_367, observedCount: 5},
+		{path: "/v1/responses", bodyBytes: 7_429_271, observedCount: 6},
+		{path: "/v1/responses", bodyBytes: 7_706_076, observedCount: 2},
+		{path: "/v1/responses", bodyBytes: 12_976_019, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 16_176_951, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 30_080_700, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 41_205_801, observedCount: 1},
+		{path: "/v1/responses", bodyBytes: 54_628_726, observedCount: 1},
+	}
+
+	upstream := &selectedAccountAuditResponsesUpstream{}
+	engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine,
+		selectedAccountAuditFallbackAccounts(service.AccountTypeOAuth, map[string]any{
+			"access_token": "verified-plus-token", "plan_type": "plus",
+		}))
+
+	totalObserved := 0
+	for _, bucket := range buckets {
+		totalObserved += bucket.observedCount
+		bucket := bucket
+		t.Run(fmt.Sprintf("%s/%d-bytes", strings.TrimPrefix(bucket.path, "/v1/"), bucket.bodyBytes), func(t *testing.T) {
+			body := selectedAccountAuditProductionOversizeFixture(t, bucket.path, bucket.bodyBytes)
+			c, recorder := selectedAccountAuditHTTPBytesContext(t, bucket.path, body)
+			if bucket.path == "/v1/chat/completions" {
+				handler.ChatCompletions(c)
+			} else {
+				handler.Responses(c)
+			}
+
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			state := openAISecurityAdmissionFromContext(c)
+			require.NotNil(t, state)
+			require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
+			require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
+			require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
+			c.Request.Body = nil
+		})
+	}
+
+	require.Equal(t, 346, totalObserved)
+	calls := upstream.calls()
+	require.Len(t, calls, len(buckets))
+	for _, accountID := range calls {
+		require.Equal(t, int64(4), accountID, "every observed signature must dispatch through the verified account")
+	}
+	require.Empty(t, scannerCalls(), "oversize replay must remain opaque and never invoke content scanning")
 }
 
 func TestOpenAIGatewayHandler_SelectedProAuditBlockReleasesConcurrencyBeforeUpstream(t *testing.T) {

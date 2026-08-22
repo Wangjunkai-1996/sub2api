@@ -420,6 +420,11 @@ var (
 // ErrNoAvailableAccounts 表示没有可用的账号
 var ErrNoAvailableAccounts = errors.New("no available accounts")
 
+// ErrGatewaySessionLimitExceeded means a security-gated candidate passed the
+// fresh terminal admission but could not reserve a new session slot. Callers
+// should release any account slot and reselect another candidate.
+var ErrGatewaySessionLimitExceeded = errors.New("gateway session limit exceeded")
+
 // ErrClaudeCodeOnly 表示分组仅允许 Claude Code 客户端访问
 var ErrClaudeCodeOnly = errors.New("this group only allows Claude Code clients")
 

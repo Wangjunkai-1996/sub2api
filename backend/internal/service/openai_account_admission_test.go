@@ -138,6 +138,30 @@ func TestClassifyOpenAIEffectiveCredentialOwner_UsesExplicitAccountStates(t *tes
 			want: securityadmission.AccountAuditExemptVerified,
 		},
 		{
+			name: "Vertex Anthropic service account is verified",
+			owner: &Account{
+				Platform: PlatformAnthropic,
+				Type:     AccountTypeServiceAccount,
+			},
+			want: securityadmission.AccountAuditExemptVerified,
+		},
+		{
+			name: "Vertex Gemini service account is verified",
+			owner: &Account{
+				Platform: PlatformGemini,
+				Type:     AccountTypeServiceAccount,
+			},
+			want: securityadmission.AccountAuditExemptVerified,
+		},
+		{
+			name: "service account on unsupported platform stays unknown",
+			owner: &Account{
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeServiceAccount,
+			},
+			want: securityadmission.AccountUnknown,
+		},
+		{
 			name: "shadow never classifies itself",
 			owner: func() *Account {
 				parentID := int64(42)
@@ -407,10 +431,18 @@ func TestOpenAIAdvancedScheduler_RequirementDropsIncompatibleSessionSticky(t *te
 	require.NotNil(t, selection)
 	require.Equal(t, int64(7072), selection.Account.ID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
-	require.Equal(t, int64(7072), cache.sessionBindings["openai:"+sessionHash], "fallback may establish a new sticky binding")
+	require.Equal(t, int64(7071), cache.sessionBindings["openai:"+sessionHash], "security-gated selection must preserve the previous sticky binding until terminal admission")
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
+	terminalCtx := WithOpenAIAccountTerminalAdmission(ctx, &OpenAIAccountRequirementAdmission{
+		Selected:                 &accounts[1],
+		EffectiveCredentialOwner: &accounts[1],
+		Requirement:              securityadmission.AccountRequirementAuditExempt,
+		AccountClass:             securityadmission.AccountAuditExemptVerified,
+	})
+	require.NoError(t, svc.BindStickySessionAfterProfitAdmission(terminalCtx, nil, sessionHash, accounts[1].ID))
+	require.Equal(t, int64(7072), cache.sessionBindings["openai:"+sessionHash], "verified terminal admission may bind the successful account")
 }
 
 func TestOpenAILegacyScheduler_RequirementFiltersProAndUnknown(t *testing.T) {

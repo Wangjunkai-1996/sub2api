@@ -529,6 +529,16 @@ func ClassifyOpenAIEffectiveCredentialOwner(owner *Account) securityadmission.Ac
 	switch owner.Type {
 	case AccountTypeAPIKey, AccountTypeSetupToken, AccountTypeUpstream, AccountTypeBedrock:
 		return securityadmission.AccountAuditExemptVerified
+	case AccountTypeServiceAccount:
+		// Vertex service accounts are non-OpenAI credentials with a concrete
+		// bearer-token owner. They are used by the generic Anthropic/Gemini
+		// gateways and must remain eligible for audit-exempt routing.
+		switch owner.Platform {
+		case PlatformAnthropic, PlatformGemini:
+			return securityadmission.AccountAuditExemptVerified
+		default:
+			return securityadmission.AccountUnknown
+		}
 	case AccountTypeOAuth:
 		if owner.Platform != PlatformOpenAI {
 			switch owner.Platform {

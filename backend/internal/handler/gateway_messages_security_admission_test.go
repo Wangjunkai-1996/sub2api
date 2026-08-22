@@ -66,4 +66,6 @@ func TestGatewayMessagesCanonicalAdmissionPrecedesLegacyAudit(t *testing.T) {
 	require.Contains(t, source, "RequestKnownViolation")
 	require.Contains(t, source, "RequestKnownNoText")
 	require.Contains(t, source, "RequestUninspectable")
+	require.Contains(t, source, "ReasonDuplicateJSONKey")
+	require.Contains(t, source, "ReasonJSONKeyCollision")
 }

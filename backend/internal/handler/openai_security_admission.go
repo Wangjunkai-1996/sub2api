@@ -252,7 +252,8 @@ func securityAuditCanReselect(decision *securityaudit.Decision) bool {
 
 func openAITerminalAdmissionCanReselect(err error) bool {
 	return errors.Is(err, service.ErrOpenAIAccountRequirementIncompatible) ||
-		errors.Is(err, service.ErrOpenAIAccountAdmissionUnavailable)
+		errors.Is(err, service.ErrOpenAIAccountAdmissionUnavailable) ||
+		errors.Is(err, service.ErrGatewaySessionLimitExceeded)
 }
 
 func openAIAuditFallbackExhausted(c *gin.Context, state *openAISecurityAdmissionState) bool {

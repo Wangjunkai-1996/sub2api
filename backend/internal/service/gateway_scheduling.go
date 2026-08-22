@@ -569,7 +569,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 								"session", shortSessionHash(sessionHash),
 								"result", "slot_acquired",
 							)
-							if s.cache != nil {
+							if s.cache != nil && !gatewaySecurityAdmissionGateActive(ctx) && !gatewayProfitControlGateActive(ctx) {
 								_ = s.cache.RefreshSessionTTL(ctx, derefGroupID(groupID), sessionHash, stickySessionTTL)
 							}
 							return s.newSelectionResult(ctx, account, true, result.ReleaseFunc, nil)
@@ -1449,6 +1449,37 @@ func (s *GatewayService) IncrementAccountRPM(ctx context.Context, accountID int6
 // sessionID: 会话标识符（使用粘性会话的 hash）
 // 返回 true 表示允许（在限制内或会话已存在），false 表示拒绝（超出限制且是新会话）
 func (s *GatewayService) checkAndRegisterSession(ctx context.Context, account *Account, sessionID string) bool {
+	// Security-gated requests must not consume a session slot before the
+	// fresh terminal account admission. The handler performs the forced
+	// registration only after that boundary succeeds; otherwise a rejected
+	// candidate would leave a phantom active session in Redis.
+	if gatewaySecurityAdmissionGateActive(ctx) {
+		return true
+	}
+	return s.registerSession(ctx, account, sessionID)
+}
+
+// RegisterSessionAfterSecurityAdmission force-reserves the session slot after
+// a security-gated request has crossed its fresh terminal account admission.
+// It is intentionally separate from checkAndRegisterSession so scheduler
+// probes cannot create a quota entry that survives terminal rejection.
+func (s *GatewayService) RegisterSessionAfterSecurityAdmission(ctx context.Context, account *Account, sessionID string) bool {
+	if !gatewaySecurityAdmissionGateActive(ctx) {
+		return true
+	}
+	terminal := OpenAIAccountTerminalAdmissionFromContext(ctx)
+	if terminal == nil || terminal.Selected == nil || account == nil ||
+		terminal.Selected.ID != account.ID ||
+		terminal.AccountClass != securityadmission.AccountAuditExemptVerified {
+		return false
+	}
+	return s.registerSession(ctx, account, sessionID)
+}
+
+func (s *GatewayService) registerSession(ctx context.Context, account *Account, sessionID string) bool {
+	if account == nil {
+		return false
+	}
 	// 只检查 Anthropic OAuth/SetupToken 账号
 	if !account.IsAnthropicOAuthOrSetupToken() {
 		return true

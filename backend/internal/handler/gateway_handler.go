@@ -183,7 +183,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
 		return
 	}
-	if admissionState.admission.Reason() == securityadmission.ReasonDuplicateJSONKey {
+	if reason := admissionState.admission.Reason(); reason == securityadmission.ReasonDuplicateJSONKey || reason == securityadmission.ReasonJSONKeyCollision {
 		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Request cannot be inspected by the security admission gate")
 		return
 	}
@@ -476,7 +476,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				continue
 			}
 			account = latest
-			admissionCtx, account, err = h.admitGatewaySecurityAccount(c, reqLog, admissionState, admissionCtx, account)
+			admissionCtx, account, err = h.admitGatewaySecurityAccount(c, reqLog, admissionState, admissionCtx, account, sessionKey)
 			if err != nil {
 				if accountReleaseFunc != nil {
 					accountReleaseFunc()
@@ -817,7 +817,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				continue
 			}
 			account = latest
-			admissionCtx, account, err = h.admitGatewaySecurityAccount(c, reqLog, admissionState, admissionCtx, account)
+			admissionCtx, account, err = h.admitGatewaySecurityAccount(c, reqLog, admissionState, admissionCtx, account, sessionKey)
 			if err != nil {
 				if accountReleaseFunc != nil {
 					accountReleaseFunc()
@@ -1139,11 +1139,12 @@ func (h *GatewayHandler) admitGatewaySecurityAccount(
 	state *openAISecurityAdmissionState,
 	ctx context.Context,
 	account *service.Account,
+	sessionKey string,
 ) (context.Context, *service.Account, error) {
 	if service.OpenAIAccountRequirementFromContext(ctx) != securityadmission.AccountRequirementAuditExempt {
 		return ctx, account, nil
 	}
-	if h == nil || h.openAIGatewayService == nil {
+	if h == nil || h.openAIGatewayService == nil || h.gatewayService == nil {
 		err := service.ErrOpenAIAccountAdmissionUnavailable
 		errorOpenAISecurityAdmission(c, reqLog, "security_admission.gateway_terminal_unavailable", state, gatewaySecurityAccountID(account),
 			securityadmission.AccountUnknown, "terminal_admission_unavailable", "upstream_not_dispatched", zap.Error(err))
@@ -1165,6 +1166,12 @@ func (h *GatewayHandler) admitGatewaySecurityAccount(
 	}
 
 	ctx = service.WithOpenAIAccountTerminalAdmission(ctx, terminal)
+	if !h.gatewayService.RegisterSessionAfterSecurityAdmission(ctx, terminal.Selected, sessionKey) {
+		err := fmt.Errorf("%w: account %d session quota reached", service.ErrGatewaySessionLimitExceeded, terminal.Selected.ID)
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.gateway_session_limit_rejected", state, terminal.Selected.ID,
+			terminal.AccountClass, "terminal_admission_rejected", "upstream_not_dispatched", zap.Error(err))
+		return ctx, account, err
+	}
 	if c != nil && c.Request != nil {
 		c.Request = c.Request.WithContext(ctx)
 	}
