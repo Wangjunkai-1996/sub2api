@@ -998,12 +998,117 @@ func TestOpenAIGatewayHandler_OversizeChatAndMessagesRouteOnlyToVerifiedNonProWi
 
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 			require.Equal(t, []int64{4}, upstream.calls(), "oversize must exclude Pro and unknown accounts")
-			require.Empty(t, scannerCalls(), "oversize classification must not materialize or scan the body")
+			require.Empty(t, scannerCalls(), "oversize classification must not materialize content or invoke the prompt scanner")
 			state := openAISecurityAdmissionFromContext(c)
 			require.NotNil(t, state)
 			require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
 			require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
 			require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
+		})
+	}
+}
+
+func TestOpenAIGatewayHandler_ChatAndMessagesRejectInvalidCompleteRoutingEnvelope(t *testing.T) {
+	oversize := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
+	payloads := []struct {
+		name    string
+		content string
+	}{
+		{name: "normal", content: "hello"},
+		{name: "oversized", content: oversize},
+	}
+	endpoints := []struct {
+		name      string
+		path      string
+		prefix    string
+		bodyClose string
+		invoke    func(*OpenAIGatewayHandler, *gin.Context)
+	}{
+		{
+			name: "Chat Completions", path: "/v1/chat/completions",
+			prefix:    `{"model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"`,
+			bodyClose: `"}]`,
+			invoke:    func(h *OpenAIGatewayHandler, c *gin.Context) { h.ChatCompletions(c) },
+		},
+		{
+			name: "Messages", path: "/v1/messages",
+			prefix:    `{"model":"gpt-5.1","stream":false,"max_tokens":16,"messages":[{"role":"user","content":"`,
+			bodyClose: `"}]`,
+			invoke:    func(h *OpenAIGatewayHandler, c *gin.Context) { h.Messages(c) },
+		},
+	}
+	cases := []struct {
+		name string
+		tail string
+	}{
+		{name: "escaped duplicate model", tail: `,"mo\u0064el":"gpt-5.2"}`},
+		{name: "duplicate stream", tail: `,"stream":true}`},
+		{name: "case-folded model alias", tail: `,"Model":"gpt-5.2"}`},
+		{name: "case-folded stream alias", tail: `,"Stream":true}`},
+		{name: "malformed tail", tail: ""},
+	}
+
+	for _, endpoint := range endpoints {
+		for _, payload := range payloads {
+			for _, test := range cases {
+				t.Run(endpoint.name+"/"+payload.name+"/"+test.name, func(t *testing.T) {
+					upstream := &selectedAccountAuditResponsesUpstream{}
+					engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+					handler, _ := newSelectedAccountAuditHandler(t, upstream, engine,
+						selectedAccountAuditFallbackAccounts(service.AccountTypeOAuth, map[string]any{
+							"access_token": "verified-plus-token", "plan_type": "plus",
+						}))
+					body := endpoint.prefix + payload.content + endpoint.bodyClose + test.tail
+					c, recorder := selectedAccountAuditHTTPContext(t, endpoint.path, body)
+
+					endpoint.invoke(handler, c)
+
+					require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+					require.Contains(t, recorder.Body.String(), "invalid_request_error")
+					require.Empty(t, upstream.calls(), "invalid routing metadata must be rejected before dispatch")
+					require.Empty(t, scannerCalls(), "invalid routing metadata must not invoke the prompt scanner")
+				})
+			}
+		}
+	}
+}
+
+func TestOpenAIGatewayHandler_OversizeChatAndMessagesKeepUnavailableRoutingEnvelopeAs503(t *testing.T) {
+	padding := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
+	tests := []struct {
+		name   string
+		path   string
+		body   string
+		invoke func(*OpenAIGatewayHandler, *gin.Context)
+	}{
+		{
+			name: "Chat Completions", path: "/v1/chat/completions",
+			body:   `{"padding":"` + padding + `","model":"gpt-5.1","stream":false,"messages":[{"role":"user","content":"hello"}]}`,
+			invoke: func(h *OpenAIGatewayHandler, c *gin.Context) { h.ChatCompletions(c) },
+		},
+		{
+			name: "Messages", path: "/v1/messages",
+			body:   `{"padding":"` + padding + `","model":"gpt-5.1","stream":false,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`,
+			invoke: func(h *OpenAIGatewayHandler, c *gin.Context) { h.Messages(c) },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := &selectedAccountAuditResponsesUpstream{}
+			engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+			handler, _ := newSelectedAccountAuditHandler(t, upstream, engine,
+				selectedAccountAuditFallbackAccounts(service.AccountTypeOAuth, map[string]any{
+					"access_token": "verified-plus-token", "plan_type": "plus",
+				}))
+			c, recorder := selectedAccountAuditHTTPContext(t, test.path, test.body)
+
+			test.invoke(handler, c)
+
+			require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
+			require.Contains(t, recorder.Body.String(), "routing metadata is unavailable")
+			require.Empty(t, upstream.calls())
+			require.Empty(t, scannerCalls())
 		})
 	}
 }

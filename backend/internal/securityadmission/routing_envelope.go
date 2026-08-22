@@ -10,6 +10,13 @@ import (
 
 const RoutingEnvelopeWindowBytes = 4 << 10
 
+// Chat and Messages are decoded downstream with encoding/json, which accepts
+// at most 10,000 nested containers. Complete routing validation uses the same
+// boundary instead of the lower admission-inspection limit: exceeding that
+// lower limit makes content uninspectable, but does not make otherwise valid
+// request JSON malformed.
+const completeRoutingEnvelopeMaxDepth = 10_000
+
 var (
 	ErrRoutingEnvelopeUnavailable = errors.New("security admission routing envelope unavailable")
 	ErrRoutingEnvelopeInvalid     = errors.New("security admission routing envelope invalid")
@@ -125,6 +132,292 @@ func ExtractRoutingEnvelope(protocol string, body []byte) (RoutingEnvelope, erro
 	}
 
 	return envelope, ErrRoutingEnvelopeUnavailable
+}
+
+// ExtractCompleteRoutingEnvelope validates the complete JSON root before using
+// the bounded envelope extractor. It enforces canonical, unique top-level
+// model and stream fields; large payload values are skipped directly in body
+// without copying them.
+//
+// This is intended for oversized HTTP requests whose body is already resident
+// in memory. Bounded callers such as WebSocket preflight must continue to use
+// ExtractRoutingEnvelope.
+func ExtractCompleteRoutingEnvelope(protocol string, body []byte) (RoutingEnvelope, error) {
+	if err := ValidateCompleteRoutingEnvelope(body); err != nil {
+		return RoutingEnvelope{}, err
+	}
+	return ExtractRoutingEnvelope(protocol, body)
+}
+
+// ValidateCompleteRoutingEnvelope validates the complete JSON root and rejects
+// duplicate or non-canonical top-level model and stream fields. Non-canonical
+// case variants are unsafe because encoding/json matches struct fields without
+// case sensitivity while the routing layer uses exact JSON paths. Other
+// duplicate keys retain their existing protocol semantics.
+func ValidateCompleteRoutingEnvelope(body []byte) error {
+	if err := validateCompleteRoutingEnvelope(body); err != nil {
+		if errors.Is(err, ErrRoutingEnvelopeUnavailable) {
+			return err
+		}
+		return fmt.Errorf("%w: complete root: %v", ErrRoutingEnvelopeInvalid, err)
+	}
+	return nil
+}
+
+func validateCompleteRoutingEnvelope(body []byte) error {
+	limits := CurrentLimits()
+	// Primitive parsing reuses jsonParser's strict literal and number scanners.
+	// A request body cannot contain enough tokens to reach maxInt.
+	limits.MaxTokens = int(^uint(0) >> 1)
+	p := jsonParser{body: body, limits: limits}
+	if err := p.expect('{'); err != nil {
+		return err
+	}
+
+	p.skipWhitespace()
+	if p.pos < len(p.body) && p.body[p.pos] == '}' {
+		p.pos++
+		return p.finish()
+	}
+
+	var seen routingEnvelopeField
+	for {
+		key, err := p.scanString(true)
+		if err != nil {
+			return err
+		}
+		field, canonical, err := completeRoutingEnvelopeFieldForKey(p.body, key)
+		if err != nil {
+			return fmt.Errorf("%w: decode routing key: %v", ErrRoutingEnvelopeUnavailable, err)
+		}
+		if field != 0 && !canonical {
+			return p.invalid(fmt.Sprintf("routing field %q must use canonical lowercase spelling", completeRoutingEnvelopeFieldName(field)))
+		}
+		if field != 0 && seen&field != 0 {
+			return fmt.Errorf("duplicate routing field %q", completeRoutingEnvelopeFieldName(field))
+		}
+		if field != 0 {
+			seen |= field
+		}
+
+		if err := p.expect(':'); err != nil {
+			return err
+		}
+		if err := skipCompleteJSONValue(&p, 1, completeRoutingEnvelopeMaxDepth); err != nil {
+			return err
+		}
+
+		p.skipWhitespace()
+		if p.pos >= len(p.body) {
+			return p.invalid("unterminated object")
+		}
+		switch p.body[p.pos] {
+		case ',':
+			p.pos++
+			p.skipWhitespace()
+			if p.pos < len(p.body) && p.body[p.pos] == '}' {
+				return p.invalid("trailing comma")
+			}
+		case '}':
+			p.pos++
+			return p.finish()
+		default:
+			return p.invalid("expected object separator")
+		}
+	}
+}
+
+func completeRoutingEnvelopeFieldForKey(body []byte, key stringRef) (routingEnvelopeField, bool, error) {
+	if !key.escaped {
+		raw := body[key.start:key.end]
+		switch {
+		case bytes.Equal(raw, []byte("model")):
+			return routingEnvelopeModel, true, nil
+		case bytes.Equal(raw, []byte("stream")):
+			return routingEnvelopeStream, true, nil
+		case bytes.EqualFold(raw, []byte("model")):
+			return routingEnvelopeModel, false, nil
+		case bytes.EqualFold(raw, []byte("stream")):
+			return routingEnvelopeStream, false, nil
+		default:
+			return 0, false, nil
+		}
+	}
+	// Only strings with the decoded length of a routing key can match. This
+	// avoids allocating for arbitrarily large escaped non-routing keys.
+	if key.runes != len("model") && key.runes != len("stream") {
+		return 0, false, nil
+	}
+	decoded, err := key.decode(body)
+	if err != nil {
+		return 0, false, err
+	}
+	switch {
+	case decoded == "model":
+		return routingEnvelopeModel, true, nil
+	case decoded == "stream":
+		return routingEnvelopeStream, true, nil
+	case strings.EqualFold(decoded, "model"):
+		return routingEnvelopeModel, false, nil
+	case strings.EqualFold(decoded, "stream"):
+		return routingEnvelopeStream, false, nil
+	default:
+		return 0, false, nil
+	}
+}
+
+func completeRoutingEnvelopeFieldName(field routingEnvelopeField) string {
+	switch field {
+	case routingEnvelopeModel:
+		return "model"
+	case routingEnvelopeStream:
+		return "stream"
+	default:
+		return "unknown"
+	}
+}
+
+type completeJSONContainerState uint8
+
+const (
+	completeJSONObjectFirstKey completeJSONContainerState = iota
+	completeJSONObjectNextKey
+	completeJSONObjectAfterValue
+	completeJSONArrayFirstValue
+	completeJSONArrayNextValue
+	completeJSONArrayAfterValue
+)
+
+func skipCompleteJSONValue(p *jsonParser, depth, maxDepth int) error {
+	// Keep ordinary payloads allocation-free. Exceptionally deep input grows a
+	// one-byte-per-container state stack instead of growing the goroutine stack.
+	var inline [32]completeJSONContainerState
+	stack := inline[:0]
+	state, container, err := startCompleteJSONValue(p, depth, maxDepth)
+	if err != nil {
+		return err
+	}
+	if container {
+		stack = append(stack, state)
+	}
+
+	for len(stack) > 0 {
+		index := len(stack) - 1
+		switch stack[index] {
+		case completeJSONObjectFirstKey, completeJSONObjectNextKey:
+			first := stack[index] == completeJSONObjectFirstKey
+			p.skipWhitespace()
+			if first && p.pos < len(p.body) && p.body[p.pos] == '}' {
+				p.pos++
+				stack = stack[:index]
+				continue
+			}
+			if _, err := p.scanString(false); err != nil {
+				return err
+			}
+			if err := p.expect(':'); err != nil {
+				return err
+			}
+			stack[index] = completeJSONObjectAfterValue
+			state, container, err := startCompleteJSONValue(p, depth+len(stack), maxDepth)
+			if err != nil {
+				return err
+			}
+			if container {
+				stack = append(stack, state)
+			}
+
+		case completeJSONArrayFirstValue, completeJSONArrayNextValue:
+			first := stack[index] == completeJSONArrayFirstValue
+			p.skipWhitespace()
+			if first && p.pos < len(p.body) && p.body[p.pos] == ']' {
+				p.pos++
+				stack = stack[:index]
+				continue
+			}
+			stack[index] = completeJSONArrayAfterValue
+			state, container, err := startCompleteJSONValue(p, depth+len(stack), maxDepth)
+			if err != nil {
+				return err
+			}
+			if container {
+				stack = append(stack, state)
+			}
+
+		case completeJSONObjectAfterValue:
+			p.skipWhitespace()
+			if p.pos >= len(p.body) {
+				return p.invalid("unterminated object")
+			}
+			switch p.body[p.pos] {
+			case ',':
+				p.pos++
+				p.skipWhitespace()
+				if p.pos < len(p.body) && p.body[p.pos] == '}' {
+					return p.invalid("trailing comma")
+				}
+				stack[index] = completeJSONObjectNextKey
+			case '}':
+				p.pos++
+				stack = stack[:index]
+			default:
+				return p.invalid("expected object separator")
+			}
+
+		case completeJSONArrayAfterValue:
+			p.skipWhitespace()
+			if p.pos >= len(p.body) {
+				return p.invalid("unterminated array")
+			}
+			switch p.body[p.pos] {
+			case ',':
+				p.pos++
+				p.skipWhitespace()
+				if p.pos < len(p.body) && p.body[p.pos] == ']' {
+					return p.invalid("trailing comma")
+				}
+				stack[index] = completeJSONArrayNextValue
+			case ']':
+				p.pos++
+				stack = stack[:index]
+			default:
+				return p.invalid("expected array separator")
+			}
+		}
+	}
+	return nil
+}
+
+func startCompleteJSONValue(
+	p *jsonParser,
+	depth, maxDepth int,
+) (completeJSONContainerState, bool, error) {
+	switch p.peek() {
+	case '{':
+		if depth >= maxDepth {
+			return 0, false, p.invalid(fmt.Sprintf("complete root nesting exceeds %d", maxDepth))
+		}
+		p.pos++
+		return completeJSONObjectFirstKey, true, nil
+	case '[':
+		if depth >= maxDepth {
+			return 0, false, p.invalid(fmt.Sprintf("complete root nesting exceeds %d", maxDepth))
+		}
+		p.pos++
+		return completeJSONArrayFirstValue, true, nil
+	case '"':
+		return 0, false, p.skipString()
+	case 't':
+		return 0, false, p.parseLiteral("true")
+	case 'f':
+		return 0, false, p.parseLiteral("false")
+	case 'n':
+		return 0, false, p.parseLiteral("null")
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return 0, false, p.parseNumber()
+	default:
+		return 0, false, p.invalid("expected value")
+	}
 }
 
 // ExtractBoundedWebSocketFrameType inspects at most the routing-envelope

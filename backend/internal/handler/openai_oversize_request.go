@@ -26,6 +26,17 @@ func extractOpenAIOversizeRoutingEnvelope(
 	return securityadmission.ExtractRoutingEnvelope(string(protocol), body)
 }
 
+func extractOpenAICompleteOversizeRoutingEnvelope(
+	state *openAISecurityAdmissionState,
+	protocol securityadmission.Protocol,
+	body []byte,
+) (securityadmission.RoutingEnvelope, error) {
+	if !isOpenAIOversizeAdmission(state) {
+		return securityadmission.RoutingEnvelope{}, securityadmission.ErrRoutingEnvelopeUnavailable
+	}
+	return securityadmission.ExtractCompleteRoutingEnvelope(string(protocol), body)
+}
+
 func openAIOversizeReasoningPolicyConfigured(c *gin.Context, apiKey *service.APIKey) bool {
 	maxEffort, mappings, applies := openAIReasoningEffortPolicyForRequest(c, apiKey)
 	return applies && (strings.TrimSpace(maxEffort) != "" || len(mappings) > 0)

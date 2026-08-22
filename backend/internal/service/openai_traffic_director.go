@@ -581,13 +581,24 @@ func (s *OpenAIGatewayService) resolveOpenAITrafficDirectorPlan(
 	resolver := s.trafficDirectorResolver()
 	if resolver == nil {
 		state := openAITrafficDirectorRequestStateFromContext(ctx)
-		recordTrafficDirectorPolicyUnavailable(state)
-		if head, ok := trafficDirectorHeadFromContext(ctx, *groupID); ok {
-			mode, valid := normalizeTrafficDirectorPolicyMode(head.Mode)
-			if !valid || mode == domain.TrafficDirectorModeEnforced ||
-				(head.Version > TrafficDirectorLegacyVersion && mode != domain.TrafficDirectorModeLegacy) {
-				return nil, ErrTrafficDirectorPolicyUnavailable
-			}
+		head, ok := trafficDirectorHeadFromContext(ctx, *groupID)
+		if !ok {
+			recordTrafficDirectorPolicyUnavailable(state)
+			return nil, nil
+		}
+		mode, valid := normalizeTrafficDirectorPolicyMode(head.Mode)
+		if !valid || head.Version < TrafficDirectorLegacyVersion ||
+			(head.Version == TrafficDirectorLegacyVersion && mode != domain.TrafficDirectorModeLegacy) ||
+			mode == domain.TrafficDirectorModeEnforced {
+			recordTrafficDirectorPolicyUnavailable(state)
+			return nil, ErrTrafficDirectorPolicyUnavailable
+		}
+		if mode == domain.TrafficDirectorModeShadow {
+			recordTrafficDirectorResolvedPolicy(state, domain.TrafficDirectorModeLegacy, TrafficDirectorResolvedPolicy{
+				Version:  syntheticTrafficDirectorLegacyPolicy(*groupID),
+				Degraded: true,
+				Source:   TrafficDirectorPolicySourceLegacy,
+			})
 		}
 		return nil, nil
 	}

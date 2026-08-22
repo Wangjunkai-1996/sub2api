@@ -347,6 +347,116 @@ func TestOpenAITrafficDirectorMissingDependenciesFailClosedForEnforcedHead(t *te
 	require.ErrorIs(t, err, ErrTrafficDirectorPolicyUnavailable)
 }
 
+func TestOpenAITrafficDirectorMissingResolverFallsBackForPublishedShadow(t *testing.T) {
+	groupID := int64(42)
+	svc := &OpenAIGatewayService{}
+	ctx := context.WithValue(context.Background(), ctxkey.Group, &Group{
+		ID:                     groupID,
+		Platform:               PlatformOpenAI,
+		Status:                 StatusActive,
+		Hydrated:               true,
+		TrafficDirectorMode:    domain.TrafficDirectorModeShadow,
+		TrafficDirectorVersion: 3,
+	})
+	ctx = svc.WithOpenAITrafficDirectorRequestContext(ctx)
+	before := SnapshotTrafficDirectorRuntimeMetrics()
+
+	for range 2 {
+		plan, err := svc.resolveOpenAITrafficDirectorPlan(ctx, &groupID, PlatformOpenAI, "request-shadow-no-resolver")
+		require.NoError(t, err)
+		require.Nil(t, plan)
+	}
+
+	after := SnapshotTrafficDirectorRuntimeMetrics()
+	require.Equal(t, before.RoutingDecisions.LegacyTotal+1, after.RoutingDecisions.LegacyTotal)
+	require.Equal(t, before.RoutingDecisions.ShadowTotal, after.RoutingDecisions.ShadowTotal)
+	require.Equal(t, before.Policy.LegacyFallbackTotal+1, after.Policy.LegacyFallbackTotal)
+	require.Equal(t, before.Policy.UnavailableTotal, after.Policy.UnavailableTotal)
+}
+
+func TestOpenAITrafficDirectorMissingResolverWithoutHeadKeepsUnavailableMetric(t *testing.T) {
+	groupID := int64(42)
+	svc := &OpenAIGatewayService{}
+	ctx := svc.WithOpenAITrafficDirectorRequestContext(context.Background())
+	before := SnapshotTrafficDirectorRuntimeMetrics()
+
+	for range 2 {
+		plan, err := svc.resolveOpenAITrafficDirectorPlan(ctx, &groupID, PlatformOpenAI, "request-no-head-no-resolver")
+		require.NoError(t, err)
+		require.Nil(t, plan)
+	}
+
+	after := SnapshotTrafficDirectorRuntimeMetrics()
+	require.Equal(t, before.Policy.UnavailableTotal+1, after.Policy.UnavailableTotal)
+	require.Equal(t, before.Policy.LegacyFallbackTotal, after.Policy.LegacyFallbackTotal)
+}
+
+func TestOpenAITrafficDirectorMissingResolverRejectsInvalidHead(t *testing.T) {
+	groupID := int64(42)
+	for _, testCase := range []struct {
+		name    string
+		mode    string
+		version int64
+	}{
+		{name: "invalid mode", mode: "unsupported", version: 3},
+		{name: "negative version", mode: domain.TrafficDirectorModeShadow, version: -1},
+		{name: "version zero shadow", mode: domain.TrafficDirectorModeShadow, version: TrafficDirectorLegacyVersion},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			svc := &OpenAIGatewayService{}
+			ctx := context.WithValue(context.Background(), ctxkey.Group, &Group{
+				ID:                     groupID,
+				Platform:               PlatformOpenAI,
+				Status:                 StatusActive,
+				Hydrated:               true,
+				TrafficDirectorMode:    testCase.mode,
+				TrafficDirectorVersion: testCase.version,
+			})
+			ctx = svc.WithOpenAITrafficDirectorRequestContext(ctx)
+
+			plan, err := svc.resolveOpenAITrafficDirectorPlan(ctx, &groupID, PlatformOpenAI, "request-invalid-head")
+			require.Nil(t, plan)
+			require.ErrorIs(t, err, ErrTrafficDirectorPolicyUnavailable)
+		})
+	}
+}
+
+func TestOpenAITrafficDirectorMissingResolverShadowUsesLegacyScheduler(t *testing.T) {
+	groupID := int64(42)
+	account := testOpenAIAccountForTrafficDirector(101, groupID)
+	svc := &OpenAIGatewayService{accountRepo: schedulerTestOpenAIAccountRepo{accounts: []Account{account}}}
+	ctx := context.WithValue(context.Background(), ctxkey.RequestID, "request-shadow-legacy-scheduler")
+	ctx = context.WithValue(ctx, ctxkey.Group, &Group{
+		ID:                     groupID,
+		Platform:               PlatformOpenAI,
+		Status:                 StatusActive,
+		Hydrated:               true,
+		TrafficDirectorMode:    domain.TrafficDirectorModeShadow,
+		TrafficDirectorVersion: 3,
+	})
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx,
+		&groupID,
+		"",
+		"",
+		"gpt-5",
+		nil,
+		OpenAIUpstreamTransportAny,
+		OpenAIEndpointCapabilityChatCompletions,
+		false,
+		false,
+		false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, account.ID, selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
 func TestOpenAITrafficDirectorEnforcedRequestHeadRequiresExactResolvedPolicy(t *testing.T) {
 	spec := testOpenAITrafficDirectorSpec()
 	groupID := int64(42)

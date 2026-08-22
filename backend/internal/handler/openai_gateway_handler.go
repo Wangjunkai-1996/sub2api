@@ -1169,13 +1169,25 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	oversizeRequest := isOpenAIOversizeAdmission(admissionState)
 	var oversizeEnvelope securityadmission.RoutingEnvelope
 	if oversizeRequest {
-		oversizeEnvelope, err = extractOpenAIOversizeRoutingEnvelope(
+		oversizeEnvelope, err = extractOpenAICompleteOversizeRoutingEnvelope(
 			admissionState, securityadmission.ProtocolAnthropicMessages, body,
 		)
 		if err != nil {
-			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_envelope_unavailable", admissionState, 0,
-				securityadmission.AccountUnknown, "oversize_envelope_unavailable", "upstream_not_dispatched", zap.Error(err))
-			h.anthropicErrorResponse(c, http.StatusServiceUnavailable, "api_error", "Oversized request routing metadata is unavailable")
+			status := http.StatusServiceUnavailable
+			errType := "api_error"
+			message := "Oversized request routing metadata is unavailable"
+			event := "security_admission.oversize_envelope_unavailable"
+			reason := "oversize_envelope_unavailable"
+			if errors.Is(err, securityadmission.ErrRoutingEnvelopeInvalid) {
+				status = http.StatusBadRequest
+				errType = "invalid_request_error"
+				message = "Invalid oversized request routing metadata"
+				event = "security_admission.oversize_envelope_invalid"
+				reason = "oversize_envelope_invalid"
+			}
+			warnOpenAISecurityAdmission(c, reqLog, event, admissionState, 0,
+				securityadmission.AccountUnknown, reason, "upstream_not_dispatched", zap.Error(err))
+			h.anthropicErrorResponse(c, status, errType, message)
 			return
 		}
 		if openAIOversizeReasoningPolicyConfigured(c, apiKey) {
@@ -1186,10 +1198,12 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		}
 	}
 
-	if !oversizeRequest && !gjson.ValidBytes(body) {
-		logRequestBodyParseFailure(reqLog, body, nil)
-		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
-		return
+	if !oversizeRequest {
+		if validateErr := securityadmission.ValidateCompleteRoutingEnvelope(body); validateErr != nil {
+			logRequestBodyParseFailure(reqLog, body, validateErr)
+			h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+			return
+		}
 	}
 
 	var reqModel string

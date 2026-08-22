@@ -64,7 +64,6 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
 	weightOverrides                map[string]float64
-	groupWeightOverridesApplied    bool
 }
 
 type openAIAdvancedSchedulerRequestSettings struct {
@@ -2100,15 +2099,29 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerEffectiveRuntimeSettings(
 		{name: "previous_response", value: overrides.WeightPreviousResponse},
 		{name: "session_sticky", value: overrides.WeightSessionSticky},
 	}
+	var globalWeightOverrides map[string]float64
+	groupWeightOverridesApplied := false
 	for _, override := range groupWeightOverrides {
 		if override.value == nil {
 			continue
+		}
+		if !groupWeightOverridesApplied {
+			globalWeightOverrides = cloneOpenAIAdvancedSchedulerWeightOverrides(settings.weightOverrides)
+			groupWeightOverridesApplied = true
 		}
 		if settings.weightOverrides == nil {
 			settings.weightOverrides = make(map[string]float64)
 		}
 		settings.weightOverrides[override.name] = *override.value
-		settings.groupWeightOverridesApplied = true
+	}
+	if groupWeightOverridesApplied {
+		effectiveWeights := applyOpenAIAdvancedSchedulerWeightOverrides(
+			s.openAIWSSchedulerWeights(),
+			settings.weightOverrides,
+		).configWeights()
+		if !effectiveWeights.IsValid() {
+			settings.weightOverrides = globalWeightOverrides
+		}
 	}
 	return settings
 }
@@ -2972,33 +2985,9 @@ func (s *OpenAIGatewayService) openAIWSSchedulerWeightsForRequest(ctx context.Co
 	}
 	overridden := applyOpenAIAdvancedSchedulerWeightOverrides(weights, settings.weightOverrides)
 	if !overridden.configWeights().IsValid() {
-		if !settings.groupWeightOverridesApplied || !openAIAdvancedSchedulerWeightsAllowingZeroAreValid(overridden) {
-			return weights
-		}
+		return weights
 	}
 	return overridden
-}
-
-func openAIAdvancedSchedulerWeightsAllowingZeroAreValid(weights GatewayOpenAIWSSchedulerScoreWeightsView) bool {
-	configWeights := weights.configWeights()
-	for _, weight := range []float64{
-		configWeights.Priority,
-		configWeights.Load,
-		configWeights.Queue,
-		configWeights.ErrorRate,
-		configWeights.TTFT,
-		configWeights.Reset,
-		configWeights.QuotaHeadroom,
-		configWeights.UpstreamCost,
-		configWeights.PreviousResponse,
-		configWeights.SessionSticky,
-	} {
-		if weight < 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
-			return false
-		}
-	}
-	total := configWeights.TotalWeightSum()
-	return !math.IsNaN(total) && !math.IsInf(total, 0)
 }
 
 func applyOpenAIAdvancedSchedulerWeightOverrides(

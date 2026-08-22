@@ -183,7 +183,6 @@ func TestOpenAIAdvancedSchedulerRequestSettingsDriveRuntimeControls(t *testing.T
 			SubscriptionPriorityEnabled: schedulerRuntimeTestPointer(false),
 			LBTopK:                      schedulerRuntimeTestPointer(2),
 			WeightPriority:              schedulerRuntimeTestPointer(0.0),
-			WeightLoad:                  schedulerRuntimeTestPointer(0.0),
 		},
 	}
 	svc := &OpenAIGatewayService{cfg: cfg}
@@ -197,7 +196,7 @@ func TestOpenAIAdvancedSchedulerRequestSettingsDriveRuntimeControls(t *testing.T
 	require.Equal(t, 2, svc.openAIWSLBTopKForRequest(ctx))
 	weights := svc.openAIWSSchedulerWeightsForRequest(ctx)
 	require.Zero(t, weights.Priority)
-	require.Zero(t, weights.Load)
+	require.Equal(t, 3.0, weights.Load)
 
 	ttft := 125
 	svc.ReportOpenAIAccountScheduleResult(99, "gpt-5", true, &ttft)
@@ -205,4 +204,62 @@ func TestOpenAIAdvancedSchedulerRequestSettingsDriveRuntimeControls(t *testing.T
 	metrics := svc.SnapshotOpenAIAccountSchedulerMetrics()
 	require.Equal(t, int64(1), metrics.AccountSwitchTotal)
 	require.Equal(t, 1, metrics.RuntimeStatsAccountCount)
+}
+
+func TestOpenAIAdvancedSchedulerAllZeroGroupBaseWeightsFallBackToGlobalOverrides(t *testing.T) {
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	openAIAdvancedSchedulerSettingCache.Store(&cachedOpenAIAdvancedSchedulerSetting{
+		enabled: true,
+		weightOverrides: map[string]float64{
+			"priority":          2,
+			"load":              3,
+			"previous_response": 7,
+		},
+		expiresAt: time.Now().Add(time.Hour).UnixNano(),
+	})
+
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights = config.GatewayOpenAIWSSchedulerScoreWeights{
+		Priority: 1, Load: 1, Queue: 0.7, ErrorRate: 0.8, TTFT: 0.5,
+		PreviousResponse: 5, SessionSticky: 3,
+	}
+	groupID := int64(8202)
+	zero := schedulerRuntimeTestPointer(0.0)
+	group := &Group{
+		ID: groupID, Platform: PlatformOpenAI, Status: StatusActive, Hydrated: true,
+		SchedulerType: GroupSchedulerTypeAdvanced,
+		AdvancedSchedulerOverrides: AdvancedSchedulerOverrides{
+			StickyWeightedEnabled: schedulerRuntimeTestPointer(false),
+			LBTopK:                schedulerRuntimeTestPointer(2),
+			WeightPriority:        zero,
+			WeightLoad:            zero,
+			WeightQueue:           zero,
+			WeightErrorRate:       zero,
+			WeightTTFT:            zero,
+			WeightReset:           zero,
+			WeightQuotaHeadroom:   zero,
+			WeightUpstreamCost:    zero,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+	ctx := context.WithValue(context.Background(), ctxkey.Group, group)
+	ctx = svc.withOpenAIAdvancedSchedulerRequestSettings(ctx, &groupID, PlatformOpenAI)
+
+	settings := svc.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
+	require.Equal(t, map[string]float64{
+		"priority":          2,
+		"load":              3,
+		"previous_response": 7,
+	}, settings.weightOverrides)
+	require.False(t, settings.stickyWeightedEnabled)
+	require.Equal(t, 2, settings.lbTopKOverride)
+
+	weights := svc.openAIWSSchedulerWeightsForRequest(ctx)
+	require.Equal(t, 2.0, weights.Priority)
+	require.Equal(t, 3.0, weights.Load)
+	require.Equal(t, 0.7, weights.Queue)
+	require.Equal(t, 0.8, weights.ErrorRate)
+	require.Equal(t, 0.5, weights.TTFT)
+	require.Equal(t, 7.0, weights.Previous)
 }
