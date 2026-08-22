@@ -346,7 +346,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		for {
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
 			if err != nil {
-				if openAIAuditFallbackExhausted(c, admissionState) {
+				if openAISecurityAdmissionUnavailable(c, admissionState, fs.LastFailoverErr) {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
 					return
@@ -676,7 +676,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			)
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
 			if err != nil {
-				if openAIAuditFallbackExhausted(c, admissionState) {
+				if openAISecurityAdmissionUnavailable(c, admissionState, fs.LastFailoverErr) {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
 					return

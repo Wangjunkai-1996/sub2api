@@ -277,9 +277,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			// A request-local audit-exempt constraint is a security capacity
 			// boundary, regardless of whether it came from classification, a final
 			// model mapping, or a failed Pro audit fallback. Do not run ordinary
-			// model diagnosis or replay an earlier upstream error: both can mask the
-			// absence of a verified non-Pro account as 404/502.
-			if openAIAuditFallbackExhausted(c, admissionState) {
+			// model diagnosis when the request has no verified non-Pro account.
+			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
 				return
@@ -301,8 +300,12 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		if selection == nil || selection.Account == nil {
-			if openAIAuditFallbackExhausted(c, admissionState) {
+			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
+			if lastFailoverErr != nil {
+				h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
 				return
 			}
 			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel)

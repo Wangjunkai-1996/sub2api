@@ -602,7 +602,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 				return
 			}
-			if openAIAuditFallbackExhausted(c, admissionState) {
+			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
 				return
@@ -628,8 +628,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 		if selection == nil || selection.Account == nil {
-			if openAIAuditFallbackExhausted(c, admissionState) {
+			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
+			if lastFailoverErr != nil {
+				h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
 				return
 			}
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
@@ -1367,7 +1371,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 				h.anthropicStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 				return
 			}
-			if openAIAuditFallbackExhausted(c, admissionState) {
+			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
 				return
@@ -1391,8 +1395,12 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}
 		}
 		if selection == nil || selection.Account == nil {
-			if openAIAuditFallbackExhausted(c, admissionState) {
+			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				return
+			}
+			if lastFailoverErr != nil {
+				h.handleAnthropicFailoverExhausted(c, lastFailoverErr, streamStarted)
 				return
 			}
 			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)

@@ -264,6 +264,23 @@ func openAIAuditFallbackExhausted(c *gin.Context, state *openAISecurityAdmission
 		service.OpenAIAccountRequirementFromContext(c.Request.Context()) == securityadmission.AccountRequirementAuditExempt
 }
 
+// openAISecurityAdmissionUnavailable reports a security-capacity failure only
+// when the request has not already reached an upstream. Once an upstream
+// failover error exists, that error is the authoritative result and must not
+// be rewritten as the generic security-admission 503. This preserves provider
+// status codes (for example, a shared Cloudflare 502) after the verified
+// account pool is exhausted.
+func openAISecurityAdmissionUnavailable(
+	c *gin.Context,
+	state *openAISecurityAdmissionState,
+	lastFailoverErr *service.UpstreamFailoverError,
+) bool {
+	if lastFailoverErr != nil {
+		return false
+	}
+	return openAIAuditFallbackExhausted(c, state)
+}
+
 func openAIAdmissionErrorStatus(err error) int {
 	if err == nil {
 		return http.StatusBadRequest

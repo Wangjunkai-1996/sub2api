@@ -27,6 +27,8 @@ import (
 type gatewayMessagesReplayUpstream struct {
 	mu         sync.Mutex
 	accountIDs []int64
+	statusCode int
+	body       string
 }
 
 type gatewayMessagesReplayConcurrencyCache struct {
@@ -88,16 +90,22 @@ func (u *gatewayMessagesReplayUpstream) respond(req *http.Request, accountID int
 	u.mu.Lock()
 	u.accountIDs = append(u.accountIDs, accountID)
 	u.mu.Unlock()
+	statusCode := u.statusCode
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	body := u.body
+	if body == "" {
+		body = `{"type":"message","id":"msg_gateway_messages_replay","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`
+	}
 
 	return &http.Response{
-		StatusCode: http.StatusOK,
+		StatusCode: statusCode,
 		Header: http.Header{
 			"Content-Type": []string{"application/json"},
 			"X-Request-Id": []string{"req_gateway_messages_replay"},
 		},
-		Body: io.NopCloser(strings.NewReader(
-			`{"type":"message","id":"msg_gateway_messages_replay","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
-		)),
+		Body: io.NopCloser(strings.NewReader(body)),
 	}, nil
 }
 
@@ -464,6 +472,43 @@ func TestGatewayHandlerMessages_OversizeContinuesThroughAuditExemptAdmission(t *
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	require.Equal(t, []int64{4}, upstream.calls())
 	require.Empty(t, scannerCalls())
+}
+
+func TestGatewayHandlerMessages_UpstreamFailoverPreserves502ForAuditExemptRequest(t *testing.T) {
+	const groupID = int64(23)
+	group := &service.Group{
+		ID: groupID, Hydrated: true, Platform: service.PlatformAnthropic,
+		Status: service.StatusActive,
+	}
+	accounts := gatewayMessagesReplayVerifiedSnapshotAccounts(groupID)[:1]
+	body := exactGatewayMessagesReplayBody(t,
+		`{"model":"claude-sonnet-4-5","stream":false,"max_tokens":16,"messages":[{"role":"future","content":"x"}]}`,
+		67_936,
+	)
+	upstream := &gatewayMessagesReplayUpstream{
+		statusCode: http.StatusBadGateway,
+		body:       `{"type":"error","error":{"type":"upstream_error","message":"Cloudflare upstream unavailable"}}`,
+	}
+	engine, scannerCalls := newSelectedAccountAuditPromptEngine(
+		t, http.StatusOK, "Safety: Safe\nCategories: None",
+	)
+	handler, concurrencyCache := newGatewayMessagesReplayHandlerWithFreshAccounts(
+		t, group, accounts, accounts, upstream, engine,
+	)
+	c, recorder := gatewayMessagesReplayContext(t, group, body)
+
+	handler.Messages(c)
+
+	// The request is audit-exempt and has one eligible account, but an actual
+	// upstream 502 must remain the authoritative terminal result. It must not be
+	// rewritten as the security-admission 503 after the account is exhausted.
+	require.Equal(t, http.StatusBadGateway, recorder.Code, recorder.Body.String())
+	require.NotContains(t, recorder.Body.String(), "security admission")
+	require.Equal(t, []int64{1}, upstream.calls())
+	require.GreaterOrEqual(t, concurrencyCache.releaseCount(1), 1)
+	require.Empty(t, scannerCalls())
+	require.Equal(t, securityadmission.AccountRequirementAuditExempt,
+		service.OpenAIAccountRequirementFromContext(c.Request.Context()))
 }
 
 func TestGatewayHandlerMessages_TerminalCredentialDriftReselectsVerifiedAccount(t *testing.T) {
