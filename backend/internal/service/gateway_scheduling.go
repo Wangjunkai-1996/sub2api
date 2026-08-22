@@ -18,6 +18,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 )
 
 // SelectAccount 选择账号（粘性会话+优先级）
@@ -965,6 +966,7 @@ func (s *GatewayService) listSchedulableAccounts(ctx context.Context, groupID *i
 			if platform == PlatformGrok || strings.EqualFold(platform, PlatformGrok) {
 				accounts = s.filterGrokFreeQuotaAccountsForGateway(ctx, accounts)
 			}
+			accounts = filterGatewayAccountsBySecurityAdmission(ctx, accounts)
 			slog.Debug("account_scheduling_list_snapshot",
 				"group_id", derefGroupID(groupID),
 				"platform", platform,
@@ -1026,7 +1028,8 @@ func (s *GatewayService) listSchedulableAccounts(ctx context.Context, groupID *i
 					"tls_fingerprint", acc.IsTLSFingerprintEnabled())
 			}
 		}
-		return s.filterAccountsBySchedulingThreshold(ctx, filtered), useMixed, nil
+		filtered = s.filterAccountsBySchedulingThreshold(ctx, filtered)
+		return filterGatewayAccountsBySecurityAdmission(ctx, filtered), useMixed, nil
 	}
 
 	var accounts []Account
@@ -1065,7 +1068,42 @@ func (s *GatewayService) listSchedulableAccounts(ctx context.Context, groupID *i
 	if platform == PlatformGrok || strings.EqualFold(platform, PlatformGrok) {
 		accounts = s.filterGrokFreeQuotaAccountsForGateway(ctx, accounts)
 	}
+	accounts = filterGatewayAccountsBySecurityAdmission(ctx, accounts)
 	return accounts, useMixed, nil
+}
+
+func filterGatewayAccountsBySecurityAdmission(ctx context.Context, accounts []Account) []Account {
+	if !gatewaySecurityAdmissionGateActive(ctx) {
+		return accounts
+	}
+	filtered := make([]Account, 0, len(accounts))
+	for i := range accounts {
+		if gatewayAccountSatisfiesSecurityAdmission(ctx, &accounts[i]) {
+			filtered = append(filtered, accounts[i])
+		}
+	}
+	if len(filtered) != len(accounts) {
+		slog.Info("security_admission.gateway_candidates_filtered",
+			"candidate_count", len(accounts),
+			"eligible_count", len(filtered),
+			"requirement", securityadmission.AccountRequirementAuditExempt)
+	}
+	return filtered
+}
+
+func gatewayAccountSatisfiesSecurityAdmission(ctx context.Context, account *Account) bool {
+	if !gatewaySecurityAdmissionGateActive(ctx) {
+		return true
+	}
+	// Generic Messages candidates are credential owners from the native
+	// Anthropic/Gemini/Antigravity pools. OpenAI shadow rows belong to the
+	// OpenAI gateway and stay excluded here; resolving their parents would add
+	// repository reads to this generic scheduler hot path.
+	return ClassifyOpenAIEffectiveCredentialOwner(account) == securityadmission.AccountAuditExemptVerified
+}
+
+func gatewaySecurityAdmissionGateActive(ctx context.Context) bool {
+	return OpenAIAccountRequirementFromContext(ctx) == securityadmission.AccountRequirementAuditExempt
 }
 
 // IsSingleAntigravityAccountGroup 检查指定分组是否只有一个 antigravity 平台的可调度账号。
@@ -1456,6 +1494,9 @@ func (s *GatewayService) getSchedulableAccount(ctx context.Context, accountID in
 		if gated := s.filterGrokFreeQuotaAccountsForGateway(ctx, []Account{*account}); len(gated) == 0 {
 			return nil, nil
 		}
+	}
+	if !gatewayAccountSatisfiesSecurityAdmission(ctx, account) {
+		return nil, nil
 	}
 	return account, nil
 }

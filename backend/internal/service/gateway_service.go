@@ -22,6 +22,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/cespare/xxhash/v2"
 	gocache "github.com/patrickmn/go-cache"
@@ -991,11 +992,11 @@ func (s *GatewayService) BindStickySession(ctx context.Context, groupID *int64, 
 }
 
 // bindGatewayStickySessionDuringSelection preserves the normal eager sticky
-// behavior unless a profit gate is installed. Profit-controlled requests bind
-// only after the terminal post-slot check, otherwise a rejected candidate could
+// behavior unless a terminal admission gate is installed. Gated requests bind
+// only after the post-slot checks, otherwise a rejected candidate could
 // overwrite a healthy pre-existing sticky binding.
 func (s *GatewayService) bindGatewayStickySessionDuringSelection(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
-	if gatewayProfitControlGateActive(ctx) {
+	if gatewayProfitControlGateActive(ctx) || gatewaySecurityAdmissionGateActive(ctx) {
 		return nil
 	}
 	return s.BindStickySession(ctx, groupID, sessionHash, accountID)
@@ -1010,6 +1011,13 @@ func (s *GatewayService) bindGatewayStickySessionDuringSelection(ctx context.Con
 func (s *GatewayService) BindStickySessionAfterProfitAdmission(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
 	if sessionHash == "" || accountID <= 0 || s.cache == nil {
 		return nil
+	}
+	if gatewaySecurityAdmissionGateActive(ctx) {
+		terminal := OpenAIAccountTerminalAdmissionFromContext(ctx)
+		if terminal == nil || terminal.Selected == nil || terminal.Selected.ID != accountID ||
+			terminal.AccountClass != securityadmission.AccountAuditExemptVerified {
+			return ErrOpenAIAccountAdmissionUnavailable
+		}
 	}
 	if !gatewayProfitControlGateActive(ctx) {
 		return s.BindStickySession(ctx, groupID, sessionHash, accountID)

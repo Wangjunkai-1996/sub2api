@@ -158,22 +158,6 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
-	// Classify before any request-body tree or downstream routing work. The
-	// generic gateway scheduler does not carry the OpenAI account requirement
-	// through its candidate filters, so an oversized body must fail closed here
-	// rather than fall through to the legacy empty-input allow path.
-	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
-		admissionState, classifyErr := classifyOpenAISecurityAdmission(
-			string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted,
-		)
-		if classifyErr == nil {
-			installOpenAISecurityAdmission(c, admissionState)
-			logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
-		}
-		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Request cannot be inspected by the security admission gate")
-		return
-	}
-
 	setOpsRequestContext(c, "", false)
 
 	bodyRef := service.NewRequestBodyRef(body)
@@ -199,7 +183,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
 		return
 	}
-	if admissionState.admission.Class() == securityadmission.RequestUninspectable {
+	if admissionState.admission.Reason() == securityadmission.ReasonDuplicateJSONKey {
 		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Request cannot be inspected by the security admission gate")
 		return
 	}
@@ -245,11 +229,19 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 
-	if admissionState.admission.Class() == securityadmission.RequestKnownNoText {
+	switch admissionState.admission.Class() {
+	case securityadmission.RequestKnownNoText:
 		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "known_no_text_skip")
-	} else if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolAnthropicMessages, reqModel, body); decision != nil && !decision.AllowNextStage {
-		h.anthropicSecurityAuditError(c, decision)
-		return
+	case securityadmission.RequestUninspectable:
+		// The generic gateway serves non-OpenAI providers. Preserve the hard
+		// audit-exempt account requirement and enforce it in candidate selection
+		// plus the terminal account check instead of rejecting compatible traffic.
+		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "audit_exempt_route")
+	default:
+		if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolAnthropicMessages, reqModel, body); decision != nil && !decision.AllowNextStage {
+			h.anthropicSecurityAuditError(c, decision)
+			return
+		}
 	}
 
 	// Track if we've started streaming (for error handling)
@@ -354,6 +346,11 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		for {
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
 			if err != nil {
+				if openAIAuditFallbackExhausted(c, admissionState) {
+					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
+					return
+				}
 				if len(fs.FailedAccountIDs) == 0 {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformGemini)
 					if !cls.ModelNotFound {
@@ -479,10 +476,23 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				continue
 			}
 			account = latest
-			selection.Account = latest
+			admissionCtx, account, err = h.admitGatewaySecurityAccount(c, reqLog, admissionState, admissionCtx, account)
+			if err != nil {
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
+				if openAITerminalAdmissionCanReselect(err) {
+					fs.FailedAccountIDs[account.ID] = struct{}{}
+					continue
+				}
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
+				return
+			}
+			selection.Account = account
 			// 等待路径保持既有 eager 绑定（无门时 helper 直接绑定）；调度器已
 			// 抢槽的直达路径无门时由选号内部绑定，这里只在门下补准入后绑定。
-			if selection.ProfitGateActive() || !selection.Acquired {
+			if selection.ProfitGateActive() || !selection.Acquired ||
+				service.OpenAIAccountRequirementFromContext(admissionCtx) == securityadmission.AccountRequirementAuditExempt {
 				if err := h.gatewayService.BindStickySessionAfterProfitAdmission(admissionCtx, apiKey.GroupID, sessionKey, account.ID); err != nil {
 					reqLog.Warn("gateway.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				}
@@ -666,6 +676,11 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			)
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
 			if err != nil {
+				if openAIAuditFallbackExhausted(c, admissionState) {
+					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
+					return
+				}
 				if len(fs.FailedAccountIDs) == 0 {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform)
 					if !cls.ModelNotFound {
@@ -802,10 +817,23 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				continue
 			}
 			account = latest
-			selection.Account = latest
+			admissionCtx, account, err = h.admitGatewaySecurityAccount(c, reqLog, admissionState, admissionCtx, account)
+			if err != nil {
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
+				if openAITerminalAdmissionCanReselect(err) {
+					fs.FailedAccountIDs[account.ID] = struct{}{}
+					continue
+				}
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "Account security admission is temporarily unavailable", streamStarted)
+				return
+			}
+			selection.Account = account
 			// 等待路径保持既有 eager 绑定（无门时 helper 直接绑定）；调度器已
 			// 抢槽的直达路径无门时由选号内部绑定，这里只在门下补准入后绑定。
-			if selection.ProfitGateActive() || !selection.Acquired {
+			if selection.ProfitGateActive() || !selection.Acquired ||
+				service.OpenAIAccountRequirementFromContext(admissionCtx) == securityadmission.AccountRequirementAuditExempt {
 				if err := h.gatewayService.BindStickySessionAfterProfitAdmission(admissionCtx, currentAPIKey.GroupID, sessionKey, account.ID); err != nil {
 					reqLog.Warn("gateway.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				}
@@ -1103,6 +1131,52 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			return
 		}
 	}
+}
+
+func (h *GatewayHandler) admitGatewaySecurityAccount(
+	c *gin.Context,
+	reqLog *zap.Logger,
+	state *openAISecurityAdmissionState,
+	ctx context.Context,
+	account *service.Account,
+) (context.Context, *service.Account, error) {
+	if service.OpenAIAccountRequirementFromContext(ctx) != securityadmission.AccountRequirementAuditExempt {
+		return ctx, account, nil
+	}
+	if h == nil || h.openAIGatewayService == nil {
+		err := service.ErrOpenAIAccountAdmissionUnavailable
+		errorOpenAISecurityAdmission(c, reqLog, "security_admission.gateway_terminal_unavailable", state, gatewaySecurityAccountID(account),
+			securityadmission.AccountUnknown, "terminal_admission_unavailable", "upstream_not_dispatched", zap.Error(err))
+		return ctx, account, err
+	}
+
+	terminal, err := h.openAIGatewayService.AdmitOpenAIAccountRequirement(ctx, account)
+	accountClass := securityadmission.AccountUnknown
+	if terminal != nil {
+		accountClass = terminal.AccountClass
+	}
+	if err != nil || terminal == nil || terminal.Selected == nil || account == nil || terminal.Selected.ID != account.ID {
+		if err == nil {
+			err = fmt.Errorf("%w: selected account changed during terminal admission", service.ErrOpenAIAccountAdmissionUnavailable)
+		}
+		warnOpenAISecurityAdmission(c, reqLog, "security_admission.gateway_terminal_rejected", state, gatewaySecurityAccountID(account),
+			accountClass, "terminal_admission_rejected", "upstream_not_dispatched", zap.Error(err))
+		return ctx, account, err
+	}
+
+	ctx = service.WithOpenAIAccountTerminalAdmission(ctx, terminal)
+	if c != nil && c.Request != nil {
+		c.Request = c.Request.WithContext(ctx)
+	}
+	logOpenAISecurityAdmission(c, reqLog, state, terminal.AccountClass, "terminal_admitted")
+	return ctx, terminal.Selected, nil
+}
+
+func gatewaySecurityAccountID(account *service.Account) int64 {
+	if account == nil {
+		return 0
+	}
+	return account.ID
 }
 
 // Models handles listing available models

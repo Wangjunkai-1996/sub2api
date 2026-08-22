@@ -41,20 +41,19 @@ func TestGatewayMessagesRejectsCanonicalUninspectableBeforeRouting(t *testing.T)
 		service.OpenAIAccountRequirementFromContext(c.Request.Context()))
 }
 
-func TestGatewayMessagesOversizeGateInstallsFailClosedAdmission(t *testing.T) {
+func TestGatewayMessagesOversizeAdmissionRequiresAuditExemptRouting(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet","messages":[{"role":"user","content":"` +
 		strings.Repeat("x", securityadmission.DefaultBodyCapBytes) + `"}]}`)
-	c, recorder := newGatewayMessagesAdmissionContext(body)
-
-	(&GatewayHandler{}).Messages(c)
-
-	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-	state := openAISecurityAdmissionFromContext(c)
-	require.NotNil(t, state)
-	require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
-	require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
+	admission, err := securityadmission.Classify(
+		string(securityadmission.ProtocolAnthropicMessages),
+		body,
+		securityadmission.Options{Lineage: securityadmission.LineageUntrusted},
+	)
+	require.NoError(t, err)
+	require.Equal(t, securityadmission.RequestUninspectable, admission.Class())
+	require.Equal(t, securityadmission.ReasonLargeBody, admission.Reason())
 	require.Equal(t, securityadmission.AccountRequirementAuditExempt,
-		service.OpenAIAccountRequirementFromContext(c.Request.Context()))
+		admission.Requirement())
 }
 
 func TestGatewayMessagesCanonicalAdmissionPrecedesLegacyAudit(t *testing.T) {
