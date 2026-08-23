@@ -98,6 +98,14 @@ const (
 	contentModerationRuntimeRefreshTimeout = 5 * time.Second
 )
 
+// ContentModerationMaxInputRunes returns the maximum text size accepted by a
+// single synchronous moderation request. Callers that need to audit a larger
+// canonical transcript must split it into chunks rather than relying on the
+// normalizing truncation performed by ContentModerationInput.Normalize.
+func ContentModerationMaxInputRunes() int {
+	return maxModerationInputRunes
+}
+
 var contentModerationCategoryOrder = []string{
 	"harassment",
 	"harassment/threatening",

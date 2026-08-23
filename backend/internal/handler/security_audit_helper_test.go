@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -368,6 +369,92 @@ func TestSelectedOpenAIProAccountAuditPromptUnavailableFallsBackToLegacyAllow(t 
 	require.Equal(t, int64(1), legacy.calls.Load(), "the already executed legacy result must be reused")
 	require.Equal(t, int64(1), engine.evaluates.Load())
 	require.NotNil(t, decision.Legacy)
+}
+
+func TestSelectedOpenAIProAccountAuditPromptUnavailableFallsBackToLegacyAllowForLargeCanonicalText(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{
+		mode:      securityaudit.ModeBlocking,
+		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
+	}
+	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
+		Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
+	}}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "pro"}}
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"` +
+		strings.Repeat("x", securityadmission.MaxAuditableTextRunes+1) + `"}]}`)
+
+	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
+		service.ContentModerationProtocolOpenAIChat, "gpt-test", body)
+	if decision == nil || decision.Kind != securityaudit.DecisionAllow || !decision.AllowNextStage {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if legacy.calls.Load() != 1 || engine.evaluates.Load() != 1 {
+		t.Fatalf("legacy_calls=%d prompt_evaluates=%d want 1/1", legacy.calls.Load(), engine.evaluates.Load())
+	}
+	state := openAISecurityAdmissionFromContext(c)
+	if state == nil {
+		t.Fatal("missing admission state")
+	}
+	if state.admission.Class() != securityadmission.RequestAuditableText ||
+		state.admission.Requirement() != securityadmission.AccountRequirementAny {
+		t.Fatalf("admission=%+v", state.admission)
+	}
+}
+
+func TestSelectedOpenAIProAccountAuditLargeCanonicalTextLegacyOutcomeMatrix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"` +
+		strings.Repeat("x", securityadmission.MaxAuditableTextRunes+1) + `"}]}`)
+	for _, test := range []struct {
+		name          string
+		legacy        *securityaudit.LegacyDecision
+		wantKind      securityaudit.DecisionKind
+		wantAllow     bool
+		wantLegacyRun int64
+	}{
+		{
+			name: "audited allow", legacy: &securityaudit.LegacyDecision{
+				Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
+			}, wantKind: securityaudit.DecisionAllow, wantAllow: true, wantLegacyRun: 1,
+		},
+		{
+			name: "hard block", legacy: &securityaudit.LegacyDecision{
+				Blocked: true, StatusCode: http.StatusForbidden, ErrorCode: "content_policy_violation",
+			}, wantKind: securityaudit.DecisionBlock, wantAllow: false, wantLegacyRun: 1,
+		},
+		{name: "unavailable", wantKind: securityaudit.DecisionUnavailable, wantAllow: false, wantLegacyRun: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &turnCountingEngine{
+				mode:      securityaudit.ModeBlocking,
+				decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
+			}
+			legacy := &handlerLegacyModerationEngine{decision: test.legacy}
+			h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+				Credentials: map[string]any{"plan_type": "pro"}}
+
+			decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
+				service.ContentModerationProtocolOpenAIChat, "gpt-test", body)
+			require.NotNil(t, decision)
+			require.Equal(t, test.wantKind, decision.Kind)
+			require.Equal(t, test.wantAllow, decision.AllowNextStage)
+			require.Equal(t, test.wantLegacyRun, legacy.calls.Load())
+			state := openAISecurityAdmissionFromContext(c)
+			require.NotNil(t, state)
+			require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
+			require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
+		})
+	}
 }
 
 func TestSelectedOpenAIProAccountAuditPromptUnavailablePreservesLegacyBlock(t *testing.T) {

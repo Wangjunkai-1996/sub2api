@@ -112,6 +112,79 @@ func Classify(protocol string, body []byte, options Options) (Admission, error) 
 	return base, nil
 }
 
+const (
+	// MaxResourceExpansionBodyBytes is the largest request body for which the
+	// gateway will retry canonical admission with the ordinary resource limits
+	// relaxed.  It matches the default gateway ingress ceiling (256 MiB), so a
+	// valid request that the HTTP server accepted cannot become an opaque,
+	// audit-exempt request merely because it crossed the 1 MiB inspection cap.
+	// Structural parser limits remain in force during the second pass.
+	MaxResourceExpansionBodyBytes = 256 << 20
+
+	// MaxAuditableTextRunes is retained as a useful regression threshold for
+	// oversized-audit tests. It is deliberately no longer a routing gate:
+	// structurally valid text of any size is still eligible for a Pro account,
+	// and the legacy adapter audits the complete canonical transcript in bounded
+	// chunks.
+	MaxAuditableTextRunes = 64 << 10
+)
+
+// ClassifyWithResourceExpansion preserves Classify's bounded, fail-closed
+// contract while allowing a complete, structurally valid text request to be
+// audited when it exceeds only the body/text inspection budgets.  The first
+// pass is deliberately unchanged: it provides the cheap bounded decision and
+// keeps opaque media, remote references, unknown shapes, duplicate keys and
+// parser-limit failures out of the relaxed path.  Only a large body or a text
+// rune limit can trigger the second pass.
+//
+// The expanded pass raises only BodyCapBytes and MaxTextRunes.  All structural
+// limits remain in force, and a parse error falls back to the original
+// fail-closed admission so callers can run their normal complete-envelope
+// validation.  A successful expanded pass returns the normal auditable/no-text
+// admission. The legacy moderation adapter owns bounded chunking of the
+// resulting canonical transcript; classification must not silently downgrade a
+// valid large text request to an audit-exempt account.
+func ClassifyWithResourceExpansion(protocol string, body []byte, options Options) (Admission, error) {
+	initial, err := Classify(protocol, body, options)
+	if err != nil {
+		return initial, err
+	}
+	if initial.Class() != RequestUninspectable ||
+		(initial.Reason() != ReasonLargeBody && initial.Reason() != ReasonTextLimit) ||
+		len(body) > MaxResourceExpansionBodyBytes {
+		return initial, nil
+	}
+
+	limits := normalizeLimits(options.Limits)
+	limits.BodyCapBytes = len(body)
+	// A valid JSON string contributes no more decoded runes than its encoded
+	// body bytes, so the body length is a conservative upper bound that avoids a
+	// second pre-scan just to count runes.  Structural/parser limits stay intact.
+	if limits.MaxTextRunes < len(body) {
+		limits.MaxTextRunes = len(body)
+	}
+	expandedOptions := options
+	expandedOptions.Limits = limits
+	expanded, expandedErr := Classify(protocol, body, expandedOptions)
+	if expandedErr != nil {
+		// Keep the original resource reason.  HTTP callers will perform their
+		// complete JSON/routing validation and return the appropriate client
+		// error instead of allowing an unvalidated payload to reach a Pro account.
+		return initial, nil
+	}
+	if expanded.Class() == RequestAuditableText {
+		return expanded, nil
+	}
+	if expanded.Class() == RequestKnownNoText {
+		return expanded, nil
+	}
+	// The relaxed pass may discover an opaque semantic or structural reason
+	// that the bounded pass could not see.  Preserve that stronger reason and
+	// its fail-closed account requirement.
+	expanded.requirement = AccountRequirementAuditExempt
+	return expanded, nil
+}
+
 func reorderResponsesSegments(parser *jsonParser) {
 	if parser == nil || len(parser.segments) < 2 {
 		return

@@ -329,13 +329,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
-	// Classify before the content walk. Oversized requests remain opaque to the
-	// prompt classifier (and therefore use audit-exempt account admission), but
-	// their complete body is already resident and still must be parsed for
-	// routing, capability, and request-shaping decisions.
+	// Classify before the content walk. Resource-limited text requests are
+	// retried through a complete bounded structural pass; only payloads that
+	// remain opaque use the audit-exempt routing path. The complete body is
+	// already resident and still must be parsed for routing/capability decisions.
 	var admissionState *openAISecurityAdmissionState
 	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
-		state, classifyErr := classifyOpenAISecurityAdmission(string(securityadmission.ProtocolOpenAIResponses), body, securityadmission.LineageUntrusted)
+		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(string(securityadmission.ProtocolOpenAIResponses), body, securityadmission.LineageUntrusted)
 		if classifyErr != nil {
 			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
 				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
@@ -430,7 +430,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 
 	if admissionState == nil {
-		state, classifyErr := classifyOpenAISecurityAdmission(
+		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(
 			string(securityadmission.ProtocolOpenAIResponses), auditBody, securityadmission.LineageUntrusted,
 		)
 		if classifyErr != nil {
@@ -1161,7 +1161,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	}
 	var admissionState *openAISecurityAdmissionState
 	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
-		state, classifyErr := classifyOpenAISecurityAdmission(string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted)
+		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted)
 		if classifyErr != nil {
 			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
 				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
@@ -1239,7 +1239,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	}
 
 	if admissionState == nil {
-		state, classifyErr := classifyOpenAISecurityAdmission(
+		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(
 			string(securityadmission.ProtocolAnthropicMessages), body, securityadmission.LineageUntrusted,
 		)
 		if classifyErr != nil {
@@ -2212,7 +2212,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "unsupported websocket message type")
 		return
 	}
-	admissionState, classifyErr := classifyOpenAISecurityAdmission(
+	admissionState, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(
 		string(securityadmission.ProtocolResponsesWebSocket), firstMessage, securityadmission.LineageUntrusted,
 	)
 	if classifyErr != nil {
@@ -2834,7 +2834,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if turn == 1 {
 					return nil
 				}
-				state, classifyErr := classifyOpenAISecurityAdmissionWithOptions(
+				state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansionOptions(
 					string(securityadmission.ProtocolResponsesWebSocket),
 					payload,
 					securityadmission.Options{ResolveLineage: func(previousResponseID string) securityadmission.LineageTrust {

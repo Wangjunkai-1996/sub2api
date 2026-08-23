@@ -65,7 +65,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 	var admissionState *openAISecurityAdmissionState
 	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
-		state, classifyErr := classifyOpenAISecurityAdmission(string(securityadmission.ProtocolOpenAIChat), body, securityadmission.LineageUntrusted)
+		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(string(securityadmission.ProtocolOpenAIChat), body, securityadmission.LineageUntrusted)
 		if classifyErr != nil {
 			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
 				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
@@ -152,7 +152,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	if admissionState == nil {
-		state, classifyErr := classifyOpenAISecurityAdmission(
+		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(
 			string(securityadmission.ProtocolOpenAIChat), auditBody, securityadmission.LineageUntrusted,
 		)
 		if classifyErr != nil {

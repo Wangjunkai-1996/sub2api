@@ -68,12 +68,51 @@ func classifyOpenAISecurityAdmission(protocol string, body []byte, lineage secur
 	return classifyOpenAISecurityAdmissionWithOptions(protocol, body, securityadmission.Options{Lineage: lineage})
 }
 
+// classifyOpenAISecurityAdmissionWithResourceExpansion is used by the
+// OpenAI-compatible gateway handlers (including Responses WebSocket frames).
+// It keeps structurally valid large text auditable while leaving opaque
+// resources on the existing verified-account path.
+func classifyOpenAISecurityAdmissionWithResourceExpansion(
+	protocol string,
+	body []byte,
+	lineage securityadmission.LineageTrust,
+) (*openAISecurityAdmissionState, error) {
+	return classifyOpenAISecurityAdmissionWithResourceExpansionOptions(
+		protocol, body, securityadmission.Options{Lineage: lineage},
+	)
+}
+
 func classifyOpenAISecurityAdmissionWithOptions(
 	protocol string,
 	body []byte,
 	options securityadmission.Options,
 ) (*openAISecurityAdmissionState, error) {
-	admission, err := securityadmission.Classify(protocol, body, options)
+	return classifyOpenAISecurityAdmissionWithOptionsInternal(protocol, body, options, false)
+}
+
+func classifyOpenAISecurityAdmissionWithResourceExpansionOptions(
+	protocol string,
+	body []byte,
+	options securityadmission.Options,
+) (*openAISecurityAdmissionState, error) {
+	return classifyOpenAISecurityAdmissionWithOptionsInternal(protocol, body, options, true)
+}
+
+func classifyOpenAISecurityAdmissionWithOptionsInternal(
+	protocol string,
+	body []byte,
+	options securityadmission.Options,
+	expandResources bool,
+) (*openAISecurityAdmissionState, error) {
+	var (
+		admission securityadmission.Admission
+		err       error
+	)
+	if expandResources {
+		admission, err = securityadmission.ClassifyWithResourceExpansion(protocol, body, options)
+	} else {
+		admission, err = securityadmission.Classify(protocol, body, options)
+	}
 	if err != nil {
 		return nil, err
 	}

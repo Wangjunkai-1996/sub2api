@@ -111,7 +111,7 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIAccount(
 		if state != nil {
 			lineage = state.lineage
 		}
-		classified, err := classifyOpenAISecurityAdmission(protocol, body, lineage)
+		classified, err := classifyOpenAISecurityAdmissionWithResourceExpansion(protocol, body, lineage)
 		if err != nil {
 			return securityAuditUnavailableDecision()
 		}
@@ -420,7 +420,8 @@ func securityAuditDecisionHasProof(decision *securityaudit.Decision) bool {
 		(decision.Prompt.Kind == securityaudit.DecisionAllow || decision.Prompt.Kind == securityaudit.DecisionFlag) {
 		return true
 	}
-	return decision.Legacy != nil && (decision.Legacy.Audited || decision.Legacy.Blocked)
+	return decision.Legacy != nil && decision.Legacy.Audited &&
+		decision.Legacy.Allowed && !decision.Legacy.Blocked
 }
 
 // deriveKnownViolationAdmission annotates observability with the authoritative

@@ -508,9 +508,12 @@ func TestOpenAIGatewayHandler_ReplaysObservedOversizeRoutingSignatures(t *testin
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 			state := openAISecurityAdmissionFromContext(c)
 			require.NotNil(t, state)
-			require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
-			require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
-			require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
+			// Resource expansion completes the canonical parse for valid text
+			// envelopes. Large text remains eligible for a Pro account; the
+			// blocking audit engine chunks the canonical transcript before dispatch.
+			require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
+			require.Equal(t, securityadmission.ReasonAuditableText, state.admission.Reason())
+			require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
 			c.Request.Body = nil
 		})
 	}
@@ -519,9 +522,9 @@ func TestOpenAIGatewayHandler_ReplaysObservedOversizeRoutingSignatures(t *testin
 	calls := upstream.calls()
 	require.Len(t, calls, len(buckets))
 	for _, accountID := range calls {
-		require.Equal(t, int64(4), accountID, "every observed signature must dispatch through the verified account")
+		require.Equal(t, int64(1), accountID, "every structurally valid observed signature must dispatch through Pro after audit")
 	}
-	require.Empty(t, scannerCalls(), "oversize replay must remain opaque and never invoke content scanning")
+	require.NotEmpty(t, scannerCalls(), "every structurally valid observed signature must receive a blocking audit")
 }
 
 func TestOpenAIGatewayHandler_SelectedProAuditBlockReleasesConcurrencyBeforeUpstream(t *testing.T) {
@@ -1073,7 +1076,7 @@ func TestOpenAIGatewayHandler_EffectiveSearchModelMappingsWithoutVerifiedNonProR
 	}
 }
 
-func TestOpenAIGatewayHandler_OversizeOpenAIHTTPRoutesOnlyToVerifiedNonProWithoutScanning(t *testing.T) {
+func TestOpenAIGatewayHandler_OversizeTextRoutesToProAfterAudit(t *testing.T) {
 	oversize := strings.Repeat("x", securityadmission.CurrentLimits().BodyCapBytes+1)
 	tests := []struct {
 		name   string
@@ -1131,15 +1134,57 @@ func TestOpenAIGatewayHandler_OversizeOpenAIHTTPRoutesOnlyToVerifiedNonProWithou
 			tt.invoke(handler, c)
 
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-			require.Equal(t, []int64{4}, upstream.calls(), "oversize must exclude Pro and unknown accounts")
-			require.Empty(t, scannerCalls(), "oversize classification must not materialize content or invoke the prompt scanner")
+			require.Equal(t, []int64{1}, upstream.calls(), "valid oversized text must reach Pro after the blocking audit")
+			require.NotEmpty(t, scannerCalls(), "valid oversized text must invoke the blocking scanner")
 			state := openAISecurityAdmissionFromContext(c)
 			require.NotNil(t, state)
-			require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
-			require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
-			require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
+			require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
+			require.Equal(t, securityadmission.ReasonAuditableText, state.admission.Reason())
+			require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
 		})
 	}
+}
+
+func TestOpenAIGatewayHandler_OversizedWhitespaceEnvelopeStillAuditsPro(t *testing.T) {
+	core := []byte(`{"model":"gpt-5.1","stream":true,"input":"short-oversize-canary"}`)
+	padding := bytes.Repeat([]byte(" "), securityadmission.CurrentLimits().BodyCapBytes+1-len(core))
+	body := append(padding, core...)
+
+	upstream := &selectedAccountAuditResponsesUpstream{}
+	engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine, selectedAccountAuditProAccounts())
+	c, recorder := selectedAccountAuditHTTPBytesContext(t, "/v1/responses", body)
+
+	handler.Responses(c)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, []int64{1}, upstream.calls(), "an oversized body with a small canonical transcript may use Pro")
+	require.Len(t, scannerCalls(), 1, "the Pro request must receive a blocking audit")
+	require.Contains(t, scannerCalls()[0], "short-oversize-canary")
+	state := openAISecurityAdmissionFromContext(c)
+	require.NotNil(t, state)
+	require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
+	require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
+}
+
+func TestOpenAIGatewayHandler_OverBudgetTextWithProOnlyPoolDispatchesAfterAudit(t *testing.T) {
+	text := strings.Repeat("x", securityadmission.MaxAuditableTextRunes+1)
+	body := `{"model":"gpt-5.1","stream":true,"input":"` + text + `"}`
+
+	upstream := &selectedAccountAuditResponsesUpstream{}
+	engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine, selectedAccountAuditProAccounts())
+	c, recorder := selectedAccountAuditHTTPContext(t, "/v1/responses", body)
+
+	handler.Responses(c)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, []int64{1}, upstream.calls(), "an over-budget but structurally valid transcript must dispatch to Pro after audit")
+	require.NotEmpty(t, scannerCalls(), "the Pro-only request must receive a blocking audit")
+	state := openAISecurityAdmissionFromContext(c)
+	require.NotNil(t, state)
+	require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
+	require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
 }
 
 func TestOpenAIGatewayHandler_MaxObservedOversizeResponsesLateRoutingFieldsSucceeds(t *testing.T) {
@@ -1156,23 +1201,20 @@ func TestOpenAIGatewayHandler_MaxObservedOversizeResponsesLateRoutingFieldsSucce
 
 	upstream := &selectedAccountAuditResponsesUpstream{}
 	engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
-	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine,
-		selectedAccountAuditFallbackAccounts(service.AccountTypeOAuth, map[string]any{
-			"access_token": "verified-plus-token", "plan_type": "plus",
-		}))
+	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine, selectedAccountAuditProAccounts())
 	c, recorder := selectedAccountAuditHTTPBytesContext(t, "/v1/responses", body)
 	body = nil
 
 	handler.Responses(c)
 
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-	require.Equal(t, []int64{4}, upstream.calls(), "maximum observed oversize request must use only an audit-exempt account")
-	require.Empty(t, scannerCalls(), "oversize classification must not invoke the prompt scanner")
+	require.Equal(t, []int64{1}, upstream.calls(), "maximum observed valid text must dispatch through Pro after audit")
+	require.NotEmpty(t, scannerCalls(), "maximum observed valid text must be audited before dispatch")
 	state := openAISecurityAdmissionFromContext(c)
 	require.NotNil(t, state)
-	require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
-	require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
-	require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
+	require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
+	require.Equal(t, securityadmission.ReasonAuditableText, state.admission.Reason())
+	require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
 }
 
 func TestOpenAIGatewayHandler_OpenAIHTTPRejectsInvalidCompleteRoutingEnvelope(t *testing.T) {
@@ -1284,7 +1326,7 @@ func TestOpenAIGatewayHandler_OversizeChatAndMessagesLateRoutingFieldsSucceed(t 
 			state := openAISecurityAdmissionFromContext(c)
 			require.NotNil(t, state)
 			require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
-			require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
+			require.Equal(t, securityadmission.ReasonUnknownField, state.admission.Reason())
 			require.Equal(t, securityadmission.AccountRequirementAuditExempt, state.admission.Requirement())
 		})
 	}
@@ -1407,5 +1449,7 @@ func TestOpenAIGatewayHandler_OversizeResponsesRejectsExplicitImageIntentBeforeD
 	state := openAISecurityAdmissionFromContext(c)
 	require.NotNil(t, state)
 	require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
-	require.Equal(t, securityadmission.ReasonLargeBody, state.admission.Reason())
+	// Full resource-expanded parsing identifies the image tool as the
+	// fail-closed reason before the permission gate rejects the request.
+	require.Equal(t, securityadmission.ReasonMediaContent, state.admission.Reason())
 }
