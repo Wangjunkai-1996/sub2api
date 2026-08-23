@@ -27,13 +27,22 @@ func TestOpenAISecurityAdmissionUnavailableDoesNotMaskUpstreamFailover(t *testin
 	// failover mapper instead of replacing the provider status with security 503.
 	require.False(t, openAISecurityAdmissionUnavailable(c, state, upstream502))
 
-	// Without an upstream attempt, an audit-exempt request with no eligible
-	// account remains a security-capacity failure.
-	require.True(t, openAISecurityAdmissionUnavailable(c, state, nil))
+	// An audit-exempt requirement alone only selects the verified account pool;
+	// it does not prove that Prompt Audit was attempted.
+	require.False(t, openAIAuditFallbackExhausted(c, state))
+	require.True(t, openAISecurityAdmissionUnavailable(c, state, nil),
+		"the verified-pool capacity gate must still return a controlled 503")
+	require.Equal(t, "No available accounts", openAISecurityAdmissionErrorMessage(c, state))
+
+	// The same distinction holds without a request-local state object.
+	require.False(t, openAIAuditFallbackExhausted(c, nil))
+	require.True(t, openAISecurityAdmissionUnavailable(c, nil, nil))
 
 	// The same rule applies when the request reached the explicit audit fallback
 	// path: only an actual upstream error can supersede the security 503.
 	state.fallback = true
+	require.True(t, openAIAuditFallbackExhausted(c, state))
 	require.True(t, openAISecurityAdmissionUnavailable(c, state, nil))
+	require.Contains(t, openAISecurityAdmissionErrorMessage(c, state), "提示词安全审计")
 	require.False(t, openAISecurityAdmissionUnavailable(c, state, upstream502))
 }

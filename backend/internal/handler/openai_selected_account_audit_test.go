@@ -918,6 +918,27 @@ func TestOpenAIGatewayHandler_RemoteContentRoutesOnlyToVerifiedNonProWithoutScan
 	}
 }
 
+func TestOpenAIGatewayHandler_UninspectableWithoutVerifiedPoolReportsAccountPoolExhaustion(t *testing.T) {
+	upstream := &selectedAccountAuditResponsesUpstream{}
+	engine, scannerCalls := newSelectedAccountAuditPromptEngine(t, http.StatusOK, "Safety: Safe\nCategories: None")
+	handler, _ := newSelectedAccountAuditHandler(t, upstream, engine, selectedAccountAuditProAccounts())
+	c, recorder := selectedAccountAuditHTTPContext(t, "/v1/responses",
+		`{"model":"gpt-5.1","stream":true,"input":[{"type":"future_item","text":"verified-pool-empty-canary"}]}`)
+
+	handler.Responses(c)
+
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
+	require.Contains(t, recorder.Body.String(), "No available accounts")
+	require.NotContains(t, recorder.Body.String(), "提示词安全审计")
+	require.NotContains(t, recorder.Body.String(), "Prompt Audit")
+	require.Empty(t, upstream.calls(), "an uninspectable request must not dispatch to Pro")
+	require.Empty(t, scannerCalls(), "an uninspectable request must not invoke Prompt Audit")
+	state := openAISecurityAdmissionFromContext(c)
+	require.NotNil(t, state)
+	require.Equal(t, securityadmission.RequestUninspectable, state.admission.Class())
+	require.False(t, state.fallback, "no Pro audit fallback was attempted")
+}
+
 func TestOpenAIGatewayHandler_EffectiveSearchModelMappingsRequireVerifiedNonPro(t *testing.T) {
 	const (
 		groupID     = int64(3131)
@@ -1067,6 +1088,8 @@ func TestOpenAIGatewayHandler_EffectiveSearchModelMappingsWithoutVerifiedNonProR
 				endpoint.invoke(handler, c)
 
 				require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
+				require.Contains(t, recorder.Body.String(), "No available accounts")
+				require.NotContains(t, recorder.Body.String(), "提示词安全审计")
 				require.Empty(t, upstream.calls())
 				require.Empty(t, scannerCalls())
 				require.Equal(t, securityadmission.AccountRequirementAuditExempt,

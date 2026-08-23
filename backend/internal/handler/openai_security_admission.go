@@ -296,11 +296,24 @@ func openAITerminalAdmissionCanReselect(err error) bool {
 }
 
 func openAIAuditFallbackExhausted(c *gin.Context, state *openAISecurityAdmissionState) bool {
-	if state != nil && state.fallback {
-		return true
-	}
+	// An audit-exempt requirement only describes the account class allowed to
+	// serve the request. It does not mean that Prompt Audit was attempted. The
+	// latter is true only after a Pro audit failure explicitly switched this
+	// request to the verified fallback pool. Keeping these states separate avoids
+	// reporting an empty verified pool as a Prompt Audit outage.
+	return state != nil && state.fallback
+}
+
+func openAISecurityAdmissionRequired(c *gin.Context) bool {
 	return c != nil && c.Request != nil &&
 		service.OpenAIAccountRequirementFromContext(c.Request.Context()) == securityadmission.AccountRequirementAuditExempt
+}
+
+func openAISecurityAdmissionErrorMessage(c *gin.Context, state *openAISecurityAdmissionState) string {
+	if openAIAuditFallbackExhausted(c, state) {
+		return securityAuditMessage(securityAuditUnavailableDecision())
+	}
+	return "No available accounts"
 }
 
 // openAISecurityAdmissionUnavailable reports a security-capacity failure only
@@ -317,7 +330,7 @@ func openAISecurityAdmissionUnavailable(
 	if lastFailoverErr != nil {
 		return false
 	}
-	return openAIAuditFallbackExhausted(c, state)
+	return openAIAuditFallbackExhausted(c, state) || openAISecurityAdmissionRequired(c)
 }
 
 func openAIAdmissionErrorStatus(err error) int {

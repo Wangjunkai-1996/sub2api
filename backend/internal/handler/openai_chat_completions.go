@@ -280,7 +280,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			// model diagnosis when the request has no verified non-Pro account.
 			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
 				return
 			}
 			if len(failedAccountIDs) == 0 {
@@ -301,7 +301,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		}
 		if selection == nil || selection.Account == nil {
 			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
-				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
 				return
 			}
 			if lastFailoverErr != nil {

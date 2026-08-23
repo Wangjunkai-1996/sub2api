@@ -604,7 +604,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
 				return
 			}
 			if len(failedAccountIDs) == 0 {
@@ -629,7 +629,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		if selection == nil || selection.Account == nil {
 			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
-				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
 				return
 			}
 			if lastFailoverErr != nil {
@@ -1373,7 +1373,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}
 			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
 				return
 			}
 			if len(failedAccountIDs) == 0 {
@@ -1396,7 +1396,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		}
 		if selection == nil || selection.Account == nil {
 			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
-				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", securityAuditMessage(securityAuditUnavailableDecision()), streamStarted)
+				h.anthropicStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
 				return
 			}
 			if lastFailoverErr != nil {
