@@ -15,10 +15,10 @@ import (
 
 const securityAuditCompletedContextKey = "sub2api.security_audit.completed"
 const securityAuditBlockingCompletedContextKey = "sub2api.security_audit.blocking_completed"
-const securityAuditProofCompletedContextKey = "sub2api.security_audit.proof_completed"
+const securityAuditSelectedCompletedContextKey = "sub2api.security_audit.selected_completed"
 const securityAuditWSTurnContextKey = "sub2api.security_audit.ws_turn"
 const securityAuditWSDedupeContextKey = "sub2api.security_audit.ws_dedupe"
-const securityAuditProofWSDedupeContextKey = "sub2api.security_audit.proof_ws_dedupe"
+const securityAuditSelectedWSDedupeContextKey = "sub2api.security_audit.selected_ws_dedupe"
 
 type securityAuditWSDedupeEntry struct {
 	stage           string
@@ -145,73 +145,53 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditForSelectedOpenAIAccount(
 			stage = "subsequent_turn"
 		}
 	}
-	decision := runSecurityAuditWithProof(c, reqLog, h.securityAuditCoordinator, h.contentModerationService,
+	decision := runSecurityAuditForSelectedAccount(c, reqLog, h.securityAuditCoordinator, h.contentModerationService,
 		apiKey, subject, protocol, model, body, stage, &state.admission)
-	// A Pro request must have a concrete synchronous audit proof. A successful
-	// Prompt Guard allow/flag is sufficient; when Prompt Guard is unavailable,
-	// the existing risk-control (legacy moderation) result is used instead, and
-	// a configuration skip/out-of-scope result is not treated as proof.
-	if decision != nil && decision.AllowNextStage && securityAuditDecisionHasProof(decision) {
-		markSecurityAuditProof(c, stage, body, *decision)
-		return decision
+	// A selected Pro account must run the existing synchronous audit path, but
+	// the optional Prompt Guard is not a second availability gate.  A concrete
+	// allow from either scanner is dispatchable; the selected-account cache is
+	// isolated from the generic request cache so a prior async/disabled check
+	// cannot make the Pro request skip the risk-control audit.
+	if selectedAllow := selectedSecurityAuditAllow(decision); selectedAllow != nil {
+		markSelectedSecurityAuditCompletion(c, stage, body, *selectedAllow)
+		return selectedAllow
 	}
-	if decision != nil && decision.AllowNextStage && !securityAuditDecisionHasProof(decision) {
-		// runSecurityAuditWithAdmission may have set an optimistic HTTP or
-		// WebSocket dedupe marker before this proof check. Clear it so a
-		// subsequent failover cannot reinterpret the rejected result as a cache
-		// hit.
-		clearSecurityAuditCompletion(c, stage)
+	if decision != nil && decision.AllowNextStage {
+		// A coordinator compatibility allow with neither a legacy result nor a
+		// completed Prompt Guard scan is not an audit. Keep Pro fail-closed here.
 		return securityAuditUnavailableDecision()
 	}
-	// Prompt Guard is an additional signal, not the only way to satisfy the
-	// existing risk-control contract.  When it is unavailable/invalid, rerun
-	// the same canonical admission through the configured LegacyModerationAdapter
-	// before considering the request unavailable.  A missing or failed legacy
-	// result still fails closed; no upstream dispatch can occur without an audit
-	// decision.
-	// A nil result is the successful HTTP cache hit. Only a concrete unavailable
-	// decision should enter the legacy fallback path; otherwise a cached Pro
-	// request would be turned into a spurious 503 on its next failover attempt.
+	// If Prompt Guard is unavailable but the existing risk-control adapter has
+	// already returned its normal fail-open allow, preserve that established
+	// behavior.  This is the production failure mode behind the Pro-only 503s:
+	// the moderation API timeout is intentionally represented as Allowed=true,
+	// Audited=false.  It must not be reclassified as a missing audit decision.
 	if decision != nil && !decision.AllowNextStage && securityAuditCanReselect(decision) {
+		if legacyAllow := selectedSecurityAuditLegacyAllow(decision); legacyAllow != nil {
+			markSelectedSecurityAuditCompletion(c, stage, body, *legacyAllow)
+			return legacyAllow
+		}
 		// Coordinator.Check already executes the legacy adapter in parallel with
-		// Prompt Guard. Reuse that result when present; rerunning the adapter would
-		// duplicate moderation side effects and audit records.
+		// Prompt Guard. Reuse that result when present; rerunning is only needed
+		// when the adapter returned no result at all.
 		if decision.Legacy != nil {
-			legacyDecision := securityaudit.DecisionFromLegacy(decision.Legacy)
-			if legacyDecision.AllowNextStage && securityAuditDecisionHasProof(&legacyDecision) {
-				markSecurityAuditProof(c, stage, body, legacyDecision)
-			}
-			return &legacyDecision
+			return decision
 		}
 		legacyDecision := h.runLegacySecurityAuditForSelectedOpenAIAccount(
 			c, reqLog, apiKey, subject, protocol, model, body, stage, &state.admission,
 		)
+		if legacyAllow := selectedSecurityAuditLegacyAllow(legacyDecision); legacyAllow != nil {
+			markSelectedSecurityAuditCompletion(c, stage, body, *legacyAllow)
+			return legacyAllow
+		}
 		if legacyDecision != nil {
-			if legacyDecision.AllowNextStage && securityAuditDecisionHasProof(legacyDecision) {
-				markSecurityAuditProof(c, stage, body, *legacyDecision)
+			if legacyDecision.AllowNextStage {
+				markSelectedSecurityAuditCompletion(c, stage, body, *legacyDecision)
 			}
 			return legacyDecision
 		}
 	}
 	return decision
-}
-
-func clearSecurityAuditCompletion(c *gin.Context, stage string) {
-	if c == nil {
-		return
-	}
-	if cachesSecurityAuditCompletion(stage) {
-		c.Set(securityAuditCompletedContextKey, false)
-		c.Set(securityAuditProofCompletedContextKey, false)
-		return
-	}
-	if isSecurityAuditWebSocketStage(stage) {
-		// Gin v1.9.1 does not expose Context.Delete. Set nil through the
-		// lock-protected API; cache readers require a concrete dedupe entry, so
-		// this is equivalent to deleting the marker without racing on c.Keys.
-		c.Set(securityAuditWSDedupeContextKey, nil)
-		c.Set(securityAuditProofWSDedupeContextKey, nil)
-	}
 }
 
 func (h *OpenAIGatewayHandler) selectedOpenAIAccountAuditClass(c *gin.Context, account *service.Account) securityadmission.AccountClass {
@@ -249,11 +229,12 @@ func (h *OpenAIGatewayHandler) runLegacySecurityAuditForSelectedOpenAIAccount(
 	return &decision
 }
 
-// markSecurityAuditProof stores only a validated Pro-account audit proof. It
-// is intentionally separate from the ordinary completion cache: a generic
-// fail-open allow may be reused by regular traffic but can never satisfy the
-// selected-Pro proof obligation.
-func markSecurityAuditProof(
+// markSelectedSecurityAuditCompletion stores the result of the selected-account
+// audit in a cache separate from the generic request audit.  This prevents a
+// prior generic check from skipping the required Pro risk-control invocation,
+// while still allowing ordinary upstream failover to reuse one completed
+// selected-account audit.
+func markSelectedSecurityAuditCompletion(
 	c *gin.Context,
 	stage string,
 	body []byte,
@@ -263,7 +244,7 @@ func markSecurityAuditProof(
 		return
 	}
 	if cachesSecurityAuditCompletion(stage) {
-		c.Set(securityAuditProofCompletedContextKey, true)
+		c.Set(securityAuditSelectedCompletedContextKey, true)
 		return
 	}
 	if !isSecurityAuditWebSocketStage(stage) {
@@ -273,7 +254,7 @@ func markSecurityAuditProof(
 	if !ok {
 		return
 	}
-	c.Set(securityAuditProofWSDedupeContextKey, securityAuditWSDedupeEntry{
+	c.Set(securityAuditSelectedWSDedupeContextKey, securityAuditWSDedupeEntry{
 		stage: stage, turn: turn, bodyHash: sha256.Sum256(body),
 		requireBlocking: false, decision: decision,
 	})
@@ -302,7 +283,7 @@ func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securitya
 	return runSecurityAuditWithAdmission(c, reqLog, coordinator, legacy, apiKey, subject, protocol, model, body, stage, admission, false)
 }
 
-func runSecurityAuditWithProof(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string, admission *securityadmission.Admission) *securityaudit.Decision {
+func runSecurityAuditForSelectedAccount(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string, admission *securityadmission.Admission) *securityaudit.Decision {
 	return runSecurityAuditWithAdmissionOptions(c, reqLog, coordinator, legacy, apiKey, subject, protocol, model, body, stage, admission, false, true)
 }
 
@@ -310,7 +291,7 @@ func runSecurityAuditWithAdmission(c *gin.Context, reqLog *zap.Logger, coordinat
 	return runSecurityAuditWithAdmissionOptions(c, reqLog, coordinator, legacy, apiKey, subject, protocol, model, body, stage, admission, requireBlocking, false)
 }
 
-func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string, admission *securityadmission.Admission, requireBlocking, requireProof bool) *securityaudit.Decision {
+func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string, admission *securityadmission.Admission, requireBlocking, selectedAccountAudit bool) *securityaudit.Decision {
 	if c == nil || c.Request == nil {
 		return nil
 	}
@@ -330,10 +311,10 @@ func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, co
 	if cacheCompletion {
 		completionKey := securityAuditCompletedContextKey
 		switch {
-		case requireProof:
-			// Pro proof is deliberately independent from ordinary request
-			// completion. A previous fail-open allow must not satisfy this check.
-			completionKey = securityAuditProofCompletedContextKey
+		case selectedAccountAudit:
+			// Selected-account audit is deliberately independent from ordinary
+			// request completion. A prior generic check must not satisfy it.
+			completionKey = securityAuditSelectedCompletedContextKey
 		case requireBlocking:
 			// A successful non-blocking/async check is not proof that the
 			// blocking scanner ran for a selected Pro account.
@@ -358,7 +339,7 @@ func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, co
 		if legacyDecision.Blocked {
 			decision.Kind, decision.HTTPStatus, decision.ErrorCode, decision.ClientMessage, decision.AllowNextStage = securityaudit.DecisionBlock, contentModerationStatus(legacyDecision), "content_policy_violation", legacyDecision.Message, false
 		}
-		if decision.AllowNextStage && cacheCompletion && !requireProof {
+		if decision.AllowNextStage && cacheCompletion && !selectedAccountAudit {
 			c.Set(securityAuditCompletedContextKey, true)
 		}
 		return &decision
@@ -369,8 +350,8 @@ func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, co
 		if turnNo, ok := securityAuditWSTurn(c); ok {
 			bodyHash := sha256.Sum256(body)
 			dedupeKey := securityAuditWSDedupeContextKey
-			if requireProof {
-				dedupeKey = securityAuditProofWSDedupeContextKey
+			if selectedAccountAudit {
+				dedupeKey = securityAuditSelectedWSDedupeContextKey
 			}
 			if cached, exists := c.Get(dedupeKey); exists {
 				if entry, ok := cached.(securityAuditWSDedupeEntry); ok &&
@@ -384,7 +365,7 @@ func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, co
 			logSecurityAuditStart(reqLog, request, len(body), false)
 			decision := coordinator.Check(c.Request.Context(), request)
 			deriveKnownViolationAdmission(&request, decision)
-			if decision.Kind == securityaudit.DecisionAllow && !requireProof {
+			if decision.Kind == securityaudit.DecisionAllow && !selectedAccountAudit {
 				c.Set(dedupeKey, securityAuditWSDedupeEntry{
 					stage: request.Stage, turn: turnNo, bodyHash: bodyHash,
 					requireBlocking: requireBlocking, decision: decision,
@@ -397,7 +378,7 @@ func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, co
 	logSecurityAuditStart(reqLog, request, len(body), false)
 	decision := coordinator.Check(c.Request.Context(), request)
 	deriveKnownViolationAdmission(&request, decision)
-	if decision.AllowNextStage && cacheCompletion && !requireProof {
+	if decision.AllowNextStage && cacheCompletion && !selectedAccountAudit {
 		if requireBlocking {
 			c.Set(securityAuditBlockingCompletedContextKey, true)
 		} else {
@@ -408,20 +389,39 @@ func runSecurityAuditWithAdmissionOptions(c *gin.Context, reqLog *zap.Logger, co
 	return &decision
 }
 
-// securityAuditDecisionHasProof distinguishes a completed scanner decision
-// from a fail-open "allow" used when either audit service is disabled, out of
-// scope, sampled, queued asynchronously, or unavailable. AllowNextStage alone
-// is never proof; the producing service must set its explicit Audited bit.
-func securityAuditDecisionHasProof(decision *securityaudit.Decision) bool {
+// selectedSecurityAuditLegacyAllow preserves the established content-risk
+// controller fail-open contract when only the optional Prompt Guard is down.
+// Explicit legacy blocks never enter this path.
+func selectedSecurityAuditLegacyAllow(decision *securityaudit.Decision) *securityaudit.Decision {
+	if decision == nil || decision.Legacy == nil || !decision.Legacy.Allowed || decision.Legacy.Blocked {
+		return nil
+	}
+	allowed := *decision
+	allowed.Kind = securityaudit.DecisionAllow
+	allowed.HTTPStatus = http.StatusOK
+	allowed.ErrorCode = ""
+	allowed.ClientMessage = ""
+	allowed.AllowNextStage = true
+	return &allowed
+}
+
+// selectedSecurityAuditAllow accepts a real synchronous result from either
+// audit surface. Legacy moderation intentionally remains fail-open on backend
+// errors, so its Audited bit is informational here; a Prompt Guard result must
+// carry its explicit Audited bit because an unconfigured prompt path is not an
+// audit at all.
+func selectedSecurityAuditAllow(decision *securityaudit.Decision) *securityaudit.Decision {
 	if decision == nil || !decision.AllowNextStage {
-		return false
+		return nil
+	}
+	if decision.Legacy != nil && decision.Legacy.Allowed && !decision.Legacy.Blocked {
+		return decision
 	}
 	if decision.Prompt != nil && decision.Prompt.Audited && decision.Prompt.AllowNextStage &&
 		(decision.Prompt.Kind == securityaudit.DecisionAllow || decision.Prompt.Kind == securityaudit.DecisionFlag) {
-		return true
+		return decision
 	}
-	return decision.Legacy != nil && decision.Legacy.Audited &&
-		decision.Legacy.Allowed && !decision.Legacy.Blocked
+	return nil
 }
 
 // deriveKnownViolationAdmission annotates observability with the authoritative

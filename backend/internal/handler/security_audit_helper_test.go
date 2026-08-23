@@ -223,6 +223,9 @@ func TestSelectedOpenAIProAccountAuditModeOffUsesLegacyModeration(t *testing.T) 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	// A generic gateway audit may have completed before account selection. The
+	// selected-Pro path must still execute its isolated synchronous audit once.
+	c.Set(securityAuditCompletedContextKey, true)
 	account := &service.Account{
 		Platform: service.PlatformOpenAI,
 		Type:     service.AccountTypeOAuth,
@@ -274,7 +277,7 @@ func TestSelectedOpenAIProAccountAuditModeOffAllowsAuditedLegacyResult(t *testin
 	require.Zero(t, engine.evaluates.Load(), "the optional Prompt Guard must stay out of the mode-off path")
 }
 
-func TestSelectedOpenAIProAccountAuditModeOffRejectsUnauditedLegacyAllow(t *testing.T) {
+func TestSelectedOpenAIProAccountAuditModeOffAllowsLegacyFailOpenAllow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := &turnCountingEngine{mode: securityaudit.ModeOff}
 	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
@@ -291,16 +294,15 @@ func TestSelectedOpenAIProAccountAuditModeOffRejectsUnauditedLegacyAllow(t *test
 	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
 		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
 	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
-	require.False(t, decision.AllowNextStage)
+	require.Equal(t, securityaudit.DecisionAllow, decision.Kind)
+	require.True(t, decision.AllowNextStage)
 	require.Equal(t, int64(1), legacy.calls.Load())
 
-	// The failed proof must not become a cache hit on a subsequent failover.
+	// The selected-account audit result may be reused on a subsequent failover.
 	second := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
 		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	require.NotNil(t, second)
-	require.Equal(t, securityaudit.DecisionUnavailable, second.Kind)
-	require.Equal(t, int64(2), legacy.calls.Load())
+	require.Nil(t, second)
+	require.Equal(t, int64(1), legacy.calls.Load())
 }
 
 func TestSelectedOpenAIProAccountAuditModeOffDoesNotCacheUnauditedWebSocketAllow(t *testing.T) {
@@ -369,6 +371,40 @@ func TestSelectedOpenAIProAccountAuditPromptUnavailableFallsBackToLegacyAllow(t 
 	require.Equal(t, int64(1), legacy.calls.Load(), "the already executed legacy result must be reused")
 	require.Equal(t, int64(1), engine.evaluates.Load())
 	require.NotNil(t, decision.Legacy)
+}
+
+func TestSelectedOpenAIProAccountAuditPromptUnavailablePreservesLegacyFailOpenAllow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{
+		mode:      securityaudit.ModeBlocking,
+		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
+	}
+	// The content moderation service deliberately reports Allowed=true and
+	// Audited=false when its remote API times out. That established fail-open
+	// result must not become the selected-Pro 503 seen in production.
+	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
+		Allowed: true, Audited: false, Action: string(service.ContentModerationActionAllow),
+	}}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "pro"}}
+	body := []byte(`{"input":"moderation timeout fail-open"}`)
+
+	first := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
+		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
+	require.NotNil(t, first)
+	require.Equal(t, securityaudit.DecisionAllow, first.Kind)
+	require.True(t, first.AllowNextStage)
+	require.Equal(t, int64(1), legacy.calls.Load(), "the existing risk-control audit must still run")
+	require.Equal(t, int64(1), engine.evaluates.Load(), "Prompt Guard remains an optional signal")
+
+	second := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
+		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
+	require.Nil(t, second, "selected audit allow should be reused on failover")
+	require.Equal(t, int64(1), legacy.calls.Load())
 }
 
 func TestSelectedOpenAIProAccountAuditPromptUnavailableFallsBackToLegacyAllowForLargeCanonicalText(t *testing.T) {
@@ -574,6 +610,9 @@ func TestSelectedOpenAIProAccountAuditCachesSuccessfulRequest(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	// A generic gateway audit may have completed before account selection. The
+	// selected-Pro path must still execute its isolated synchronous audit once.
+	c.Set(securityAuditCompletedContextKey, true)
 	account := &service.Account{
 		Platform: service.PlatformOpenAI,
 		Type:     service.AccountTypeOAuth,
