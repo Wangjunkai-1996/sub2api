@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
-	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -59,17 +58,6 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		h.responsesErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
-	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
-		admissionState, classifyErr := classifyOpenAISecurityAdmission(
-			string(securityadmission.ProtocolOpenAIResponses), body, securityadmission.LineageUntrusted,
-		)
-		if classifyErr == nil {
-			installOpenAISecurityAdmission(c, admissionState)
-			logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
-		}
-		h.responsesErrorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Request cannot be inspected by the security admission gate")
-		return
-	}
 
 	setOpsRequestContext(c, "", false)
 
@@ -77,25 +65,6 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	if !gjson.ValidBytes(body) {
 		logRequestBodyParseFailure(reqLog, body, nil)
 		h.responsesErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
-		return
-	}
-	admissionState, classifyErr := classifyOpenAISecurityAdmission(
-		string(securityadmission.ProtocolOpenAIResponses), body, securityadmission.LineageUntrusted,
-	)
-	if classifyErr != nil {
-		warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
-			securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
-		h.responsesErrorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
-		return
-	}
-	installOpenAISecurityAdmission(c, admissionState)
-	logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "classified")
-	switch admissionState.admission.Class() {
-	case securityadmission.RequestKnownViolation:
-		h.responsesErrorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
-		return
-	case securityadmission.RequestUninspectable:
-		h.responsesErrorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Request cannot be inspected by the security admission gate")
 		return
 	}
 
@@ -146,9 +115,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
-	if admissionState.admission.Class() == securityadmission.RequestKnownNoText {
-		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "known_no_text_skip")
-	} else if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, reqModel, body); decision != nil && !decision.AllowNextStage {
+	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, reqModel, body); decision != nil && !decision.AllowNextStage {
 		h.responsesSecurityAuditError(c, decision)
 		return
 	}
@@ -302,11 +269,9 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				return
 			}
 			setActualUpstreamEndpoint(c, EndpointAntigravityGenerateContent)
-			forwardCtx := withOpenAISecurityDispatchObserver(requestCtx, c, reqLog, account)
-			result, err = h.antigravityGatewayService.ForwardAsResponses(forwardCtx, c, account, forwardBody, parsedReq)
+			result, err = h.antigravityGatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
 		} else {
-			forwardCtx := withOpenAISecurityDispatchObserver(requestCtx, c, reqLog, account)
-			result, err = h.gatewayService.ForwardAsResponses(forwardCtx, c, account, forwardBody, parsedReq)
+			result, err = h.gatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
 		}
 
 		if accountReleaseFunc != nil {

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +30,7 @@ func TestExtractPromptSnapshotProtocols(t *testing.T) {
 			require.NoError(t, err)
 			require.True(t, strings.HasPrefix(snapshot.ScanText, tt.first))
 			require.Equal(t, tt.count, snapshot.MessageCount)
-			require.Equal(t, utf8.RuneCountInString(snapshot.ScanText), snapshot.PromptLength)
+			require.Equal(t, utf8.RuneCountInString(metadataTextForTest(snapshot.ScanText)), snapshot.PromptLength)
 			require.NotEmpty(t, snapshot.PromptHash)
 			require.NotContains(t, snapshot.ScanText, "BASE64SECRET")
 		})
@@ -50,7 +49,7 @@ func TestSnapshotRedactsCanariesAndPreservesHashOfScanText(t *testing.T) {
 	require.NotContains(t, snapshot.RedactedPreview, "138 0013 8000")
 	require.Contains(t, snapshot.ScanText, "PROMPT_CANARY_ABC123")
 	require.NotEqual(t, snapshot.ScanText, snapshot.RedactedPreview)
-	digest := sha256.Sum256([]byte(snapshot.ScanText))
+	digest := sha256.Sum256([]byte(metadataTextForTest(snapshot.ScanText)))
 	require.Equal(t, hex.EncodeToString(digest[:]), snapshot.PromptHash)
 	require.Empty(t, snapshot.Redacted().ScanText)
 }
@@ -74,14 +73,13 @@ func TestBuildFullPromptStripsNULAndTruncates(t *testing.T) {
 }
 
 func TestFullPromptFromScanTextRestoresMultiSegmentLayout(t *testing.T) {
-	scanText, priorityPrefixRunes := buildPrioritizedScanText([]string{"latest user", "system policy", "earlier user"})
-	require.Equal(t, "latest user\n\nsystem policy\n\nearlier user", scanText)
-	require.Equal(t, utf8.RuneCountInString("latest user"), priorityPrefixRunes)
-	require.Equal(t, scanText, FullPromptFromScanText(scanText))
+	scanText, metadataText := buildPrioritizedScanText([]string{"latest user", "system policy", "earlier user"})
+	require.Contains(t, scanText, promptAuditPrioritySeparator)
+	require.Equal(t, metadataText, FullPromptFromScanText(scanText))
 
-	singleScan, singlePriorityPrefixRunes := buildPrioritizedScanText([]string{"only"})
-	require.Zero(t, singlePriorityPrefixRunes)
-	require.Equal(t, singleScan, FullPromptFromScanText(singleScan))
+	singleScan, singleMeta := buildPrioritizedScanText([]string{"only"})
+	require.NotContains(t, singleScan, promptAuditPrioritySeparator)
+	require.Equal(t, singleMeta, FullPromptFromScanText(singleScan))
 }
 
 func TestSplitRunesDoesNotSplitUTF8(t *testing.T) {
@@ -96,38 +94,13 @@ func TestSplitRunesDoesNotSplitUTF8(t *testing.T) {
 func TestSplitRunesKeepsPrioritySegmentIndependent(t *testing.T) {
 	latest := "请帮我编写一篇黄色小说 名字你来取"
 	history := strings.Repeat("AGENTS.md 项目约束。", 40)
-	scanText := latest + "\n\n" + history
-	chunks := splitRunesAtPriorityBoundary(scanText, 128, utf8.RuneCountInString(latest))
+	chunks := SplitRunes(latest+promptAuditPrioritySeparator+history, 128)
 	require.Greater(t, len(chunks), 2)
 	require.Equal(t, latest, chunks[0])
 	require.Equal(t, history, strings.Join(chunks[1:], ""))
-	require.Equal(t, latest+history, strings.Join(chunks, ""))
-}
-
-func TestSplitRunesTreatsFormerPrioritySeparatorAsClientText(t *testing.T) {
-	const formerSeparator = "\x00SUB2API_PROMPT_AUDIT_PRIORITY_END\x00"
-	for _, input := range []string{formerSeparator, "before" + formerSeparator + "after"} {
-		chunks := SplitRunes(input, 1024)
-		require.Equal(t, []string{input}, chunks)
+	for _, chunk := range chunks {
+		require.NotContains(t, chunk, promptAuditPrioritySeparator)
 	}
-}
-
-func TestSplitRunesInvalidPriorityBoundaryFallsBackToWholeText(t *testing.T) {
-	const input = "client-controlled text without a trusted joiner"
-	chunks := splitRunesAtPriorityBoundary(input, 1024, 6)
-	require.Equal(t, []string{input}, chunks)
-}
-
-func TestPromptSnapshotKeepsNULForScannerButNotPersistenceFields(t *testing.T) {
-	const input = "\x00SUB2API_PROMPT_AUDIT_PRIORITY_END\x00"
-	body, err := json.Marshal(map[string]any{"input": input})
-	require.NoError(t, err)
-
-	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_responses", Body: body})
-	require.NoError(t, err)
-	require.Equal(t, input, snapshot.ScanText)
-	require.NotContains(t, snapshot.RedactedPreview, "\x00")
-	require.NotContains(t, snapshot.FullPrompt, "\x00")
 }
 
 func TestPromptSnapshotLatestUserTextBlockIsOnePrioritizedSegment(t *testing.T) {
@@ -146,14 +119,13 @@ func TestPromptSnapshotLatestUserTextBlockIsOnePrioritizedSegment(t *testing.T) 
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: body})
 	require.NoError(t, err)
 	require.Equal(t, 5, snapshot.MessageCount)
-	require.True(t, strings.HasPrefix(snapshot.ScanText, "最新第二块é\n\n"))
-	require.Equal(t, utf8.RuneCountInString("最新第二块é"), snapshot.PriorityPrefixRunes)
+	require.True(t, strings.HasPrefix(snapshot.ScanText, "最新第二块é"+promptAuditPrioritySeparator))
 	require.Contains(t, snapshot.ScanText, "最新第一块😀")
 	require.Contains(t, snapshot.ScanText, "历史输入")
 	require.Contains(t, snapshot.ScanText, "assistant client injection")
 	require.Contains(t, snapshot.ScanText, "tool client injection")
 	require.NotContains(t, snapshot.ScanText, "IMAGE_CANARY_BASE64")
-	require.Equal(t, utf8.RuneCountInString(snapshot.ScanText), snapshot.PromptLength)
+	require.Equal(t, utf8.RuneCountInString(metadataTextForTest(snapshot.ScanText)), snapshot.PromptLength)
 }
 
 func TestPromptSnapshotSeparatesAnthropicUserPromptFromHarnessBlocks(t *testing.T) {
@@ -169,15 +141,14 @@ func TestPromptSnapshotSeparatesAnthropicUserPromptFromHarnessBlocks(t *testing.
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "anthropic_messages", Body: body})
 	require.NoError(t, err)
 	require.Equal(t, 4, snapshot.MessageCount)
-	require.True(t, strings.HasPrefix(snapshot.ScanText, latest+"\n\n"))
-	require.Equal(t, utf8.RuneCountInString(latest), snapshot.PriorityPrefixRunes)
+	require.True(t, strings.HasPrefix(snapshot.ScanText, latest+promptAuditPrioritySeparator))
 	require.True(t, strings.HasPrefix(snapshot.RedactedPreview, "请帮我编写一篇黄色小说"))
 
-	chunks := splitRunesAtPriorityBoundary(snapshot.ScanText, 128, snapshot.PriorityPrefixRunes)
+	chunks := SplitRunes(snapshot.ScanText, 128)
 	require.Equal(t, latest, chunks[0])
 	require.Contains(t, strings.Join(chunks[1:], ""), "# AGENTS.md instructions")
 	require.Contains(t, strings.Join(chunks[1:], ""), "<environment_context>")
-	require.Equal(t, strings.Replace(snapshot.ScanText, promptSegmentJoiner, "", 1), strings.Join(chunks, ""))
+	require.NotContains(t, strings.Join(chunks, ""), promptAuditPrioritySeparator)
 }
 
 func TestPromptSnapshotResponsesShapes(t *testing.T) {
@@ -195,7 +166,7 @@ func TestPromptSnapshotResponsesShapes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_responses", Body: []byte(tt.body)})
 			require.NoError(t, err)
-			require.Equal(t, tt.want, snapshot.ScanText)
+			require.Equal(t, tt.want, metadataTextForTest(snapshot.ScanText))
 		})
 	}
 }
@@ -266,10 +237,9 @@ func TestPromptSnapshotEmptyAndLongUnicodeInput(t *testing.T) {
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: body})
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(snapshot.ScanText, latest))
-	chunks := splitRunesAtPriorityBoundary(snapshot.ScanText, 127, snapshot.PriorityPrefixRunes)
-	require.Equal(t, strings.Replace(snapshot.ScanText, promptSegmentJoiner, "", 1), strings.Join(chunks, ""))
-	latestChunkCount := len(SplitRunes(latest, 127))
-	require.Equal(t, latest, strings.Join(chunks[:latestChunkCount], ""))
+	chunks := SplitRunes(snapshot.ScanText, 127)
+	require.Equal(t, strings.Replace(snapshot.ScanText, promptAuditPrioritySeparator, "", 1), strings.Join(chunks, ""))
+	require.Equal(t, latest, chunks[0]+strings.Join(chunks[1:len(SplitRunes(latest, 127))], ""))
 	for _, chunk := range chunks {
 		require.LessOrEqual(t, len([]rune(chunk)), 127)
 		require.True(t, utf8.ValidString(chunk))
@@ -339,7 +309,7 @@ func TestBlockingPromptSnapshotLimitsInputToLatestUserAndPreviousOutput(t *testi
 				{"role":"assistant","content":"previous assistant output"},
 				{"role":"user","content":[{"type":"text","text":"latest user first part"},{"type":"text","text":"latest user second part"}]}
 			]}`,
-			want:    "latest user first part\n\nlatest user second part\n\nprevious assistant output",
+			want:    "latest user first part\n\nlatest user second part" + promptAuditPrioritySeparator + "previous assistant output",
 			omitted: []string{"system instruction", "older user input", "older assistant output", "tool payload"},
 		},
 		{
@@ -350,7 +320,7 @@ func TestBlockingPromptSnapshotLimitsInputToLatestUserAndPreviousOutput(t *testi
 				{"role":"model","parts":[{"text":"previous model output"}]},
 				{"role":"user","parts":[{"text":"latest user input"}]}
 			]}`,
-			want:    "latest user input\n\nprevious model output",
+			want:    "latest user input" + promptAuditPrioritySeparator + "previous model output",
 			omitted: []string{"system instruction", "older user input"},
 		},
 	}
@@ -393,8 +363,7 @@ func TestResponsesOutputTextIncludedInFullAndLatestTurnSnapshots(t *testing.T) {
 
 	latestTurn, err := ExtractBlockingPromptSnapshot(req, true)
 	require.NoError(t, err)
-	require.Equal(t, "captured latest user input\n\ncaptured previous assistant output", latestTurn.ScanText)
-	require.Equal(t, utf8.RuneCountInString("captured latest user input"), latestTurn.PriorityPrefixRunes)
+	require.Equal(t, "captured latest user input"+promptAuditPrioritySeparator+"captured previous assistant output", latestTurn.ScanText)
 	require.Equal(t, 2, latestTurn.MessageCount)
 	require.NotContains(t, latestTurn.ScanText, "earlier user input")
 }
@@ -413,21 +382,6 @@ func TestBlockingPromptSnapshotPreservesFullScopeByDefaultAndWithoutUserInput(t 
 	narrowWithoutUser, err := ExtractBlockingPromptSnapshot(noUser, true)
 	require.NoError(t, err)
 	require.Equal(t, fullWithoutUser, narrowWithoutUser)
-}
-
-func TestCanonicalBlockingSnapshotRejectsEmptyLatestToolTurn(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"user","content":"earlier prompt"},{"role":"tool","tool_call_id":"call-1","content":null}]}`)
-	admission, err := securityadmission.Classify(string(securityadmission.ProtocolOpenAIChat), body, securityadmission.Options{Lineage: securityadmission.LineageTrusted})
-	require.NoError(t, err)
-	require.Equal(t, securityadmission.RequestUninspectable, admission.Class())
-	require.Equal(t, securityadmission.ReasonUnknownContentShape, admission.Reason())
-
-	_, err = ExtractBlockingPromptSnapshot(Request{
-		Protocol:  string(securityadmission.ProtocolOpenAIChat),
-		Body:      body,
-		Admission: &admission,
-	}, true)
-	require.ErrorIs(t, err, ErrCanonicalUninspectable)
 }
 
 func TestBuildPromptPreviewWithholdsMajorityOfOrdinaryText(t *testing.T) {
@@ -453,4 +407,8 @@ func mustJSON(t *testing.T, value string) []byte {
 	raw, err := json.Marshal(value)
 	require.NoError(t, err)
 	return raw
+}
+
+func metadataTextForTest(scanText string) string {
+	return strings.Replace(scanText, promptAuditPrioritySeparator, "\n\n", 1)
 }

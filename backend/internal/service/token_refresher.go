@@ -116,22 +116,16 @@ func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, refreshWindow time
 }
 
 // Refresh 执行token刷新
-// 保留本地路由等非令牌元数据；plan_type 必须由刷新后的凭据重新证明。
+// 保留原有credentials中的所有字段，只更新token相关字段
 func (r *OpenAITokenRefresher) Refresh(ctx context.Context, account *Account) (map[string]any, error) {
 	tokenInfo, err := r.openaiOAuthService.RefreshAccountToken(ctx, account)
 	if err != nil {
 		return nil, err
 	}
 
-	// 使用服务提供的方法构建新凭证，并保留非令牌元数据。
+	// 使用服务提供的方法构建新凭证，并保留原有字段
 	newCredentials := r.openaiOAuthService.BuildAccountCredentials(tokenInfo)
 	newCredentials = MergeCredentials(account.Credentials, newCredentials)
-	// plan_type describes the refreshed access token. When neither the token
-	// claims nor enrichment can prove it, carrying the previous token's plan
-	// through the generic merge would incorrectly preserve audit exemption.
-	if strings.TrimSpace(tokenInfo.PlanType) == "" {
-		delete(newCredentials, "plan_type")
-	}
 	newCredentials = NormalizeOpenAIPersonalAccessTokenCredentials(account, tokenInfo, newCredentials)
 
 	return newCredentials, nil

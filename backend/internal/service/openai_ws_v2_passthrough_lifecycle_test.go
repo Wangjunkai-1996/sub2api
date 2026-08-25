@@ -153,16 +153,6 @@ func startPassthroughLifecycleServer(
 	svc *OpenAIGatewayService,
 	account *Account,
 ) (*httptest.Server, <-chan error) {
-	return startPassthroughLifecycleServerWithHooks(t, controlCtx, svc, account, nil)
-}
-
-func startPassthroughLifecycleServerWithHooks(
-	t *testing.T,
-	controlCtx context.Context,
-	svc *OpenAIGatewayService,
-	account *Account,
-	hooks *OpenAIWSIngressHooks,
-) (*httptest.Server, <-chan error) {
 	t.Helper()
 	serverErr := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -172,7 +162,6 @@ func startPassthroughLifecycleServerWithHooks(
 			return
 		}
 		defer func() { _ = conn.CloseNow() }()
-		conn.SetReadLimit(ResolveOpenAIWSClientReadLimitBytes(svc.cfg))
 
 		msgType, firstMessage, err := ReadOpenAIWSClientMessage(
 			controlCtx,
@@ -195,7 +184,7 @@ func startPassthroughLifecycleServerWithHooks(
 		req := r.Clone(controlCtx)
 		req.Header = req.Header.Clone()
 		ginCtx.Request = req
-		serverErr <- svc.ProxyResponsesWebSocketFromClient(controlCtx, ginCtx, conn, account, "sk-test", firstMessage, hooks)
+		serverErr <- svc.ProxyResponsesWebSocketFromClient(controlCtx, ginCtx, conn, account, "sk-test", firstMessage, nil)
 	}))
 	return server, serverErr
 }

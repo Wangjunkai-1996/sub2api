@@ -494,6 +494,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		var bridgeReplayInput []json.RawMessage
 		bridgeReplayInputExists := false
 		for turn := 1; ; turn++ {
+			if turn > 1 && hooks != nil && hooks.BeforeRequest != nil {
+				if err := hooks.BeforeRequest(turn, currentBridgePayload.payloadRaw, currentBridgePayload.originalModel); err != nil {
+					return err
+				}
+			}
 			if hooks != nil && hooks.BeforeTurn != nil {
 				if err := hooks.BeforeTurn(turn); err != nil {
 					return err
@@ -545,11 +550,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				)
 				if err != nil {
 					return fmt.Errorf("resolve Grok websocket cache identity: %w", err)
-				}
-			}
-			if hooks != nil && hooks.BeforeDispatch != nil {
-				if err := hooks.BeforeDispatch(turn); err != nil {
-					return err
 				}
 			}
 			result, bridgeErr := s.proxyOpenAIWSHTTPBridgeTurn(
@@ -607,11 +607,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				return fmt.Errorf("read client websocket request: %w", readErr)
 			}
-			if hooks != nil && hooks.BeforeRequest != nil {
-				if hookErr := hooks.BeforeRequest(turn+1, nextClientMessage, ""); hookErr != nil {
-					return hookErr
-				}
-			}
 			nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 			if parseErr != nil {
 				return parseErr
@@ -637,15 +632,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if buildHdrErr != nil {
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
-	credentialProof, proofErr := openAIWSFinalizedCredentialProofFromContext(ctx, account)
-	if proofErr != nil {
-		return fmt.Errorf("resolve ws credential proof: %w", proofErr)
-	}
 	baseAcquireReq := openAIWSAcquireRequest{
-		Account:         account,
-		WSURL:           wsURL,
-		Headers:         wsHeaders,
-		CredentialProof: credentialProof,
+		Account: account,
+		WSURL:   wsURL,
+		Headers: wsHeaders,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -729,11 +719,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if recoveryErr := s.recoverAgentIdentityTask(ctx, account, account.GetCredential("task_id")); recoveryErr != nil {
 				return nil, fmt.Errorf("agent identity task recovery failed: %w", recoveryErr)
 			}
-			refreshedProof, proofErr := openAIWSFinalizedCredentialProofFromContext(ctx, account)
-			if proofErr != nil {
-				return nil, fmt.Errorf("resolve recovered ws credential proof: %w", proofErr)
-			}
-			baseAcquireReq.CredentialProof = refreshedProof
 			return acquireTurnLease(turn, preferred, forcePreferredConn)
 		}
 		if acquireErr != nil {
@@ -817,11 +802,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		turnStart := time.Now()
 		wroteDownstream := false
-		if hooks != nil && hooks.BeforeDispatch != nil {
-			if err := hooks.BeforeDispatch(turn); err != nil {
-				return nil, err
-			}
-		}
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
@@ -1277,8 +1257,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return true
 	}
 	for {
-		if skipBeforeTurn && hooks != nil && hooks.BeforeRetry != nil {
-			if err := hooks.BeforeRetry(turn); err != nil {
+		if turn > 1 && !skipBeforeTurn && hooks != nil && hooks.BeforeRequest != nil {
+			if err := hooks.BeforeRequest(turn, currentPayload, currentOriginalModel); err != nil {
 				return err
 			}
 		}
@@ -1662,11 +1642,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				return nil
 			}
 			return fmt.Errorf("read client websocket request: %w", readErr)
-		}
-		if hooks != nil && hooks.BeforeRequest != nil {
-			if hookErr := hooks.BeforeRequest(turn+1, nextClientMessage, ""); hookErr != nil {
-				return hookErr
-			}
 		}
 
 		nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)

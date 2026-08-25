@@ -19,8 +19,6 @@ func TestAtomicMetricsExposeCountsLatencyDistributionAndAsyncDelivery(t *testing
 	metrics.IncFailover()
 	metrics.IncBulkheadFull()
 	metrics.IncRecordFailed()
-	metrics.ObserveScannerCall(true)
-	metrics.ObserveScannerCall(false)
 	metrics.IncEnqueued()
 	metrics.IncDropped()
 
@@ -32,9 +30,6 @@ func TestAtomicMetricsExposeCountsLatencyDistributionAndAsyncDelivery(t *testing
 	require.Equal(t, int64(40), snapshot.LatencyP95MS)
 	require.Equal(t, int64(40), snapshot.LatencyP99MS)
 	require.Equal(t, int64(100), snapshot.LatencyMaxMS)
-	require.Equal(t, int64(2), snapshot.ScannerCalls)
-	require.Equal(t, int64(1), snapshot.ScannerSucceeded)
-	require.Equal(t, int64(1), snapshot.ScannerFailed)
 	require.Equal(t, AuditMetricsSnapshot{Enqueued: 1, Dropped: 1}, metrics.AuditSnapshot())
 }
 

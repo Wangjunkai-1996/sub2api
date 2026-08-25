@@ -3503,18 +3503,11 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_WriteFailBeforeD
 	}
 	var hooksMu sync.Mutex
 	beforeTurnCalls := make(map[int]int)
-	beforeRetryCalls := make(map[int]int)
 	afterTurnCalls := make(map[int]int)
 	hooks := &OpenAIWSIngressHooks{
 		BeforeTurn: func(turn int) error {
 			hooksMu.Lock()
 			beforeTurnCalls[turn]++
-			hooksMu.Unlock()
-			return nil
-		},
-		BeforeRetry: func(turn int) error {
-			hooksMu.Lock()
-			beforeRetryCalls[turn]++
 			hooksMu.Unlock()
 			return nil
 		},
@@ -3602,15 +3595,11 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_WriteFailBeforeD
 	hooksMu.Lock()
 	beforeTurn1 := beforeTurnCalls[1]
 	beforeTurn2 := beforeTurnCalls[2]
-	beforeRetry1 := beforeRetryCalls[1]
-	beforeRetry2 := beforeRetryCalls[2]
 	afterTurn1 := afterTurnCalls[1]
 	afterTurn2 := afterTurnCalls[2]
 	hooksMu.Unlock()
 	require.Equal(t, 1, beforeTurn1, "首轮 turn BeforeTurn 应执行一次")
 	require.Equal(t, 1, beforeTurn2, "同一 turn 重试不应重复触发 BeforeTurn")
-	require.Zero(t, beforeRetry1, "未重试的首轮不应触发 BeforeRetry")
-	require.Equal(t, 1, beforeRetry2, "同一 turn 再次写上游前必须触发一次 BeforeRetry")
 	require.Equal(t, 1, afterTurn1, "首轮 turn AfterTurn 应执行一次")
 	require.Equal(t, 1, afterTurn2, "第二轮 turn AfterTurn 应执行一次")
 }

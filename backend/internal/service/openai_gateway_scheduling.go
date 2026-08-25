@@ -804,7 +804,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	// 4. 设置粘性会话绑定（利润门下推迟到 handler 终检通过后再绑定，
 	// 终检否决的账号不得成为新的粘性目标；无门保持既有 eager 绑定与 TTL）
 	// Set sticky session binding (deferred until terminal admission under a profit gate)
-	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) && !gatewaySecurityAdmissionGateActive(ctx) {
+	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
 		_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, selected.ID, openaiStickySessionTTL)
 	}
 
@@ -842,12 +842,6 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 	if err != nil {
 		return nil
 	}
-	if account != nil {
-		s.preloadOpenAIRequirementParents(ctx, []Account{*account})
-	}
-	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, account, ""); !compatible {
-		return nil
-	}
 
 	// 检查账号是否需要清理粘性会话
 	// Check if sticky session should be cleared
@@ -882,9 +876,7 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 
 	// 刷新会话 TTL 并返回账号
 	// Refresh session TTL and return account
-	if !gatewayProfitControlGateActive(ctx) && !gatewaySecurityAdmissionGateActive(ctx) {
-		_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
-	}
+	_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
 	return account
 }
 
@@ -1101,9 +1093,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 							if selectErr != nil {
 								return nil, selectErr
 							}
-							if !gatewayProfitControlGateActive(ctx) && !gatewaySecurityAdmissionGateActive(ctx) {
-								_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
-							}
+							_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
 							return selection, nil
 						}
 
@@ -1130,7 +1120,10 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if a, ok := parentCacheL2[id]; ok {
 			return a
 		}
-		a := s.lookupOpenAIRequirementParent(ctx, id)
+		if s.accountRepo == nil {
+			return nil
+		}
+		a, _ := s.accountRepo.GetByID(ctx, id)
 		parentCacheL2[id] = a
 		return a
 	}
@@ -1148,9 +1141,6 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		// re-check schedulability here so recently rate-limited/overloaded accounts
 		// are not selected again before the bucket is rebuilt.
 		if !isOpenAICompatibleAccountEligibleForRequest(ctx, acc, platform, requestedModel, false, requiredCapability) {
-			continue
-		}
-		if compatible, _ := s.openAIAccountRequirementCompatible(ctx, acc, ""); !compatible {
 			continue
 		}
 		if !parentHealthyForShadow(acc, parentLookupL2) {
@@ -1264,7 +1254,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				if selectErr != nil {
 					return nil, true, selectErr
 				}
-				if sessionHash != "" && !gatewayProfitControlGateActive(ctx) && !gatewaySecurityAdmissionGateActive(ctx) {
+				if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
 					_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, fresh.ID, openaiStickySessionTTL)
 				}
 				return selection, true, nil
@@ -1303,7 +1293,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				if selectErr != nil {
 					return nil, selectErr
 				}
-				if sessionHash != "" && !gatewayProfitControlGateActive(ctx) && !gatewaySecurityAdmissionGateActive(ctx) {
+				if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
 					_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, fresh.ID, openaiStickySessionTTL)
 				}
 				return selection, nil
@@ -1372,7 +1362,6 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 		if platform == PlatformGrok {
 			accounts = s.filterGrokFreeQuotaAccountsForOpenAI(ctx, accounts)
 		}
-		s.preloadOpenAIRequirementParents(ctx, accounts)
 		return accounts, nil
 	}
 	var accounts []Account
@@ -1391,7 +1380,6 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 	if platform == PlatformGrok {
 		accounts = s.filterGrokFreeQuotaAccountsForOpenAI(ctx, accounts)
 	}
-	s.preloadOpenAIRequirementParents(ctx, accounts)
 	return accounts, nil
 }
 
@@ -1434,9 +1422,6 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(
 	if !parentHealthyForShadow(fresh, s.parentAccountLookup(ctx)) {
 		return nil
 	}
-	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, fresh, ""); !compatible {
-		return nil
-	}
 	if s.isOpenAIAccountRequestRuntimeBlocked(fresh, requestedModel) {
 		return nil
 	}
@@ -1455,7 +1440,11 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(
 // L2 候选循环改用带 per-pass 缓存的 parentLookupL2,不走此方法。
 func (s *OpenAIGatewayService) parentAccountLookup(ctx context.Context) func(int64) *Account {
 	return func(id int64) *Account {
-		return s.lookupOpenAIRequirementParent(ctx, id)
+		if s.accountRepo == nil {
+			return nil
+		}
+		a, _ := s.accountRepo.GetByID(ctx, id)
+		return a
 	}
 }
 
@@ -1485,9 +1474,6 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 		if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
 			return nil
 		}
-		if compatible, _ := s.openAIAccountRequirementCompatible(ctx, account, ""); !compatible {
-			return nil
-		}
 		if s.isOpenAIProxyStreamQuarantined(ctx, account) {
 			return nil
 		}
@@ -1505,9 +1491,6 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 		return nil
 	}
 	if !parentHealthyForShadow(latest, s.parentAccountLookup(ctx)) {
-		return nil
-	}
-	if compatible, _ := s.openAIAccountRequirementCompatible(ctx, latest, ""); !compatible {
 		return nil
 	}
 	if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel) {

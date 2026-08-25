@@ -11,7 +11,6 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
-	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,72 +36,6 @@ type blockingTrafficDirectorAccountRepo struct {
 type trafficDirectorEligibilityGroupRepoStub struct {
 	GroupRepository
 	group *Group
-}
-
-type trafficDirectorRequirementSnapshotCache struct {
-	SchedulerCache
-	snapshotAccounts []*Account
-	freshByID        map[int64]*Account
-	metadataByID     map[int64]*Account
-	getAccountCalls  map[int64]int
-}
-
-type trafficDirectorRequirementAccountRepo struct {
-	AccountRepository
-	accountsByID map[int64]*Account
-	getByIDCalls map[int64]int
-}
-
-func (r *trafficDirectorRequirementAccountRepo) GetByID(_ context.Context, accountID int64) (*Account, error) {
-	if r.getByIDCalls == nil {
-		r.getByIDCalls = make(map[int64]int)
-	}
-	r.getByIDCalls[accountID]++
-	account := r.accountsByID[accountID]
-	if account == nil {
-		return nil, errors.New("account not found")
-	}
-	clone := *account
-	return &clone, nil
-}
-
-func (c *trafficDirectorRequirementSnapshotCache) GetSnapshot(context.Context, SchedulerBucket) ([]*Account, bool, error) {
-	accounts := make([]*Account, 0, len(c.snapshotAccounts))
-	for _, account := range c.snapshotAccounts {
-		if account == nil {
-			continue
-		}
-		clone := *account
-		accounts = append(accounts, &clone)
-	}
-	return accounts, true, nil
-}
-
-func (c *trafficDirectorRequirementSnapshotCache) GetAccount(_ context.Context, accountID int64) (*Account, error) {
-	if c.getAccountCalls == nil {
-		c.getAccountCalls = make(map[int64]int)
-	}
-	c.getAccountCalls[accountID]++
-	account := c.freshByID[accountID]
-	if account == nil {
-		return nil, nil
-	}
-	clone := *account
-	return &clone, nil
-}
-
-func (c *trafficDirectorRequirementSnapshotCache) GetAccountMetadataByIDs(_ context.Context, accountIDs []int64) (map[int64]*Account, error) {
-	accounts := make(map[int64]*Account, len(accountIDs))
-	for _, accountID := range accountIDs {
-		account := c.metadataByID[accountID]
-		if account == nil {
-			accounts[accountID] = nil
-			continue
-		}
-		clone := *account
-		accounts[accountID] = &clone
-	}
-	return accounts, nil
 }
 
 func (r trafficDirectorEligibilityGroupRepoStub) GetByID(context.Context, int64) (*Group, error) {
@@ -496,42 +429,6 @@ func TestOpenAITrafficDirectorMissingResolverRejectsInvalidHead(t *testing.T) {
 			require.Nil(t, plan)
 			require.ErrorIs(t, err, ErrTrafficDirectorPolicyUnavailable)
 		})
-	}
-}
-
-func TestOpenAITrafficDirectorMissingResolverShadowUsesLegacyScheduler(t *testing.T) {
-	groupID := int64(42)
-	account := testOpenAIAccountForTrafficDirector(101, groupID)
-	svc := &OpenAIGatewayService{accountRepo: schedulerTestOpenAIAccountRepo{accounts: []Account{account}}}
-	ctx := context.WithValue(context.Background(), ctxkey.RequestID, "request-shadow-legacy-scheduler")
-	ctx = context.WithValue(ctx, ctxkey.Group, &Group{
-		ID:                     groupID,
-		Platform:               PlatformOpenAI,
-		Status:                 StatusActive,
-		Hydrated:               true,
-		TrafficDirectorMode:    domain.TrafficDirectorModeShadow,
-		TrafficDirectorVersion: 3,
-	})
-
-	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
-		ctx,
-		&groupID,
-		"",
-		"",
-		"gpt-5",
-		nil,
-		OpenAIUpstreamTransportAny,
-		OpenAIEndpointCapabilityChatCompletions,
-		false,
-		false,
-		false,
-	)
-	require.NoError(t, err)
-	require.NotNil(t, selection)
-	require.Equal(t, account.ID, selection.Account.ID)
-	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
-	if selection.ReleaseFunc != nil {
-		selection.ReleaseFunc()
 	}
 }
 
@@ -1102,165 +999,6 @@ func TestOpenAITrafficDirectorHealthUsesForwardedModelChain(t *testing.T) {
 	}
 }
 
-func TestOpenAITrafficDirectorEligibleAccountIDs_AuditExemptRequirementFiltersCachedPool(t *testing.T) {
-	groupID := int64(42)
-	proParentID := int64(9100)
-	proParent := testOpenAIAccountForTrafficDirector(proParentID, groupID)
-	proParent.Credentials = map[string]any{"plan_type": "pro"}
-
-	account := func(id int64, accountType, planType string) *Account {
-		candidate := testOpenAIAccountForTrafficDirector(id, groupID)
-		candidate.Type = accountType
-		if planType != "" {
-			candidate.Credentials = map[string]any{"plan_type": planType}
-		}
-		return &candidate
-	}
-	pro := account(101, AccountTypeOAuth, "pro")
-	unknown := account(102, AccountTypeOAuth, "future_plan")
-	shadow := account(103, AccountTypeOAuth, "")
-	shadow.ParentAccountID = &proParentID
-	shadow.QuotaDimension = QuotaDimensionSpark
-	plus := account(104, AccountTypeOAuth, "plus")
-	team := account(105, AccountTypeOAuth, "team")
-	apiKey := account(106, AccountTypeAPIKey, "")
-	candidates := []*Account{pro, unknown, shadow, plus, team, apiKey}
-
-	cache := &trafficDirectorRequirementSnapshotCache{
-		snapshotAccounts: candidates,
-		freshByID: map[int64]*Account{
-			pro.ID: pro, unknown.ID: unknown, shadow.ID: shadow,
-			plus.ID: plus, team.ID: team, apiKey.ID: apiKey,
-		},
-		metadataByID: map[int64]*Account{proParent.ID: &proParent},
-	}
-	svc := &OpenAIGatewayService{
-		schedulerSnapshot: &SchedulerSnapshotService{cache: cache},
-	}
-	plan := &openAITrafficDirectorRequestPlan{
-		key:           openAITrafficDirectorPlanKey{groupID: groupID, platform: PlatformOpenAI},
-		mode:          domain.TrafficDirectorModeEnforced,
-		poolByAccount: map[int64]string{},
-	}
-	pool := domain.TrafficDirectorPool{Key: "primary", WeightBPS: 10000, MinAvailable: 1}
-	for _, candidate := range candidates {
-		pool.AccountIDs = append(pool.AccountIDs, candidate.ID)
-		plan.poolByAccount[candidate.ID] = pool.Key
-	}
-	ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
-
-	allowed, err := svc.trafficDirectorEligibleAccountIDs(
-		ctx, &groupID, PlatformOpenAI, "gpt-5",
-		OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityChatCompletions, "", false,
-		nil, plan, pool,
-	)
-	require.NoError(t, err)
-	require.Len(t, allowed, 3)
-	require.Contains(t, allowed, plus.ID)
-	require.Contains(t, allowed, team.ID)
-	require.Contains(t, allowed, apiKey.ID)
-	require.NotContains(t, allowed, pro.ID)
-	require.NotContains(t, allowed, unknown.ID)
-	require.NotContains(t, allowed, shadow.ID, "a Spark shadow must inherit its Pro parent's audit requirement")
-}
-
-func TestOpenAITrafficDirectorEligibleAccountIDs_AuditExemptRequirementRejectsFreshPro(t *testing.T) {
-	groupID := int64(42)
-	cachedPlus := testOpenAIAccountForTrafficDirector(101, groupID)
-	cachedPlus.Credentials = map[string]any{"plan_type": "plus"}
-	freshPro := cachedPlus
-	freshPro.Credentials = map[string]any{"plan_type": "pro"}
-	cache := &trafficDirectorRequirementSnapshotCache{
-		snapshotAccounts: []*Account{&cachedPlus},
-	}
-	repo := &trafficDirectorRequirementAccountRepo{
-		accountsByID: map[int64]*Account{cachedPlus.ID: &freshPro},
-	}
-	svc := &OpenAIGatewayService{
-		accountRepo:       repo,
-		schedulerSnapshot: NewSchedulerSnapshotService(cache, nil, repo, nil, nil),
-	}
-	pool := domain.TrafficDirectorPool{
-		Key: "primary", WeightBPS: 10000, AccountIDs: []int64{cachedPlus.ID}, MinAvailable: 1,
-	}
-	plan := &openAITrafficDirectorRequestPlan{
-		key:           openAITrafficDirectorPlanKey{groupID: groupID, platform: PlatformOpenAI},
-		mode:          domain.TrafficDirectorModeEnforced,
-		poolByAccount: map[int64]string{cachedPlus.ID: pool.Key},
-	}
-	ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
-
-	allowed, err := svc.trafficDirectorEligibleAccountIDs(
-		ctx, &groupID, PlatformOpenAI, "gpt-5",
-		OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityChatCompletions, "", false,
-		nil, plan, pool,
-	)
-	require.NoError(t, err)
-	require.Empty(t, allowed)
-	require.Equal(t, 1, cache.getAccountCalls[cachedPlus.ID])
-	require.Equal(t, 1, repo.getByIDCalls[cachedPlus.ID], "a cached Plus candidate must be reclassified by the fresh DB row")
-}
-
-func TestOpenAITrafficDirectorHardPreviousAccount_AuditExemptRequirementAppliesAtBothSnapshots(t *testing.T) {
-	groupID := int64(42)
-	plan := &openAITrafficDirectorRequestPlan{
-		key:           openAITrafficDirectorPlanKey{groupID: groupID, platform: PlatformOpenAI},
-		mode:          domain.TrafficDirectorModeEnforced,
-		poolByAccount: map[int64]string{101: "primary"},
-	}
-	ctx := WithOpenAIAccountRequirement(context.Background(), securityadmission.AccountRequirementAuditExempt)
-
-	t.Run("cached Pro is rejected before fresh lookup", func(t *testing.T) {
-		cachedPro := testOpenAIAccountForTrafficDirector(101, groupID)
-		cachedPro.Credentials = map[string]any{"plan_type": "pro"}
-		freshPlus := cachedPro
-		freshPlus.Credentials = map[string]any{"plan_type": "plus"}
-		cache := &trafficDirectorRequirementSnapshotCache{
-			freshByID: map[int64]*Account{cachedPro.ID: &freshPlus},
-		}
-		repo := &trafficDirectorRequirementAccountRepo{
-			accountsByID: map[int64]*Account{cachedPro.ID: &freshPlus},
-		}
-		svc := &OpenAIGatewayService{
-			accountRepo:       repo,
-			schedulerSnapshot: NewSchedulerSnapshotService(cache, nil, repo, nil, nil),
-		}
-
-		selected := svc.trafficDirectorHardPreviousAccount(
-			ctx, &groupID, PlatformOpenAI, "gpt-5",
-			OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityChatCompletions, "", false,
-			plan, &cachedPro,
-		)
-		require.Nil(t, selected)
-		require.Zero(t, cache.getAccountCalls[cachedPro.ID], "an incompatible cached binding must not reach fresh admission")
-		require.Zero(t, repo.getByIDCalls[cachedPro.ID])
-	})
-
-	t.Run("fresh Pro cannot inherit cached Plus admission", func(t *testing.T) {
-		cachedPlus := testOpenAIAccountForTrafficDirector(101, groupID)
-		cachedPlus.Credentials = map[string]any{"plan_type": "plus"}
-		freshPro := cachedPlus
-		freshPro.Credentials = map[string]any{"plan_type": "pro"}
-		cache := &trafficDirectorRequirementSnapshotCache{}
-		repo := &trafficDirectorRequirementAccountRepo{
-			accountsByID: map[int64]*Account{cachedPlus.ID: &freshPro},
-		}
-		svc := &OpenAIGatewayService{
-			accountRepo:       repo,
-			schedulerSnapshot: NewSchedulerSnapshotService(cache, nil, repo, nil, nil),
-		}
-
-		selected := svc.trafficDirectorHardPreviousAccount(
-			ctx, &groupID, PlatformOpenAI, "gpt-5",
-			OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityChatCompletions, "", false,
-			plan, &cachedPlus,
-		)
-		require.Nil(t, selected)
-		require.Equal(t, 1, cache.getAccountCalls[cachedPlus.ID])
-		require.Equal(t, 1, repo.getByIDCalls[cachedPlus.ID], "hard previous must reapply the requirement to the fresh DB row")
-	})
-}
-
 func TestOpenAITrafficDirectorUnifiedSelectionFallsBackAfterExclusion(t *testing.T) {
 	spec := testOpenAITrafficDirectorSpec()
 	resolver := &openAITrafficDirectorResolverStub{policy: TrafficDirectorResolvedPolicy{
@@ -1390,9 +1128,13 @@ func TestOpenAITrafficDirectorHardPreviousRejectsAccountOutsidePolicy(t *testing
 		false,
 		false,
 	)
-	require.ErrorIs(t, err, ErrNoAvailableAccounts)
-	require.Nil(t, selection,
-		"a hard binding removed from policy must fail closed instead of migrating to an allowed account")
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, allowed.ID, selection.Account.ID,
+		"hard previous may cross configured pools but must not bypass the policy account allow-list")
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
 }
 
 func TestOpenAITrafficDirectorHardPreviousPreservesPoolEligibilityBoundaries(t *testing.T) {

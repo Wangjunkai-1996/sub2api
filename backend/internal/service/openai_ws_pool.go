@@ -64,10 +64,6 @@ type openAIWSAcquireRequest struct {
 	Account *Account
 	WSURL   string
 	Headers http.Header
-	// CredentialProof binds reuse to the finalized selected/effective credential
-	// snapshot. It contains hashes/versions only, never the bearer token itself.
-	// Nil preserves the legacy non-admission pool partition.
-	CredentialProof *OpenAICredentialProof
 	// HeadersFactory is evaluated inside dialConn. It exists so credentials
 	// whose authorization is per-dial (Agent Identity) are never cached in
 	// lastAcquire or delayed prewarm state.
@@ -81,8 +77,6 @@ type openAIWSAcquireRequest struct {
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
-	wsURL               string
-	proxyURL            string
 	betaFeatures        string
 	codexInstallationID string
 	sessionIDHyphen     string
@@ -90,9 +84,6 @@ type openAIWSHandshakeCompatibilityKey struct {
 	threadID            string
 	clientRequestID     string
 	codexWindowID       string
-
-	credentialProof    OpenAICredentialProof
-	hasCredentialProof bool
 }
 
 type openAIWSConnLease struct {
@@ -403,10 +394,6 @@ func (c *openAIWSConn) writeJSON(value any, writeCtx context.Context) error {
 	if writeCtx == nil {
 		writeCtx = context.Background()
 	}
-	// This is the first business-frame transport boundary. Connection acquire,
-	// handshake, health ping, and credential-incompatible candidates never reach
-	// it, while a failed socket write still counts as a real dispatch attempt.
-	notifyOpenAIUpstreamDispatch(writeCtx)
 	if err := c.ws.WriteJSON(writeCtx, value); err != nil {
 		return err
 	}
@@ -874,7 +861,7 @@ func (p *openAIWSConnPool) acquire(ctx context.Context, req openAIWSAcquireReque
 
 retryAcquire:
 	accountID := req.Account.ID
-	compatibility := normalizeOpenAIWSAcquireCompatibility(req)
+	compatibility := normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
 	routingAffinity := normalizeOpenAIWSRoutingAffinity(req.Headers)
 	effectiveMaxConns := p.effectiveMaxConnsByAccount(req.Account)
 	if effectiveMaxConns <= 0 {
@@ -1536,13 +1523,6 @@ func (p *openAIWSConnPool) ensureTargetIdleAsync(accountID int64) {
 	if ap.lastAcquire == nil {
 		return
 	}
-	// Agent Identity assertions are rebuilt by HeadersFactory. Delayed prewarm
-	// runs without the request's finalized credential context, so it cannot
-	// prove that a newly generated assertion still matches the stored proof.
-	// Keep those connections request-bound; bearer proofs remain prewarmable.
-	if proof := ap.lastAcquire.CredentialProof; proof != nil && proof.authMode == OpenAIAuthModeAgentIdentity {
-		return
-	}
 	if ap.prewarmActive {
 		return
 	}
@@ -1827,7 +1807,7 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	}
 	id := p.nextConnID(req.Account.ID)
 	pooledConn := newOpenAIWSConn(id, req.Account.ID, conn, handshakeHeaders)
-	pooledConn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req)
+	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
 	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(req.Headers)
 	return pooledConn, nil
 }
@@ -1993,10 +1973,6 @@ func (p *openAIWSConnPool) dialTimeout() time.Duration {
 func cloneOpenAIWSAcquireRequest(req openAIWSAcquireRequest) openAIWSAcquireRequest {
 	copied := req
 	copied.Headers = cloneHeader(req.Headers)
-	if req.CredentialProof != nil {
-		proof := *req.CredentialProof
-		copied.CredentialProof = &proof
-	}
 	copied.WSURL = stringsTrim(req.WSURL)
 	copied.ProxyURL = stringsTrim(req.ProxyURL)
 	copied.PreferredConnID = stringsTrim(req.PreferredConnID)
@@ -2014,18 +1990,7 @@ func cloneOpenAIWSAcquireRequestPtr(req *openAIWSAcquireRequest) *openAIWSAcquir
 func sameOpenAIWSPrewarmTarget(a, b openAIWSAcquireRequest) bool {
 	return stringsTrim(a.WSURL) == stringsTrim(b.WSURL) &&
 		stringsTrim(a.ProxyURL) == stringsTrim(b.ProxyURL) &&
-		normalizeOpenAIWSAcquireCompatibility(a) == normalizeOpenAIWSAcquireCompatibility(b)
-}
-
-func normalizeOpenAIWSAcquireCompatibility(req openAIWSAcquireRequest) openAIWSHandshakeCompatibilityKey {
-	key := normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
-	key.wsURL = stringsTrim(req.WSURL)
-	key.proxyURL = stringsTrim(req.ProxyURL)
-	if req.CredentialProof != nil {
-		key.credentialProof = *req.CredentialProof
-		key.hasCredentialProof = true
-	}
-	return key
+		normalizeOpenAIWSHandshakeCompatibility(a.Account, a.Headers) == normalizeOpenAIWSHandshakeCompatibility(b.Account, b.Headers)
 }
 
 func normalizeOpenAIWSBetaFeatures(headers http.Header) string {

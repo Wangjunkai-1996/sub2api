@@ -499,7 +499,6 @@ func TestContentModerationCheck_PreBlockKeywordHitSkipsUpstreamCall(t *testing.T
 
 	require.NoError(t, err)
 	require.True(t, decision.Blocked)
-	require.True(t, decision.Audited, "a deterministic keyword block is an audit proof")
 	require.Equal(t, ContentModerationActionKeywordBlock, decision.Action)
 	require.False(t, upstreamCalled, "keyword block must short-circuit upstream moderation call")
 	logs := requireContentModerationLogCount(t, repo, 1)
@@ -551,7 +550,6 @@ func TestContentModerationCheck_KeywordsIgnoredInObserveMode(t *testing.T) {
 
 	require.NoError(t, err)
 	require.True(t, decision.Allowed, "observe mode must let the request through even on keyword hit")
-	require.False(t, decision.Audited, "an observe enqueue is not synchronous audit proof")
 	require.Equal(t, ContentModerationActionAllow, decision.Action)
 }
 
@@ -598,7 +596,6 @@ func TestContentModerationCheck_KeywordOnlyStrategySkipsAPIOnMiss(t *testing.T) 
 
 	require.NoError(t, err)
 	require.True(t, decision.Allowed, "keyword-only must allow misses without calling the API")
-	require.False(t, decision.Audited, "a keyword-only miss did not execute an audit")
 	require.False(t, upstreamCalled, "keyword-only must not call the upstream moderation API")
 	require.Len(t, repo.snapshotLogs(), 0)
 }
@@ -646,84 +643,8 @@ func TestContentModerationCheck_APIOnlyStrategyIgnoresKeywordList(t *testing.T) 
 
 	require.NoError(t, err)
 	require.True(t, decision.Allowed, "api-only must let the request through when API does not flag it")
-	require.True(t, decision.Audited, "a successful synchronous moderation API result is proof")
 	require.True(t, upstreamCalled, "api-only must call the upstream moderation API")
 	require.NotEqual(t, ContentModerationActionKeywordBlock, decision.Action)
-}
-
-func TestContentModerationCheckAuditProofRejectsFailOpenSkips(t *testing.T) {
-	tests := []struct {
-		name        string
-		riskEnabled bool
-		mutate      func(*ContentModerationConfig)
-		status      int
-		wantAudited bool
-	}{
-		{name: "successful pre-block API", riskEnabled: true, status: http.StatusOK, wantAudited: true},
-		{name: "risk control disabled", riskEnabled: false, status: http.StatusOK},
-		{name: "moderation config disabled", riskEnabled: true, status: http.StatusOK, mutate: func(cfg *ContentModerationConfig) {
-			cfg.Enabled = false
-		}},
-		{name: "sampled out", riskEnabled: true, status: http.StatusOK, mutate: func(cfg *ContentModerationConfig) {
-			cfg.SampleRate = 0
-		}},
-		{name: "observe mode", riskEnabled: true, status: http.StatusOK, mutate: func(cfg *ContentModerationConfig) {
-			cfg.Mode = ContentModerationModeObserve
-		}},
-		{name: "no audit key", riskEnabled: true, status: http.StatusOK, mutate: func(cfg *ContentModerationConfig) {
-			cfg.APIKeys = nil
-		}},
-		{name: "moderation API error", riskEnabled: true, status: http.StatusInternalServerError},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tt.status)
-				if tt.status == http.StatusOK {
-					_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{
-						CategoryScores: map[string]float64{"sexual": 0.01},
-					}}})
-				}
-			}))
-			defer server.Close()
-
-			cfg := defaultContentModerationConfig()
-			cfg.Enabled = true
-			cfg.Mode = ContentModerationModePreBlock
-			cfg.BaseURL = server.URL
-			cfg.APIKeys = []string{"sk-proof-test"}
-			cfg.RetryCount = 0
-			if tt.mutate != nil {
-				tt.mutate(cfg)
-			}
-			rawCfg, err := json.Marshal(cfg)
-			require.NoError(t, err)
-
-			svc := NewContentModerationService(
-				&contentModerationTestSettingRepo{values: map[string]string{
-					SettingKeyRiskControlEnabled:      fmt.Sprintf("%t", tt.riskEnabled),
-					SettingKeyContentModerationConfig: string(rawCfg),
-				}},
-				&contentModerationTestRepo{},
-				&contentModerationTestHashCache{},
-				nil,
-				nil,
-				nil,
-				nil,
-				nil,
-			)
-			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
-				Model:    "gpt-5.6-terra",
-				Protocol: ContentModerationProtocolOpenAIResponses,
-				Body:     []byte(`{"input":"audit proof canary"}`),
-			})
-
-			require.NoError(t, err)
-			require.NotNil(t, decision)
-			require.Equal(t, tt.wantAudited, decision.Audited)
-		})
-	}
 }
 
 func TestNormalizeKeywordBlockingMode_UnknownFallsBackToDefault(t *testing.T) {
@@ -983,7 +904,7 @@ func TestExtractContentModerationInput_AnthropicImageSourceOnlyParticipatesInMem
 	require.NotContains(t, log.InputExcerpt, "aGVsbG8=")
 }
 
-func TestExtractContentModerationInput_AnthropicKeepsSystemReminderAndEphemeralUserText(t *testing.T) {
+func TestExtractContentModerationInput_AnthropicKeepsEphemeralUserTextAndSkipsSystemReminders(t *testing.T) {
 	body := []byte(`{
 		"messages": [
 			{
@@ -999,16 +920,8 @@ func TestExtractContentModerationInput_AnthropicKeepsSystemReminderAndEphemeralU
 
 	input := ExtractContentModerationInput(ContentModerationProtocolAnthropicMessages, body)
 
-	require.Equal(t, "<system-reminder>工具说明</system-reminder> <system-reminder>Ainder> hid", input.Text)
+	require.Equal(t, "hid", input.Text)
 	require.Empty(t, input.Images)
-}
-
-func TestExtractContentModerationInput_DoesNotDropMixedSystemReminderText(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"user","content":"prefix <system-reminder>canary</system-reminder> suffix"}]}`)
-
-	input := ExtractContentModerationInput(ContentModerationProtocolAnthropicMessages, body)
-
-	require.Equal(t, "prefix <system-reminder>canary</system-reminder> suffix", input.Text)
 }
 
 func TestExtractContentModerationInput_OpenAIChatUsesLastUserMessage(t *testing.T) {
@@ -1153,7 +1066,6 @@ func TestContentModerationCheck_OpenAIResponsesRecordsNonHitForCodexPayload(t *t
 
 	require.NoError(t, err)
 	require.False(t, decision.Blocked)
-	require.True(t, decision.Audited, "a successful pre-block moderation API result is proof")
 	logs := requireContentModerationLogCount(t, repo, 1)
 	require.False(t, logs[0].Flagged)
 	require.Equal(t, ContentModerationActionAllow, logs[0].Action)
@@ -1220,7 +1132,6 @@ func TestContentModerationCheck_PreBlockBlocksCodexResponsesLatestUserInput(t *t
 
 	require.NoError(t, err)
 	require.True(t, decision.Blocked)
-	require.True(t, decision.Audited, "a synchronous API block is proof")
 	require.Equal(t, ContentModerationActionBlock, decision.Action)
 	require.Equal(t, http.StatusUnavailableForLegalReasons, decision.StatusCode)
 	require.Equal(t, "内容审计测试阻断", decision.Message)

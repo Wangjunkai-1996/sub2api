@@ -28,16 +28,7 @@ func NewCoordinator(legacy LegacyEngine, prompt PromptEngine) *Coordinator {
 
 func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 	if c == nil {
-		if req.RequireBlocking {
-			return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-		}
 		return allowDecision(nil, nil)
-	}
-	if req.RequireBlocking {
-		if c.prompt == nil || c.prompt.EffectiveMode() != ModeBlocking {
-			return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-		}
-		return c.checkBlocking(ctx, req)
 	}
 	mode := ModeOff
 	if c.prompt != nil {
@@ -58,53 +49,6 @@ func (c *Coordinator) Check(ctx context.Context, req Request) Decision {
 	}
 }
 
-// CheckLegacy runs only the existing risk-control adapter.  It is used as a
-// controlled fallback for an audit-required account when the optional Prompt
-// Guard path is unavailable.  The caller still receives a normal Decision, so
-// blocks remain hard blocks and a missing/failed legacy audit remains a
-// fail-closed unavailable result.
-func (c *Coordinator) CheckLegacy(ctx context.Context, req Request) Decision {
-	if c == nil || c.legacy == nil {
-		return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-	}
-	legacy, err := c.checkLegacy(ctx, req)
-	if err != nil || legacy == nil {
-		return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-	}
-	return DecisionFromLegacy(legacy)
-}
-
-// DecisionFromLegacy converts an already executed legacy moderation result to
-// the coordinator's public decision shape.  Keeping this conversion separate
-// lets callers reuse the legacy result attached to a failed Prompt Guard check
-// without running the moderation adapter twice.
-func DecisionFromLegacy(legacy *LegacyDecision) Decision {
-	if legacy == nil {
-		return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-	}
-	// A hard block is safe to preserve even when an older adapter did not yet
-	// populate the proof bit.  An allow/flag result, however, is only useful for
-	// an audit-required account when the moderation path actually ran.
-	if !legacy.Audited && !legacy.Blocked {
-		return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-	}
-	return prioritize(legacy, nil)
-}
-
-func (p *PromptDecision) asDecision() Decision {
-	if p == nil {
-		return unavailablePromptDecision(ErrorCodeUnavailable).asDecision()
-	}
-	return Decision{
-		Kind:           p.Kind,
-		HTTPStatus:     http.StatusServiceUnavailable,
-		ErrorCode:      p.ErrorCode,
-		ClientMessage:  "提示词安全审计暂时不可用，请稍后重试",
-		Prompt:         p,
-		AllowNextStage: false,
-	}
-}
-
 func (c *Coordinator) checkBlocking(ctx context.Context, req Request) Decision {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -120,7 +64,7 @@ func (c *Coordinator) checkBlocking(ctx context.Context, req Request) Decision {
 			prompt = unavailablePromptDecision(ErrorCodeUnavailable)
 			return
 		}
-		result, err := c.prompt.Evaluate(ctx, req.CloneForBlocking())
+		result, err := c.prompt.Evaluate(ctx, req.Clone())
 		if err != nil {
 			var guardErr *GuardError
 			if errors.As(err, &guardErr) && guardErr.Code == ErrorCodeInvalidResponse {

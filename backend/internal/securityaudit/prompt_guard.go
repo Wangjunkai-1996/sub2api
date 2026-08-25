@@ -71,14 +71,12 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 	evalCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	inputLimit := minimumInputLimit(endpoints)
-	chunks := splitRunesAtPriorityBoundary(snapshot.ScanText, inputLimit, snapshot.PriorityPrefixRunes)
+	chunks := SplitRunes(snapshot.ScanText, inputLimit)
 	if len(chunks) == 0 {
 		if g.metrics != nil {
-			g.metrics.Observe(DecisionInvalid, g.clock.Now().Sub(start))
+			g.metrics.Observe(DecisionAllow, g.clock.Now().Sub(start))
 		}
-		err := errors.New("prompt guard input produced no chunks")
-		logGuardFailure(snapshot, cfg, DecisionInvalid, ErrorCodeInvalidResponse, "", g.clock.Now().Sub(start))
-		return nil, &GuardError{Code: ErrorCodeInvalidResponse, Cause: err}
+		return &PromptDecision{Kind: DecisionAllow, AllowNextStage: true}, nil
 	}
 	LogInfo(EventEvaluationStarted, mergeLogFields(baseFields, map[string]any{"chunk_total": len(chunks), "status": "started"}))
 	results := make([]*NormalizedResult, 0, len(chunks))
@@ -139,12 +137,7 @@ func (g *GuardEvaluator) Evaluate(ctx context.Context, cfg ActiveConfig, snapsho
 	if aggregated.Action == ActionBlock {
 		kind = DecisionBlock
 	}
-	decision := &PromptDecision{
-		Kind:           kind,
-		Result:         aggregated,
-		AllowNextStage: kind == DecisionAllow || kind == DecisionFlag,
-		Audited:        true,
-	}
+	decision := &PromptDecision{Kind: kind, Result: aggregated, AllowNextStage: kind == DecisionAllow || kind == DecisionFlag}
 	if kind == DecisionBlock {
 		decision.ErrorCode = ErrorCodeBlocked
 	}
@@ -213,9 +206,6 @@ func (g *GuardEvaluator) scanChunk(ctx context.Context, cfg ActiveConfig, endpoi
 			continue
 		}
 		result, err := callPromptScanner(ctx, g.scanner, endpoint, chunk, cfg.Scanners)
-		if g.metrics != nil {
-			g.metrics.ObserveScannerCall(err == nil && result != nil)
-		}
 		<-semaphore
 		if err == nil && result != nil {
 			return result, nil

@@ -11,7 +11,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
-	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -63,110 +62,35 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
-	var admissionState *openAISecurityAdmissionState
-	if len(body) > securityadmission.CurrentLimits().BodyCapBytes {
-		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(string(securityadmission.ProtocolOpenAIChat), body, securityadmission.LineageUntrusted)
-		if classifyErr != nil {
-			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
-				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
-			h.errorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
-			return
-		}
-		admissionState = state
-		installOpenAISecurityAdmission(c, admissionState)
-		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "oversize_gate")
-	}
-	oversizeRequest := isOpenAIOversizeAdmission(admissionState)
-	var oversizeEnvelope securityadmission.RoutingEnvelope
-	if oversizeRequest {
-		oversizeEnvelope, err = extractOpenAICompleteOversizeRoutingEnvelope(
-			admissionState, securityadmission.ProtocolOpenAIChat, body,
-		)
-		if err != nil {
-			status := http.StatusServiceUnavailable
-			code := "service_unavailable"
-			message := "Oversized request routing metadata is unavailable"
-			event := "security_admission.oversize_envelope_unavailable"
-			reason := "oversize_envelope_unavailable"
-			if errors.Is(err, securityadmission.ErrRoutingEnvelopeInvalid) {
-				status = http.StatusBadRequest
-				code = "invalid_request_error"
-				message = "Invalid oversized request routing metadata"
-				event = "security_admission.oversize_envelope_invalid"
-				reason = "oversize_envelope_invalid"
-			}
-			warnOpenAISecurityAdmission(c, reqLog, event, admissionState, 0,
-				securityadmission.AccountUnknown, reason, "upstream_not_dispatched", zap.Error(err))
-			h.errorResponse(c, status, code, message)
-			return
-		}
-		if openAIOversizeReasoningPolicyConfigured(c, apiKey) {
-			warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
-				securityadmission.AccountUnknown, "oversize_reasoning_policy_required", "upstream_not_dispatched")
-			h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request requires unsupported gateway preprocessing")
-			return
-		}
+
+	if !gjson.ValidBytes(body) {
+		logRequestBodyParseFailure(reqLog, body, nil)
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
 	}
 
-	if !oversizeRequest {
-		if validateErr := securityadmission.ValidateCompleteRoutingEnvelope(body); validateErr != nil {
-			logRequestBodyParseFailure(reqLog, body, validateErr)
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
-			return
-		}
+	modelResult := gjson.GetBytes(body, "model")
+	if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+		return
 	}
-
-	var reqModel string
-	if oversizeRequest {
-		reqModel = oversizeEnvelope.Model
-	} else {
-		modelResult := gjson.GetBytes(body, "model")
-		if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
-			return
-		}
-		reqModel = modelResult.String()
-	}
+	reqModel := modelResult.String()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	if !openAICompatibleTextTargetAllowed(c, apiKey, reqModel) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
 	auditBody := body
-	if !oversizeRequest {
-		if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
-			body = cappedBody
-		}
+	if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
+		body = cappedBody
 	}
-	reqStream := oversizeEnvelope.Stream
-	if !oversizeRequest {
-		reqStream, ok = parseOpenAICompatibleStream(body)
-		if !ok {
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
-			return
-		}
+	reqStream, ok := parseOpenAICompatibleStream(body)
+	if !ok {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", invalidStreamFieldTypeMessage)
+		return
 	}
 	if service.IsGPTImageGenerationModel(reqModel) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "This model is not supported on the Chat Completions endpoint")
-		return
-	}
-
-	if admissionState == nil {
-		state, classifyErr := classifyOpenAISecurityAdmissionWithResourceExpansion(
-			string(securityadmission.ProtocolOpenAIChat), auditBody, securityadmission.LineageUntrusted,
-		)
-		if classifyErr != nil {
-			warnOpenAISecurityAdmission(c, reqLog, "security_admission.classification_failed", nil, 0,
-				securityadmission.AccountUnknown, "classification_failed", "upstream_not_dispatched", zap.Error(classifyErr))
-			h.errorResponse(c, openAIAdmissionErrorStatus(classifyErr), "invalid_request_error", "Failed to inspect request body")
-			return
-		}
-		admissionState = state
-		installOpenAISecurityAdmission(c, admissionState)
-		logOpenAISecurityAdmission(c, reqLog, admissionState, securityadmission.AccountUnknown, "classified")
-	}
-	if openAIAdmissionShouldRejectBeforeRouting(admissionState) {
-		h.errorResponse(c, http.StatusForbidden, "permission_error", "Request blocked by content policy")
 		return
 	}
 
@@ -177,19 +101,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
-	if oversizeRequest && channelMapping.Mapped {
-		warnOpenAISecurityAdmission(c, reqLog, "security_admission.oversize_preprocessing_required", admissionState, 0,
-			securityadmission.AccountUnknown, "oversize_channel_model_mapping_required", "upstream_not_dispatched")
-		h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable", "Oversized request requires unsupported gateway preprocessing")
-		return
-	}
-	forwardModel := reqModel
-	if channelMapping.Mapped {
-		forwardModel = channelMapping.MappedModel
-	}
-	forwardCtx := service.WithOpenAIDirectForwardModel(c.Request.Context(), forwardModel)
-	forwardCtx = withOpenAIRemoteModelRequirement(forwardCtx, forwardModel)
-	c.Request = c.Request.WithContext(forwardCtx)
 	healthModel := openAITrafficDirectorHealthModel(reqModel, channelMapping)
 
 	if h.errorPassthroughService != nil {
@@ -220,12 +131,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	sessionMetadataBody := body
-	if oversizeRequest {
-		sessionMetadataBody = nil
-	}
-	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionMetadataBody)
-	promptCacheKey := h.gatewayService.ExtractSessionID(c, sessionMetadataBody)
+	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
+	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
 
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
@@ -274,15 +181,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 				return
 			}
-			// A request-local audit-exempt constraint is a security capacity
-			// boundary, regardless of whether it came from classification, a final
-			// model mapping, or a failed Pro audit fallback. Do not run ordinary
-			// model diagnosis when the request has no verified non-Pro account.
-			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
-				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
-				return
-			}
 			if len(failedAccountIDs) == 0 {
 				cls := classifyOpenAICompatibleSelectionErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, err)
 				if !cls.ModelNotFound {
@@ -300,14 +198,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		if selection == nil || selection.Account == nil {
-			if openAISecurityAdmissionUnavailable(c, admissionState, lastFailoverErr) {
-				h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", openAISecurityAdmissionErrorMessage(c, admissionState), streamStarted)
-				return
-			}
-			if lastFailoverErr != nil {
-				h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
-				return
-			}
 			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel)
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
@@ -339,32 +229,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		account = selection.Account
-		terminalAdmission, terminalErr := h.gatewayService.AdmitOpenAIAccountRequirement(c.Request.Context(), account)
-		if terminalErr != nil {
-			if accountReleaseFunc != nil {
-				accountReleaseFunc()
-				accountReleaseFunc = nil
-			}
-			if openAITerminalAdmissionCanReselect(terminalErr) {
-				failedAccountIDs[account.ID] = struct{}{}
-				warnOpenAISecurityAdmission(c, reqLog, "security_admission.terminal_rejected", admissionState, account.ID,
-					securityadmission.AccountUnknown, "terminal_admission_reselect", "upstream_not_dispatched", zap.Error(terminalErr))
-				continue
-			}
-			errorOpenAISecurityAdmission(c, reqLog, "security_admission.terminal_unavailable", admissionState, account.ID,
-				securityadmission.AccountUnknown, "terminal_admission_unavailable", "upstream_not_dispatched", zap.Error(terminalErr))
-			h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "service_unavailable", "Account security admission is temporarily unavailable", streamStarted)
-			return
-		}
-		account = terminalAdmission.Selected
-		selection.Account = account
-		terminalCtx := service.WithOpenAIAccountTerminalAdmission(c.Request.Context(), terminalAdmission)
-		c.Request = c.Request.WithContext(terminalCtx)
-		if service.OpenAIAccountRequirementFromContext(terminalCtx) == securityadmission.AccountRequirementAuditExempt {
-			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(terminalCtx, apiKey.GroupID, sessionHash, account.ID); err != nil {
-				reqLog.Warn("openai_chat_completions.bind_security_sticky_session_after_terminal_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-			}
-		}
 		releaseAccount := func() {
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()
@@ -381,16 +245,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			reqModel,
 			auditBody,
 		); decision != nil && !decision.AllowNextStage {
-			if securityAuditCanReselect(decision) && h.selectedOpenAIAccountMayUseAuditFallback(c, account) && admissionState != nil &&
-				admissionState.admission.Class() == securityadmission.RequestAuditableText && !admissionState.fallback {
-				admissionState.fallback = true
-				releaseAccount()
-				failedAccountIDs[account.ID] = struct{}{}
-				setOpenAIAccountRequirement(c, securityadmission.AccountRequirementAuditExempt)
-				warnOpenAISecurityAdmission(c, reqLog, "security_admission.pro_audit_unavailable_reselect", admissionState, account.ID,
-					securityadmission.AccountUnknown, string(decision.Kind), "upstream_not_dispatched")
-				continue
-			}
 			releaseAccount()
 			h.handleStreamingAwareErrorWithCode(
 				c,
@@ -415,8 +269,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
 			selection.CommitTrafficDirectorAttempt()
-			forwardCtx := withOpenAISecurityDispatchObserver(c.Request.Context(), c, reqLog, account)
-			return h.gatewayService.ForwardAsChatCompletions(forwardCtx, c, account, forwardBody, promptCacheKey, "")
+			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
 		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))

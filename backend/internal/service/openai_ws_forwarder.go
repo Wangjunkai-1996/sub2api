@@ -223,20 +223,7 @@ type OpenAIWSIngressHooks struct {
 	ReasoningEffortMappings []ReasoningEffortMapping
 	TurnStarted             func(turn int, startedAt time.Time)
 	BeforeTurn              func(turn int) error
-	// BeforeRetry revalidates request-local invariants immediately before a
-	// previously admitted turn is dispatched again. It must not repeat content
-	// scanning or concurrency admission owned by BeforeTurn.
-	BeforeRetry func(turn int) error
-	// BeforeDispatch runs after any connection acquire, queue wait, reconnect,
-	// or health preflight and immediately before an upstream business write. It
-	// must only revalidate terminal credential proof; turn scanning and concurrency
-	// admission remain owned by BeforeTurn/BeforeRetry.
-	BeforeDispatch func(turn int) error
-	BeforeRequest  func(turn int, payload []byte, originalModel string) error
-	// BeforeNonTurnFrame validates client frames that do not start a response
-	// turn. It runs before session state is updated or the frame is written
-	// upstream and must not mutate turn lifecycle state.
-	BeforeNonTurnFrame func(payload []byte) error
+	BeforeRequest           func(turn int, payload []byte, originalModel string) error
 	// MapRequestModel resolves the current turn's client model to the model
 	// that must be written into the upstream response.create frame.
 	MapRequestModel func(turn int, originalModel string) (string, error)

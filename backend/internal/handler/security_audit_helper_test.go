@@ -4,11 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/Wei-Shaw/sub2api/internal/securityadmission"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -26,129 +24,6 @@ func TestCachesSecurityAuditCompletionSkipsWebSocketStages(t *testing.T) {
 	require.True(t, isSecurityAuditWebSocketStage("first_turn"))
 	require.True(t, isSecurityAuditWebSocketStage("subsequent_turn"))
 	require.False(t, isSecurityAuditWebSocketStage("http"))
-}
-
-func TestBlockingAuditFailsClosedWithoutCoordinator(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	c.Set(securityAuditCompletedContextKey, true)
-
-	decision := runSecurityAuditWithAdmission(
-		c,
-		nil,
-		nil,
-		nil,
-		nil,
-		middleware2.AuthSubject{UserID: 7},
-		service.ContentModerationProtocolOpenAIResponses,
-		"gpt-test",
-		[]byte(`{"input":"must be scanned"}`),
-		"http",
-		nil,
-		true,
-	)
-
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
-	require.Equal(t, securityaudit.ErrorCodeUnavailable, decision.ErrorCode)
-	require.Equal(t, http.StatusServiceUnavailable, decision.HTTPStatus)
-	require.False(t, decision.AllowNextStage)
-}
-
-func TestBlockingAuditDoesNotReuseNonBlockingCompletion(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{mode: securityaudit.ModeAsync}
-	coordinator := securityaudit.NewCoordinator(nil, engine)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	body := []byte(`{"input":"must reach blocking scanner"}`)
-
-	nonBlocking := runSecurityAudit(
-		c,
-		nil,
-		coordinator,
-		nil,
-		nil,
-		middleware2.AuthSubject{UserID: 7},
-		service.ContentModerationProtocolOpenAIResponses,
-		"gpt-test",
-		body,
-		"http",
-	)
-	require.NotNil(t, nonBlocking)
-	require.True(t, nonBlocking.AllowNextStage)
-
-	blocking := runSecurityAuditWithAdmission(
-		c,
-		nil,
-		coordinator,
-		nil,
-		nil,
-		middleware2.AuthSubject{UserID: 7},
-		service.ContentModerationProtocolOpenAIResponses,
-		"gpt-test",
-		body,
-		"http",
-		nil,
-		true,
-	)
-	require.NotNil(t, blocking)
-	require.Equal(t, securityaudit.DecisionUnavailable, blocking.Kind)
-	require.False(t, blocking.AllowNextStage)
-	require.Equal(t, int64(1), engine.enqueues.Load(), "the non-blocking path may enqueue once")
-	require.Zero(t, engine.evaluates.Load(), "async mode must never be treated as a completed blocking scan")
-}
-
-func TestSecurityAdmissionDoesNotReuseEqualLengthDifferentBody(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	protocol := service.ContentModerationProtocolOpenAIResponses
-	firstBody := []byte(`{"input":"safe"}`)
-	secondBody := []byte(`{"input":"evil"}`)
-	require.Len(t, secondBody, len(firstBody))
-
-	firstState, err := classifyOpenAISecurityAdmission(protocol, firstBody, "untrusted")
-	require.NoError(t, err)
-	installOpenAISecurityAdmission(c, firstState)
-	require.True(t, firstState.matchesBody(protocol, firstBody))
-	require.False(t, firstState.matchesBody(protocol, secondBody))
-	require.Nil(t, buildSecurityAuditRequest(
-		c, nil, middleware2.AuthSubject{UserID: 7}, protocol, "gpt-test", secondBody, "subsequent_turn",
-	).Admission, "equal length must not reuse offsets from another allocation")
-
-	account := &service.Account{
-		Platform: service.PlatformOpenAI,
-		Type:     service.AccountTypeOAuth,
-		Credentials: map[string]any{
-			"plan_type": "pro",
-		},
-	}
-	h := &OpenAIGatewayHandler{
-		securityAuditCoordinator: securityaudit.NewCoordinator(
-			&handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{Allowed: true, Audited: true}},
-			&turnCountingEngine{mode: securityaudit.ModeBlocking},
-		),
-	}
-	c.Set(securityAuditWSTurnContextKey, 2)
-	decision := h.checkSecurityAuditForSelectedOpenAIAccount(
-		c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		protocol, "gpt-test", secondBody, true,
-	)
-	require.NotNil(t, decision)
-	require.True(t, decision.AllowNextStage)
-
-	secondState := openAISecurityAdmissionFromContext(c)
-	require.NotSame(t, firstState, secondState)
-	require.True(t, secondState.matchesBody(protocol, secondBody))
-	materialized, err := secondState.admission.MaterializeText(secondBody)
-	require.NoError(t, err)
-	require.Contains(t, materialized, "evil")
-	require.NotContains(t, materialized, "safe")
 }
 
 func TestSelectedOpenAIProAccountAuditEligibility(t *testing.T) {
@@ -213,406 +88,13 @@ func TestSelectedOpenAIProAccountAuditEligibility(t *testing.T) {
 	}
 }
 
-func TestSelectedOpenAIProAccountAuditModeOffUsesLegacyModeration(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{mode: securityaudit.ModeOff}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Blocked: true, StatusCode: http.StatusForbidden, ErrorCode: "content_policy_violation", Message: "legacy block",
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	// A generic gateway audit may have completed before account selection. The
-	// selected-Pro path must still execute its isolated synchronous audit once.
-	c.Set(securityAuditCompletedContextKey, true)
-	account := &service.Account{
-		Platform: service.PlatformOpenAI,
-		Type:     service.AccountTypeOAuth,
-		Credentials: map[string]any{
-			"plan_type": "pro",
-		},
-	}
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
-		c,
-		nil,
-		nil,
-		middleware2.AuthSubject{UserID: 7},
-		account,
-		service.ContentModerationProtocolOpenAIResponses,
-		"gpt-test",
-		[]byte(`{"input":"hello"}`),
-	)
-
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionBlock, decision.Kind)
-	require.False(t, decision.AllowNextStage)
-	require.Equal(t, int64(1), legacy.calls.Load(), "mode off must retain the existing content moderation audit")
-	require.Zero(t, engine.evaluates.Load(), "mode off must not invoke the blocking scanner")
-	require.Zero(t, engine.enqueues.Load(), "mode off must not enqueue an async audit")
-}
-
-func TestSelectedOpenAIProAccountAuditModeOffAllowsAuditedLegacyResult(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{mode: securityaudit.ModeOff}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"input":"production legacy audit path"}`)
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-5.5", body)
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionAllow, decision.Kind)
-	require.True(t, decision.AllowNextStage)
-	require.True(t, decision.Legacy.Audited)
-	require.Equal(t, int64(1), legacy.calls.Load())
-	require.Zero(t, engine.evaluates.Load(), "the optional Prompt Guard must stay out of the mode-off path")
-}
-
-func TestSelectedOpenAIProAccountAuditModeOffAllowsLegacyFailOpenAllow(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{mode: securityaudit.ModeOff}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"input":"unaudited legacy allow"}`)
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionAllow, decision.Kind)
-	require.True(t, decision.AllowNextStage)
-	require.Equal(t, int64(1), legacy.calls.Load())
-
-	// The selected-account audit result may be reused on a subsequent failover.
-	second := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	require.Nil(t, second)
-	require.Equal(t, int64(1), legacy.calls.Load())
-}
-
-func TestSelectedOpenAIProAccountAuditModeOffDoesNotCacheUnauditedWebSocketAllow(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{mode: securityaudit.ModeOff}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	c.Set(securityAuditWSTurnContextKey, 2)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"type":"response.create","input":"unaudited websocket allow"}`)
-
-	first := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		string(securityadmission.ProtocolResponsesWebSocket), "gpt-test", body)
-	second := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		string(securityadmission.ProtocolResponsesWebSocket), "gpt-test", body)
-	require.NotNil(t, first)
-	require.Equal(t, securityaudit.DecisionUnavailable, first.Kind)
-	require.NotNil(t, second)
-	require.Equal(t, securityaudit.DecisionUnavailable, second.Kind)
-	require.Zero(t, engine.evaluates.Load())
-	cachedValue, cached := c.Get(securityAuditWSDedupeContextKey)
-	require.False(t, cached && cachedValue != nil, "an unaudited allow must not leave a concrete dedupe entry")
-}
-
-func TestSelectedOpenAIProAccountAuditRejectsMissingCoordinator(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	h := &OpenAIGatewayHandler{}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", []byte(`{"input":"missing coordinator"}`))
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
-	require.False(t, decision.AllowNextStage)
-}
-
-func TestSelectedOpenAIProAccountAuditPromptUnavailableFallsBackToLegacyAllow(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"input":"legacy fallback allow"}`)
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionAllow, decision.Kind)
-	require.True(t, decision.AllowNextStage)
-	require.Equal(t, int64(1), legacy.calls.Load(), "the already executed legacy result must be reused")
-	require.Equal(t, int64(1), engine.evaluates.Load())
-	require.NotNil(t, decision.Legacy)
-}
-
-func TestSelectedOpenAIProAccountAuditPromptUnavailablePreservesLegacyFailOpenAllow(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	// The content moderation service deliberately reports Allowed=true and
-	// Audited=false when its remote API times out. That established fail-open
-	// result must not become the selected-Pro 503 seen in production.
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Audited: false, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"input":"moderation timeout fail-open"}`)
-
-	first := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	require.NotNil(t, first)
-	require.Equal(t, securityaudit.DecisionAllow, first.Kind)
-	require.True(t, first.AllowNextStage)
-	require.Equal(t, int64(1), legacy.calls.Load(), "the existing risk-control audit must still run")
-	require.Equal(t, int64(1), engine.evaluates.Load(), "Prompt Guard remains an optional signal")
-
-	second := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	require.Nil(t, second, "selected audit allow should be reused on failover")
-	require.Equal(t, int64(1), legacy.calls.Load())
-}
-
-func TestSelectedOpenAIProAccountAuditPromptUnavailableFallsBackToLegacyAllowForLargeCanonicalText(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"` +
-		strings.Repeat("x", securityadmission.MaxAuditableTextRunes+1) + `"}]}`)
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIChat, "gpt-test", body)
-	if decision == nil || decision.Kind != securityaudit.DecisionAllow || !decision.AllowNextStage {
-		t.Fatalf("decision=%+v", decision)
-	}
-	if legacy.calls.Load() != 1 || engine.evaluates.Load() != 1 {
-		t.Fatalf("legacy_calls=%d prompt_evaluates=%d want 1/1", legacy.calls.Load(), engine.evaluates.Load())
-	}
-	state := openAISecurityAdmissionFromContext(c)
-	if state == nil {
-		t.Fatal("missing admission state")
-	}
-	if state.admission.Class() != securityadmission.RequestAuditableText ||
-		state.admission.Requirement() != securityadmission.AccountRequirementAny {
-		t.Fatalf("admission=%+v", state.admission)
-	}
-}
-
-func TestSelectedOpenAIProAccountAuditLargeCanonicalTextLegacyOutcomeMatrix(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"` +
-		strings.Repeat("x", securityadmission.MaxAuditableTextRunes+1) + `"}]}`)
-	for _, test := range []struct {
-		name          string
-		legacy        *securityaudit.LegacyDecision
-		wantKind      securityaudit.DecisionKind
-		wantAllow     bool
-		wantLegacyRun int64
-	}{
-		{
-			name: "audited allow", legacy: &securityaudit.LegacyDecision{
-				Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
-			}, wantKind: securityaudit.DecisionAllow, wantAllow: true, wantLegacyRun: 1,
-		},
-		{
-			name: "hard block", legacy: &securityaudit.LegacyDecision{
-				Blocked: true, StatusCode: http.StatusForbidden, ErrorCode: "content_policy_violation",
-			}, wantKind: securityaudit.DecisionBlock, wantAllow: false, wantLegacyRun: 1,
-		},
-		{name: "unavailable", wantKind: securityaudit.DecisionUnavailable, wantAllow: false, wantLegacyRun: 2},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			engine := &turnCountingEngine{
-				mode:      securityaudit.ModeBlocking,
-				decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-			}
-			legacy := &handlerLegacyModerationEngine{decision: test.legacy}
-			h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-			recorder := httptest.NewRecorder()
-			c, _ := gin.CreateTestContext(recorder)
-			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-			account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-				Credentials: map[string]any{"plan_type": "pro"}}
-
-			decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-				service.ContentModerationProtocolOpenAIChat, "gpt-test", body)
-			require.NotNil(t, decision)
-			require.Equal(t, test.wantKind, decision.Kind)
-			require.Equal(t, test.wantAllow, decision.AllowNextStage)
-			require.Equal(t, test.wantLegacyRun, legacy.calls.Load())
-			state := openAISecurityAdmissionFromContext(c)
-			require.NotNil(t, state)
-			require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class())
-			require.Equal(t, securityadmission.AccountRequirementAny, state.admission.Requirement())
-		})
-	}
-}
-
-func TestSelectedOpenAIProAccountAuditPromptUnavailablePreservesLegacyBlock(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Blocked: true, StatusCode: http.StatusForbidden, ErrorCode: "content_policy_violation", Message: "legacy block",
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", []byte(`{"input":"legacy fallback block"}`))
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionBlock, decision.Kind)
-	require.False(t, decision.AllowNextStage)
-	require.Equal(t, int64(1), legacy.calls.Load())
-	require.Equal(t, int64(1), engine.evaluates.Load())
-	_, cached := c.Get(securityAuditCompletedContextKey)
-	require.False(t, cached, "a block must never populate the HTTP audit cache")
-}
-
-func TestSelectedOpenAIProAccountAuditPromptAndLegacyUnavailableFailsClosed(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-
-	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		service.ContentModerationProtocolOpenAIResponses, "gpt-test", []byte(`{"input":"legacy unavailable"}`))
-	require.NotNil(t, decision)
-	require.Equal(t, securityaudit.DecisionUnavailable, decision.Kind)
-	require.False(t, decision.AllowNextStage)
-	require.Equal(t, securityaudit.ErrorCodeUnavailable, decision.ErrorCode)
-	require.Equal(t, int64(1), engine.evaluates.Load())
-}
-
-func TestSelectedOpenAIProAccountAuditPromptUnavailableFallbackCachesAllow(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"input":"legacy fallback cache"}`)
-	check := func() *securityaudit.Decision {
-		return h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-			service.ContentModerationProtocolOpenAIResponses, "gpt-test", body)
-	}
-
-	first := check()
-	second := check()
-	require.NotNil(t, first)
-	require.True(t, first.AllowNextStage)
-	require.Nil(t, second, "a successful Legacy fallback must reuse the HTTP completion cache")
-	require.Equal(t, int64(1), legacy.calls.Load())
-	require.Equal(t, int64(1), engine.evaluates.Load())
-}
-
-func TestSelectedOpenAIProAccountAuditPromptUnavailableFallbackCachesWebSocketTurn(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := &turnCountingEngine{
-		mode:      securityaudit.ModeBlocking,
-		decisions: []*securityaudit.PromptDecision{{Kind: securityaudit.DecisionUnavailable, AllowNextStage: false}},
-	}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{
-		Allowed: true, Audited: true, Action: string(service.ContentModerationActionAllow),
-	}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	c.Set(securityAuditWSTurnContextKey, 2)
-	account := &service.Account{Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
-		Credentials: map[string]any{"plan_type": "pro"}}
-	body := []byte(`{"type":"response.create","input":"legacy websocket fallback"}`)
-
-	first := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		string(securityadmission.ProtocolResponsesWebSocket), "gpt-test", body)
-	second := h.checkSecurityAuditForSelectedOpenAIProAccount(c, nil, nil, middleware2.AuthSubject{UserID: 7}, account,
-		string(securityadmission.ProtocolResponsesWebSocket), "gpt-test", body)
-	require.NotNil(t, first)
-	require.True(t, first.AllowNextStage)
-	require.NotNil(t, second)
-	require.True(t, second.AllowNextStage)
-	require.Equal(t, int64(1), legacy.calls.Load())
-	require.Equal(t, int64(1), engine.evaluates.Load())
-}
-
 func TestSelectedOpenAIProAccountAuditCachesSuccessfulRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := &turnCountingEngine{mode: securityaudit.ModeBlocking}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{Allowed: true, Audited: true}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	// A generic gateway audit may have completed before account selection. The
-	// selected-Pro path must still execute its isolated synchronous audit once.
-	c.Set(securityAuditCompletedContextKey, true)
 	account := &service.Account{
 		Platform: service.PlatformOpenAI,
 		Type:     service.AccountTypeOAuth,
@@ -645,8 +127,7 @@ func TestSelectedOpenAIProAccountAuditCachesSuccessfulRequest(t *testing.T) {
 func TestSelectedOpenAIProAccountAuditStartsAfterIneligibleFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := &turnCountingEngine{mode: securityaudit.ModeBlocking}
-	legacy := &handlerLegacyModerationEngine{decision: &securityaudit.LegacyDecision{Allowed: true, Audited: true}}
-	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(legacy, engine)}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -694,8 +175,6 @@ func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
 		},
 	}
 	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
-	core, logs := observer.New(zap.InfoLevel)
-	reqLog := zap.New(core)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -709,7 +188,7 @@ func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
 
 	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
 		c,
-		reqLog,
+		nil,
 		nil,
 		middleware2.AuthSubject{UserID: 7},
 		account,
@@ -721,17 +200,7 @@ func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
 	require.NotNil(t, decision)
 	require.Equal(t, securityaudit.DecisionBlock, decision.Kind)
 	require.False(t, decision.AllowNextStage)
-	require.False(t, securityAuditCanReselect(decision), "an explicit block must never trigger account fallback")
 	require.Equal(t, int64(1), engine.evaluates.Load())
-	state := openAISecurityAdmissionFromContext(c)
-	require.NotNil(t, state)
-	require.Equal(t, securityadmission.RequestAuditableText, state.admission.Class(),
-		"the canonical routing/audit admission must remain immutable")
-	doneLogs := logs.FilterMessage("security_audit.gateway_check_done").All()
-	require.Len(t, doneLogs, 1)
-	require.Equal(t, string(securityadmission.RequestKnownViolation), doneLogs[0].ContextMap()["request_class"])
-	require.Equal(t, securityaudit.ErrorCodeBlocked, doneLogs[0].ContextMap()["reason"])
-	require.Equal(t, "upstream_not_dispatched", doneLogs[0].ContextMap()["dispatch"])
 	_, cached := c.Get(securityAuditCompletedContextKey)
 	require.False(t, cached, "blocking decisions must never populate the request cache")
 }
@@ -877,16 +346,6 @@ type turnCountingEngine struct {
 	enqueues  atomic.Int64
 	evaluates atomic.Int64
 	decisions []*securityaudit.PromptDecision
-}
-
-type handlerLegacyModerationEngine struct {
-	decision *securityaudit.LegacyDecision
-	calls    atomic.Int64
-}
-
-func (e *handlerLegacyModerationEngine) Check(context.Context, securityaudit.Request) (*securityaudit.LegacyDecision, error) {
-	e.calls.Add(1)
-	return e.decision, nil
 }
 
 func (e *turnCountingEngine) EffectiveMode() securityaudit.Mode { return e.mode }

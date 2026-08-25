@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,46 +39,6 @@ type agentIdentityKey struct {
 	runtimeID  string
 	privateKey ed25519.PrivateKey
 	taskID     string
-}
-
-// agentIdentityCredentialMaterialDigest binds a connection to the stable
-// material that determines the effective Agent Identity and ChatGPT tenant.
-// task_id is intentionally excluded: it is a recoverable registration under
-// the same runtime/signing key, not a change of credential owner. Generated
-// assertions are also excluded because their timestamp and signature rotate.
-func agentIdentityCredentialMaterialDigest(account *Account) ([sha256.Size]byte, error) {
-	var zero [sha256.Size]byte
-	if account == nil || !account.IsOpenAIAgentIdentity() {
-		return zero, errors.New("agent identity account is required")
-	}
-	runtimeID := strings.TrimSpace(account.GetCredential("agent_runtime_id"))
-	privateKey := strings.TrimSpace(account.GetCredential("agent_private_key"))
-	chatGPTAccountID := strings.TrimSpace(account.GetChatGPTAccountID())
-	if runtimeID == "" || privateKey == "" || chatGPTAccountID == "" {
-		return zero, errors.New("agent identity stable credential material is incomplete")
-	}
-
-	digest := sha256.New()
-	_, _ = digest.Write([]byte("sub2api/openai-agent-identity-credential/v1"))
-	writeField := func(value string) {
-		var size [8]byte
-		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
-		_, _ = digest.Write(size[:])
-		_, _ = digest.Write([]byte(value))
-	}
-	writeField(runtimeID)
-	writeField(privateKey)
-	writeField(chatGPTAccountID)
-	writeField(strings.TrimSpace(account.GetCredential("chatgpt_user_id")))
-	var fedRAMP [1]byte
-	if account.IsChatGPTAccountFedRAMP() {
-		fedRAMP[0] = 1
-	}
-	_, _ = digest.Write(fedRAMP[:])
-
-	var result [sha256.Size]byte
-	copy(result[:], digest.Sum(nil))
-	return result, nil
 }
 
 type agentIdentityTaskRegistrationResponse struct {
@@ -299,10 +257,6 @@ func ensureAgentIdentityTaskForAccount(ctx context.Context, repo AccountReposito
 	if taskMu == nil {
 		return errors.New("agent identity task lock is unavailable")
 	}
-	terminal := OpenAIAccountTerminalAdmissionFromContext(ctx)
-	if terminal != nil && repo == nil {
-		return NewOpenAISecurityCredentialFailoverError(terminal.Selected, "agent identity credential reload unavailable")
-	}
 	sharedTaskMu := taskMu
 	if credAccount.ID > 0 {
 		candidate := &sync.Mutex{}
@@ -320,21 +274,7 @@ func ensureAgentIdentityTaskForAccount(ctx context.Context, repo AccountReposito
 	// would allow sequential duplicate registrations after the first writer
 	// has already persisted a new task.
 	if repo != nil && credAccount.ID > 0 {
-		refreshed, refreshErr := repo.GetByID(ctx, credAccount.ID)
-		if terminal != nil {
-			if refreshErr != nil || refreshed == nil || refreshed.ID != credAccount.ID || refreshed.IsShadow() ||
-				!refreshed.IsOpenAIAgentIdentity() {
-				return NewOpenAISecurityCredentialFailoverError(terminal.Selected, "agent identity credential changed before task registration")
-			}
-			class := ClassifyOpenAIEffectiveCredentialOwner(refreshed)
-			if class != terminal.AccountClass || !openAIAccountClassSatisfiesRequirement(class, terminal.Requirement) {
-				return NewOpenAISecurityCredentialFailoverError(terminal.Selected, "agent identity account class changed before task registration")
-			}
-			credAccount = refreshed
-			if !account.IsShadow() {
-				account.Credentials = shallowCopyMap(credAccount.Credentials)
-			}
-		} else if refreshErr == nil && refreshed != nil {
+		if refreshed, refreshErr := repo.GetByID(ctx, credAccount.ID); refreshErr == nil && refreshed != nil {
 			if refreshed.IsShadow() {
 				if resolved, resolveErr := resolveCredentialAccount(ctx, repo, refreshed); resolveErr == nil && resolved != nil {
 					refreshed = resolved
@@ -369,12 +309,6 @@ func ensureAgentIdentityTaskForAccount(ctx context.Context, repo AccountReposito
 	}
 	if wsInvalidator != nil {
 		wsInvalidator.InvalidateAgentIdentityWSConnections(credAccount.ID)
-		// Pool partitions are keyed by the selected scheduling row. A shadow
-		// therefore needs its own partition invalidated in addition to its
-		// effective credential owner after task recovery.
-		if account.ID > 0 && account.ID != credAccount.ID {
-			wsInvalidator.InvalidateAgentIdentityWSConnections(account.ID)
-		}
 	}
 	return nil
 }
@@ -438,27 +372,6 @@ func (s *OpenAIGatewayService) buildOpenAIAuthenticationHeaders(ctx context.Cont
 	if account == nil {
 		return nil, errors.New("account is nil")
 	}
-	if OpenAIAccountTerminalAdmissionFromContext(ctx) != nil {
-		credential, err := openAIFinalizedCredentialForAuthentication(ctx, account, token)
-		if err != nil {
-			return nil, err
-		}
-		owner := credential.admission.EffectiveCredentialOwner
-		var headers http.Header
-		if credential.authMode == OpenAIAuthModeAgentIdentity {
-			headers, err = buildAgentIdentityAuthenticationHeadersFromSnapshot(owner)
-			if err != nil {
-				return nil, NewOpenAISecurityCredentialFailoverError(account, "finalized agent identity credential unavailable")
-			}
-		} else {
-			headers = make(http.Header)
-			headers.Set("Authorization", "Bearer "+token)
-		}
-		// Keep ChatGPT tenant metadata on the same immutable owner snapshot as
-		// the Authorization value. Downstream header helpers verify/reuse it.
-		setOpenAIChatGPTAccountHeaders(headers, owner)
-		return headers, nil
-	}
 	credAccount := account
 	if account.IsShadow() {
 		resolved, err := resolveCredentialAccount(ctx, s.accountRepo, account)
@@ -486,13 +399,6 @@ func buildAgentIdentityAuthenticationHeaders(ctx context.Context, repo AccountRe
 	if err := ensureAgentIdentityTaskForAccount(ctx, repo, wsInvalidator, taskMu, account, ""); err != nil {
 		return nil, err
 	}
-	return buildAgentIdentityAuthenticationHeadersFromSnapshot(account)
-}
-
-func buildAgentIdentityAuthenticationHeadersFromSnapshot(account *Account) (http.Header, error) {
-	if account == nil || !account.IsOpenAIAgentIdentity() {
-		return nil, errors.New("agent identity account is required")
-	}
 	key, err := agentIdentityKeyFromAccount(account)
 	if err != nil {
 		return nil, err
@@ -509,26 +415,6 @@ func buildAgentIdentityAuthenticationHeadersFromSnapshot(account *Account) (http
 func (s *OpenAIGatewayService) refreshOpenAIAgentIdentityHeaders(ctx context.Context, account *Account, headers http.Header) (http.Header, error) {
 	if account == nil {
 		return cloneHeader(headers), nil
-	}
-	if OpenAIAccountTerminalAdmissionFromContext(ctx) != nil {
-		credential, err := openAIFinalizedCredentialFromContext(ctx, account)
-		if err != nil {
-			return nil, err
-		}
-		if credential.authMode != OpenAIAuthModeAgentIdentity {
-			return cloneHeader(headers), nil
-		}
-		refreshed := cloneHeader(headers)
-		if refreshed == nil {
-			refreshed = make(http.Header)
-		}
-		authHeaders, err := buildAgentIdentityAuthenticationHeadersFromSnapshot(credential.admission.EffectiveCredentialOwner)
-		if err != nil {
-			return nil, NewOpenAISecurityCredentialFailoverError(account, "finalized agent identity credential unavailable")
-		}
-		refreshed.Set("Authorization", authHeaders.Get("Authorization"))
-		setOpenAIChatGPTAccountHeaders(refreshed, credential.admission.EffectiveCredentialOwner)
-		return refreshed, nil
 	}
 	credAccount := account
 	if account.IsShadow() {
@@ -554,36 +440,6 @@ func (s *OpenAIGatewayService) refreshOpenAIAgentIdentityHeaders(ctx context.Con
 }
 
 func (s *OpenAIGatewayService) recoverAgentIdentityTask(ctx context.Context, account *Account, expectedTaskID string) error {
-	if OpenAIAccountTerminalAdmissionFromContext(ctx) != nil {
-		credential, err := openAIFinalizedCredentialFromContext(ctx, account)
-		if err != nil {
-			return err
-		}
-		if credential.authMode != OpenAIAuthModeAgentIdentity ||
-			!credential.admission.EffectiveCredentialOwner.IsOpenAIAgentIdentity() {
-			return NewOpenAISecurityCredentialFailoverError(account, "agent identity recovery mode changed")
-		}
-		selected := credential.admission.Selected
-		owner := cloneOpenAICredentialAccountSnapshot(credential.admission.EffectiveCredentialOwner)
-		if strings.TrimSpace(expectedTaskID) == "" || selected.IsShadow() {
-			expectedTaskID = strings.TrimSpace(owner.GetCredential("task_id"))
-		}
-		// Invalidate the old dispatch permit before touching credentials. A
-		// concurrent header rebuild must fail closed until recovery is freshly
-		// admitted and a replacement immutable snapshot is installed.
-		clearOpenAIFinalizedCredential(ctx)
-		if err := ensureAgentIdentityTaskForAccount(ctx, s.accountRepo, s, &s.agentIdentityTaskMu, owner, expectedTaskID); err != nil {
-			return NewOpenAISecurityCredentialFailoverError(selected, "agent identity task recovery unavailable")
-		}
-		if selected.ID > 0 && selected.ID != owner.ID {
-			s.InvalidateAgentIdentityWSConnections(selected.ID)
-		}
-		fresh, err := s.finalizeOpenAISecurityCredential(ctx, selected, nil, "", OpenAIAuthModeAgentIdentity)
-		if err != nil {
-			return err
-		}
-		return setOpenAIFinalizedCredential(ctx, fresh, "", OpenAIAuthModeAgentIdentity)
-	}
 	if account != nil && account.IsShadow() {
 		if resolved, err := resolveCredentialAccount(ctx, s.accountRepo, account); err == nil && resolved != nil && strings.TrimSpace(expectedTaskID) == "" {
 			expectedTaskID = strings.TrimSpace(resolved.GetCredential("task_id"))
@@ -595,11 +451,6 @@ func (s *OpenAIGatewayService) recoverAgentIdentityTask(ctx context.Context, acc
 func (s *OpenAIGatewayService) isAgentIdentityAccount(ctx context.Context, account *Account) bool {
 	if account == nil {
 		return false
-	}
-	if OpenAIAccountTerminalAdmissionFromContext(ctx) != nil {
-		credential, err := openAIFinalizedCredentialFromContext(ctx, account)
-		return err == nil && credential != nil && credential.authMode == OpenAIAuthModeAgentIdentity &&
-			credential.admission.EffectiveCredentialOwner.IsOpenAIAgentIdentity()
 	}
 	credAccount := account
 	if account.IsShadow() {
@@ -664,13 +515,6 @@ func redactAgentIdentitySensitiveBodyForAccount(ctx context.Context, repo Accoun
 }
 
 func (s *OpenAIGatewayService) redactAgentIdentitySensitiveBody(ctx context.Context, account *Account, body []byte) []byte {
-	if OpenAIAccountTerminalAdmissionFromContext(ctx) != nil {
-		credential, err := openAIFinalizedCredentialFromContext(ctx, account)
-		if err != nil || credential == nil || credential.authMode != OpenAIAuthModeAgentIdentity {
-			return body
-		}
-		return redactAgentIdentitySensitiveBodyForAccount(ctx, nil, credential.admission.EffectiveCredentialOwner, body)
-	}
 	if !s.isAgentIdentityAccount(ctx, account) {
 		return body
 	}

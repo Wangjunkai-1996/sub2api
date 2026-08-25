@@ -669,7 +669,7 @@ func (c *stubGatewayCache) GetSessionAccountID(ctx context.Context, groupID int6
 	if id, ok := c.sessionBindings[sessionHash]; ok {
 		return id, nil
 	}
-	return 0, ErrStickySessionNotFound
+	return 0, errors.New("not found")
 }
 
 func (c *stubGatewayCache) SetSessionAccountID(ctx context.Context, groupID int64, sessionHash string, accountID int64, ttl time.Duration) error {

@@ -90,15 +90,15 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocketRunsPromptAudit(t *testing.T) {
+func TestResponsesWebSocketDoesNotRunPromptAudit(t *testing.T) {
 	routeSource, err := os.ReadFile("gateway.go")
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, strings.Count(string(routeSource), `.GET("/responses"`), 2)
 	handlerSource, err := os.ReadFile(filepath.Join("..", "..", "handler", "openai_gateway_handler.go"))
 	require.NoError(t, err)
 	require.Contains(t, string(handlerSource), `func (h *OpenAIGatewayHandler) ResponsesWebSocket`)
-	require.Contains(t, string(handlerSource), `checkSecurityAuditForSelectedOpenAIProAccount`)
-	require.Contains(t, string(handlerSource), `ProxyResponsesWebSocketFromClient`)
+	require.NotContains(t, string(handlerSource), `newOpenAIAccountAuditState`)
+	require.NotContains(t, string(handlerSource), `ensureSecurityAuditForAccount`)
 }
 
 func TestPromptAuditAdminRoutesRejectUnauthenticatedAndNonAdminRequests(t *testing.T) {

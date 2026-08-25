@@ -467,12 +467,14 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledUsesLega
 		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
 	}
 
+	store := svc.getOpenAIWSStateStore()
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_disabled_001", 36001, time.Hour))
 	require.False(t, svc.isOpenAIAdvancedSchedulerEnabled(ctx))
 
 	selection, decision, err := svc.SelectAccountWithScheduler(
 		ctx,
 		&groupID,
-		"",
+		"resp_disabled_001",
 		"",
 		"gpt-5.1",
 		nil,
@@ -1255,7 +1257,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedPreviousR
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_HardPreviousCompactUnsupportedDoesNotFallback(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseCompactUnsupportedDeletesBinding(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 
 	ctx := context.Background()
@@ -1307,7 +1309,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_HardPreviousCompactUnsu
 	store := svc.getOpenAIWSStateStore()
 	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_compact_unsupported", 37121, time.Hour))
 
-	selection, _, err := svc.SelectAccountWithScheduler(
+	selection, decision, err := svc.SelectAccountWithScheduler(
 		ctx,
 		&groupID,
 		"resp_compact_unsupported",
@@ -1317,8 +1319,15 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_HardPreviousCompactUnsu
 		OpenAIUpstreamTransportAny,
 		true,
 	)
-	require.ErrorIs(t, err, ErrNoAvailableAccounts)
-	require.Nil(t, selection, "an incompatible hard binding must not migrate to the compact-capable backup")
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(37122), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.False(t, decision.StickyPreviousHit)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
 
 	accountID, err := store.GetResponseAccount(ctx, groupID, "resp_compact_unsupported")
 	require.NoError(t, err)
@@ -1387,7 +1396,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_Enabled_EmbeddingsSkips
 	require.Equal(t, 1, decision.CandidateCount)
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_Enabled_HardPreviousCapabilityMismatchDoesNotFallback(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_Enabled_EmbeddingsSkipsChatOnlyStickyBindings(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 
 	ctx := context.Background()
@@ -1441,7 +1450,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_Enabled_HardPreviousCap
 	store := svc.getOpenAIWSStateStore()
 	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_embeddings_chat_only", 37021, time.Hour))
 
-	selection, _, err := svc.SelectAccountWithSchedulerForCapability(
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
 		ctx,
 		&groupID,
 		"resp_embeddings_chat_only",
@@ -1454,9 +1463,14 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_Enabled_HardPreviousCap
 		false,
 		true,
 	)
-	require.ErrorIs(t, err, ErrNoAvailableAccounts)
-	require.Nil(t, selection, "a capability mismatch must not migrate a hard previous-response continuation")
-	require.Equal(t, int64(37021), cache.sessionBindings["openai:session_hash_embeddings"])
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(37022), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.False(t, decision.StickyPreviousHit)
+	require.False(t, decision.StickySessionHit)
+	require.Equal(t, int64(37022), cache.sessionBindings["openai:session_hash_embeddings"])
 }
 
 func TestOpenAIGatewayService_OpenAIAccountSchedulerMetrics_DisabledNoOp(t *testing.T) {

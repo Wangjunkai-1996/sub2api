@@ -98,14 +98,6 @@ const (
 	contentModerationRuntimeRefreshTimeout = 5 * time.Second
 )
 
-// ContentModerationMaxInputRunes returns the maximum text size accepted by a
-// single synchronous moderation request. Callers that need to audit a larger
-// canonical transcript must split it into chunks rather than relying on the
-// normalizing truncation performed by ContentModerationInput.Normalize.
-func ContentModerationMaxInputRunes() int {
-	return maxModerationInputRunes
-}
-
 var contentModerationCategoryOrder = []string{
 	"harassment",
 	"harassment/threatening",
@@ -327,11 +319,6 @@ type ContentModerationCheckInput struct {
 	Model      string
 	Protocol   string
 	Body       []byte
-	// CanonicalText is supplied by the bounded security admission parser for
-	// covered protocols. When present, Check must not re-parse Body with a
-	// protocol-specific extractor.
-	CanonicalText  string
-	CanonicalClass string
 }
 
 type ContentModerationInput struct {
@@ -386,15 +373,9 @@ func (in ContentModerationInput) Hash() string {
 }
 
 type ContentModerationDecision struct {
-	Allowed bool `json:"allowed"`
-	Blocked bool `json:"blocked"`
-	Flagged bool `json:"flagged"`
-	// Audited is true only when this synchronous check actually evaluated the
-	// request (local blocking rule or a successful moderation API result).
-	// Configuration skips, sampling skips, observe-mode enqueue, and audit API
-	// failures deliberately leave it false so an audit-required Pro request
-	// cannot mistake a fail-open legacy decision for proof of review.
-	Audited         bool               `json:"audited"`
+	Allowed         bool               `json:"allowed"`
+	Blocked         bool               `json:"blocked"`
+	Flagged         bool               `json:"flagged"`
 	Message         string             `json:"message"`
 	StatusCode      int                `json:"status_code"`
 	InputHash       string             `json:"input_hash,omitempty"`
@@ -928,22 +909,7 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"configured_models", cfg.ModelFilter.Models)
 		return allow, nil
 	}
-	content := ContentModerationInput{}
-	if strings.TrimSpace(input.CanonicalClass) != "" {
-		if input.CanonicalClass == "auditable_text" {
-			content.Text = input.CanonicalText
-			content.Normalize()
-		} else if input.CanonicalClass == "known_no_text" {
-			content = ContentModerationInput{}
-		} else {
-			// Canonical uninspectable/violation inputs are never silently reduced
-			// to an empty legacy moderation request. The strict prompt path owns
-			// the controlled unavailable/block decision.
-			return nil, errors.New("canonical content is not auditable")
-		}
-	} else {
-		content = ExtractContentModerationInput(input.Protocol, input.Body)
-	}
+	content := ExtractContentModerationInput(input.Protocol, input.Body)
 	if content.IsEmpty() {
 		slog.Info("content_moderation.skip_empty_input",
 			"user_id", input.UserID,
@@ -984,7 +950,6 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 					Allowed:         false,
 					Blocked:         true,
 					Flagged:         true,
-					Audited:         true,
 					Message:         cfg.BlockMessage,
 					StatusCode:      cfg.BlockStatus,
 					HighestCategory: contentModerationKeywordCategory,
@@ -1032,7 +997,6 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 				Allowed:    false,
 				Blocked:    true,
 				Flagged:    true,
-				Audited:    true,
 				Message:    message,
 				StatusCode: cfg.BlockStatus,
 				InputHash:  hashText,
@@ -1154,7 +1118,6 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 			Allowed:         false,
 			Blocked:         true,
 			Flagged:         true,
-			Audited:         true,
 			Message:         cfg.BlockMessage,
 			StatusCode:      cfg.BlockStatus,
 			HighestCategory: highestCategory,
@@ -1166,7 +1129,6 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 	return &ContentModerationDecision{
 		Allowed:         true,
 		Flagged:         flagged,
-		Audited:         true,
 		Message:         "",
 		HighestCategory: highestCategory,
 		HighestScore:    highestScore,

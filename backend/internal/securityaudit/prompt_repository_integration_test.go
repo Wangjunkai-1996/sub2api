@@ -43,7 +43,7 @@ func openPromptAuditIntegrationDB(t *testing.T) *sql.DB {
 		);
 	`)
 	require.NoError(t, err)
-	for _, name := range []string{"181_prompt_audit.sql", "182_prompt_audit_full_prompt.sql", "229_prompt_audit_priority_boundary.sql"} {
+	for _, name := range []string{"181_prompt_audit.sql", "182_prompt_audit_full_prompt.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", name))
 		require.NoError(t, err)
 		// The migration runner can retry an interrupted deployment; the migration
@@ -144,8 +144,6 @@ func TestPromptAuditMigrationSchemaAndLeakageGate(t *testing.T) {
 	_, err = db.ExecContext(ctx, `INSERT INTO prompt_audit_jobs(status) VALUES ('unknown')`)
 	require.Error(t, err)
 	_, err = db.ExecContext(ctx, `INSERT INTO prompt_audit_jobs(prompt_length) VALUES (-1)`)
-	require.Error(t, err)
-	_, err = db.ExecContext(ctx, `INSERT INTO prompt_audit_jobs(prompt_length,priority_prefix_runes) VALUES (1,2)`)
 	require.Error(t, err)
 	var jobID int64
 	require.NoError(t, db.QueryRowContext(ctx, `INSERT INTO prompt_audit_jobs DEFAULT VALUES RETURNING id`).Scan(&jobID))
@@ -295,24 +293,6 @@ func TestPromptAuditRepositoryAdmissionClaimFencingAndEventTransaction(t *testin
 	require.Equal(t, int64(1), reclaimed)
 	require.NoError(t, db.QueryRow(`SELECT status FROM prompt_audit_jobs WHERE id=$1`, staging.ID).Scan(&status))
 	require.Equal(t, "failed", status)
-}
-
-func TestPromptAuditRepositoryPriorityBoundaryRoundTrip(t *testing.T) {
-	db := openPromptAuditIntegrationDB(t)
-	repo := NewPostgreSQLRepository(db)
-	ctx := context.Background()
-	snapshot := integrationSnapshot("boundary")
-	snapshot.PriorityPrefixRunes = 3
-
-	created, err := repo.CreateStagingWithCapacity(ctx, snapshot, 1, 3, 10)
-	require.NoError(t, err)
-	require.Equal(t, 3, created.Snapshot.PriorityPrefixRunes)
-	require.NoError(t, repo.PublishQueued(ctx, created.ID))
-
-	claimed, ok, err := repo.ClaimNextJob(ctx, time.Now().Add(time.Second))
-	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, 3, claimed.Snapshot.PriorityPrefixRunes)
 }
 
 func TestPromptAuditRepositoryForeignKeysFiltersAndStableIdentitySnapshots(t *testing.T) {

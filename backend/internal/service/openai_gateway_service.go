@@ -558,7 +558,7 @@ func NewOpenAIGatewayService(
 			nil,
 			"service.openai_gateway",
 		),
-		httpUpstream:          observeHTTPUpstreamDispatch(httpUpstream),
+		httpUpstream:          httpUpstream,
 		deferredService:       deferredService,
 		openAITokenProvider:   openAITokenProvider,
 		grokTokenProvider:     grokTokenProvider,
@@ -1195,122 +1195,60 @@ func hashSensitiveValueForLog(raw string) string {
 
 // GetAccessToken gets the access token for an OpenAI account
 func (s *OpenAIGatewayService) GetAccessToken(ctx context.Context, account *Account) (string, string, error) {
-	selectedAccount := account
-	terminal := OpenAIAccountTerminalAdmissionFromContext(ctx)
-	if terminal != nil {
-		// A second acquisition attempt must not inherit a credential authorized
-		// by an earlier attempt that subsequently failed.
-		clearOpenAIFinalizedCredential(ctx)
-	}
-	securityFailure := func(err error) error {
-		// Non-OpenAI providers retain their provider-specific credential error
-		// classification. In particular, Grok OAuth must quarantine revoked
-		// credentials before its failover loop selects another account.
-		if err == nil || selectedAccount == nil || selectedAccount.Platform != PlatformOpenAI ||
-			terminal == nil {
-			return err
-		}
-		var failoverErr *UpstreamFailoverError
-		if errors.As(err, &failoverErr) {
-			return err
-		}
-		return NewOpenAISecurityCredentialFailoverError(selectedAccount, "credential acquisition unavailable")
-	}
-	finish := func(token, authMode string, effectiveOwner *Account) (string, string, error) {
-		fresh, err := s.finalizeOpenAISecurityCredential(ctx, selectedAccount, effectiveOwner, token, authMode)
-		if err != nil {
-			return "", "", err
-		}
-		if fresh != nil {
-			if err := setOpenAIFinalizedCredential(ctx, fresh, token, authMode); err != nil {
-				return "", "", err
-			}
-		}
-		return token, authMode, nil
-	}
-	if account == nil {
-		return "", "", securityFailure(errors.New("account is nil"))
-	}
-	if terminal != nil {
-		if terminal.Selected == nil || terminal.EffectiveCredentialOwner == nil ||
-			terminal.Selected.ID != selectedAccount.ID {
-			return "", "", securityFailure(errors.New("terminal credential owner unavailable"))
-		}
-		account = cloneOpenAICredentialAccountSnapshot(terminal.EffectiveCredentialOwner)
-	} else if account.IsShadow() {
+	if account.IsShadow() {
 		credAccount, err := resolveCredentialAccount(ctx, s.accountRepo, account)
 		if err != nil {
-			return "", "", securityFailure(err)
+			return "", "", err
 		}
 		account = credAccount
 	}
 	switch account.Type {
 	case AccountTypeOAuth:
 		if account.IsOpenAIAgentIdentity() {
-			// Task registration may update credentials. Complete it before the
-			// authoritative final admission so outbound signing never needs to
-			// re-read or mutate the credential owner afterward.
-			if terminal != nil {
-				if err := ensureAgentIdentityTaskForAccount(ctx, s.accountRepo, s, &s.agentIdentityTaskMu, account, ""); err != nil {
-					return "", "", securityFailure(err)
-				}
-			}
-			return finish("", OpenAIAuthModeAgentIdentity, account)
+			return "", OpenAIAuthModeAgentIdentity, nil
 		}
 		if account.Platform == PlatformGrok {
 			if s.grokTokenProvider != nil {
 				accessToken, err := s.grokTokenProvider.GetAccessToken(ctx, account)
 				if err != nil {
-					return "", "", securityFailure(err)
+					return "", "", err
 				}
-				return finish(accessToken, "oauth", account)
+				return accessToken, "oauth", nil
 			}
 			accessToken := account.GetGrokAccessToken()
 			if accessToken == "" {
-				return "", "", securityFailure(errors.New("access_token not found in credentials"))
+				return "", "", errors.New("access_token not found in credentials")
 			}
-			return finish(accessToken, "oauth", account)
+			return accessToken, "oauth", nil
 		}
 		// 使用 TokenProvider 获取缓存的 token
 		if s.openAITokenProvider != nil {
-			accessToken, effectiveOwner, err := s.openAITokenProvider.GetAccessTokenWithAccount(ctx, account)
+			accessToken, err := s.openAITokenProvider.GetAccessToken(ctx, account)
 			if err != nil {
-				return "", "", securityFailure(err)
+				return "", "", err
 			}
-			if admissionErr := s.validateOpenAISecurityCredentialAfterRefresh(ctx, selectedAccount, effectiveOwner); admissionErr != nil {
-				return "", "", admissionErr
-			}
-			return finish(accessToken, "oauth", effectiveOwner)
+			return accessToken, "oauth", nil
 		}
 		// 降级：TokenProvider 未配置时直接从账号读取
 		accessToken := account.GetOpenAIAccessToken()
 		if accessToken == "" {
-			return "", "", securityFailure(errors.New("access_token not found in credentials"))
+			return "", "", errors.New("access_token not found in credentials")
 		}
-		if admissionErr := s.validateOpenAISecurityCredentialAfterRefresh(ctx, selectedAccount, account); admissionErr != nil {
-			return "", "", admissionErr
-		}
-		return finish(accessToken, "oauth", account)
+		return accessToken, "oauth", nil
 	case AccountTypeAPIKey:
 		if account.Platform == PlatformGrok {
 			apiKey := strings.TrimSpace(account.GetCredential("api_key"))
 			if apiKey == "" {
-				return "", "", securityFailure(errors.New("api_key not found in credentials"))
+				return "", "", errors.New("api_key not found in credentials")
 			}
-			if admissionErr := s.validateOpenAISecurityCredentialAfterRefresh(ctx, selectedAccount, account); admissionErr != nil {
-				return "", "", admissionErr
-			}
-			return finish(apiKey, "apikey", account)
+			return apiKey, "apikey", nil
 		}
 		apiKey := strings.TrimSpace(account.GetOpenAIProtocolAPIKey())
 		if apiKey == "" {
-			return "", "", securityFailure(errors.New("api_key not found in credentials"))
+			return "", "", errors.New("api_key not found in credentials")
 		}
-		if admissionErr := s.validateOpenAISecurityCredentialAfterRefresh(ctx, selectedAccount, account); admissionErr != nil {
-			return "", "", admissionErr
-		}
-		return finish(apiKey, "apikey", account)
+		return apiKey, "apikey", nil
 	default:
-		return "", "", securityFailure(fmt.Errorf("unsupported account type: %s", account.Type))
+		return "", "", fmt.Errorf("unsupported account type: %s", account.Type)
 	}
 }

@@ -289,18 +289,16 @@ func TestOpenAIWSConnPool_AcquireQueueWaitMetrics(t *testing.T) {
 	pool := newOpenAIWSConnPool(cfg)
 	accountID := int64(99)
 	account := &Account{ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
-	req := openAIWSAcquireRequest{
-		Account: account,
-		WSURL:   "wss://example.com/v1/responses",
-	}
 	conn := newOpenAIWSConn("busy", accountID, &openAIWSFakeConn{}, nil)
-	conn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req)
 	require.True(t, conn.tryAcquire()) // 占用连接，触发后续排队
 
 	ap := pool.ensureAccountPoolLocked(accountID)
 	ap.mu.Lock()
 	ap.conns[conn.id] = conn
-	ap.lastAcquire = &req
+	ap.lastAcquire = &openAIWSAcquireRequest{
+		Account: account,
+		WSURL:   "wss://example.com/v1/responses",
+	}
 	ap.mu.Unlock()
 
 	go func() {
@@ -308,7 +306,10 @@ func TestOpenAIWSConnPool_AcquireQueueWaitMetrics(t *testing.T) {
 		conn.release()
 	}()
 
-	lease, err := pool.Acquire(context.Background(), req)
+	lease, err := pool.Acquire(context.Background(), openAIWSAcquireRequest{
+		Account: account,
+		WSURL:   "wss://example.com/v1/responses",
+	})
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	require.True(t, lease.Reused())
@@ -970,17 +971,9 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnQueuesOnPreferredOnly(t *test
 
 	pool := newOpenAIWSConnPool(cfg)
 	account := &Account{ID: 125, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
-	req := openAIWSAcquireRequest{
-		Account:            account,
-		WSURL:              "wss://example.com/v1/responses",
-		PreferredConnID:    "preferred_conn",
-		ForcePreferredConn: true,
-	}
 	ap := pool.getOrCreateAccountPool(account.ID)
 	preferredConn := newOpenAIWSConn("preferred_conn", account.ID, &openAIWSFakeConn{}, nil)
 	otherConn := newOpenAIWSConn("other_conn_idle", account.ID, &openAIWSFakeConn{}, nil)
-	preferredConn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req)
-	otherConn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req)
 	require.True(t, preferredConn.tryAcquire(), "先占用 preferred 连接，触发排队获取")
 	ap.mu.Lock()
 	ap.conns[preferredConn.id] = preferredConn
@@ -995,7 +988,12 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnQueuesOnPreferredOnly(t *test
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	lease, err := pool.Acquire(ctx, req)
+	lease, err := pool.Acquire(ctx, openAIWSAcquireRequest{
+		Account:            account,
+		WSURL:              "wss://example.com/v1/responses",
+		PreferredConnID:    preferredConn.id,
+		ForcePreferredConn: true,
+	})
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	require.Equal(t, preferredConn.id, lease.ConnID(), "严格模式应只等待并复用 preferred 连接，不可漂移")
@@ -1014,31 +1012,33 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnDirectAndQueueFull(t *testing
 
 	pool := newOpenAIWSConnPool(cfg)
 	account := &Account{ID: 127, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
-	req := openAIWSAcquireRequest{
-		Account:            account,
-		WSURL:              "wss://example.com/v1/responses",
-		PreferredConnID:    "preferred_conn_direct",
-		ForcePreferredConn: true,
-	}
 	ap := pool.getOrCreateAccountPool(account.ID)
 	preferredConn := newOpenAIWSConn("preferred_conn_direct", account.ID, &openAIWSFakeConn{}, nil)
 	otherConn := newOpenAIWSConn("other_conn_direct", account.ID, &openAIWSFakeConn{}, nil)
-	preferredConn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req)
-	otherConn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req)
 	ap.mu.Lock()
 	ap.conns[preferredConn.id] = preferredConn
 	ap.conns[otherConn.id] = otherConn
 	ap.lastCleanupAt = time.Now()
 	ap.mu.Unlock()
 
-	lease, err := pool.Acquire(context.Background(), req)
+	lease, err := pool.Acquire(context.Background(), openAIWSAcquireRequest{
+		Account:            account,
+		WSURL:              "wss://example.com/v1/responses",
+		PreferredConnID:    preferredConn.id,
+		ForcePreferredConn: true,
+	})
 	require.NoError(t, err)
 	require.Equal(t, preferredConn.id, lease.ConnID(), "preferred 空闲时应直接命中")
 	lease.Release()
 
 	require.True(t, preferredConn.tryAcquire())
 	preferredConn.waiters.Store(1)
-	_, err = pool.Acquire(context.Background(), req)
+	_, err = pool.Acquire(context.Background(), openAIWSAcquireRequest{
+		Account:            account,
+		WSURL:              "wss://example.com/v1/responses",
+		PreferredConnID:    preferredConn.id,
+		ForcePreferredConn: true,
+	})
 	require.ErrorIs(t, err, errOpenAIWSConnQueueFull, "严格模式下队列满应直接失败，不得漂移")
 	preferredConn.waiters.Store(0)
 	preferredConn.release()
@@ -2007,20 +2007,18 @@ func TestOpenAIWSConnPool_Acquire_ErrorBranches(t *testing.T) {
 
 	// queue full 分支：waiters 达上限
 	account2 := &Account{ID: 2002, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
-	req2 := openAIWSAcquireRequest{
-		Account: account2,
-		WSURL:   "wss://example.com/v1/responses",
-	}
 	ap2 := fullPool.getOrCreateAccountPool(account2.ID)
 	conn := newOpenAIWSConn("queue_full", account2.ID, &openAIWSFakeConn{}, nil)
-	conn.handshakeCompatibility = normalizeOpenAIWSAcquireCompatibility(req2)
 	require.True(t, conn.tryAcquire())
 	conn.waiters.Store(1)
 	ap2.mu.Lock()
 	ap2.conns[conn.id] = conn
 	ap2.lastCleanupAt = time.Now()
 	ap2.mu.Unlock()
-	_, err = fullPool.Acquire(context.Background(), req2)
+	_, err = fullPool.Acquire(context.Background(), openAIWSAcquireRequest{
+		Account: account2,
+		WSURL:   "wss://example.com/v1/responses",
+	})
 	require.ErrorIs(t, err, errOpenAIWSConnQueueFull)
 }
 

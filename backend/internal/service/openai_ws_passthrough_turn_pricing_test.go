@@ -60,9 +60,9 @@ func startPassthroughHookRecordingServer(
 	return server, serverErr
 }
 
-// The first passthrough turn is revalidated after the upstream dial and before
-// its first write. It still reports TurnStarted before AfterTurn so handler-side
-// billing can use the exact accepted timestamp.
+// The first passthrough turn is admitted before the proxy starts. It still
+// reports TurnStarted before AfterTurn so handler-side billing can use the
+// exact accepted timestamp when no per-turn pricing snapshot exists yet.
 func TestPassthroughIngressReportsInitialTurnLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
@@ -128,7 +128,7 @@ func TestPassthroughIngressReportsInitialTurnLifecycle(t *testing.T) {
 	gotEvents := append([]hookEvent(nil), hookEvents...)
 	hooksMu.Unlock()
 
-	require.Equal(t, 1, gotBefore, "首轮必须在 upstream dial 后、首个业务帧写入前 fresh revalidate 一次")
+	require.Zero(t, gotBefore, "首轮已在建连前完成准入，不应重复调用 BeforeTurn")
 	require.GreaterOrEqual(t, len(gotEvents), 2, "透传 ingress 应报告 TurnStarted 和 AfterTurn")
 	require.Equal(t, "TurnStarted", gotEvents[0].name)
 	require.Equal(t, expectedTurnStartedAt, gotEvents[0].startedAt, "TurnStarted 必须携带入口冻结的首轮开始时刻")
@@ -190,12 +190,6 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 	clientConn := dialPassthroughLifecycleClient(t, server)
 	defer func() { _ = clientConn.CloseNow() }()
 
-	select {
-	case turn := <-beforeTurnEntered:
-		require.Equal(t, 1, turn, "首轮 passthrough turn 必须在写上游前重新准入")
-	case <-time.After(time.Second):
-		t.Fatal("first turn did not enter BeforeTurn")
-	}
 	require.Equal(t, "response.create", gjson.GetBytes(requirePassthroughUpstreamWrite(t, upstream, 3*time.Second), "type").String())
 	firstCompleted, err := readPassthroughLifecycleFrame(t, clientConn, 3*time.Second)
 	require.NoError(t, err)
@@ -245,77 +239,5 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 	case <-serverErr:
 	case <-time.After(3 * time.Second):
 		t.Fatal("passthrough ingress did not exit")
-	}
-}
-
-func TestPassthroughIngressNonTurnHookReceivesRawFrameBeforeUpstreamWrite(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	for _, test := range []struct {
-		name        string
-		messageType coderws.MessageType
-	}{
-		{name: "text", messageType: coderws.MessageText},
-		{name: "binary", messageType: coderws.MessageBinary},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			controlCtx, cancelControl := context.WithCancelCause(context.Background())
-			defer cancelControl(context.Canceled)
-
-			upstream := newStagedPassthroughConn()
-			upstream.Send(`{"type":"response.completed","response":{"id":"resp_before_non_turn","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
-			hookPayload := make(chan []byte, 1)
-			hookFailure := errors.New("non-turn frame rejected by test hook")
-			hooks := &OpenAIWSIngressHooks{
-				InitialTurnStartedAt: time.Now(),
-				BeforeNonTurnFrame: func(payload []byte) error {
-					hookPayload <- append([]byte(nil), payload...)
-					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "non-turn frame rejected", hookFailure)
-				},
-			}
-			cfg := passthroughLifecycleConfig()
-			cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 1
-
-			server, serverErr := startPassthroughHookRecordingServer(
-				t,
-				controlCtx,
-				newPassthroughLifecycleService(cfg, upstream),
-				passthroughLifecycleAccount(),
-				hooks,
-			)
-			defer server.Close()
-			clientConn := dialPassthroughLifecycleClient(t, server)
-			defer func() { _ = clientConn.CloseNow() }()
-
-			require.Equal(t, "response.create", gjson.GetBytes(requirePassthroughUpstreamWrite(t, upstream, 3*time.Second), "type").String())
-			completed, readErr := readPassthroughLifecycleFrame(t, clientConn, 3*time.Second)
-			require.NoError(t, readErr)
-			require.Equal(t, "resp_before_non_turn", gjson.GetBytes(completed, "response.id").String())
-
-			rawFrame := []byte(` { "type" : "session.update", "session" : { "model" : "gpt-5.5", "instructions" : "raw-frame-canary" } } `)
-			writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
-			writeErr := clientConn.Write(writeCtx, test.messageType, rawFrame)
-			cancelWrite()
-			require.NoError(t, writeErr)
-
-			select {
-			case got := <-hookPayload:
-				require.Equal(t, rawFrame, got, "hook must receive the client frame before normalization or policy mutation")
-			case <-time.After(time.Second):
-				t.Fatal("non-turn hook was not called")
-			}
-			select {
-			case unexpected := <-upstream.writes:
-				t.Fatalf("rejected non-turn frame reached upstream: %s", unexpected)
-			case <-time.After(100 * time.Millisecond):
-			}
-			require.NoError(t, clientConn.CloseNow())
-			require.NoError(t, upstream.Close())
-			select {
-			case proxyErr := <-serverErr:
-				require.ErrorIs(t, proxyErr, hookFailure)
-			case <-time.After(5 * time.Second):
-				t.Fatal("passthrough ingress did not return the non-turn hook error")
-			}
-		})
 	}
 }

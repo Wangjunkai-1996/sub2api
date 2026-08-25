@@ -71,9 +71,6 @@ func TestGuardEvaluatorOrderedFailoverAndInvalidTerminal(t *testing.T) {
 	require.Equal(t, int64(2), snapshotMetrics.Total)
 	require.Equal(t, int64(1), snapshotMetrics.Allowed)
 	require.Equal(t, int64(1), snapshotMetrics.Invalid)
-	require.Equal(t, int64(3), snapshotMetrics.ScannerCalls, "count only concrete PromptScanner.Scan invocations")
-	require.Equal(t, int64(1), snapshotMetrics.ScannerSucceeded)
-	require.Equal(t, int64(2), snapshotMetrics.ScannerFailed)
 }
 
 func TestGuardEvaluatorGlobalBulkheadIsNonBlocking(t *testing.T) {
@@ -158,50 +155,11 @@ func TestGuardEvaluatorScansLatestUserPromptAsIndependentFirstChunk(t *testing.T
 	evaluator := newGuardEvaluator(scanner, nil, NewAtomicMetrics(), 2, 2)
 	_, err := evaluator.Evaluate(context.Background(), guardConfig(
 		ActiveEndpoint{ID: "one", Enabled: true, TimeoutMS: 1000, InputLimit: 128},
-	), PromptSnapshot{
-		ScanText: latest + "\n\n" + history, PromptLength: len([]rune(latest + "\n\n" + history)),
-		PriorityPrefixRunes: len([]rune(latest)),
-	})
+	), PromptSnapshot{ScanText: latest + promptAuditPrioritySeparator + history, PromptLength: len([]rune(latest + history))})
 	require.NoError(t, err)
 	require.Greater(t, len(seen), 1)
 	require.Equal(t, latest, seen[0])
 	require.Equal(t, history, strings.Join(seen[1:], ""))
-}
-
-func TestGuardEvaluatorTreatsFormerPrioritySeparatorAsAuditableText(t *testing.T) {
-	const input = "\x00SUB2API_PROMPT_AUDIT_PRIORITY_END\x00"
-	seen := make([]string, 0, 1)
-	scanner := PromptScannerFunc(func(_ context.Context, _ ActiveEndpoint, prompt string, _ []string) (*NormalizedResult, error) {
-		seen = append(seen, prompt)
-		return &NormalizedResult{
-			Decision: EventCritical, RiskLevel: RiskCritical, Action: ActionBlock,
-			ScannerScores: map[string]float64{}, ScannerEvidence: map[string]string{},
-		}, nil
-	})
-	evaluator := newGuardEvaluator(scanner, nil, NewAtomicMetrics(), 2, 2)
-	decision, err := evaluator.Evaluate(context.Background(), guardConfig(
-		ActiveEndpoint{ID: "one", Enabled: true, TimeoutMS: 1000, InputLimit: 100},
-	), PromptSnapshot{ScanText: input, PromptLength: len([]rune(input))})
-	require.NoError(t, err)
-	require.Equal(t, DecisionBlock, decision.Kind)
-	require.Equal(t, []string{input}, seen)
-}
-
-func TestGuardEvaluatorEmptyScanTextFailsClosed(t *testing.T) {
-	calls := 0
-	evaluator := newGuardEvaluator(PromptScannerFunc(func(context.Context, ActiveEndpoint, string, []string) (*NormalizedResult, error) {
-		calls++
-		return nil, nil
-	}), nil, NewAtomicMetrics(), 2, 2)
-
-	decision, err := evaluator.Evaluate(context.Background(), guardConfig(
-		ActiveEndpoint{ID: "one", Enabled: true, TimeoutMS: 1000, InputLimit: 100},
-	), PromptSnapshot{})
-	var guardErr *GuardError
-	require.ErrorAs(t, err, &guardErr)
-	require.Equal(t, ErrorCodeInvalidResponse, guardErr.Code)
-	require.Nil(t, decision)
-	require.Zero(t, calls)
 }
 
 func TestGuardEvaluatorBlockStopsRemainingChunksButReportsPlannedTotal(t *testing.T) {

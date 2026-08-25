@@ -161,7 +161,7 @@ func NewAntigravityGatewayService(
 		accountRepo:       accountRepo,
 		tokenProvider:     tokenProvider,
 		rateLimitService:  rateLimitService,
-		httpUpstream:      observeHTTPUpstreamDispatch(httpUpstream),
+		httpUpstream:      httpUpstream,
 		settingService:    settingService,
 		cache:             cache,
 		schedulerSnapshot: schedulerSnapshot,

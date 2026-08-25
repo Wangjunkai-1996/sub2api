@@ -3,38 +3,25 @@ package securityaudit
 import (
 	"errors"
 	"sort"
+	"strings"
 	"time"
 )
 
 func SplitRunes(value string, limit int) []string {
-	return splitRunesAtPriorityBoundary(value, limit, 0)
-}
-
-func splitRunesAtPriorityBoundary(value string, limit, priorityPrefixRunes int) []string {
 	if limit <= 0 {
 		return nil
 	}
-	runes := []rune(value)
-	if len(runes) == 0 {
-		return nil
-	}
-	joiner := []rune(promptSegmentJoiner)
-	if priorityPrefixRunes <= 0 || priorityPrefixRunes+len(joiner) >= len(runes) ||
-		string(runes[priorityPrefixRunes:priorityPrefixRunes+len(joiner)]) != promptSegmentJoiner {
-		return appendRuneChunks(nil, runes, limit)
-	}
-	chunks := make([]string, 0, (len(runes)+limit-1)/limit+1)
-	chunks = appendRuneChunks(chunks, runes[:priorityPrefixRunes], limit)
-	return appendRuneChunks(chunks, runes[priorityPrefixRunes+len(joiner):], limit)
-}
-
-func appendRuneChunks(chunks []string, runes []rune, limit int) []string {
-	for start := 0; start < len(runes); start += limit {
-		end := start + limit
-		if end > len(runes) {
-			end = len(runes)
+	segments := strings.Split(value, promptAuditPrioritySeparator)
+	chunks := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		runes := []rune(segment)
+		for start := 0; start < len(runes); start += limit {
+			end := start + limit
+			if end > len(runes) {
+				end = len(runes)
+			}
+			chunks = append(chunks, string(runes[start:end]))
 		}
-		chunks = append(chunks, string(runes[start:end]))
 	}
 	return chunks
 }

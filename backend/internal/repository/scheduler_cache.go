@@ -585,50 +585,6 @@ func (c *schedulerCache) GetAccount(ctx context.Context, accountID int64) (*serv
 	return account, nil
 }
 
-func (c *schedulerCache) GetAccountMetadataByIDs(ctx context.Context, accountIDs []int64) (map[int64]*service.Account, error) {
-	accountsByID := make(map[int64]*service.Account, len(accountIDs))
-	uniqueIDs := make([]int64, 0, len(accountIDs))
-	keys := make([]string, 0, len(accountIDs))
-	seen := make(map[int64]struct{}, len(accountIDs))
-	for _, accountID := range accountIDs {
-		if _, exists := seen[accountID]; exists {
-			continue
-		}
-		seen[accountID] = struct{}{}
-		accountsByID[accountID] = nil
-		if accountID <= 0 {
-			continue
-		}
-		uniqueIDs = append(uniqueIDs, accountID)
-		keys = append(keys, schedulerAccountMetaKey(strconv.FormatInt(accountID, 10)))
-	}
-	if len(keys) == 0 {
-		return accountsByID, nil
-	}
-
-	values, err := c.mgetChunked(ctx, keys)
-	if err != nil {
-		return accountsByID, err
-	}
-	if len(values) != len(uniqueIDs) {
-		return accountsByID, fmt.Errorf("scheduler account metadata batch length mismatch: ids=%d values=%d", len(uniqueIDs), len(values))
-	}
-	for i, value := range values {
-		if value == nil {
-			continue
-		}
-		account, err := decodeCachedAccount(value)
-		if err != nil {
-			return accountsByID, fmt.Errorf("decode scheduler account metadata %d: %w", uniqueIDs[i], err)
-		}
-		if account == nil || account.ID != uniqueIDs[i] {
-			return accountsByID, fmt.Errorf("scheduler account metadata ID mismatch: requested=%d", uniqueIDs[i])
-		}
-		accountsByID[uniqueIDs[i]] = account
-	}
-	return accountsByID, nil
-}
-
 func (c *schedulerCache) SetAccount(ctx context.Context, account *service.Account) error {
 	if account == nil || account.ID <= 0 {
 		return nil

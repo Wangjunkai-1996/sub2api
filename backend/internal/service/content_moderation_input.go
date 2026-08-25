@@ -93,7 +93,9 @@ func collectAnthropicUserContentValue(value gjson.Result, parts *[]string, image
 	case !value.Exists():
 		return
 	case value.Type == gjson.String:
-		addModerationText(parts, value.String())
+		if !isAnthropicSystemReminderText(value.String()) {
+			addModerationText(parts, value.String())
+		}
 	case value.IsArray():
 		value.ForEach(func(_, item gjson.Result) bool {
 			collectAnthropicUserContentValue(item, parts, images)
@@ -103,7 +105,7 @@ func collectAnthropicUserContentValue(value gjson.Result, parts *[]string, image
 		typ := strings.ToLower(strings.TrimSpace(value.Get("type").String()))
 		switch typ {
 		case "", "text", "input_text", "message":
-			if value.Get("text").Exists() {
+			if value.Get("text").Exists() && !isAnthropicSystemReminderText(value.Get("text").String()) {
 				addModerationText(parts, value.Get("text").String())
 			}
 			if value.Get("content").Exists() {
@@ -113,6 +115,10 @@ func collectAnthropicUserContentValue(value gjson.Result, parts *[]string, image
 			collectContentValue(value, parts, images)
 		}
 	}
+}
+
+func isAnthropicSystemReminderText(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "<system-reminder>")
 }
 
 func collectLastResponsesInput(input gjson.Result, parts *[]string, images *[]string) {
@@ -300,6 +306,9 @@ func limitContentModerationImages(images []string) []string {
 func addModerationText(parts *[]string, text string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
+		return
+	}
+	if strings.Contains(text, "<system-reminder>") {
 		return
 	}
 	*parts = append(*parts, text)

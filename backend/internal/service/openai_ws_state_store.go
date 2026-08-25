@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -143,11 +142,9 @@ func (s *defaultOpenAIWSStateStore) GetResponseAccount(ctx context.Context, grou
 	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
 	defer cancel()
 	accountID, err := s.cache.GetSessionAccountID(cacheCtx, groupID, cacheKey)
-	if errors.Is(err, ErrStickySessionNotFound) || (err == nil && accountID <= 0) {
+	if err != nil || accountID <= 0 {
+		// 缓存读取失败不阻断主流程，按未命中降级。
 		return 0, nil
-	}
-	if err != nil {
-		return 0, err
 	}
 	return accountID, nil
 }

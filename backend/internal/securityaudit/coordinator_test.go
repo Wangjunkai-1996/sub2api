@@ -83,39 +83,6 @@ func TestCoordinatorDoesNotMutateRequestBody(t *testing.T) {
 	require.Equal(t, original, body)
 }
 
-func TestCoordinatorCheckLegacyRequiresAuditProofForAllow(t *testing.T) {
-	tests := []struct {
-		name      string
-		decision  *LegacyDecision
-		err       error
-		wantKind  DecisionKind
-		wantAllow bool
-	}{
-		{name: "missing result", wantKind: DecisionUnavailable},
-		{name: "adapter error", err: errors.New("legacy unavailable"), wantKind: DecisionUnavailable},
-		{name: "un-audited allow", decision: &LegacyDecision{Allowed: true}, wantKind: DecisionUnavailable},
-		{name: "audited allow", decision: &LegacyDecision{Allowed: true, Audited: true}, wantKind: DecisionAllow, wantAllow: true},
-		{name: "un-audited hard block remains block", decision: &LegacyDecision{Blocked: true}, wantKind: DecisionBlock},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			coordinator := NewCoordinator(&fakeLegacyEngine{decision: tt.decision, err: tt.err}, nil)
-			got := coordinator.CheckLegacy(context.Background(), Request{})
-			require.Equal(t, tt.wantKind, got.Kind)
-			require.Equal(t, tt.wantAllow, got.AllowNextStage)
-			if tt.wantKind == DecisionUnavailable {
-				require.Equal(t, ErrorCodeUnavailable, got.ErrorCode)
-			}
-		})
-	}
-}
-
-func TestDecisionFromLegacyDoesNotTurnUnAuditedAllowIntoDispatch(t *testing.T) {
-	got := DecisionFromLegacy(&LegacyDecision{Allowed: true, Flagged: true})
-	require.Equal(t, DecisionUnavailable, got.Kind)
-	require.False(t, got.AllowNextStage)
-}
-
 func TestCoordinatorBlockingPriorityCoversBothEngineDecisionMatrix(t *testing.T) {
 	legacyCases := []struct {
 		name     string
