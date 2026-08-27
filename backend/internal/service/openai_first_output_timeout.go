@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +24,7 @@ const (
 	openAIFirstOutputStageMemoryLimit        = 64 * 1024
 	openAIFirstOutputStageMaxBytes           = 8 * 1024 * 1024
 	openAIFirstOutputScannerFramingAllowance = 64
-	openAIFirstOutputGuardQueueSize          = 1
+	openAIFirstOutputTypeProbeBytes          = 64 * 1024
 	openAIDefaultStreamQueueSize             = 16
 )
 
@@ -61,13 +62,6 @@ func newDefaultOpenAIFirstOutputStage() *openAIFirstOutputStage {
 	return newOpenAIFirstOutputStage(openAIFirstOutputStageMaxBytes)
 }
 
-func openAIFirstOutputEventQueueSize(guardFirstOutput bool) int {
-	if guardFirstOutput {
-		return openAIFirstOutputGuardQueueSize
-	}
-	return openAIDefaultStreamQueueSize
-}
-
 func openAIFirstOutputDynamicScanLines(guardActive *atomic.Bool) bufio.SplitFunc {
 	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		advance, token, err = bufio.ScanLines(data, atEOF)
@@ -76,18 +70,61 @@ func openAIFirstOutputDynamicScanLines(guardActive *atomic.Bool) bufio.SplitFunc
 		}
 		limit := openAIFirstOutputStageMaxBytes + openAIFirstOutputScannerFramingAllowance
 		if token != nil {
-			if len(token) > limit {
+			if len(token) > limit && !openAIFirstOutputOversizedDataTokenIsSemantic(token) {
 				return 0, nil, errOpenAIFirstOutputScannerLimit
 			}
 			return advance, token, nil
 		}
 		// At the limit with no delimiter, another byte would necessarily exceed
-		// the guarded token budget. Fail before Scanner grows toward MaxLineSize.
-		if len(data) >= limit {
+		// the guarded token budget. A clearly identified semantic event may grow
+		// to MaxLineSize; only replayable preamble remains subject to this cap.
+		if len(data) >= limit && !openAIFirstOutputOversizedDataTokenIsSemantic(data) {
 			return 0, nil, errOpenAIFirstOutputScannerLimit
 		}
 		return advance, token, nil
 	}
+}
+
+func openAIFirstOutputOversizedDataTokenIsSemantic(line []byte) bool {
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return false
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) > openAIFirstOutputTypeProbeBytes {
+		payload = payload[:openAIFirstOutputTypeProbeBytes]
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return false
+	}
+	for field := 0; field < 16 && decoder.More(); field++ {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false
+		}
+		value, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if key == "type" {
+			eventType, _ := value.(string)
+			switch strings.TrimSpace(eventType) {
+			case "", "response.created", "response.in_progress", "response.failed", "error":
+				return false
+			default:
+				return true
+			}
+		}
+		if _, nested := value.(json.Delim); nested {
+			return false
+		}
+	}
+	return false
 }
 
 func (s *openAIFirstOutputStage) Buffered() int64 {

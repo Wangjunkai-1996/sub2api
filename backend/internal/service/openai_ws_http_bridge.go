@@ -492,6 +492,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
+	upstreamTerminalStatusCode := 0
 	sawDone := false
 	wroteDownstream := false
 	pendingClientMessages := make([][]byte, 0, 4)
@@ -528,6 +529,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			Stream:                        reqStream,
 			OpenAIWSMode:                  true,
 			UpstreamTerminalEvent:         upstreamTerminalEvent,
+			UpstreamTerminalStatusCode:    upstreamTerminalStatusCode,
 			ResponseHeaders:               cloneHeader(resp.Header),
 			Duration:                      time.Since(turnStart),
 			FirstTokenMs:                  firstTokenMs,
@@ -786,6 +788,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			} else {
 				upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, resp.Header, upstreamMessage)
 			}
+			upstreamTerminalStatusCode = openAIWSTerminalHealthStatus(upstreamMessage)
 			terminalEventCount++
 			firstTokenMsValue := -1
 			if firstTokenMs != nil {

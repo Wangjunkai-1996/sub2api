@@ -331,15 +331,23 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 		return fmt.Errorf("openai input_tokens upstream request failed: %s", safeErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// Preserve every real upstream response, including a successful 2xx, so the
+	// health reporter can distinguish it from local estimation and conversion.
+	setOpsUpstreamError(c, resp.StatusCode, "", "")
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		setOpsUpstreamError(c, 0, "failed to read input_tokens upstream response", "")
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to read response")
 		return fmt.Errorf("read input_tokens response: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
 		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+		// Record the provider status before capability-specific fallbacks (such
+		// as OAuth/404 local estimation) so health reporting can distinguish a
+		// client/provider response from a successful upstream attempt.
+		setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, "")
 		if account.Type == AccountTypeOAuth && isOpenAIOAuthInputTokensUnsupported(resp.StatusCode, respBody) {
 			writeOpenAIOAuthInputTokensFallback(c, account, prepared, resp.StatusCode)
 			return nil
@@ -380,6 +388,11 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 
 	inputTokens := gjson.GetBytes(respBody, "input_tokens")
 	if !inputTokens.Exists() {
+		// A successful HTTP status with an unusable provider payload is still an
+		// upstream stream/protocol anomaly. Mark it before translating the error
+		// so Traffic Director health reporting does not mistake it for a local
+		// request-conversion failure.
+		setOpsUpstreamError(c, resp.StatusCode, "stream error: upstream response missing input_tokens", "")
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream response missing input_tokens")
 		return fmt.Errorf("input_tokens response missing input_tokens field")
 	}

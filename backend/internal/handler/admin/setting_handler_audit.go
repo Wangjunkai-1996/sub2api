@@ -2,6 +2,7 @@ package admin
 
 import (
 	"log/slog"
+	"slices"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -591,11 +592,20 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if before.RiskControlEnabled != after.RiskControlEnabled {
 		changed = append(changed, "risk_control_enabled")
 	}
-	if before.CyberSessionBlockEnabled != after.CyberSessionBlockEnabled {
-		changed = append(changed, "cyber_session_block_enabled")
+	if before.OpenAICyberAccountCooldownEnabled != after.OpenAICyberAccountCooldownEnabled {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownEnabled)
 	}
-	if before.CyberSessionBlockTTLSeconds != after.CyberSessionBlockTTLSeconds {
-		changed = append(changed, "cyber_session_block_ttl_seconds")
+	if before.OpenAICyberAccountCooldownWindowSeconds != after.OpenAICyberAccountCooldownWindowSeconds {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownWindowSeconds)
+	}
+	if before.OpenAICyberAccountCooldownFirstSeconds != after.OpenAICyberAccountCooldownFirstSeconds {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownFirstSeconds)
+	}
+	if before.OpenAICyberAccountCooldownEscalatedSeconds != after.OpenAICyberAccountCooldownEscalatedSeconds {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds)
+	}
+	if !slices.Equal(before.OpenAICyberAccountCooldownGroupIDs, after.OpenAICyberAccountCooldownGroupIDs) {
+		changed = append(changed, service.SettingKeyOpenAICyberAccountCooldownGroupIDs)
 	}
 	// Default platform quotas（JSON map，整体比较）
 	if !equalPlatformQuotaSettings(before.DefaultPlatformQuotas, after.DefaultPlatformQuotas) {

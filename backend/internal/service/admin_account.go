@@ -462,6 +462,20 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 }
 
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	// New OpenAI OAuth/PAT accounts inherit the configured default proxy only
+	// when the caller did not explicitly choose one. API-key accounts and
+	// explicit proxy selections retain their existing behavior.
+	if input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil && s.settingService != nil {
+		proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if proxy != nil {
+			proxyID := proxy.ID
+			input.ProxyID = &proxyID
+		}
+	}
+
 	accountExtra, err := normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
 	if err != nil {
 		return nil, err

@@ -223,8 +223,6 @@ func (c *gatewayCache) ReleaseGrokVideoBilled(ctx context.Context, key string) e
 	return c.rdb.Del(ctx, grokVideoBilledPrefix+key).Err()
 }
 
-// Compile-time assertion: gatewayCache must implement CyberSessionBlockStore.
-var _ service.CyberSessionBlockStore = (*gatewayCache)(nil)
 var _ service.LiveCallStore = (*gatewayCache)(nil)
 
 const reasoningContentPrefix = "reasoning_content:"

@@ -140,6 +140,16 @@ const (
 	FieldProfitMinMargin = "profit_min_margin"
 	// FieldProfitSafetyBuffer holds the string denoting the profit_safety_buffer field in the database.
 	FieldProfitSafetyBuffer = "profit_safety_buffer"
+	// FieldSchedulerType holds the string denoting the scheduler_type field in the database.
+	FieldSchedulerType = "scheduler_type"
+	// FieldAdvancedSchedulerOverrides holds the string denoting the advanced_scheduler_overrides field in the database.
+	FieldAdvancedSchedulerOverrides = "advanced_scheduler_overrides"
+	// FieldTrafficDirectorMode holds the string denoting the traffic_director_mode field in the database.
+	FieldTrafficDirectorMode = "traffic_director_mode"
+	// FieldTrafficDirectorVersion holds the string denoting the traffic_director_version field in the database.
+	FieldTrafficDirectorVersion = "traffic_director_version"
+	// FieldTrafficDirectorSpec holds the string denoting the traffic_director_spec field in the database.
+	FieldTrafficDirectorSpec = "traffic_director_spec"
 	// EdgeAPIKeys holds the string denoting the api_keys edge name in mutations.
 	EdgeAPIKeys = "api_keys"
 	// EdgeRedeemCodes holds the string denoting the redeem_codes edge name in mutations.
@@ -277,6 +287,11 @@ var Columns = []string{
 	FieldProfitControlEnabled,
 	FieldProfitMinMargin,
 	FieldProfitSafetyBuffer,
+	FieldSchedulerType,
+	FieldAdvancedSchedulerOverrides,
+	FieldTrafficDirectorMode,
+	FieldTrafficDirectorVersion,
+	FieldTrafficDirectorSpec,
 }
 
 var (
@@ -412,6 +427,20 @@ var (
 	DefaultProfitMinMargin float64
 	// DefaultProfitSafetyBuffer holds the default value on creation for the "profit_safety_buffer" field.
 	DefaultProfitSafetyBuffer float64
+	// DefaultSchedulerType holds the default value on creation for the "scheduler_type" field.
+	DefaultSchedulerType string
+	// SchedulerTypeValidator is a validator for the "scheduler_type" field. It is called by the builders before save.
+	SchedulerTypeValidator func(string) error
+	// DefaultAdvancedSchedulerOverrides holds the default value on creation for the "advanced_scheduler_overrides" field.
+	DefaultAdvancedSchedulerOverrides domain.AdvancedSchedulerOverrides
+	// DefaultTrafficDirectorMode holds the default value on creation for the "traffic_director_mode" field.
+	DefaultTrafficDirectorMode string
+	// TrafficDirectorModeValidator is a validator for the "traffic_director_mode" field. It is called by the builders before save.
+	TrafficDirectorModeValidator func(string) error
+	// DefaultTrafficDirectorVersion holds the default value on creation for the "traffic_director_version" field.
+	DefaultTrafficDirectorVersion int64
+	// TrafficDirectorVersionValidator is a validator for the "traffic_director_version" field. It is called by the builders before save.
+	TrafficDirectorVersionValidator func(int64) error
 )
 
 // OrderOption defines the ordering options for the Group queries.
@@ -695,6 +724,21 @@ func ByProfitMinMargin(opts ...sql.OrderTermOption) OrderOption {
 // ByProfitSafetyBuffer orders the results by the profit_safety_buffer field.
 func ByProfitSafetyBuffer(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldProfitSafetyBuffer, opts...).ToFunc()
+}
+
+// BySchedulerType orders the results by the scheduler_type field.
+func BySchedulerType(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSchedulerType, opts...).ToFunc()
+}
+
+// ByTrafficDirectorMode orders the results by the traffic_director_mode field.
+func ByTrafficDirectorMode(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldTrafficDirectorMode, opts...).ToFunc()
+}
+
+// ByTrafficDirectorVersion orders the results by the traffic_director_version field.
+func ByTrafficDirectorVersion(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldTrafficDirectorVersion, opts...).ToFunc()
 }
 
 // ByAPIKeysCount orders the results by api_keys count.

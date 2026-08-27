@@ -1305,6 +1305,14 @@ func (a *Account) UsesOpenAICodexProtocol() bool {
 	return a != nil && (a.Type == AccountTypeOAuth || a.IsOpenAIOAuthLike())
 }
 
+// IsOpenAIProOAuthAccount reports whether account is an OpenAI OAuth account
+// whose persisted plan type is exactly Pro. A database ID is intentionally not
+// part of this classification so callers can use it before persistence.
+func IsOpenAIProOAuthAccount(account *Account) bool {
+	return account != nil && account.IsOpenAIOAuth() &&
+		strings.EqualFold(strings.TrimSpace(account.GetCredential("plan_type")), "pro")
+}
+
 func (a *Account) IsOpenAIChatGPTSubscription() bool {
 	if !a.IsOpenAIOAuth() {
 		return false

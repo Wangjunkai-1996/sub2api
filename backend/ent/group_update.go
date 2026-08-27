@@ -1162,6 +1162,34 @@ func (_u *GroupUpdate) AddProfitSafetyBuffer(v float64) *GroupUpdate {
 	return _u
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (_u *GroupUpdate) SetSchedulerType(v string) *GroupUpdate {
+	_u.mutation.SetSchedulerType(v)
+	return _u
+}
+
+// SetNillableSchedulerType sets the "scheduler_type" field if the given value is not nil.
+func (_u *GroupUpdate) SetNillableSchedulerType(v *string) *GroupUpdate {
+	if v != nil {
+		_u.SetSchedulerType(*v)
+	}
+	return _u
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (_u *GroupUpdate) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpdate {
+	_u.mutation.SetAdvancedSchedulerOverrides(v)
+	return _u
+}
+
+// SetNillableAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field if the given value is not nil.
+func (_u *GroupUpdate) SetNillableAdvancedSchedulerOverrides(v *domain.AdvancedSchedulerOverrides) *GroupUpdate {
+	if v != nil {
+		_u.SetAdvancedSchedulerOverrides(*v)
+	}
+	return _u
+}
+
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by IDs.
 func (_u *GroupUpdate) AddAPIKeyIDs(ids ...int64) *GroupUpdate {
 	_u.mutation.AddAPIKeyIDs(ids...)
@@ -1485,6 +1513,11 @@ func (_u *GroupUpdate) check() error {
 	if v, ok := _u.mutation.MaxReasoningEffort(); ok {
 		if err := group.MaxReasoningEffortValidator(v); err != nil {
 			return &ValidationError{Name: "max_reasoning_effort", err: fmt.Errorf(`ent: validator failed for field "Group.max_reasoning_effort": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.SchedulerType(); ok {
+		if err := group.SchedulerTypeValidator(v); err != nil {
+			return &ValidationError{Name: "scheduler_type", err: fmt.Errorf(`ent: validator failed for field "Group.scheduler_type": %w`, err)}
 		}
 	}
 	return nil
@@ -1843,6 +1876,15 @@ func (_u *GroupUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.AddedProfitSafetyBuffer(); ok {
 		_spec.AddField(group.FieldProfitSafetyBuffer, field.TypeFloat64, value)
+	}
+	if value, ok := _u.mutation.SchedulerType(); ok {
+		_spec.SetField(group.FieldSchedulerType, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.AdvancedSchedulerOverrides(); ok {
+		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
+	}
+	if _u.mutation.TrafficDirectorSpecCleared() {
+		_spec.ClearField(group.FieldTrafficDirectorSpec, field.TypeJSON)
 	}
 	if _u.mutation.APIKeysCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -3283,6 +3325,34 @@ func (_u *GroupUpdateOne) AddProfitSafetyBuffer(v float64) *GroupUpdateOne {
 	return _u
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (_u *GroupUpdateOne) SetSchedulerType(v string) *GroupUpdateOne {
+	_u.mutation.SetSchedulerType(v)
+	return _u
+}
+
+// SetNillableSchedulerType sets the "scheduler_type" field if the given value is not nil.
+func (_u *GroupUpdateOne) SetNillableSchedulerType(v *string) *GroupUpdateOne {
+	if v != nil {
+		_u.SetSchedulerType(*v)
+	}
+	return _u
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (_u *GroupUpdateOne) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpdateOne {
+	_u.mutation.SetAdvancedSchedulerOverrides(v)
+	return _u
+}
+
+// SetNillableAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field if the given value is not nil.
+func (_u *GroupUpdateOne) SetNillableAdvancedSchedulerOverrides(v *domain.AdvancedSchedulerOverrides) *GroupUpdateOne {
+	if v != nil {
+		_u.SetAdvancedSchedulerOverrides(*v)
+	}
+	return _u
+}
+
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by IDs.
 func (_u *GroupUpdateOne) AddAPIKeyIDs(ids ...int64) *GroupUpdateOne {
 	_u.mutation.AddAPIKeyIDs(ids...)
@@ -3619,6 +3689,11 @@ func (_u *GroupUpdateOne) check() error {
 	if v, ok := _u.mutation.MaxReasoningEffort(); ok {
 		if err := group.MaxReasoningEffortValidator(v); err != nil {
 			return &ValidationError{Name: "max_reasoning_effort", err: fmt.Errorf(`ent: validator failed for field "Group.max_reasoning_effort": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.SchedulerType(); ok {
+		if err := group.SchedulerTypeValidator(v); err != nil {
+			return &ValidationError{Name: "scheduler_type", err: fmt.Errorf(`ent: validator failed for field "Group.scheduler_type": %w`, err)}
 		}
 	}
 	return nil
@@ -3994,6 +4069,15 @@ func (_u *GroupUpdateOne) sqlSave(ctx context.Context) (_node *Group, err error)
 	}
 	if value, ok := _u.mutation.AddedProfitSafetyBuffer(); ok {
 		_spec.AddField(group.FieldProfitSafetyBuffer, field.TypeFloat64, value)
+	}
+	if value, ok := _u.mutation.SchedulerType(); ok {
+		_spec.SetField(group.FieldSchedulerType, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.AdvancedSchedulerOverrides(); ok {
+		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
+	}
+	if _u.mutation.TrafficDirectorSpecCleared() {
+		_spec.ClearField(group.FieldTrafficDirectorSpec, field.TypeJSON)
 	}
 	if _u.mutation.APIKeysCleared() {
 		edge := &sqlgraph.EdgeSpec{

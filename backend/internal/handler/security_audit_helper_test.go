@@ -9,6 +9,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -23,6 +24,185 @@ func TestCachesSecurityAuditCompletionSkipsWebSocketStages(t *testing.T) {
 	require.True(t, isSecurityAuditWebSocketStage("first_turn"))
 	require.True(t, isSecurityAuditWebSocketStage("subsequent_turn"))
 	require.False(t, isSecurityAuditWebSocketStage("http"))
+}
+
+func TestSelectedOpenAIProAccountAuditEligibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name    string
+		account *service.Account
+	}{
+		{name: "nil account"},
+		{name: "OpenAI API key", account: &service.Account{
+			Platform: service.PlatformOpenAI,
+			Type:     service.AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"plan_type": "pro",
+			},
+		}},
+		{name: "OpenAI OAuth Plus", account: &service.Account{
+			Platform: service.PlatformOpenAI,
+			Type:     service.AccountTypeOAuth,
+			Credentials: map[string]any{
+				"plan_type": "plus",
+			},
+		}},
+		{name: "OpenAI OAuth Free", account: &service.Account{
+			Platform: service.PlatformOpenAI,
+			Type:     service.AccountTypeOAuth,
+			Credentials: map[string]any{
+				"plan_type": "free",
+			},
+		}},
+		{name: "non-OpenAI OAuth Pro", account: &service.Account{
+			Platform: service.PlatformGrok,
+			Type:     service.AccountTypeOAuth,
+			Credentials: map[string]any{
+				"plan_type": "pro",
+			},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine := &turnCountingEngine{mode: securityaudit.ModeBlocking}
+			h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+			decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
+				c,
+				nil,
+				nil,
+				middleware2.AuthSubject{UserID: 7},
+				tt.account,
+				service.ContentModerationProtocolOpenAIResponses,
+				"gpt-test",
+				[]byte(`{"input":"hello"}`),
+			)
+
+			require.Nil(t, decision)
+			require.Zero(t, engine.evaluates.Load(), "ineligible accounts must stay on the in-memory fast path")
+		})
+	}
+}
+
+func TestSelectedOpenAIProAccountAuditCachesSuccessfulRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{mode: securityaudit.ModeBlocking}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	account := &service.Account{
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"plan_type": "pro",
+		},
+	}
+	check := func() *securityaudit.Decision {
+		return h.checkSecurityAuditForSelectedOpenAIProAccount(
+			c,
+			nil,
+			nil,
+			middleware2.AuthSubject{UserID: 7},
+			account,
+			service.ContentModerationProtocolOpenAIResponses,
+			"gpt-test",
+			[]byte(`{"input":"hello"}`),
+		)
+	}
+
+	first := check()
+	second := check()
+
+	require.NotNil(t, first)
+	require.True(t, first.AllowNextStage)
+	require.Nil(t, second, "a successful HTTP audit must be reused during failover")
+	require.Equal(t, int64(1), engine.evaluates.Load())
+}
+
+func TestSelectedOpenAIProAccountAuditStartsAfterIneligibleFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{mode: securityaudit.ModeBlocking}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	plus := &service.Account{
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"plan_type": "plus",
+		},
+	}
+	pro := &service.Account{
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"plan_type": "pro",
+		},
+	}
+	check := func(account *service.Account) *securityaudit.Decision {
+		return h.checkSecurityAuditForSelectedOpenAIProAccount(
+			c,
+			nil,
+			nil,
+			middleware2.AuthSubject{UserID: 7},
+			account,
+			service.ContentModerationProtocolOpenAIResponses,
+			"gpt-test",
+			[]byte(`{"input":"hello"}`),
+		)
+	}
+
+	require.Nil(t, check(plus))
+	require.Zero(t, engine.evaluates.Load())
+	decision := check(pro)
+	require.NotNil(t, decision)
+	require.True(t, decision.AllowNextStage)
+	require.Equal(t, int64(1), engine.evaluates.Load())
+}
+
+func TestSelectedOpenAIProAccountAuditPropagatesBlockingDecision(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := &turnCountingEngine{
+		mode: securityaudit.ModeBlocking,
+		decisions: []*securityaudit.PromptDecision{
+			{Kind: securityaudit.DecisionBlock, AllowNextStage: false},
+		},
+	}
+	h := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	account := &service.Account{
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"plan_type": "pro",
+		},
+	}
+
+	decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
+		c,
+		nil,
+		nil,
+		middleware2.AuthSubject{UserID: 7},
+		account,
+		service.ContentModerationProtocolOpenAIResponses,
+		"gpt-test",
+		[]byte(`{"input":"blocked"}`),
+	)
+
+	require.NotNil(t, decision)
+	require.Equal(t, securityaudit.DecisionBlock, decision.Kind)
+	require.False(t, decision.AllowNextStage)
+	require.Equal(t, int64(1), engine.evaluates.Load())
+	_, cached := c.Get(securityAuditCompletedContextKey)
+	require.False(t, cached, "blocking decisions must never populate the request cache")
 }
 
 func TestRunSecurityAuditDoesNotSkipSubsequentWebSocketTurns(t *testing.T) {

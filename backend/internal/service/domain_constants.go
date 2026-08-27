@@ -197,25 +197,28 @@ const (
 	SettingKeyRegistrationEmailSuffixWhitelist = "registration_email_suffix_whitelist" // 注册邮箱后缀白名单（JSON 数组）
 	// 白名单非空时，是否放行非白名单域名按主域名限量注册（每域名 1 个账户）。
 	// 默认 false：非白名单域名直接拒绝（白名单严格模式）。
-	SettingKeyRegistrationEmailDomainQuotaEnabled = "registration_email_domain_quota_enabled"
-	SettingKeyPromoCodeEnabled                    = "promo_code_enabled"               // 是否启用优惠码功能
-	SettingKeyPasswordResetEnabled                = "password_reset_enabled"           // 是否启用忘记密码功能（需要先开启邮件验证）
-	SettingKeyFrontendURL                         = "frontend_url"                     // 前端基础URL，用于生成邮件中的重置密码链接
-	SettingKeyInvitationCodeEnabled               = "invitation_code_enabled"          // 是否启用邀请码注册
-	SettingKeyAffiliateEnabled                    = "affiliate_enabled"                // 邀请返利功能总开关
-	SettingKeyAffiliateRebateRate                 = "affiliate_rebate_rate"            // 邀请返利比例（百分比，0-100）
-	SettingKeyAffiliateRebateFreezeHours          = "affiliate_rebate_freeze_hours"    // 返利冻结期（小时，0=不冻结）
-	SettingKeyAffiliateRebateDurationDays         = "affiliate_rebate_duration_days"   // 返利有效期（天，0=永久）
-	SettingKeyAffiliateRebatePerInviteeCap        = "affiliate_rebate_per_invitee_cap" // 单人返利上限（0=无上限）
-	SettingKeyAffiliateAdminRechargeEnabled       = "affiliate_admin_recharge_enabled" // 管理员充值是否产生返利
-	SettingKeyRiskControlEnabled                  = "risk_control_enabled"             // 是否启用风控中心入口与审计链路
-	SettingKeyContentModerationConfig             = "content_moderation_config"        // 内容审计配置（JSON）
-	SettingKeyCyberSessionBlockEnabled            = "cyber_session_block_enabled"      // cyber 命中后会话级自动屏蔽总开关(默认关)
-	SettingKeyCyberSessionBlockTTLSeconds         = "cyber_session_block_ttl_seconds"  // 会话屏蔽 TTL 秒数(默认 3600)
-	SettingKeyLoginAgreementEnabled               = "login_agreement_enabled"          // 登录前是否要求同意条款
-	SettingKeyLoginAgreementMode                  = "login_agreement_mode"             // 条款确认展示模式：modal / checkbox
-	SettingKeyLoginAgreementUpdatedAt             = "login_agreement_updated_at"       // 条款更新日期（展示用）
-	SettingKeyLoginAgreementDocuments             = "login_agreement_documents"        // 条款文档列表（JSON，Markdown 内容）
+	SettingKeyRegistrationEmailDomainQuotaEnabled        = "registration_email_domain_quota_enabled"
+	SettingKeyPromoCodeEnabled                           = "promo_code_enabled"               // 是否启用优惠码功能
+	SettingKeyPasswordResetEnabled                       = "password_reset_enabled"           // 是否启用忘记密码功能（需要先开启邮件验证）
+	SettingKeyFrontendURL                                = "frontend_url"                     // 前端基础URL，用于生成邮件中的重置密码链接
+	SettingKeyInvitationCodeEnabled                      = "invitation_code_enabled"          // 是否启用邀请码注册
+	SettingKeyAffiliateEnabled                           = "affiliate_enabled"                // 邀请返利功能总开关
+	SettingKeyAffiliateRebateRate                        = "affiliate_rebate_rate"            // 邀请返利比例（百分比，0-100）
+	SettingKeyAffiliateRebateFreezeHours                 = "affiliate_rebate_freeze_hours"    // 返利冻结期（小时，0=不冻结）
+	SettingKeyAffiliateRebateDurationDays                = "affiliate_rebate_duration_days"   // 返利有效期（天，0=永久）
+	SettingKeyAffiliateRebatePerInviteeCap               = "affiliate_rebate_per_invitee_cap" // 单人返利上限（0=无上限）
+	SettingKeyAffiliateAdminRechargeEnabled              = "affiliate_admin_recharge_enabled" // 管理员充值是否产生返利
+	SettingKeyRiskControlEnabled                         = "risk_control_enabled"             // 是否启用风控中心入口与审计链路
+	SettingKeyContentModerationConfig                    = "content_moderation_config"        // 内容审计配置（JSON）
+	SettingKeyOpenAICyberAccountCooldownEnabled          = "openai_cyber_account_cooldown_enabled"
+	SettingKeyOpenAICyberAccountCooldownWindowSeconds    = "openai_cyber_account_cooldown_window_seconds"
+	SettingKeyOpenAICyberAccountCooldownFirstSeconds     = "openai_cyber_account_cooldown_first_seconds"
+	SettingKeyOpenAICyberAccountCooldownEscalatedSeconds = "openai_cyber_account_cooldown_escalated_seconds"
+	SettingKeyOpenAICyberAccountCooldownGroupIDs         = "openai_cyber_account_cooldown_group_ids"
+	SettingKeyLoginAgreementEnabled                      = "login_agreement_enabled"    // 登录前是否要求同意条款
+	SettingKeyLoginAgreementMode                         = "login_agreement_mode"       // 条款确认展示模式：modal / checkbox
+	SettingKeyLoginAgreementUpdatedAt                    = "login_agreement_updated_at" // 条款更新日期（展示用）
+	SettingKeyLoginAgreementDocuments                    = "login_agreement_documents"  // 条款文档列表（JSON，Markdown 内容）
 
 	// 邮件服务设置
 	SettingKeySMTPHost     = "smtp_host"      // SMTP服务器地址
@@ -497,6 +500,10 @@ const (
 	// SettingKeyGrokDefaultBaseURLMode controls the default text upstream for
 	// Grok accounts without an explicit credentials.base_url.
 	SettingKeyGrokDefaultBaseURLMode = "grok_default_base_url_mode"
+
+	// SettingKeyOpenAIOAuthDefaultProxyID identifies the proxy inherited by new
+	// OpenAI OAuth accounts and OAuth bootstrap flows when no proxy was supplied.
+	SettingKeyOpenAIOAuthDefaultProxyID = "openai_oauth_default_proxy_id"
 
 	// SettingKeyAvailableChannelsEnabled is a DB-backed soft switch for the "Available Channels"
 	// user-facing aggregate view. When false: user endpoint returns an empty list and the

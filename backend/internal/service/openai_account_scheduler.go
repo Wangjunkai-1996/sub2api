@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -64,6 +66,15 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	weightOverrides                map[string]float64
 }
 
+type openAIAdvancedSchedulerRequestSettings struct {
+	groupID    int64
+	hasGroupID bool
+	platform   string
+	settings   openAIAdvancedSchedulerRuntimeSettings
+}
+
+type openAIAdvancedSchedulerRequestSettingsContextKey struct{}
+
 var openAIAdvancedSchedulerSettingCache atomic.Value // *cachedOpenAIAdvancedSchedulerSetting
 var openAIAdvancedSchedulerSettingSF singleflight.Group
 
@@ -89,6 +100,10 @@ type OpenAIAccountScheduleRequest struct {
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
 	ExcludedIDs    map[int64]struct{}
+	// AllowedIDs is an optional Traffic Director pool constraint. An empty/nil
+	// set preserves the scheduler's existing candidate universe. Hard previous
+	// response affinity is deliberately handled before this constraint.
+	AllowedIDs map[int64]struct{}
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -416,6 +431,14 @@ func (s *defaultOpenAIAccountScheduler) Select(
 				selection = nil
 			}
 		}
+		if selection != nil && selection.Account != nil && req.AllowedIDs != nil {
+			if _, allowed := req.AllowedIDs[selection.Account.ID]; !allowed {
+				if selection.ReleaseFunc != nil {
+					selection.ReleaseFunc()
+				}
+				selection = nil
+			}
+		}
 		if selection != nil && selection.Account != nil {
 			decision.Layer = openAIAccountScheduleLayerPreviousResponse
 			decision.StickyPreviousHit = true
@@ -512,6 +535,11 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	}
 	if req.ExcludedIDs != nil {
 		if _, excluded := req.ExcludedIDs[accountID]; excluded {
+			return nil, false, nil
+		}
+	}
+	if req.AllowedIDs != nil {
+		if _, allowed := req.AllowedIDs[accountID]; !allowed {
 			return nil, false, nil
 		}
 	}
@@ -1272,6 +1300,11 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 				continue
 			}
 		}
+		if req.AllowedIDs != nil {
+			if _, allowed := req.AllowedIDs[accountID]; !allowed {
+				continue
+			}
+		}
 		account, err := s.service.getSchedulableAccount(ctx, accountID)
 		if err != nil || account == nil {
 			continue
@@ -1436,6 +1469,12 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		if req.ExcludedIDs != nil {
 			if _, excluded := req.ExcludedIDs[account.ID]; excluded {
 				filterStats.exclude("excluded")
+				continue
+			}
+		}
+		if req.AllowedIDs != nil {
+			if _, allowed := req.AllowedIDs[account.ID]; !allowed {
+				filterStats.exclude("traffic_director_pool")
 				continue
 			}
 		}
@@ -1961,26 +2000,154 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 	return settings
 }
 
+func cloneOpenAIAdvancedSchedulerRuntimeSettings(settings openAIAdvancedSchedulerRuntimeSettings) openAIAdvancedSchedulerRuntimeSettings {
+	settings.weightOverrides = cloneOpenAIAdvancedSchedulerWeightOverrides(settings.weightOverrides)
+	return settings
+}
+
+func (s *OpenAIGatewayService) openAIAdvancedSchedulerEffectiveRuntimeSettings(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+) openAIAdvancedSchedulerRuntimeSettings {
+	settings := cloneOpenAIAdvancedSchedulerRuntimeSettings(s.openAIAdvancedSchedulerRuntimeSettings(ctx))
+	if platform != PlatformOpenAI || groupID == nil || *groupID <= 0 {
+		return settings
+	}
+
+	var group *Group
+	if ctxGroup, ok := ctx.Value(ctxkey.Group).(*Group); ok && IsGroupContextValid(ctxGroup) && ctxGroup.ID == *groupID {
+		group = ctxGroup
+	} else if s != nil && s.schedulerSnapshot != nil {
+		loaded, err := s.schedulerSnapshot.GetGroupByIDLite(ctx, *groupID)
+		if err != nil {
+			slog.Warn("openai_group_scheduler_settings_load_failed", "group_id", *groupID, "error", err)
+			return settings
+		}
+		group = loaded
+	}
+	if group == nil || group.Platform != PlatformOpenAI {
+		return settings
+	}
+
+	schedulerType, err := NormalizeGroupSchedulerType(group.SchedulerType)
+	if err != nil {
+		slog.Warn("openai_group_scheduler_type_invalid", "group_id", group.ID, "scheduler_type", group.SchedulerType, "error", err)
+		return settings
+	}
+	switch schedulerType {
+	case GroupSchedulerTypeBasic:
+		settings.enabled = false
+		return settings
+	case GroupSchedulerTypeAdvanced:
+		settings.enabled = true
+	case GroupSchedulerTypeInherit:
+		if !settings.enabled {
+			return settings
+		}
+	}
+
+	overrides := group.AdvancedSchedulerOverrides
+	if err := ValidateAdvancedSchedulerOverrides(overrides); err != nil {
+		slog.Warn("openai_group_scheduler_overrides_invalid", "group_id", group.ID, "error", err)
+		return settings
+	}
+	if overrides.StickyWeightedEnabled != nil {
+		settings.stickyWeightedEnabled = *overrides.StickyWeightedEnabled
+	}
+	if overrides.SubscriptionPriorityEnabled != nil {
+		settings.subscriptionPriorityEnabled = *overrides.SubscriptionPriorityEnabled
+	}
+	if overrides.LBTopK != nil {
+		settings.lbTopKOverride = *overrides.LBTopK
+	}
+	groupWeightOverrides := []struct {
+		name  string
+		value *float64
+	}{
+		{name: "priority", value: overrides.WeightPriority},
+		{name: "load", value: overrides.WeightLoad},
+		{name: "queue", value: overrides.WeightQueue},
+		{name: "error_rate", value: overrides.WeightErrorRate},
+		{name: "ttft", value: overrides.WeightTTFT},
+		{name: "reset", value: overrides.WeightReset},
+		{name: "quota_headroom", value: overrides.WeightQuotaHeadroom},
+		{name: "upstream_cost", value: overrides.WeightUpstreamCost},
+		{name: "previous_response", value: overrides.WeightPreviousResponse},
+		{name: "session_sticky", value: overrides.WeightSessionSticky},
+	}
+	var globalWeightOverrides map[string]float64
+	groupWeightOverridesApplied := false
+	for _, override := range groupWeightOverrides {
+		if override.value == nil {
+			continue
+		}
+		if !groupWeightOverridesApplied {
+			globalWeightOverrides = cloneOpenAIAdvancedSchedulerWeightOverrides(settings.weightOverrides)
+			groupWeightOverridesApplied = true
+		}
+		if settings.weightOverrides == nil {
+			settings.weightOverrides = make(map[string]float64)
+		}
+		settings.weightOverrides[override.name] = *override.value
+	}
+	if groupWeightOverridesApplied {
+		effectiveWeights := applyOpenAIAdvancedSchedulerWeightOverrides(
+			s.openAIWSSchedulerWeights(),
+			settings.weightOverrides,
+		).configWeights()
+		if !effectiveWeights.IsValid() {
+			settings.weightOverrides = globalWeightOverrides
+		}
+	}
+	return settings
+}
+
+func (s *OpenAIGatewayService) withOpenAIAdvancedSchedulerRequestSettings(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+) context.Context {
+	requestSettings := openAIAdvancedSchedulerRequestSettings{platform: platform}
+	if groupID != nil && *groupID > 0 {
+		requestSettings.groupID = *groupID
+		requestSettings.hasGroupID = true
+	}
+	if existing, ok := ctx.Value(openAIAdvancedSchedulerRequestSettingsContextKey{}).(*openAIAdvancedSchedulerRequestSettings); ok &&
+		existing != nil && existing.groupID == requestSettings.groupID && existing.hasGroupID == requestSettings.hasGroupID && existing.platform == platform {
+		return ctx
+	}
+	requestSettings.settings = s.openAIAdvancedSchedulerEffectiveRuntimeSettings(ctx, groupID, platform)
+	return context.WithValue(ctx, openAIAdvancedSchedulerRequestSettingsContextKey{}, &requestSettings)
+}
+
+func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx context.Context) openAIAdvancedSchedulerRuntimeSettings {
+	if requestSettings, ok := ctx.Value(openAIAdvancedSchedulerRequestSettingsContextKey{}).(*openAIAdvancedSchedulerRequestSettings); ok && requestSettings != nil {
+		return cloneOpenAIAdvancedSchedulerRuntimeSettings(requestSettings.settings)
+	}
+	return s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+}
+
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerEnabled(ctx context.Context) bool {
-	return s.openAIAdvancedSchedulerRuntimeSettings(ctx).enabled
+	return s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx).enabled
 }
 
 func (s *OpenAIGatewayService) isOpenAILowUpstreamRatePriorityEnabled(ctx context.Context) bool {
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	return !settings.enabled && settings.lowUpstreamRatePriorityEnabled
 }
 
 func (s *OpenAIGatewayService) openAIOAuthSchedulingRateMultiplier(ctx context.Context) float64 {
-	return s.openAIAdvancedSchedulerRuntimeSettings(ctx).oauthSchedulingRateMultiplier
+	return s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx).oauthSchedulingRateMultiplier
 }
 
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx context.Context) bool {
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	return settings.enabled && settings.stickyWeightedEnabled
 }
 
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx context.Context) bool {
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	return settings.enabled && settings.subscriptionPriorityEnabled
 }
 
@@ -2069,11 +2236,22 @@ func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) Op
 		if s.openaiAccountStats == nil {
 			s.openaiAccountStats = newOpenAIAccountRuntimeStats()
 		}
-		if s.openaiScheduler == nil {
-			s.openaiScheduler = newDefaultOpenAIAccountScheduler(s, s.openaiAccountStats)
-		}
+		scheduler := newDefaultOpenAIAccountScheduler(s, s.openaiAccountStats)
+		s.openaiSchedulerMu.Lock()
+		s.openaiScheduler = scheduler
+		s.openaiSchedulerMu.Unlock()
 	})
-	return s.openaiScheduler
+	return s.initializedOpenAIAccountScheduler()
+}
+
+func (s *OpenAIGatewayService) initializedOpenAIAccountScheduler() OpenAIAccountScheduler {
+	if s == nil {
+		return nil
+	}
+	s.openaiSchedulerMu.RLock()
+	scheduler := s.openaiScheduler
+	s.openaiSchedulerMu.RUnlock()
+	return scheduler
 }
 
 func resetOpenAIAdvancedSchedulerSettingCacheForTest() {
@@ -2126,25 +2304,159 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
 	excludedIDs map[int64]struct{},
 	requiredCapability OpenAIImagesCapability,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
-	selection, decision, err := s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", requiredCapability, false, PlatformOpenAI, false, false)
-	if err == nil && selection != nil && selection.Account != nil {
-		return selection, decision, nil
-	}
-	// 如果要求 native 能力（如指定了模型）但没有可用的 APIKey 账号，回退到 basic（OAuth 账号）
+	ctx = s.prepareOpenAITrafficDirectorSelectionContext(ctx, groupID, PlatformOpenAI)
+	poolLocalCtx := withOpenAITrafficDirectorPoolAdvanceSuppressed(ctx)
+	capabilities := []OpenAIImagesCapability{requiredCapability}
 	if requiredCapability == OpenAIImagesCapabilityNative {
-		return s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", OpenAIImagesCapabilityBasic, false, PlatformOpenAI, false, false)
+		capabilities = append(capabilities, OpenAIImagesCapabilityBasic)
 	}
-	return selection, decision, err
+
+	for {
+		var selection *AccountSelectionResult
+		var decision OpenAIAccountScheduleDecision
+		var err error
+		expectedPoolIndex := -1
+		trafficPlan, trafficPlanErr := s.resolveOpenAITrafficDirectorPlan(poolLocalCtx, groupID, PlatformOpenAI, sessionHash)
+		if trafficPlanErr != nil {
+			return nil, decision, trafficPlanErr
+		}
+		if trafficPlan != nil && trafficPlan.mode == domain.TrafficDirectorModeEnforced {
+			if state := openAITrafficDirectorRequestStateFromContext(poolLocalCtx); state != nil {
+				state.mu.Lock()
+				expectedPoolIndex = trafficPlan.currentIndex
+				state.mu.Unlock()
+			} else {
+				expectedPoolIndex = trafficPlan.currentIndex
+			}
+		}
+		for _, capability := range capabilities {
+			selection, decision, err = s.selectAccountWithScheduler(poolLocalCtx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", capability, false, PlatformOpenAI, false, false)
+			if err == nil && selection != nil && selection.Account != nil {
+				return selection, decision, nil
+			}
+			if errors.Is(err, ErrOpenAICyberAccountCooldownStateUnavailable) {
+				return nil, decision, err
+			}
+		}
+
+		poolExhausted := err == nil || errors.Is(err, ErrNoAvailableAccounts) ||
+			errors.Is(err, ErrNoAvailableCompactAccounts) || errors.Is(err, ErrTrafficDirectorNoAvailablePool)
+		if !poolExhausted {
+			return selection, decision, err
+		}
+		enforced, advanced, advanceErr := s.advanceOpenAITrafficDirectorPool(poolLocalCtx, groupID, PlatformOpenAI, sessionHash, expectedPoolIndex)
+		if advanceErr != nil {
+			return nil, decision, advanceErr
+		}
+		if !enforced {
+			return selection, decision, err
+		}
+		if !advanced {
+			return nil, decision, ErrTrafficDirectorNoAvailablePool
+		}
+	}
 }
 
-// selectAccountWithScheduler wraps selectAccountWithSchedulerOnce with a
+// selectAccountWithScheduler performs the final cross-instance Cyber cooldown
+// admission after either scheduler returns. A blocked account is released and
+// excluded before retrying; Redis state failures stop selection.
+func (s *OpenAIGatewayService) selectAccountWithScheduler(
+	ctx context.Context,
+	groupID *int64,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requiredImageCapability OpenAIImagesCapability,
+	requireCompact bool,
+	platform string,
+	previousResponseCanMove bool,
+	useUpstreamTokenCost bool,
+) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	ctx = s.prepareOpenAITrafficDirectorSelectionContext(ctx, groupID, platform)
+	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
+	for {
+		selection, decision, err := s.selectAccountWithSchedulerBeforeCyberCooldown(
+			ctx,
+			groupID,
+			previousResponseID,
+			sessionHash,
+			requestedModel,
+			effectiveExcludedIDs,
+			requiredTransport,
+			requiredCapability,
+			requiredImageCapability,
+			requireCompact,
+			platform,
+			previousResponseCanMove,
+			useUpstreamTokenCost,
+		)
+		if err != nil || selection == nil || selection.Account == nil {
+			return selection, decision, err
+		}
+
+		cooldownErr := s.RecheckOpenAICyberAccountCooldown(ctx, selection.Account)
+		if cooldownErr == nil {
+			// Immediate selections normally acquire the half-open probe here. When
+			// profit control is active, the handler must first replace the selected
+			// account with the latest post-slot snapshot; defer admission so its
+			// model key matches the account that will actually be forwarded.
+			if selection.Acquired {
+				selection.setTrafficDirectorAdmission(func(admitCtx context.Context, account *Account) (bool, func()) {
+					return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel, requireCompact)
+				})
+				if !selection.ProfitGateActive() && !selection.AdmitTrafficDirector(ctx, selection.ReleaseFunc) {
+					if selection.ReleaseFunc != nil {
+						selection.ReleaseFunc()
+					}
+					if effectiveExcludedIDs == nil {
+						effectiveExcludedIDs = make(map[int64]struct{})
+					}
+					if _, exists := effectiveExcludedIDs[selection.Account.ID]; exists {
+						recordTrafficDirectorNoAvailablePoolFromContext(ctx)
+						return nil, decision, ErrTrafficDirectorNoAvailablePool
+					}
+					effectiveExcludedIDs[selection.Account.ID] = struct{}{}
+					continue
+				}
+			} else {
+				selection.setTrafficDirectorAdmission(func(admitCtx context.Context, account *Account) (bool, func()) {
+					return s.trafficDirectorHealthAdmission(admitCtx, account, requestedModel, requireCompact)
+				})
+			}
+			s.logTrafficDirectorShadowSelectionOnce(ctx, groupID, requestedModel, selection.Account.ID)
+			return selection, decision, nil
+		}
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		if errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownStateUnavailable) {
+			return nil, decision, cooldownErr
+		}
+		if !errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownBlocked) {
+			return nil, decision, cooldownErr
+		}
+		if effectiveExcludedIDs == nil {
+			effectiveExcludedIDs = make(map[int64]struct{})
+		}
+		accountID := selection.Account.ID
+		if _, exists := effectiveExcludedIDs[accountID]; exists {
+			return nil, decision, ErrNoAvailableAccounts
+		}
+		effectiveExcludedIDs[accountID] = struct{}{}
+	}
+}
+
+// selectAccountWithSchedulerBeforeCyberCooldown wraps selectAccountWithSchedulerOnce with a
 // fail-open second pass for the proxy stream circuit (#5056): when the only
 // reason no account is available is that every candidate sits behind a
 // quarantined proxy, the quarantine must degrade to a preference instead of
 // zeroing out capacity. The retry re-runs the exact same selection with the
 // quarantine checks bypassed, so healthy proxies always win the first pass
 // and quarantined ones only serve when nothing else can.
-func (s *OpenAIGatewayService) selectAccountWithScheduler(
+func (s *OpenAIGatewayService) selectAccountWithSchedulerBeforeCyberCooldown(
 	ctx context.Context,
 	groupID *int64,
 	previousResponseID string,
@@ -2210,6 +2522,70 @@ func (s *OpenAIGatewayService) loadOpenAIGroupRequiresPrivacySet(ctx context.Con
 	return group != nil && group.RequirePrivacySet
 }
 
+// retryTrafficDirectorFallbackOnNoAvailable advances an enforced request to
+// the next explicit pool after the scheduler has exhausted every statically
+// eligible account in the current pool. Capacity-full accounts are represented
+// by WaitPlan and never reach this helper; only a genuine no-candidate result
+// does. The pool state itself is monotonic in the request context.
+func (s *OpenAIGatewayService) retryTrafficDirectorFallbackOnNoAvailable(
+	ctx context.Context,
+	trafficPlan *openAITrafficDirectorRequestPlan,
+	currentAllowedIDs map[int64]struct{},
+	groupID *int64,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requiredImageCapability OpenAIImagesCapability,
+	requireCompact bool,
+	platform string,
+	previousResponseCanMove bool,
+	useUpstreamTokenCost bool,
+	err error,
+) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error, bool) {
+	if openAITrafficDirectorPoolAdvanceSuppressed(ctx) ||
+		trafficPlan == nil || trafficPlan.mode != domain.TrafficDirectorModeEnforced ||
+		(!errors.Is(err, ErrNoAvailableAccounts) && !errors.Is(err, ErrNoAvailableCompactAccounts)) {
+		return nil, OpenAIAccountScheduleDecision{}, err, false
+	}
+	if len(currentAllowedIDs) == 0 {
+		return nil, OpenAIAccountScheduleDecision{}, err, false
+	}
+	nextExcluded := cloneExcludedAccountIDs(excludedIDs)
+	if nextExcluded == nil {
+		nextExcluded = make(map[int64]struct{}, len(currentAllowedIDs))
+	}
+	added := 0
+	for accountID := range currentAllowedIDs {
+		if _, exists := nextExcluded[accountID]; exists {
+			continue
+		}
+		nextExcluded[accountID] = struct{}{}
+		added++
+	}
+	if added == 0 {
+		return nil, OpenAIAccountScheduleDecision{}, err, false
+	}
+	selection, decision, nextErr := s.selectAccountWithSchedulerOnce(
+		ctx,
+		groupID,
+		previousResponseID,
+		sessionHash,
+		requestedModel,
+		nextExcluded,
+		requiredTransport,
+		requiredCapability,
+		requiredImageCapability,
+		requireCompact,
+		platform,
+		previousResponseCanMove,
+		useUpstreamTokenCost,
+	)
+	return selection, decision, nextErr, true
+}
+
 func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	ctx context.Context,
 	groupID *int64,
@@ -2236,12 +2612,98 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	if requiredImageCapability == "" {
 		ctx = s.withOpenAIProfitControlGate(ctx, groupID)
 	}
+	// Traffic Director's platform boundary must inspect the caller's original
+	// value. The legacy scheduler intentionally normalizes unknown and Anthropic
+	// values to OpenAI, but using that normalized value for V1 would let an
+	// unauthoritative internal call opt another platform into pool routing.
+	trafficDirectorPlatform := platform
 	platform = NormalizeOpenAICompatiblePlatform(platform)
+	ctx = s.withOpenAIAdvancedSchedulerRequestSettings(ctx, groupID, platform)
+	ctx = s.WithOpenAITrafficDirectorRequestContext(ctx)
 	decision := OpenAIAccountScheduleDecision{}
 	preserveGuardianParentBinding := preserveOpenAIGuardianParentBinding(ctx, sessionHash)
 	guardianParentAccountID := int64(0)
 	if strings.TrimSpace(previousResponseID) == "" {
 		guardianParentAccountID = s.resolveOpenAIGuardianParentAccountID(ctx, groupID)
+	}
+	// Resolve Traffic Director once for this request context. Legacy and
+	// non-OpenAI platforms remain byte-for-byte on the existing path.
+	trafficPlan, trafficErr := s.resolveOpenAITrafficDirectorPlan(ctx, groupID, trafficDirectorPlatform, sessionHash)
+	if trafficErr != nil {
+		return nil, decision, trafficErr
+	}
+	trafficDirectorEnforced := trafficPlan != nil && trafficPlan.mode == domain.TrafficDirectorModeEnforced
+	var trafficAllowedIDs map[int64]struct{}
+	// Once enforced routing has inspected a hard previous_response_id and
+	// rejected that account (health, transport, capability, or exclusion), do
+	// not let the generic scheduler's previous-response layer reintroduce it
+	// outside the selected Traffic Director pool. Movable previous-response
+	// affinity remains handled by the weighted scheduler below.
+	schedulerPreviousResponseID := previousResponseID
+	if trafficDirectorEnforced {
+		// Hard previous_response_id affinity is checked before pool restriction:
+		// protocol continuation may explicitly cross a configured pool boundary.
+		if strings.TrimSpace(previousResponseID) != "" && !previousResponseCanMove {
+			schedulerPreviousResponseID = ""
+			previousSelection, previousErr := s.selectAccountByPreviousResponseIDForCapability(
+				ctx,
+				groupID,
+				previousResponseID,
+				requestedModel,
+				excludedIDs,
+				requiredCapability,
+				requireCompact,
+			)
+			if previousErr != nil {
+				return nil, decision, previousErr
+			}
+			if previousSelection != nil && previousSelection.Account != nil {
+				eligibleAccount := s.trafficDirectorHardPreviousAccount(
+					ctx,
+					groupID,
+					platform,
+					requestedModel,
+					requiredTransport,
+					requiredCapability,
+					requiredImageCapability,
+					requireCompact,
+					trafficPlan,
+					previousSelection.Account,
+				)
+				if eligibleAccount == nil {
+					if previousSelection.ReleaseFunc != nil {
+						previousSelection.ReleaseFunc()
+					}
+				} else {
+					previousSelection.Account = eligibleAccount
+					s.logTrafficDirectorPreviousOverride(ctx, trafficPlan, previousSelection.Account.ID, requestedModel)
+					if sessionHash != "" {
+						_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, previousSelection.Account.ID)
+					}
+					decision.Layer = openAIAccountScheduleLayerPreviousResponse
+					decision.StickyPreviousHit = true
+					decision.SelectedAccountID = previousSelection.Account.ID
+					decision.SelectedAccountType = previousSelection.Account.Type
+					return previousSelection, decision, nil
+				}
+			}
+		}
+		trafficPlan, trafficAllowedIDs, trafficErr = s.trafficDirectorSelectPool(
+			ctx,
+			groupID,
+			platform,
+			sessionHash,
+			requestedModel,
+			requiredTransport,
+			requiredCapability,
+			requiredImageCapability,
+			requireCompact,
+			excludedIDs,
+		)
+		if trafficErr != nil {
+			return nil, decision, trafficErr
+		}
+		ctx = withOpenAITrafficDirectorAllowedIDs(ctx, trafficAllowedIDs)
 	}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
@@ -2285,9 +2747,15 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 			for {
 				selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, legacySessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost)
 				if err != nil {
+					if retrySelection, retryDecision, retryErr, retried := s.retryTrafficDirectorFallbackOnNoAvailable(ctx, trafficPlan, trafficAllowedIDs, groupID, schedulerPreviousResponseID, sessionHash, requestedModel, effectiveExcludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost, err); retried {
+						return retrySelection, retryDecision, retryErr
+					}
 					return nil, decision, err
 				}
 				if selection == nil || selection.Account == nil {
+					if retrySelection, retryDecision, retryErr, retried := s.retryTrafficDirectorFallbackOnNoAvailable(ctx, trafficPlan, trafficAllowedIDs, groupID, schedulerPreviousResponseID, sessionHash, requestedModel, effectiveExcludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost, ErrNoAvailableAccounts); retried {
+						return retrySelection, retryDecision, retryErr
+					}
 					return selection, decision, nil
 				}
 				if accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
@@ -2310,9 +2778,15 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		for {
 			selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, legacySessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost)
 			if err != nil {
+				if retrySelection, retryDecision, retryErr, retried := s.retryTrafficDirectorFallbackOnNoAvailable(ctx, trafficPlan, trafficAllowedIDs, groupID, schedulerPreviousResponseID, sessionHash, requestedModel, effectiveExcludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost, err); retried {
+					return retrySelection, retryDecision, retryErr
+				}
 				return nil, decision, err
 			}
 			if selection == nil || selection.Account == nil {
+				if retrySelection, retryDecision, retryErr, retried := s.retryTrafficDirectorFallbackOnNoAvailable(ctx, trafficPlan, trafficAllowedIDs, groupID, schedulerPreviousResponseID, sessionHash, requestedModel, effectiveExcludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost, ErrNoAvailableAccounts); retried {
+					return retrySelection, retryDecision, retryErr
+				}
 				return selection, decision, nil
 			}
 			if s.isOpenAIAccountTransportCompatible(selection.Account, requiredTransport) &&
@@ -2352,7 +2826,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		stickyPreviousAccountID = s.ResolveAccountIDByPreviousResponseIDForScheduler(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
 	}
 
-	return scheduler.Select(ctx, OpenAIAccountScheduleRequest{
+	selection, schedulerDecision, schedulerErr := scheduler.Select(ctx, OpenAIAccountScheduleRequest{
 		GroupID:                 groupID,
 		Platform:                platform,
 		SessionHash:             sessionHash,
@@ -2363,7 +2837,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		SubscriptionPriority:    subscriptionPriority,
 		PreserveStickyBinding:   preserveGuardianParentBinding,
 		RequirePrivacySet:       s.openAIGroupRequiresPrivacySet(ctx, groupID),
-		PreviousResponseID:      previousResponseID,
+		PreviousResponseID:      schedulerPreviousResponseID,
 		PreviousResponseCanMove: previousResponseCanMove,
 		UseUpstreamTokenCost:    useUpstreamTokenCost,
 		RequestedModel:          requestedModel,
@@ -2372,7 +2846,17 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		RequiredImageCapability: requiredImageCapability,
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
+		AllowedIDs:              trafficAllowedIDs,
 	})
+	if schedulerErr == nil && (selection == nil || selection.Account == nil) {
+		if retrySelection, retryDecision, retryErr, retried := s.retryTrafficDirectorFallbackOnNoAvailable(ctx, trafficPlan, trafficAllowedIDs, groupID, schedulerPreviousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost, ErrNoAvailableAccounts); retried {
+			return retrySelection, retryDecision, retryErr
+		}
+	}
+	if retrySelection, retryDecision, retryErr, retried := s.retryTrafficDirectorFallbackOnNoAvailable(ctx, trafficPlan, trafficAllowedIDs, groupID, schedulerPreviousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost, schedulerErr); retried {
+		return retrySelection, retryDecision, retryErr
+	}
+	return selection, schedulerDecision, schedulerErr
 }
 
 func accountSupportsOpenAICapabilities(account *Account, requiredCapability OpenAIEndpointCapability, requiredImageCapability OpenAIImagesCapability) bool {
@@ -2435,6 +2919,9 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Accoun
 	}
 	scheduler := s.getOpenAIAccountScheduler(context.Background())
 	if scheduler == nil {
+		scheduler = s.initializedOpenAIAccountScheduler()
+	}
+	if scheduler == nil {
 		return healthTripped
 	}
 	scheduler.ReportResult(accountID, success, firstTokenMs)
@@ -2453,6 +2940,9 @@ func (s *OpenAIGatewayService) ObserveOpenAIAccountHealthFailure(ctx context.Con
 func (s *OpenAIGatewayService) RecordOpenAIAccountSwitch() {
 	scheduler := s.getOpenAIAccountScheduler(context.Background())
 	if scheduler == nil {
+		scheduler = s.initializedOpenAIAccountScheduler()
+	}
+	if scheduler == nil {
 		return
 	}
 	scheduler.ReportSwitch()
@@ -2460,6 +2950,9 @@ func (s *OpenAIGatewayService) RecordOpenAIAccountSwitch() {
 
 func (s *OpenAIGatewayService) SnapshotOpenAIAccountSchedulerMetrics() OpenAIAccountSchedulerMetricsSnapshot {
 	scheduler := s.getOpenAIAccountScheduler(context.Background())
+	if scheduler == nil {
+		scheduler = s.initializedOpenAIAccountScheduler()
+	}
 	if scheduler == nil {
 		return OpenAIAccountSchedulerMetricsSnapshot{}
 	}
@@ -2482,7 +2975,7 @@ func (s *OpenAIGatewayService) openAIWSLBTopK() int {
 
 func (s *OpenAIGatewayService) openAIWSLBTopKForRequest(ctx context.Context) int {
 	base := s.openAIWSLBTopK()
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	// DB 覆盖值与 stickyWeighted/subscriptionPriority 一样受总开关门控：
 	// 关闭高级调度器后所有调用方（含管理页分数快照）都应回到配置/默认行为。
 	if !settings.enabled {
@@ -2556,7 +3049,7 @@ func (s *OpenAIGatewayService) openAIWSSchedulerWeights() GatewayOpenAIWSSchedul
 
 func (s *OpenAIGatewayService) openAIWSSchedulerWeightsForRequest(ctx context.Context) GatewayOpenAIWSSchedulerScoreWeightsView {
 	weights := s.openAIWSSchedulerWeights()
-	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettingsForRequest(ctx)
 	// 同 openAIWSLBTopKForRequest：总开关关闭时不应用 DB 覆盖值。
 	if !settings.enabled {
 		return weights

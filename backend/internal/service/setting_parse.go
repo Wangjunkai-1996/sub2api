@@ -213,9 +213,12 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		// 风控中心功能（默认关闭，显式启用）
 		SettingKeyRiskControlEnabled: "false",
 
-		// cyber 会话屏蔽（默认关闭，TTL 默认 3600s）
-		SettingKeyCyberSessionBlockEnabled:    "false",
-		SettingKeyCyberSessionBlockTTLSeconds: "3600",
+		// Upstream Cyber account cooldown. Only configured OpenAI OAuth Pro pools qualify.
+		SettingKeyOpenAICyberAccountCooldownEnabled:          "false",
+		SettingKeyOpenAICyberAccountCooldownWindowSeconds:    strconv.Itoa(defaultOpenAICyberAccountCooldownWindowSeconds),
+		SettingKeyOpenAICyberAccountCooldownFirstSeconds:     strconv.Itoa(defaultOpenAICyberAccountCooldownFirstSeconds),
+		SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: strconv.Itoa(defaultOpenAICyberAccountCooldownEscalatedSeconds),
+		SettingKeyOpenAICyberAccountCooldownGroupIDs:         "[12]",
 
 		// Claude Code version check (default: empty = disabled)
 		SettingKeyMinClaudeCodeVersion: "",
@@ -829,13 +832,28 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	// 风控中心功能（默认关闭，严格 true 才启用）
 	result.RiskControlEnabled = settings[SettingKeyRiskControlEnabled] == "true"
 
-	// cyber 会话屏蔽（默认关闭，TTL 默认 3600s）
-	result.CyberSessionBlockEnabled = settings[SettingKeyCyberSessionBlockEnabled] == "true"
-	if v, err := strconv.Atoi(strings.TrimSpace(settings[SettingKeyCyberSessionBlockTTLSeconds])); err == nil && v > 0 {
-		result.CyberSessionBlockTTLSeconds = v
-	} else {
-		result.CyberSessionBlockTTLSeconds = 3600
+	result.OpenAICyberAccountCooldownEnabled = settings[SettingKeyOpenAICyberAccountCooldownEnabled] == "true"
+	result.OpenAICyberAccountCooldownWindowSeconds = parseOpenAICyberAccountCooldownSeconds(
+		settings[SettingKeyOpenAICyberAccountCooldownWindowSeconds],
+		defaultOpenAICyberAccountCooldownWindowSeconds,
+	)
+	result.OpenAICyberAccountCooldownFirstSeconds = parseOpenAICyberAccountCooldownSeconds(
+		settings[SettingKeyOpenAICyberAccountCooldownFirstSeconds],
+		defaultOpenAICyberAccountCooldownFirstSeconds,
+	)
+	result.OpenAICyberAccountCooldownEscalatedSeconds = parseOpenAICyberAccountCooldownSeconds(
+		settings[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds],
+		defaultOpenAICyberAccountCooldownEscalatedSeconds,
+	)
+	if result.OpenAICyberAccountCooldownEscalatedSeconds < result.OpenAICyberAccountCooldownFirstSeconds {
+		result.OpenAICyberAccountCooldownEscalatedSeconds = result.OpenAICyberAccountCooldownFirstSeconds
 	}
+	groupIDs, err := parseOpenAICyberAccountCooldownGroupIDs(settings[SettingKeyOpenAICyberAccountCooldownGroupIDs])
+	if err != nil {
+		slog.Warn("invalid OpenAI Cyber account cooldown group IDs; using default", "error", err)
+		groupIDs = append([]int64(nil), defaultOpenAICyberAccountCooldownGroupIDs...)
+	}
+	result.OpenAICyberAccountCooldownGroupIDs = groupIDs
 
 	// Claude Code version check
 	result.MinClaudeCodeVersion = settings[SettingKeyMinClaudeCodeVersion]

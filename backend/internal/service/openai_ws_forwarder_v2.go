@@ -374,6 +374,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
+	upstreamTerminalStatusCode := 0
 
 	var flusher http.Flusher
 	if reqStream {
@@ -702,6 +703,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
 			}
 			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
+			upstreamTerminalStatusCode = openAIWSTerminalHealthStatus(message)
 			// A terminal event must be the final JSON document in its WS message.
 			// Ignore any tail for the completed client turn, but never reuse the
 			// ambiguous upstream connection for another request.
@@ -787,6 +789,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		Stream:                        reqStream,
 		OpenAIWSMode:                  true,
 		UpstreamTerminalEvent:         upstreamTerminalEvent,
+		UpstreamTerminalStatusCode:    upstreamTerminalStatusCode,
 		ResponseHeaders:               lease.HandshakeHeaders(),
 		Duration:                      time.Since(startTime),
 		FirstTokenMs:                  firstTokenMs,

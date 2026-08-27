@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -255,7 +256,31 @@ func (s *OpenAIGatewayService) SelectAccountForModel(ctx context.Context, groupI
 // SelectAccountForModelWithExclusions selects an account supporting the requested model while excluding specified accounts.
 // SelectAccountForModelWithExclusions 选择支持指定模型的账号，同时排除指定的账号。
 func (s *OpenAIGatewayService) SelectAccountForModelWithExclusions(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*Account, error) {
-	return s.selectAccountForModelWithExclusions(s.withOpenAIQuotaAutoPauseContext(ctx), groupID, PlatformOpenAI, sessionHash, requestedModel, excludedIDs, false, 0, "", false)
+	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
+	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
+	for {
+		account, err := s.selectAccountForModelWithExclusions(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, effectiveExcludedIDs, false, 0, "", false)
+		if err != nil || account == nil {
+			return account, err
+		}
+		cooldownErr := s.RecheckOpenAICyberAccountCooldown(ctx, account)
+		if cooldownErr == nil {
+			return account, nil
+		}
+		if errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownStateUnavailable) {
+			return nil, cooldownErr
+		}
+		if !errors.Is(cooldownErr, ErrOpenAICyberAccountCooldownBlocked) {
+			return nil, cooldownErr
+		}
+		if effectiveExcludedIDs == nil {
+			effectiveExcludedIDs = make(map[int64]struct{})
+		}
+		if _, exists := effectiveExcludedIDs[account.ID]; exists {
+			return nil, ErrNoAvailableAccounts
+		}
+		effectiveExcludedIDs[account.ID] = struct{}{}
+	}
 }
 
 // SelectAccountForTokenCount selects an account for a non-billable token-count
@@ -899,6 +924,15 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	if err != nil {
 		return nil, fmt.Errorf("query accounts failed: %w", err)
 	}
+	if allowed, ok := ctx.Value(openAITrafficDirectorAllowedIDsKey{}).(map[int64]struct{}); ok && allowed != nil {
+		filtered := accounts[:0]
+		for i := range accounts {
+			if _, exists := allowed[accounts[i].ID]; exists {
+				filtered = append(filtered, accounts[i])
+			}
+		}
+		accounts = filtered
+	}
 
 	// 3. 按优先级 + LRU 选择最佳账号
 	// Select by priority + LRU
@@ -944,6 +978,9 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 	}
 
 	if _, excluded := excludedIDs[accountID]; excluded {
+		return nil
+	}
+	if !openAITrafficDirectorAllowsAccount(ctx, accountID) {
 		return nil
 	}
 
@@ -1113,6 +1150,7 @@ func (s *OpenAIGatewayService) SelectAccountWithLoadAwareness(ctx context.Contex
 
 func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, requiredCapability OpenAIEndpointCapability, useUpstreamTokenCost bool) (*AccountSelectionResult, error) {
 	platform = NormalizeOpenAICompatiblePlatform(platform)
+	ctx = s.withOpenAIAdvancedSchedulerRequestSettings(ctx, groupID, platform)
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
 		slog.Warn("channel pricing restriction blocked request",
 			"group_id", derefGroupID(groupID),
@@ -1181,7 +1219,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	stickySpillover := false
 	if sessionHash != "" {
 		accountID := stickyAccountID
-		if accountID > 0 && !isExcluded(accountID) {
+		if accountID > 0 && !isExcluded(accountID) && openAITrafficDirectorAllowsAccount(ctx, accountID) {
 			account, err := s.getSchedulableAccount(ctx, accountID)
 			if err == nil {
 				clearSticky := shouldClearStickySession(account, requestedModel)
@@ -1249,6 +1287,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		acc := &accounts[i]
 		if isExcluded(acc.ID) {
 			filterStats.exclude("excluded")
+			continue
+		}
+		if !openAITrafficDirectorAllowsAccount(ctx, acc.ID) {
 			continue
 		}
 		// Scheduler snapshots can be temporarily stale (bucket rebuild is throttled);

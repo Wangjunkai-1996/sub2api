@@ -1205,6 +1205,28 @@ func init() {
 	groupDescProfitSafetyBuffer := groupFields[58].Descriptor()
 	// group.DefaultProfitSafetyBuffer holds the default value on creation for the profit_safety_buffer field.
 	group.DefaultProfitSafetyBuffer = groupDescProfitSafetyBuffer.Default.(float64)
+	// groupDescSchedulerType is the schema descriptor for scheduler_type field.
+	groupDescSchedulerType := groupFields[59].Descriptor()
+	// group.DefaultSchedulerType holds the default value on creation for the scheduler_type field.
+	group.DefaultSchedulerType = groupDescSchedulerType.Default.(string)
+	// group.SchedulerTypeValidator is a validator for the "scheduler_type" field. It is called by the builders before save.
+	group.SchedulerTypeValidator = groupDescSchedulerType.Validators[0].(func(string) error)
+	// groupDescAdvancedSchedulerOverrides is the schema descriptor for advanced_scheduler_overrides field.
+	groupDescAdvancedSchedulerOverrides := groupFields[60].Descriptor()
+	// group.DefaultAdvancedSchedulerOverrides holds the default value on creation for the advanced_scheduler_overrides field.
+	group.DefaultAdvancedSchedulerOverrides = groupDescAdvancedSchedulerOverrides.Default.(domain.AdvancedSchedulerOverrides)
+	// groupDescTrafficDirectorMode is the schema descriptor for traffic_director_mode field.
+	groupDescTrafficDirectorMode := groupFields[61].Descriptor()
+	// group.DefaultTrafficDirectorMode holds the default value on creation for the traffic_director_mode field.
+	group.DefaultTrafficDirectorMode = groupDescTrafficDirectorMode.Default.(string)
+	// group.TrafficDirectorModeValidator is a validator for the "traffic_director_mode" field. It is called by the builders before save.
+	group.TrafficDirectorModeValidator = groupDescTrafficDirectorMode.Validators[0].(func(string) error)
+	// groupDescTrafficDirectorVersion is the schema descriptor for traffic_director_version field.
+	groupDescTrafficDirectorVersion := groupFields[62].Descriptor()
+	// group.DefaultTrafficDirectorVersion holds the default value on creation for the traffic_director_version field.
+	group.DefaultTrafficDirectorVersion = groupDescTrafficDirectorVersion.Default.(int64)
+	// group.TrafficDirectorVersionValidator is a validator for the "traffic_director_version" field. It is called by the builders before save.
+	group.TrafficDirectorVersionValidator = groupDescTrafficDirectorVersion.Validators[0].(func(int64) error)
 	idempotencyrecordMixin := schema.IdempotencyRecord{}.Mixin()
 	idempotencyrecordMixinFields0 := idempotencyrecordMixin[0].Fields()
 	_ = idempotencyrecordMixinFields0

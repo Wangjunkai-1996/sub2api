@@ -330,6 +330,21 @@ func ProfitSafetyBuffer(v float64) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldProfitSafetyBuffer, v))
 }
 
+// SchedulerType applies equality check predicate on the "scheduler_type" field. It's identical to SchedulerTypeEQ.
+func SchedulerType(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldSchedulerType, v))
+}
+
+// TrafficDirectorMode applies equality check predicate on the "traffic_director_mode" field. It's identical to TrafficDirectorModeEQ.
+func TrafficDirectorMode(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorVersion applies equality check predicate on the "traffic_director_version" field. It's identical to TrafficDirectorVersionEQ.
+func TrafficDirectorVersion(v int64) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldTrafficDirectorVersion, v))
+}
+
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.
 func CreatedAtEQ(v time.Time) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldCreatedAt, v))
@@ -2548,6 +2563,186 @@ func ProfitSafetyBufferLT(v float64) predicate.Group {
 // ProfitSafetyBufferLTE applies the LTE predicate on the "profit_safety_buffer" field.
 func ProfitSafetyBufferLTE(v float64) predicate.Group {
 	return predicate.Group(sql.FieldLTE(FieldProfitSafetyBuffer, v))
+}
+
+// SchedulerTypeEQ applies the EQ predicate on the "scheduler_type" field.
+func SchedulerTypeEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldSchedulerType, v))
+}
+
+// SchedulerTypeNEQ applies the NEQ predicate on the "scheduler_type" field.
+func SchedulerTypeNEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldSchedulerType, v))
+}
+
+// SchedulerTypeIn applies the In predicate on the "scheduler_type" field.
+func SchedulerTypeIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldSchedulerType, vs...))
+}
+
+// SchedulerTypeNotIn applies the NotIn predicate on the "scheduler_type" field.
+func SchedulerTypeNotIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldSchedulerType, vs...))
+}
+
+// SchedulerTypeGT applies the GT predicate on the "scheduler_type" field.
+func SchedulerTypeGT(v string) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldSchedulerType, v))
+}
+
+// SchedulerTypeGTE applies the GTE predicate on the "scheduler_type" field.
+func SchedulerTypeGTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldSchedulerType, v))
+}
+
+// SchedulerTypeLT applies the LT predicate on the "scheduler_type" field.
+func SchedulerTypeLT(v string) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldSchedulerType, v))
+}
+
+// SchedulerTypeLTE applies the LTE predicate on the "scheduler_type" field.
+func SchedulerTypeLTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldSchedulerType, v))
+}
+
+// SchedulerTypeContains applies the Contains predicate on the "scheduler_type" field.
+func SchedulerTypeContains(v string) predicate.Group {
+	return predicate.Group(sql.FieldContains(FieldSchedulerType, v))
+}
+
+// SchedulerTypeHasPrefix applies the HasPrefix predicate on the "scheduler_type" field.
+func SchedulerTypeHasPrefix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasPrefix(FieldSchedulerType, v))
+}
+
+// SchedulerTypeHasSuffix applies the HasSuffix predicate on the "scheduler_type" field.
+func SchedulerTypeHasSuffix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasSuffix(FieldSchedulerType, v))
+}
+
+// SchedulerTypeEqualFold applies the EqualFold predicate on the "scheduler_type" field.
+func SchedulerTypeEqualFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldEqualFold(FieldSchedulerType, v))
+}
+
+// SchedulerTypeContainsFold applies the ContainsFold predicate on the "scheduler_type" field.
+func SchedulerTypeContainsFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldContainsFold(FieldSchedulerType, v))
+}
+
+// TrafficDirectorModeEQ applies the EQ predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeNEQ applies the NEQ predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeNEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeIn applies the In predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldTrafficDirectorMode, vs...))
+}
+
+// TrafficDirectorModeNotIn applies the NotIn predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeNotIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldTrafficDirectorMode, vs...))
+}
+
+// TrafficDirectorModeGT applies the GT predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeGT(v string) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeGTE applies the GTE predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeGTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeLT applies the LT predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeLT(v string) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeLTE applies the LTE predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeLTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeContains applies the Contains predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeContains(v string) predicate.Group {
+	return predicate.Group(sql.FieldContains(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeHasPrefix applies the HasPrefix predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeHasPrefix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasPrefix(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeHasSuffix applies the HasSuffix predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeHasSuffix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasSuffix(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeEqualFold applies the EqualFold predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeEqualFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldEqualFold(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorModeContainsFold applies the ContainsFold predicate on the "traffic_director_mode" field.
+func TrafficDirectorModeContainsFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldContainsFold(FieldTrafficDirectorMode, v))
+}
+
+// TrafficDirectorVersionEQ applies the EQ predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionEQ(v int64) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldTrafficDirectorVersion, v))
+}
+
+// TrafficDirectorVersionNEQ applies the NEQ predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionNEQ(v int64) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldTrafficDirectorVersion, v))
+}
+
+// TrafficDirectorVersionIn applies the In predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionIn(vs ...int64) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldTrafficDirectorVersion, vs...))
+}
+
+// TrafficDirectorVersionNotIn applies the NotIn predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionNotIn(vs ...int64) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldTrafficDirectorVersion, vs...))
+}
+
+// TrafficDirectorVersionGT applies the GT predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionGT(v int64) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldTrafficDirectorVersion, v))
+}
+
+// TrafficDirectorVersionGTE applies the GTE predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionGTE(v int64) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldTrafficDirectorVersion, v))
+}
+
+// TrafficDirectorVersionLT applies the LT predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionLT(v int64) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldTrafficDirectorVersion, v))
+}
+
+// TrafficDirectorVersionLTE applies the LTE predicate on the "traffic_director_version" field.
+func TrafficDirectorVersionLTE(v int64) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldTrafficDirectorVersion, v))
+}
+
+// TrafficDirectorSpecIsNil applies the IsNil predicate on the "traffic_director_spec" field.
+func TrafficDirectorSpecIsNil() predicate.Group {
+	return predicate.Group(sql.FieldIsNull(FieldTrafficDirectorSpec))
+}
+
+// TrafficDirectorSpecNotNil applies the NotNil predicate on the "traffic_director_spec" field.
+func TrafficDirectorSpecNotNil() predicate.Group {
+	return predicate.Group(sql.FieldNotNull(FieldTrafficDirectorSpec))
 }
 
 // HasAPIKeys applies the HasEdge predicate on the "api_keys" edge.

@@ -81,6 +81,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
+	auditBody := body
 	if cappedBody, changed := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); changed {
 		body = cappedBody
 	}
@@ -103,16 +104,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	setOpsRequestContext(c, reqModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
 
-	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIChat, reqModel, body); decision != nil && !decision.AllowNextStage {
-		h.openAISecurityAuditError(c, decision)
-		return
-	}
-	if h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatChat) {
-		return
-	}
-
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	healthModel := openAITrafficDirectorHealthModel(reqModel, channelMapping)
 
 	if h.errorPassthroughService != nil {
 		service.BindErrorPassthroughService(c, h.errorPassthroughService)
@@ -155,6 +149,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	// 分组利润控制：chat completions 文本入口请求级装门并固定 pricingAt。
 	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
+	ccPricingCtx = service.WithOpenAITrafficDirectorHealthModel(ccPricingCtx, healthModel)
+	ccPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(ccPricingCtx)
 	c.Request = c.Request.WithContext(ccPricingCtx)
 
 	for {
@@ -185,8 +181,13 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
+			if cls, ok := classifyTrafficDirectorSelectionError(err); ok {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
+				return
+			}
 			if len(failedAccountIDs) == 0 {
-				cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel)
+				cls := classifyOpenAICompatibleSelectionErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, err)
 				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
@@ -225,7 +226,41 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			}
 			continue
 		}
+		if slotResult == openAISlotAcquireRetry {
+			failedAccountIDs[account.ID] = struct{}{}
+			reqLog.Info("openai.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
+			continue
+		}
 		if slotResult != openAISlotAcquireOK {
+			return
+		}
+		account = selection.Account
+		releaseAccount := func() {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+				accountReleaseFunc = nil
+			}
+		}
+		if decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
+			c,
+			reqLog,
+			apiKey,
+			subject,
+			account,
+			service.ContentModerationProtocolOpenAIChat,
+			reqModel,
+			auditBody,
+		); decision != nil && !decision.AllowNextStage {
+			releaseAccount()
+			h.handleStreamingAwareErrorWithCode(
+				c,
+				securityAuditStatus(decision),
+				securityAuditErrorType(decision),
+				securityAuditErrorCode(decision),
+				securityAuditMessage(decision),
+				streamStarted,
+				false,
+			)
 			return
 		}
 
@@ -238,11 +273,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		}
 		writerSizeBeforeForward := c.Writer.Size()
 		result, err := func() (*service.OpenAIForwardResult, error) {
-			defer func() {
-				if accountReleaseFunc != nil {
-					accountReleaseFunc()
-				}
-			}()
+			defer releaseAccount()
+			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
 		var cyberBlockBodyChat []byte
@@ -250,6 +282,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			cyberBlockBodyChat = body
 		}
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyChat, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
+		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)

@@ -189,7 +189,7 @@ func (s *defaultOpenAIWSStateStore) BindResponseAccount(ctx context.Context, gro
 		return nil
 	}
 	cacheKey := openAIWSResponseAccountCacheKey(id)
-	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	cacheCtx, cancel := withOpenAIWSStateStoreDetachedRedisTimeout(ctx)
 	defer cancel()
 	return s.cache.SetSessionAccountID(cacheCtx, groupID, cacheKey, accountID, ttl)
 }
@@ -546,6 +546,16 @@ func openAIWSSessionTurnStateKey(groupID int64, sessionHash string) string {
 func withOpenAIWSStateStoreRedisTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, openAIWSStateStoreRedisTimeout)
+}
+
+// Response bindings must outlive client disconnects because continuations use Redis as their authority.
+func withOpenAIWSStateStoreDetachedRedisTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
 	}
 	return context.WithTimeout(ctx, openAIWSStateStoreRedisTimeout)
 }

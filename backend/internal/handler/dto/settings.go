@@ -324,9 +324,11 @@ type SystemSettings struct {
 	// 风控中心功能开关
 	RiskControlEnabled bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    bool `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds int  `json:"cyber_session_block_ttl_seconds"`
+	OpenAICyberAccountCooldownEnabled          bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         []int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// Affiliate (邀请返利) feature switch
 	AffiliateEnabled bool `json:"affiliate_enabled"`

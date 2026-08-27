@@ -9,6 +9,7 @@ import (
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -393,6 +394,13 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	if err := ValidateProfitControlConfig(platform, profitControlEnabled, profitMinMargin, profitSafetyBuffer); err != nil {
 		return nil, err
 	}
+	schedulerType, err := NormalizeGroupSchedulerType(input.SchedulerType)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateAdvancedSchedulerOverrides(input.AdvancedSchedulerOverrides); err != nil {
+		return nil, err
+	}
 
 	// 校验降级分组
 	if input.FallbackGroupID != nil {
@@ -480,6 +488,8 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		ProfitControlEnabled:            profitControlEnabled,
 		ProfitMinMargin:                 profitMinMargin,
 		ProfitSafetyBuffer:              profitSafetyBuffer,
+		SchedulerType:                   schedulerType,
+		AdvancedSchedulerOverrides:      input.AdvancedSchedulerOverrides.Clone(),
 		ImagePrice1K:                    imagePrice1K,
 		ImagePrice2K:                    imagePrice2K,
 		ImagePrice4K:                    imagePrice4K,
@@ -643,6 +653,13 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 
 	// 渠道缓存里存了 groupID → platform 的映射，改了平台要让它失效（见函数末尾）
 	previousPlatform := group.Platform
+	trafficDirectorMode := strings.ToLower(strings.TrimSpace(group.TrafficDirectorMode))
+	if trafficDirectorMode == "" && group.TrafficDirectorVersion == TrafficDirectorLegacyVersion {
+		trafficDirectorMode = domain.TrafficDirectorModeLegacy
+	}
+	if input.Platform != "" && input.Platform != group.Platform && trafficDirectorMode != domain.TrafficDirectorModeLegacy {
+		return nil, errors.New("publish Traffic Director legacy before changing a group platform")
+	}
 
 	if input.Name != "" {
 		group.Name = input.Name
@@ -664,6 +681,19 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	}
 	if input.Status != "" {
 		group.Status = input.Status
+	}
+	if input.SchedulerType != nil {
+		schedulerType, normalizeErr := NormalizeGroupSchedulerType(*input.SchedulerType)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		group.SchedulerType = schedulerType
+	}
+	if input.AdvancedSchedulerOverrides != nil {
+		if err := ValidateAdvancedSchedulerOverrides(*input.AdvancedSchedulerOverrides); err != nil {
+			return nil, err
+		}
+		group.AdvancedSchedulerOverrides = input.AdvancedSchedulerOverrides.Clone()
 	}
 	if input.LongContextPricingEnabled != nil {
 		group.LongContextPricingEnabled = *input.LongContextPricingEnabled

@@ -151,6 +151,36 @@ type schedulerTestGatewayCache struct {
 	deletedSessions map[string]int
 }
 
+type schedulerCyberGatewayCache struct {
+	*schedulerTestGatewayCache
+	mu        sync.Mutex
+	deadlines map[int64]time.Time
+	err       error
+	reads     []int64
+}
+
+func (c *schedulerCyberGatewayCache) RecordOpenAICyberAccountCooldownStrike(
+	context.Context,
+	int64,
+	string,
+	time.Duration,
+	time.Duration,
+	time.Duration,
+	time.Time,
+) (OpenAICyberAccountCooldownStrike, error) {
+	return OpenAICyberAccountCooldownStrike{}, errors.New("unexpected Cyber cooldown write")
+}
+
+func (c *schedulerCyberGatewayCache) GetOpenAICyberAccountCooldownDeadline(_ context.Context, accountID int64) (time.Time, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads = append(c.reads, accountID)
+	if c.err != nil {
+		return time.Time{}, c.err
+	}
+	return c.deadlines[accountID], nil
+}
+
 func (c *schedulerTestGatewayCache) GetSessionAccountID(ctx context.Context, groupID int64, sessionHash string) (int64, error) {
 	if id, ok := c.sessionBindings[sessionHash]; ok {
 		return id, nil
@@ -3812,4 +3842,147 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SubscriptionPriorityWai
 	require.NotNil(t, selection.WaitPlan)
 	require.Equal(t, int64(38011), selection.WaitPlan.AccountID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CyberDeadlineExcludesAndReleasesFinalSelection(t *testing.T) {
+	for _, advanced := range []bool{false, true} {
+		t.Run(fmt.Sprintf("advanced=%t", advanced), func(t *testing.T) {
+			resetOpenAIAdvancedSchedulerSettingCacheForTest()
+			defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+			groupID := int64(101101)
+			blocked := Account{ID: 38101, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"}}
+			allowed := Account{ID: 38102, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 10, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"}}
+			cache := &schedulerCyberGatewayCache{
+				schedulerTestGatewayCache: &schedulerTestGatewayCache{sessionBindings: map[string]int64{"cyber-sticky": blocked.ID}},
+				deadlines:                 map[int64]time.Time{blocked.ID: time.Now().Add(time.Hour)},
+			}
+			var acquiredIDs, releasedIDs []int64
+			concurrencyCache := schedulerTestConcurrencyCache{acquiredIDs: &acquiredIDs, releasedIDs: &releasedIDs}
+			cfg := newSchedulerTestSubscriptionPriorityConfig()
+			cfg.Gateway.Scheduling.LoadBatchEnabled = false
+			settingRepo := &openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+				SettingKeyOpenAICyberAccountCooldownEnabled:          "true",
+				SettingKeyOpenAICyberAccountCooldownWindowSeconds:    "3600",
+				SettingKeyOpenAICyberAccountCooldownFirstSeconds:     "3600",
+				SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: "7200",
+				openAIAdvancedSchedulerSettingKey:                    strconv.FormatBool(advanced),
+			}}
+			settingService := NewSettingService(settingRepo, cfg)
+			svc := &OpenAIGatewayService{
+				accountRepo:        schedulerTestOpenAIAccountRepo{accounts: []Account{blocked, allowed}},
+				cache:              cache,
+				cfg:                cfg,
+				settingService:     settingService,
+				rateLimitService:   &RateLimitService{settingService: settingService},
+				concurrencyService: NewConcurrencyService(concurrencyCache),
+			}
+
+			selection, _, err := svc.SelectAccountWithScheduler(
+				context.Background(), &groupID, "", "cyber-sticky", "gpt-5.1", nil,
+				OpenAIUpstreamTransportAny, false,
+			)
+
+			require.NoError(t, err)
+			require.NotNil(t, selection)
+			require.Equal(t, allowed.ID, selection.Account.ID)
+			require.Contains(t, acquiredIDs, blocked.ID)
+			require.Contains(t, releasedIDs, blocked.ID, "blocked final selection must release its acquired slot")
+			require.Equal(t, []int64{blocked.ID, allowed.ID}, cache.reads)
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+		})
+	}
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CyberRedisReadFailureIsClosed(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	groupID := int64(101102)
+	account := Account{ID: 38111, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"}}
+	cache := &schedulerCyberGatewayCache{
+		schedulerTestGatewayCache: &schedulerTestGatewayCache{},
+		err:                       errors.New("redis unavailable"),
+	}
+	var releasedIDs []int64
+	settingRepo := &openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+		SettingKeyOpenAICyberAccountCooldownEnabled: "true",
+	}}
+	settingService := NewSettingService(settingRepo, &config.Config{})
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: []Account{account}},
+		cache:              cache,
+		cfg:                &config.Config{},
+		settingService:     settingService,
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{releasedIDs: &releasedIDs}),
+	}
+
+	selection, _, err := svc.SelectAccountWithScheduler(
+		context.Background(), &groupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, false,
+	)
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrOpenAICyberAccountCooldownStateUnavailable)
+	require.Equal(t, []int64{account.ID}, releasedIDs, "Redis read failure must release the selected slot")
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_CyberBlockedWaitPlanIsNotReturned(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	groupID := int64(101103)
+	account := Account{ID: 38121, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"}}
+	cache := &schedulerCyberGatewayCache{
+		schedulerTestGatewayCache: &schedulerTestGatewayCache{},
+		deadlines:                 map[int64]time.Time{account.ID: time.Now().Add(time.Hour)},
+	}
+	settingRepo := &openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+		SettingKeyOpenAICyberAccountCooldownEnabled: "true",
+	}}
+	settingService := NewSettingService(settingRepo, &config.Config{})
+	svc := &OpenAIGatewayService{
+		accountRepo:    schedulerTestOpenAIAccountRepo{accounts: []Account{account}},
+		cache:          cache,
+		cfg:            &config.Config{},
+		settingService: settingService,
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{
+			acquireResults: map[int64]bool{account.ID: false},
+		}),
+	}
+
+	selection, _, err := svc.SelectAccountWithScheduler(
+		context.Background(), &groupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, false,
+	)
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrNoAvailableAccounts)
+	require.Equal(t, []int64{account.ID}, cache.reads)
+}
+
+func TestOpenAIGatewayService_SelectAccountForModelWithExclusions_CyberDeadlineIsClosed(t *testing.T) {
+	groupID := int64(101104)
+	account := Account{ID: 38131, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"}}
+	cache := &schedulerCyberGatewayCache{
+		schedulerTestGatewayCache: &schedulerTestGatewayCache{},
+		deadlines:                 map[int64]time.Time{account.ID: time.Now().Add(time.Hour)},
+	}
+	settingService := NewSettingService(&openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+		SettingKeyOpenAICyberAccountCooldownEnabled: "true",
+	}}, &config.Config{})
+	svc := &OpenAIGatewayService{
+		accountRepo:    schedulerTestOpenAIAccountRepo{accounts: []Account{account}},
+		cache:          cache,
+		cfg:            &config.Config{},
+		settingService: settingService,
+	}
+
+	selected, err := svc.SelectAccountForModelWithExclusions(context.Background(), &groupID, "", "gpt-5.1", nil)
+
+	require.Nil(t, selected)
+	require.ErrorIs(t, err, ErrNoAvailableAccounts)
+	require.Equal(t, []int64{account.ID}, cache.reads)
 }

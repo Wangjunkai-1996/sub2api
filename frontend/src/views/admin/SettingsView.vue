@@ -7242,30 +7242,143 @@
               </div>
               <Toggle v-model="form.risk_control_enabled" />
             </div>
+          </div>
+        </div>
 
-            <div class="flex items-center justify-between">
+        <div class="card" data-testid="openai-cyber-account-cooldown">
+          <div class="border-b border-gray-100 px-6 py-4 dark:border-dark-700">
+            <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+              {{ t('admin.settings.features.cyberAccountCooldown.title') }}
+            </h2>
+            <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+              {{ t('admin.settings.features.cyberAccountCooldown.description') }}
+            </p>
+          </div>
+          <div class="space-y-5 p-6">
+            <div class="flex items-center justify-between gap-4">
               <div>
                 <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  {{ t('admin.settings.features.riskControl.cyberSessionBlock') }}
+                  {{ t('admin.settings.features.cyberAccountCooldown.enabled') }}
                 </label>
-                <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-                  {{ t('admin.settings.features.riskControl.cyberSessionBlockHint') }}
+                <p class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400">
+                  {{ t('admin.settings.features.cyberAccountCooldown.enabledHint') }}
                 </p>
               </div>
-              <Toggle v-model="form.cyber_session_block_enabled" />
+              <Toggle
+                v-model="form.openai_cyber_account_cooldown_enabled"
+                data-testid="openai-cyber-account-cooldown-toggle"
+              />
             </div>
 
-            <div v-if="form.cyber_session_block_enabled">
-              <label class="input-label">
-                {{ t('admin.settings.features.riskControl.cyberSessionBlockTTL') }}
-                <span class="text-red-500">*</span>
-              </label>
-              <input
-                v-model.number="form.cyber_session_block_ttl_seconds"
-                type="number"
-                min="1"
-                class="input"
-              />
+            <div
+              v-if="form.openai_cyber_account_cooldown_enabled"
+              class="space-y-5 border-t border-gray-100 pt-5 dark:border-dark-700"
+            >
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.cyberAccountCooldown.windowSeconds') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_window_seconds"
+                    data-testid="openai-cyber-account-cooldown-window"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    step="1"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.cyberAccountCooldown.firstSeconds') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_first_seconds"
+                    data-testid="openai-cyber-account-cooldown-first"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    step="1"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.cyberAccountCooldown.escalatedSeconds') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_escalated_seconds"
+                    data-testid="openai-cyber-account-cooldown-escalated"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    step="1"
+                    class="input"
+                  />
+                </div>
+              </div>
+
+              <div class="space-y-3 border-t border-gray-100 pt-5 dark:border-dark-700">
+                <div>
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t('admin.settings.features.cyberAccountCooldown.groupScope') }}
+                  </label>
+                  <p class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400">
+                    {{ t('admin.settings.features.cyberAccountCooldown.groupScopeHint') }}
+                  </p>
+                </div>
+                <div class="relative">
+                  <Icon
+                    name="search"
+                    size="sm"
+                    class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  />
+                  <input
+                    v-model.trim="cyberAccountCooldownGroupSearch"
+                    type="search"
+                    data-testid="openai-cyber-account-cooldown-group-search"
+                    class="input pl-9"
+                    :placeholder="t('admin.settings.features.cyberAccountCooldown.searchGroups')"
+                  />
+                </div>
+                <div class="grid max-h-64 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+                  <label
+                    v-for="group in filteredCyberAccountCooldownGroups"
+                    :key="group.id"
+                    :data-testid="`openai-cyber-account-cooldown-group-${group.id}`"
+                    class="flex cursor-pointer items-center gap-3 rounded-md border border-gray-100 px-3 py-2.5 transition-colors hover:bg-gray-50 dark:border-dark-700 dark:hover:bg-dark-700/60"
+                  >
+                    <input
+                      type="checkbox"
+                      :value="group.id"
+                      :checked="form.openai_cyber_account_cooldown_group_ids.includes(group.id)"
+                      class="h-4 w-4 shrink-0 rounded border-gray-300 text-primary-500 focus:ring-primary-500 dark:border-dark-500"
+                      @change="toggleCyberAccountCooldownGroup(group.id, ($event.target as HTMLInputElement).checked)"
+                    />
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm font-medium text-gray-900 dark:text-white">
+                        {{ group.name }}
+                      </span>
+                      <span class="block truncate text-xs text-gray-500 dark:text-gray-400">
+                        #{{ group.id }} · {{ group.platform }} · {{ group.subscription_type }}
+                      </span>
+                    </span>
+                    <span
+                      v-if="group.status !== 'active'"
+                      class="shrink-0 text-xs text-gray-400"
+                    >
+                      {{ t('admin.settings.features.cyberAccountCooldown.disabledGroup') }}
+                    </span>
+                  </label>
+                  <p
+                    v-if="filteredCyberAccountCooldownGroups.length === 0"
+                    class="text-sm text-gray-500 dark:text-gray-400 sm:col-span-2"
+                  >
+                    {{ t('admin.settings.features.cyberAccountCooldown.noGroups') }}
+                  </p>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -8930,6 +9043,21 @@ const adminApiKeyMasked = ref("");
 const adminApiKeyOperating = ref(false);
 const newAdminApiKey = ref("");
 const subscriptionGroups = ref<AdminGroup[]>([]);
+const defaultOpenAICyberAccountCooldownGroupIDs = [12];
+const cyberAccountCooldownGroups = ref<AdminGroup[]>([]);
+const cyberAccountCooldownGroupSearch = ref("");
+
+const filteredCyberAccountCooldownGroups = computed(() => {
+  const query = cyberAccountCooldownGroupSearch.value.trim().toLowerCase();
+  if (!query) {
+    return cyberAccountCooldownGroups.value;
+  }
+  return cyberAccountCooldownGroups.value.filter((group) =>
+    [group.id, group.name, group.description, group.platform, group.subscription_type]
+      .filter((value) => value !== null && value !== undefined)
+      .some((value) => String(value).toLowerCase().includes(query)),
+  );
+});
 
 // Upstream billing probe state
 const upstreamBillingProbeLoading = ref(true);
@@ -9544,8 +9672,13 @@ const form = reactive<SettingsForm>({
   hide_ccs_import_button: false,
   payment_enabled: false,
   risk_control_enabled: false,
-  cyber_session_block_enabled: false,
-  cyber_session_block_ttl_seconds: 3600,
+  openai_cyber_account_cooldown_enabled: false,
+  openai_cyber_account_cooldown_window_seconds: 86400,
+  openai_cyber_account_cooldown_first_seconds: 3600,
+  openai_cyber_account_cooldown_escalated_seconds: 86400,
+  openai_cyber_account_cooldown_group_ids: [
+    ...defaultOpenAICyberAccountCooldownGroupIDs,
+  ],
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -10796,6 +10929,13 @@ async function loadSettings() {
     form.default_subscriptions = normalizeDefaultSubscriptionSettings(
       settings.default_subscriptions,
     );
+    const cooldownGroupIDs = normalizeCyberAccountCooldownGroupIDs(
+      form.openai_cyber_account_cooldown_group_ids,
+    );
+    form.openai_cyber_account_cooldown_group_ids =
+      cooldownGroupIDs.length > 0
+        ? cooldownGroupIDs
+        : [...defaultOpenAICyberAccountCooldownGroupIDs];
     registrationEmailSuffixWhitelistTags.value =
       normalizeRegistrationEmailSuffixDomains(
         settings.registration_email_suffix_whitelist,
@@ -10911,13 +11051,40 @@ async function loadSettings() {
 async function loadSubscriptionGroups() {
   try {
     const groups = await adminAPI.groups.getAll();
+    cyberAccountCooldownGroups.value = groups;
     subscriptionGroups.value = groups.filter(
       (group) =>
         group.subscription_type === "subscription" && group.status === "active",
     );
   } catch (_error: unknown) {
+    cyberAccountCooldownGroups.value = [];
     subscriptionGroups.value = [];
   }
+}
+
+function normalizeCyberAccountCooldownGroupIDs(groupIDs: unknown): number[] {
+  if (!Array.isArray(groupIDs)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      groupIDs.filter(
+        (groupID): groupID is number =>
+          typeof groupID === "number" &&
+          Number.isInteger(groupID) &&
+          groupID > 0,
+      ),
+    ),
+  ).sort((left, right) => left - right);
+}
+
+function toggleCyberAccountCooldownGroup(groupID: number, checked: boolean): void {
+  const selected = normalizeCyberAccountCooldownGroupIDs(
+    form.openai_cyber_account_cooldown_group_ids,
+  );
+  form.openai_cyber_account_cooldown_group_ids = checked
+    ? normalizeCyberAccountCooldownGroupIDs([...selected, groupID])
+    : selected.filter((selectedGroupID) => selectedGroupID !== groupID);
 }
 
 function findNextAvailableSubscriptionGroup(
@@ -11052,6 +11219,39 @@ async function saveSettings() {
     form.forwarded_client_ip_headers = normalizeForwardedClientIpHeaders(
       form.forwarded_client_ip_headers,
     );
+
+    form.openai_cyber_account_cooldown_group_ids =
+      normalizeCyberAccountCooldownGroupIDs(
+        form.openai_cyber_account_cooldown_group_ids,
+      );
+    if (form.openai_cyber_account_cooldown_group_ids.length === 0) {
+      appStore.showError(
+        t("admin.settings.features.cyberAccountCooldown.groupsRequired"),
+      );
+      return;
+    }
+
+    const cyberAccountCooldownValues = [
+      Number(form.openai_cyber_account_cooldown_window_seconds),
+      Number(form.openai_cyber_account_cooldown_first_seconds),
+      Number(form.openai_cyber_account_cooldown_escalated_seconds),
+    ];
+    if (
+      cyberAccountCooldownValues.some(
+        (value) => !Number.isInteger(value) || value < 60 || value > 604800,
+      )
+    ) {
+      appStore.showError(
+        t("admin.settings.features.cyberAccountCooldown.rangeError"),
+      );
+      return;
+    }
+    if (cyberAccountCooldownValues[2] < cyberAccountCooldownValues[1]) {
+      appStore.showError(
+        t("admin.settings.features.cyberAccountCooldown.orderError"),
+      );
+      return;
+    }
 
     const normalizedDefaultSubscriptions = normalizeDefaultSubscriptionSettings(
       form.default_subscriptions,
@@ -11346,9 +11546,16 @@ async function saveSettings() {
       // Payment configuration
       payment_enabled: form.payment_enabled,
       risk_control_enabled: form.risk_control_enabled,
-      cyber_session_block_enabled: form.cyber_session_block_enabled,
-      cyber_session_block_ttl_seconds:
-        Number(form.cyber_session_block_ttl_seconds) || 3600,
+      openai_cyber_account_cooldown_enabled:
+        form.openai_cyber_account_cooldown_enabled,
+      openai_cyber_account_cooldown_window_seconds:
+        Number(form.openai_cyber_account_cooldown_window_seconds),
+      openai_cyber_account_cooldown_first_seconds:
+        Number(form.openai_cyber_account_cooldown_first_seconds),
+      openai_cyber_account_cooldown_escalated_seconds:
+        Number(form.openai_cyber_account_cooldown_escalated_seconds),
+      openai_cyber_account_cooldown_group_ids:
+        form.openai_cyber_account_cooldown_group_ids,
       payment_min_amount: Number(form.payment_min_amount) || 0,
       payment_max_amount: Number(form.payment_max_amount) || 0,
       payment_daily_limit: Number(form.payment_daily_limit) || 0,

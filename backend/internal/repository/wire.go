@@ -63,10 +63,26 @@ func ProvideSchedulerCache(rdb *redis.Client, cfg *config.Config) service.Schedu
 	return newSchedulerCacheWithChunkSizes(rdb, mgetChunkSize, writeChunkSize)
 }
 
+// ProvideTrafficDirectorPolicyStore exposes the immutable version lookup from
+// the transactional repository without making the cache depend on repository
+// implementation details.
+func ProvideTrafficDirectorPolicyStore(repository service.TrafficDirectorRepository) service.TrafficDirectorPolicyStore {
+	return repository
+}
+
+func ProvideTrafficDirectorPolicyRedisCache(rdb *redis.Client) service.TrafficDirectorPolicyRedisCache {
+	return NewTrafficDirectorPolicyRedisCache(rdb)
+}
+
+func ProvideTrafficDirectorHealthStore(rdb *redis.Client) service.TrafficDirectorHealthStore {
+	return NewTrafficDirectorHealthRedisStore(rdb)
+}
+
 // ProviderSet is the Wire provider set for all repositories
 var ProviderSet = wire.NewSet(
 	NewUserRepository,
 	NewAPIKeyRepository,
+	NewTrafficDirectorRepository,
 	NewGroupRepository,
 	NewAdminGroupRepository,
 	NewCompositeModelRouteRepository,
@@ -132,6 +148,9 @@ var ProviderSet = wire.NewSet(
 	ProvideSchedulerCache,
 	NewSchedulerOutboxRepository,
 	NewAuthCacheInvalidationOutboxRepository,
+	ProvideTrafficDirectorPolicyStore,
+	ProvideTrafficDirectorPolicyRedisCache,
+	ProvideTrafficDirectorHealthStore,
 	NewProxyLatencyCache,
 	NewTotpCache,
 	NewRefreshTokenCache,

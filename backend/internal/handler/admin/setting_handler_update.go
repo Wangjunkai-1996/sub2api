@@ -356,9 +356,11 @@ type UpdateSettingsRequest struct {
 	// 风控中心功能开关
 	RiskControlEnabled *bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    *bool `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds *int  `json:"cyber_session_block_ttl_seconds"`
+	OpenAICyberAccountCooldownEnabled          *bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    *int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     *int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds *int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         *[]int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// OpenAI fast/flex policy (optional, only updated when provided)
 	OpenAIFastPolicySettings *dto.OpenAIFastPolicySettings `json:"openai_fast_policy_settings,omitempty"`
@@ -1487,12 +1489,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
-	// cyber 会话屏蔽 TTL 校验：提供时必须 > 0
-	if req.CyberSessionBlockTTLSeconds != nil && *req.CyberSessionBlockTTLSeconds <= 0 {
-		response.BadRequest(c, "cyber_session_block_ttl_seconds must be > 0")
-		return
-	}
-
 	settings := &service.SystemSettings{
 		// 系统全局 platform quota 默认值（整体替换语义）
 		DefaultPlatformQuotas:       req.DefaultPlatformQuotas,
@@ -1959,17 +1955,29 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.RiskControlEnabled
 		}(),
-		CyberSessionBlockEnabled: func() bool {
-			if req.CyberSessionBlockEnabled != nil {
-				return *req.CyberSessionBlockEnabled
+		OpenAICyberAccountCooldownEnabled: func() bool {
+			if req.OpenAICyberAccountCooldownEnabled != nil {
+				return *req.OpenAICyberAccountCooldownEnabled
 			}
-			return previousSettings.CyberSessionBlockEnabled
+			return previousSettings.OpenAICyberAccountCooldownEnabled
 		}(),
-		CyberSessionBlockTTLSeconds: func() int {
-			if req.CyberSessionBlockTTLSeconds != nil {
-				return *req.CyberSessionBlockTTLSeconds
+		OpenAICyberAccountCooldownWindowSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownWindowSeconds,
+			previousSettings.OpenAICyberAccountCooldownWindowSeconds,
+		),
+		OpenAICyberAccountCooldownFirstSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownFirstSeconds,
+			previousSettings.OpenAICyberAccountCooldownFirstSeconds,
+		),
+		OpenAICyberAccountCooldownEscalatedSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownEscalatedSeconds,
+			previousSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		),
+		OpenAICyberAccountCooldownGroupIDs: func() []int64 {
+			if req.OpenAICyberAccountCooldownGroupIDs != nil {
+				return append([]int64(nil), (*req.OpenAICyberAccountCooldownGroupIDs)...)
 			}
-			return previousSettings.CyberSessionBlockTTLSeconds
+			return append([]int64(nil), previousSettings.OpenAICyberAccountCooldownGroupIDs...)
 		}(),
 	}
 
@@ -2373,11 +2381,14 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 
 		AffiliateEnabled: updatedSettings.AffiliateEnabled,
 
-		RiskControlEnabled:          updatedSettings.RiskControlEnabled,
-		CyberSessionBlockEnabled:    updatedSettings.CyberSessionBlockEnabled,
-		CyberSessionBlockTTLSeconds: updatedSettings.CyberSessionBlockTTLSeconds,
-		AccountSchedulingThresholds: updatedSettings.AccountSchedulingThresholds,
-		AllowUserViewErrorRequests:  updatedSettings.AllowUserViewErrorRequests,
+		RiskControlEnabled:                         updatedSettings.RiskControlEnabled,
+		OpenAICyberAccountCooldownEnabled:          updatedSettings.OpenAICyberAccountCooldownEnabled,
+		OpenAICyberAccountCooldownWindowSeconds:    updatedSettings.OpenAICyberAccountCooldownWindowSeconds,
+		OpenAICyberAccountCooldownFirstSeconds:     updatedSettings.OpenAICyberAccountCooldownFirstSeconds,
+		OpenAICyberAccountCooldownEscalatedSeconds: updatedSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		OpenAICyberAccountCooldownGroupIDs:         updatedSettings.OpenAICyberAccountCooldownGroupIDs,
+		AccountSchedulingThresholds:                updatedSettings.AccountSchedulingThresholds,
+		AllowUserViewErrorRequests:                 updatedSettings.AllowUserViewErrorRequests,
 	}
 	if fastPolicy, err := h.settingService.GetOpenAIFastPolicySettings(c.Request.Context()); err != nil {
 		slog.Error("openai_fast_policy_settings_get_failed", "error", err)

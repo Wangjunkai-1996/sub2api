@@ -207,6 +207,21 @@ vi.mock("vue-i18n", async () => {
     "admin.settings.openaiExperimentalScheduler.stickyWeightedDescription": "开启后 previous_response_id 和 session_hash 粘性进入高级调度打分；关闭时仍按旧逻辑硬命中粘性账号。",
     "admin.settings.openaiExperimentalScheduler.subscriptionPriorityTitle": "订阅优先",
     "admin.settings.openaiExperimentalScheduler.subscriptionPriorityDescription": "开启后先在 ChatGPT 订阅账号池中按权值选取；订阅池拿不到席位时再回退到非订阅账号池。",
+    "admin.settings.features.cyberAccountCooldown.title": "OpenAI Cyber 账号冷却",
+    "admin.settings.features.cyberAccountCooldown.description": "仅根据上游真实返回的 cyber_policy 冷却实际命中的账号，不发起额外审核请求。",
+    "admin.settings.features.cyberAccountCooldown.enabled": "启用账号阶梯冷却",
+    "admin.settings.features.cyberAccountCooldown.enabledHint": "仅对所选账号组中的 OpenAI OAuth Pro 账号生效；Plus、API Key 和其他平台账号不会进入冷却。",
+    "admin.settings.features.cyberAccountCooldown.windowSeconds": "安静重置窗口（秒）",
+    "admin.settings.features.cyberAccountCooldown.firstSeconds": "首次冷却（秒）",
+    "admin.settings.features.cyberAccountCooldown.escalatedSeconds": "再次冷却（秒）",
+    "admin.settings.features.cyberAccountCooldown.groupScope": "适用账号组",
+    "admin.settings.features.cyberAccountCooldown.groupScopeHint": "默认账号组为 12。账号仍须同时满足 OpenAI、OAuth 和 plan_type=pro 才会命中。",
+    "admin.settings.features.cyberAccountCooldown.searchGroups": "搜索分组名称、平台、类型或 ID",
+    "admin.settings.features.cyberAccountCooldown.disabledGroup": "已停用",
+    "admin.settings.features.cyberAccountCooldown.noGroups": "没有匹配的分组",
+    "admin.settings.features.cyberAccountCooldown.groupsRequired": "请至少选择一个 Cyber 账号冷却组。",
+    "admin.settings.features.cyberAccountCooldown.rangeError": "Cyber 账号冷却时间必须是 60 到 604800 之间的整数秒。",
+    "admin.settings.features.cyberAccountCooldown.orderError": "再次冷却时长不能短于首次冷却时长。",
     "admin.settings.openaiExperimentalScheduler.weightsTitle": "调度权值覆盖",
     "admin.settings.openaiExperimentalScheduler.weightsDescription": "留空时使用配置/环境变量值；配置未设置时使用内置默认值。页面非空设置优先。",
     "admin.settings.openaiExperimentalScheduler.defaultPlaceholder": "配置/默认：{value}",
@@ -476,6 +491,12 @@ const baseSettingsResponse = {
   antigravity_user_agent_version: "",
   openai_codex_user_agent: "",
   payment_enabled: true,
+  risk_control_enabled: false,
+  openai_cyber_account_cooldown_enabled: false,
+  openai_cyber_account_cooldown_window_seconds: 86400,
+  openai_cyber_account_cooldown_first_seconds: 3600,
+  openai_cyber_account_cooldown_escalated_seconds: 86400,
+  openai_cyber_account_cooldown_group_ids: [12],
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -583,6 +604,16 @@ async function openSecurityTab(wrapper: ReturnType<typeof mountView>) {
   await flushPromises();
 }
 
+async function openFeaturesTab(wrapper: ReturnType<typeof mountView>) {
+  const featuresTabButton = wrapper
+    .findAll("button")
+    .find((node) => node.text().includes("admin.settings.tabs.features"));
+
+  expect(featuresTabButton).toBeDefined();
+  await featuresTabButton?.trigger("click");
+  await flushPromises();
+}
+
 async function openGatewayTab(wrapper: ReturnType<typeof mountView>) {
   const gatewayTabButton = wrapper
     .findAll("button")
@@ -622,6 +653,18 @@ describe("admin SettingsView email domain quota copy", () => {
     expect(zhQuotaHint).toContain("关闭时非白名单域名直接拒绝");
     expect(enQuotaHint).toContain("one account");
     expect(enQuotaHint).toContain("When disabled");
+  });
+});
+
+describe("admin SettingsView Cyber account cooldown copy", () => {
+  it("states the fixed Pro OAuth eligibility in both locales", () => {
+    const zhCopy = zhSettings.settings.features.cyberAccountCooldown;
+    const enCopy = enSettings.settings.features.cyberAccountCooldown;
+
+    expect(zhCopy.enabledHint).toContain("OpenAI OAuth Pro");
+    expect(zhCopy.enabledHint).toContain("Plus");
+    expect(enCopy.enabledHint).toContain("OpenAI OAuth Pro");
+    expect(enCopy.enabledHint).toContain("Plus");
   });
 });
 
@@ -733,6 +776,143 @@ describe("admin SettingsView payment visible method controls", () => {
     expect(updateSettings).toHaveBeenCalledWith(
       expect.objectContaining({ compact_home_enabled: true }),
     );
+  });
+
+  it("renders and persists the OpenAI Cyber account cooldown group scope", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      openai_cyber_account_cooldown_enabled: true,
+      openai_cyber_account_cooldown_group_ids: [12],
+    });
+    getGroups.mockResolvedValueOnce([
+      {
+        id: 12,
+        name: "Pro",
+        description: "Pro pool",
+        platform: "openai",
+        subscription_type: "subscription",
+        status: "active",
+      },
+      {
+        id: 13,
+        name: "Plus",
+        description: "Plus pool",
+        platform: "openai",
+        subscription_type: "subscription",
+        status: "inactive",
+      },
+    ]);
+
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+
+    const section = wrapper.get('[data-testid="openai-cyber-account-cooldown"]');
+    expect(section.text()).toContain("OpenAI OAuth Pro");
+    expect(section.text()).toContain("Plus");
+
+    const proGroup = section.get('[data-testid="openai-cyber-account-cooldown-group-12"]');
+    const plusGroup = section.get('[data-testid="openai-cyber-account-cooldown-group-13"]');
+    expect((proGroup.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true);
+    expect((plusGroup.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(false);
+
+    await section
+      .get('[data-testid="openai-cyber-account-cooldown-group-search"]')
+      .setValue("Plus");
+    expect(section.find('[data-testid="openai-cyber-account-cooldown-group-12"]').exists()).toBe(false);
+    expect(section.find('[data-testid="openai-cyber-account-cooldown-group-13"]').exists()).toBe(true);
+    await section
+      .get('[data-testid="openai-cyber-account-cooldown-group-search"]')
+      .setValue("");
+    await section
+      .get('[data-testid="openai-cyber-account-cooldown-group-12"] input[type="checkbox"]')
+      .setValue(false);
+    await section
+      .get('[data-testid="openai-cyber-account-cooldown-group-13"] input[type="checkbox"]')
+      .setValue(true);
+    await section.get('[data-testid="openai-cyber-account-cooldown-window"]').setValue(172800);
+    await section.get('[data-testid="openai-cyber-account-cooldown-first"]').setValue(7200);
+    await section.get('[data-testid="openai-cyber-account-cooldown-escalated"]').setValue(172800);
+
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        openai_cyber_account_cooldown_enabled: true,
+        openai_cyber_account_cooldown_window_seconds: 172800,
+        openai_cyber_account_cooldown_first_seconds: 7200,
+        openai_cyber_account_cooldown_escalated_seconds: 172800,
+        openai_cyber_account_cooldown_group_ids: [13],
+      }),
+    );
+  });
+
+  it("defaults a missing OpenAI Cyber cooldown group scope to group 12", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      openai_cyber_account_cooldown_group_ids: undefined,
+    });
+
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        openai_cyber_account_cooldown_group_ids: [12],
+      }),
+    );
+  });
+
+  it("rejects an empty OpenAI Cyber cooldown group scope", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      openai_cyber_account_cooldown_enabled: true,
+      openai_cyber_account_cooldown_group_ids: [12],
+    });
+    getGroups.mockResolvedValueOnce([
+      {
+        id: 12,
+        name: "Pro",
+        description: "Pro pool",
+        platform: "openai",
+        subscription_type: "subscription",
+        status: "active",
+      },
+    ]);
+
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+    await wrapper
+      .get('[data-testid="openai-cyber-account-cooldown-group-12"] input[type="checkbox"]')
+      .setValue(false);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).not.toHaveBeenCalled();
+    expect(showError).toHaveBeenCalledWith("请至少选择一个 Cyber 账号冷却组。");
+  });
+
+  it("rejects an OpenAI Cyber cooldown escalation shorter than the first tier", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      openai_cyber_account_cooldown_enabled: true,
+    });
+
+    const wrapper = mountView();
+    await flushPromises();
+    await openFeaturesTab(wrapper);
+    const section = wrapper.get('[data-testid="openai-cyber-account-cooldown"]');
+    await section.get('[data-testid="openai-cyber-account-cooldown-first"]').setValue(3600);
+    await section.get('[data-testid="openai-cyber-account-cooldown-escalated"]').setValue(600);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).not.toHaveBeenCalled();
+    expect(showError).toHaveBeenCalledWith("再次冷却时长不能短于首次冷却时长。");
   });
 
   it("renders panel rate limit card and saves settings", async () => {

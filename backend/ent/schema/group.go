@@ -289,6 +289,33 @@ func (Group) Fields() []ent.Field {
 			SchemaType(map[string]string{dialect.Postgres: "decimal(10,4)"}).
 			Default(0).
 			Comment("安全缓冲，小数；与 margin 相加后从下游倍率中扣除，默认 0"),
+
+		field.String("scheduler_type").
+			MaxLen(16).
+			Default(domain.GroupSchedulerTypeInherit).
+			Comment("分组调度模式：inherit 沿用全局开关，basic 强制旧调度，advanced 强制高级调度"),
+		field.JSON("advanced_scheduler_overrides", domain.AdvancedSchedulerOverrides{}).
+			Default(domain.AdvancedSchedulerOverrides{}).
+			SchemaType(map[string]string{dialect.Postgres: "jsonb"}).
+			Comment("分组级高级调度稀疏覆盖；缺失字段继承全局值，显式 false/0 必须保留"),
+
+		// Traffic Director head is updated only by the dedicated publication
+		// repository. Immutable keeps ordinary group update builders read-only.
+		field.String("traffic_director_mode").
+			MaxLen(16).
+			Default(domain.TrafficDirectorModeLegacy).
+			Immutable().
+			Comment("已发布 Traffic Director 模式：legacy/shadow/enforced"),
+		field.Int64("traffic_director_version").
+			Default(0).
+			Min(0).
+			Immutable().
+			Comment("已发布 Traffic Director 版本；0 为合成的 legacy 版本"),
+		field.JSON("traffic_director_spec", &domain.TrafficDirectorSpec{}).
+			Optional().
+			Immutable().
+			SchemaType(map[string]string{dialect.Postgres: "jsonb"}).
+			Comment("已发布 Traffic Director 规范；legacy 模式为 NULL"),
 	}
 }
 

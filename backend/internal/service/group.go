@@ -124,6 +124,16 @@ type Group struct {
 	ProfitMinMargin      float64 // 最低毛利率，小数存储（0.30=30%）
 	ProfitSafetyBuffer   float64 // 安全缓冲，小数，与 margin 相加后从 D 中扣除
 
+	// OpenAI scheduler policy. Inherit preserves the legacy global switch;
+	// sparse overrides are applied only when the resolved mode is advanced.
+	SchedulerType              string
+	AdvancedSchedulerOverrides AdvancedSchedulerOverrides
+
+	// Traffic Director auth hot-path head. The full pool spec is deliberately
+	// excluded and resolved by immutable version through the policy cache.
+	TrafficDirectorMode    string
+	TrafficDirectorVersion int64
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 

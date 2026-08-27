@@ -850,6 +850,68 @@ func (_c *GroupCreate) SetNillableProfitSafetyBuffer(v *float64) *GroupCreate {
 	return _c
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (_c *GroupCreate) SetSchedulerType(v string) *GroupCreate {
+	_c.mutation.SetSchedulerType(v)
+	return _c
+}
+
+// SetNillableSchedulerType sets the "scheduler_type" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableSchedulerType(v *string) *GroupCreate {
+	if v != nil {
+		_c.SetSchedulerType(*v)
+	}
+	return _c
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (_c *GroupCreate) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupCreate {
+	_c.mutation.SetAdvancedSchedulerOverrides(v)
+	return _c
+}
+
+// SetNillableAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableAdvancedSchedulerOverrides(v *domain.AdvancedSchedulerOverrides) *GroupCreate {
+	if v != nil {
+		_c.SetAdvancedSchedulerOverrides(*v)
+	}
+	return _c
+}
+
+// SetTrafficDirectorMode sets the "traffic_director_mode" field.
+func (_c *GroupCreate) SetTrafficDirectorMode(v string) *GroupCreate {
+	_c.mutation.SetTrafficDirectorMode(v)
+	return _c
+}
+
+// SetNillableTrafficDirectorMode sets the "traffic_director_mode" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableTrafficDirectorMode(v *string) *GroupCreate {
+	if v != nil {
+		_c.SetTrafficDirectorMode(*v)
+	}
+	return _c
+}
+
+// SetTrafficDirectorVersion sets the "traffic_director_version" field.
+func (_c *GroupCreate) SetTrafficDirectorVersion(v int64) *GroupCreate {
+	_c.mutation.SetTrafficDirectorVersion(v)
+	return _c
+}
+
+// SetNillableTrafficDirectorVersion sets the "traffic_director_version" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableTrafficDirectorVersion(v *int64) *GroupCreate {
+	if v != nil {
+		_c.SetTrafficDirectorVersion(*v)
+	}
+	return _c
+}
+
+// SetTrafficDirectorSpec sets the "traffic_director_spec" field.
+func (_c *GroupCreate) SetTrafficDirectorSpec(v *domain.TrafficDirectorSpec) *GroupCreate {
+	_c.mutation.SetTrafficDirectorSpec(v)
+	return _c
+}
+
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by IDs.
 func (_c *GroupCreate) AddAPIKeyIDs(ids ...int64) *GroupCreate {
 	_c.mutation.AddAPIKeyIDs(ids...)
@@ -1139,6 +1201,22 @@ func (_c *GroupCreate) defaults() error {
 		v := group.DefaultProfitSafetyBuffer
 		_c.mutation.SetProfitSafetyBuffer(v)
 	}
+	if _, ok := _c.mutation.SchedulerType(); !ok {
+		v := group.DefaultSchedulerType
+		_c.mutation.SetSchedulerType(v)
+	}
+	if _, ok := _c.mutation.AdvancedSchedulerOverrides(); !ok {
+		v := group.DefaultAdvancedSchedulerOverrides
+		_c.mutation.SetAdvancedSchedulerOverrides(v)
+	}
+	if _, ok := _c.mutation.TrafficDirectorMode(); !ok {
+		v := group.DefaultTrafficDirectorMode
+		_c.mutation.SetTrafficDirectorMode(v)
+	}
+	if _, ok := _c.mutation.TrafficDirectorVersion(); !ok {
+		v := group.DefaultTrafficDirectorVersion
+		_c.mutation.SetTrafficDirectorVersion(v)
+	}
 	return nil
 }
 
@@ -1328,6 +1406,33 @@ func (_c *GroupCreate) check() error {
 	}
 	if _, ok := _c.mutation.ProfitSafetyBuffer(); !ok {
 		return &ValidationError{Name: "profit_safety_buffer", err: errors.New(`ent: missing required field "Group.profit_safety_buffer"`)}
+	}
+	if _, ok := _c.mutation.SchedulerType(); !ok {
+		return &ValidationError{Name: "scheduler_type", err: errors.New(`ent: missing required field "Group.scheduler_type"`)}
+	}
+	if v, ok := _c.mutation.SchedulerType(); ok {
+		if err := group.SchedulerTypeValidator(v); err != nil {
+			return &ValidationError{Name: "scheduler_type", err: fmt.Errorf(`ent: validator failed for field "Group.scheduler_type": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.AdvancedSchedulerOverrides(); !ok {
+		return &ValidationError{Name: "advanced_scheduler_overrides", err: errors.New(`ent: missing required field "Group.advanced_scheduler_overrides"`)}
+	}
+	if _, ok := _c.mutation.TrafficDirectorMode(); !ok {
+		return &ValidationError{Name: "traffic_director_mode", err: errors.New(`ent: missing required field "Group.traffic_director_mode"`)}
+	}
+	if v, ok := _c.mutation.TrafficDirectorMode(); ok {
+		if err := group.TrafficDirectorModeValidator(v); err != nil {
+			return &ValidationError{Name: "traffic_director_mode", err: fmt.Errorf(`ent: validator failed for field "Group.traffic_director_mode": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.TrafficDirectorVersion(); !ok {
+		return &ValidationError{Name: "traffic_director_version", err: errors.New(`ent: missing required field "Group.traffic_director_version"`)}
+	}
+	if v, ok := _c.mutation.TrafficDirectorVersion(); ok {
+		if err := group.TrafficDirectorVersionValidator(v); err != nil {
+			return &ValidationError{Name: "traffic_director_version", err: fmt.Errorf(`ent: validator failed for field "Group.traffic_director_version": %w`, err)}
+		}
 	}
 	return nil
 }
@@ -1603,6 +1708,26 @@ func (_c *GroupCreate) createSpec() (*Group, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ProfitSafetyBuffer(); ok {
 		_spec.SetField(group.FieldProfitSafetyBuffer, field.TypeFloat64, value)
 		_node.ProfitSafetyBuffer = value
+	}
+	if value, ok := _c.mutation.SchedulerType(); ok {
+		_spec.SetField(group.FieldSchedulerType, field.TypeString, value)
+		_node.SchedulerType = value
+	}
+	if value, ok := _c.mutation.AdvancedSchedulerOverrides(); ok {
+		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
+		_node.AdvancedSchedulerOverrides = value
+	}
+	if value, ok := _c.mutation.TrafficDirectorMode(); ok {
+		_spec.SetField(group.FieldTrafficDirectorMode, field.TypeString, value)
+		_node.TrafficDirectorMode = value
+	}
+	if value, ok := _c.mutation.TrafficDirectorVersion(); ok {
+		_spec.SetField(group.FieldTrafficDirectorVersion, field.TypeInt64, value)
+		_node.TrafficDirectorVersion = value
+	}
+	if value, ok := _c.mutation.TrafficDirectorSpec(); ok {
+		_spec.SetField(group.FieldTrafficDirectorSpec, field.TypeJSON, value)
+		_node.TrafficDirectorSpec = value
 	}
 	if nodes := _c.mutation.APIKeysIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -2768,6 +2893,30 @@ func (u *GroupUpsert) AddProfitSafetyBuffer(v float64) *GroupUpsert {
 	return u
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (u *GroupUpsert) SetSchedulerType(v string) *GroupUpsert {
+	u.Set(group.FieldSchedulerType, v)
+	return u
+}
+
+// UpdateSchedulerType sets the "scheduler_type" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateSchedulerType() *GroupUpsert {
+	u.SetExcluded(group.FieldSchedulerType)
+	return u
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (u *GroupUpsert) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpsert {
+	u.Set(group.FieldAdvancedSchedulerOverrides, v)
+	return u
+}
+
+// UpdateAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateAdvancedSchedulerOverrides() *GroupUpsert {
+	u.SetExcluded(group.FieldAdvancedSchedulerOverrides)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -2784,6 +2933,15 @@ func (u *GroupUpsertOne) UpdateNewValues() *GroupUpsertOne {
 		}
 		if _, exists := u.create.mutation.DuplicateOperationID(); exists {
 			s.SetIgnore(group.FieldDuplicateOperationID)
+		}
+		if _, exists := u.create.mutation.TrafficDirectorMode(); exists {
+			s.SetIgnore(group.FieldTrafficDirectorMode)
+		}
+		if _, exists := u.create.mutation.TrafficDirectorVersion(); exists {
+			s.SetIgnore(group.FieldTrafficDirectorVersion)
+		}
+		if _, exists := u.create.mutation.TrafficDirectorSpec(); exists {
+			s.SetIgnore(group.FieldTrafficDirectorSpec)
 		}
 	}))
 	return u
@@ -3992,6 +4150,34 @@ func (u *GroupUpsertOne) UpdateProfitSafetyBuffer() *GroupUpsertOne {
 	})
 }
 
+// SetSchedulerType sets the "scheduler_type" field.
+func (u *GroupUpsertOne) SetSchedulerType(v string) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetSchedulerType(v)
+	})
+}
+
+// UpdateSchedulerType sets the "scheduler_type" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateSchedulerType() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateSchedulerType()
+	})
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (u *GroupUpsertOne) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetAdvancedSchedulerOverrides(v)
+	})
+}
+
+// UpdateAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateAdvancedSchedulerOverrides() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateAdvancedSchedulerOverrides()
+	})
+}
+
 // Exec executes the query.
 func (u *GroupUpsertOne) Exec(ctx context.Context) error {
 	if len(u.create.conflict) == 0 {
@@ -4173,6 +4359,15 @@ func (u *GroupUpsertBulk) UpdateNewValues() *GroupUpsertBulk {
 			}
 			if _, exists := b.mutation.DuplicateOperationID(); exists {
 				s.SetIgnore(group.FieldDuplicateOperationID)
+			}
+			if _, exists := b.mutation.TrafficDirectorMode(); exists {
+				s.SetIgnore(group.FieldTrafficDirectorMode)
+			}
+			if _, exists := b.mutation.TrafficDirectorVersion(); exists {
+				s.SetIgnore(group.FieldTrafficDirectorVersion)
+			}
+			if _, exists := b.mutation.TrafficDirectorSpec(); exists {
+				s.SetIgnore(group.FieldTrafficDirectorSpec)
 			}
 		}
 	}))
@@ -5379,6 +5574,34 @@ func (u *GroupUpsertBulk) AddProfitSafetyBuffer(v float64) *GroupUpsertBulk {
 func (u *GroupUpsertBulk) UpdateProfitSafetyBuffer() *GroupUpsertBulk {
 	return u.Update(func(s *GroupUpsert) {
 		s.UpdateProfitSafetyBuffer()
+	})
+}
+
+// SetSchedulerType sets the "scheduler_type" field.
+func (u *GroupUpsertBulk) SetSchedulerType(v string) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetSchedulerType(v)
+	})
+}
+
+// UpdateSchedulerType sets the "scheduler_type" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateSchedulerType() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateSchedulerType()
+	})
+}
+
+// SetAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field.
+func (u *GroupUpsertBulk) SetAdvancedSchedulerOverrides(v domain.AdvancedSchedulerOverrides) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetAdvancedSchedulerOverrides(v)
+	})
+}
+
+// UpdateAdvancedSchedulerOverrides sets the "advanced_scheduler_overrides" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateAdvancedSchedulerOverrides() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateAdvancedSchedulerOverrides()
 	})
 }
 

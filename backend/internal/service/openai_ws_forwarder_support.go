@@ -264,6 +264,70 @@ func markOpenAIWSClientVisibleFailure(c *gin.Context, eventType string, payload 
 	MarkOpsStreamFailure(c, errType, code, message, status)
 }
 
+// openAIWSTerminalHealthStatus maps the structured terminal payload to an
+// HTTP-equivalent status used only by the distributed health classifier. It
+// intentionally distinguishes request/auth/quota failures from account-scoped
+// server failures while avoiding retention of the full terminal event.
+func openAIWSTerminalHealthStatus(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	statusValues := gjson.GetManyBytes(payload,
+		"response.error.status_code",
+		"response.error.status",
+		"error.status_code",
+		"error.status",
+		"status_code",
+	)
+	for _, value := range statusValues {
+		if status := int(value.Int()); status >= 400 && status <= 599 {
+			return status
+		}
+	}
+	values := gjson.GetManyBytes(payload,
+		"response.error.code",
+		"response.error.type",
+		"response.error.message",
+		"error.code",
+		"error.type",
+		"error.message",
+		"response.incomplete_details.reason",
+		"response.status_details.reason",
+	)
+	var signal strings.Builder
+	for _, value := range values {
+		if text := strings.ToLower(strings.TrimSpace(value.String())); text != "" {
+			signal.WriteByte(' ')
+			signal.WriteString(text)
+		}
+	}
+	message := signal.String()
+	switch {
+	case strings.Contains(message, "rate_limit"), strings.Contains(message, "rate limit"),
+		strings.Contains(message, "usage_limit"), strings.Contains(message, "usage limit"),
+		strings.Contains(message, "insufficient_quota"), strings.Contains(message, "quota"),
+		strings.Contains(message, "overloaded"), strings.Contains(message, "slow_down"):
+		return http.StatusTooManyRequests
+	case strings.Contains(message, "invalid_api_key"), strings.Contains(message, "authentication"),
+		strings.Contains(message, "unauthorized"):
+		return http.StatusUnauthorized
+	case strings.Contains(message, "permission"), strings.Contains(message, "forbidden"):
+		return http.StatusForbidden
+	case strings.Contains(message, "invalid_request"), strings.Contains(message, "invalid request"),
+		strings.Contains(message, "bad_request"), strings.Contains(message, "bad request"),
+		strings.Contains(message, "unsupported"), strings.Contains(message, "cyber_policy"),
+		strings.Contains(message, "content_policy"), strings.Contains(message, "content filter"),
+		strings.Contains(message, "content_filter"), strings.Contains(message, "safety"),
+		strings.Contains(message, "max_output_tokens"):
+		return http.StatusBadRequest
+	case strings.Contains(message, "server_error"), strings.Contains(message, "internal_error"),
+		strings.Contains(message, "upstream_error"), strings.Contains(message, "stream_error"):
+		return http.StatusInternalServerError
+	default:
+		return 0
+	}
+}
+
 func openAIWSPayloadTransientStatus(payload []byte) int {
 	if len(payload) == 0 {
 		return 0
