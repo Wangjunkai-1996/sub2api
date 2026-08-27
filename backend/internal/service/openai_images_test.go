@@ -112,7 +112,7 @@ func TestOpenAIGatewayServiceParseOpenAIImagesRequest_ValidatesJSONN(t *testing.
 		{name: "fraction", n: "1.5", wantErr: true},
 		{name: "exponent notation", n: "1e0", wantErr: true},
 		{name: "oversized integer", n: "18446744073709551616", wantErr: true},
-		{name: "batch stream", n: "2", stream: true, wantErr: true},
+		{name: "batch stream", n: "2", stream: true, want: 2},
 	}
 
 	for _, tt := range tests {
@@ -131,6 +131,7 @@ func TestOpenAIGatewayServiceParseOpenAIImagesRequest_ValidatesJSONN(t *testing.
 			}
 			require.NoError(t, err)
 			require.Equal(t, tt.want, parsed.N)
+			require.Equal(t, tt.stream && tt.want == 1, parsed.EffectiveStream())
 		})
 	}
 }
@@ -973,58 +974,91 @@ func TestOpenAIGatewayServiceForwardImages_OAuthSingleImageDoesNotPassN(t *testi
 	require.Equal(t, "draw a cat 1", gjson.Get(rec.Body.String(), "data.0.revised_prompt").String())
 }
 
-func TestOpenAIGatewayServiceForwardImages_OAuthBatchFansOutAndAggregatesUsage(t *testing.T) {
+func TestOpenAIGatewayServiceForwardImages_OAuthLikeBatchFansOutAndAggregatesUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, n := range []int{2, 4} {
-		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			body := []byte(fmt.Sprintf(`{"model":"gpt-image-2","prompt":"draw a cat","size":"1024x1024","n":%d}`, n))
-			req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			c, _ := gin.CreateTestContext(rec)
-			c.Request = req
+	for _, accountType := range []string{AccountTypeOAuth, AccountTypeSetupToken} {
+		for _, n := range []int{2, 4} {
+			t.Run(fmt.Sprintf("%s/n=%d", accountType, n), func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"gpt-image-2","prompt":"draw a cat","size":"1024x1024","n":%d,"stream":true}`, n))
+				req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(rec)
+				c.Request = req
 
-			responses := make([]*http.Response, 0, n)
-			responseBodies := make([]*passthroughCloseTrackingReadCloser, 0, n)
-			for i := 0; i < n; i++ {
-				responseBody := &passthroughCloseTrackingReadCloser{Reader: strings.NewReader(fmt.Sprintf(
-					"data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1710000000,\"tool_usage\":{\"image_gen\":{\"input_tokens\":10,\"output_tokens\":20,\"output_tokens_details\":{\"image_tokens\":15},\"images\":1}},\"output\":[{\"type\":\"image_generation_call\",\"result\":\"image-%d\",\"output_format\":\"png\",\"size\":\"1024x1024\"}]}}\n\ndata: [DONE]\n\n",
-					i+1,
-				))}
-				responseBodies = append(responseBodies, responseBody)
-				responses = append(responses, &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "X-Request-Id": []string{fmt.Sprintf("req_img_%d", i+1)}},
-					Body:       responseBody,
-				})
-			}
+				responses := make([]*http.Response, 0, n)
+				responseBodies := make([]*passthroughCloseTrackingReadCloser, 0, n)
+				for i := 0; i < n; i++ {
+					responseBody := &passthroughCloseTrackingReadCloser{Reader: strings.NewReader(fmt.Sprintf(
+						"data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1710000000,\"tool_usage\":{\"image_gen\":{\"input_tokens\":10,\"output_tokens\":20,\"output_tokens_details\":{\"image_tokens\":15},\"images\":1}},\"output\":[{\"type\":\"image_generation_call\",\"result\":\"image-%d\",\"output_format\":\"png\",\"size\":\"1024x1024\"}]}}\n\ndata: [DONE]\n\n",
+						i+1,
+					))}
+					responseBodies = append(responseBodies, responseBody)
+					responseHeader := http.Header{"Content-Type": []string{"text/event-stream"}, "X-Request-Id": []string{fmt.Sprintf("req_img_%d", i+1)}}
+					if n == 2 && i == n-1 {
+						responseHeader = nil
+					}
+					responses = append(responses, &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     responseHeader,
+						Body:       responseBody,
+					})
+				}
 
-			upstream := &httpUpstreamRecorder{responses: responses}
-			svc := &OpenAIGatewayService{httpUpstream: upstream}
-			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
-			require.NoError(t, err)
-			account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+				upstream := &httpUpstreamRecorder{responses: responses}
+				svc := &OpenAIGatewayService{httpUpstream: upstream}
+				parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+				require.NoError(t, err)
+				account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: accountType, Credentials: map[string]any{"access_token": "token-123"}}
 
-			result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
-			require.NoError(t, err)
-			require.NotNil(t, result)
-			require.Equal(t, n, result.ImageCount)
-			require.Equal(t, OpenAIUsage{InputTokens: 10 * n, OutputTokens: 20 * n, ImageOutputTokens: 15 * n}, result.Usage)
-			require.Len(t, upstream.bodies, n)
-			for _, sentBody := range upstream.bodies {
-				require.False(t, gjson.GetBytes(sentBody, "tools.0.n").Exists())
-				require.Equal(t, "gpt-image-2", gjson.GetBytes(sentBody, "tools.0.model").String())
-			}
-			for _, responseBody := range responseBodies {
-				require.True(t, responseBody.closed)
-			}
-			require.Equal(t, http.StatusOK, rec.Code)
-			require.Len(t, gjson.Get(rec.Body.String(), "data").Array(), n)
-			require.Equal(t, int64(n), gjson.Get(rec.Body.String(), "usage.images").Int())
-			require.Equal(t, int64(10*n), gjson.Get(rec.Body.String(), "usage.input_tokens").Int())
-			require.Equal(t, fmt.Sprintf("image-%d", n), gjson.Get(rec.Body.String(), fmt.Sprintf("data.%d.b64_json", n-1)).String())
-		})
+				result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				require.False(t, result.Stream)
+				require.Equal(t, "application/json; charset=utf-8", result.ResponseHeaders.Get("Content-Type"))
+				require.Equal(t, n, result.ImageCount)
+				require.Equal(t, OpenAIUsage{InputTokens: 10 * n, OutputTokens: 20 * n, ImageOutputTokens: 15 * n}, result.Usage)
+				require.Len(t, upstream.bodies, n)
+				for _, sentBody := range upstream.bodies {
+					require.True(t, gjson.GetBytes(sentBody, "stream").Bool())
+					require.False(t, gjson.GetBytes(sentBody, "tools.0.n").Exists())
+					require.Equal(t, "gpt-image-2", gjson.GetBytes(sentBody, "tools.0.model").String())
+				}
+				for _, responseBody := range responseBodies {
+					require.True(t, responseBody.closed)
+				}
+				require.Equal(t, http.StatusOK, rec.Code)
+				require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+				require.Len(t, gjson.Get(rec.Body.String(), "data").Array(), n)
+				require.Equal(t, int64(n), gjson.Get(rec.Body.String(), "usage.images").Int())
+				require.Equal(t, int64(10*n), gjson.Get(rec.Body.String(), "usage.input_tokens").Int())
+				require.Equal(t, fmt.Sprintf("image-%d", n), gjson.Get(rec.Body.String(), fmt.Sprintf("data.%d.b64_json", n-1)).String())
+			})
+		}
 	}
+}
+
+func TestOpenAIGatewayServiceForwardImages_APIKeyRejectsStreamingBatchBeforeUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","n":4,"stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	upstream := &httpUpstreamRecorder{}
+	svc := &OpenAIGatewayService{httpUpstream: upstream}
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+
+	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+
+	require.Nil(t, result)
+	require.ErrorIs(t, err, ErrOpenAIImagesStreamingBatchUnsupported)
+	require.Empty(t, upstream.requests)
+	require.False(t, c.Writer.Written())
 }
 
 func TestAddOpenAIUsageSaturatesInsteadOfOverflowing(t *testing.T) {

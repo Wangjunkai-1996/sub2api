@@ -2050,6 +2050,9 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuthBatch(
 		)
 	}
 	resultHeaders := responseHeaders.Clone()
+	if resultHeaders == nil {
+		resultHeaders = make(http.Header)
+	}
 	if latestCodexHeaders != nil {
 		for _, rawKey := range []string{
 			"x-codex-primary-used-percent",
@@ -2067,6 +2070,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuthBatch(
 			}
 		}
 	}
+	resultHeaders.Set("Content-Type", "application/json; charset=utf-8")
 
 	usageRaw := []byte(`{"images":0}`)
 	usageRaw, _ = sjson.SetBytes(usageRaw, "images", len(results))
@@ -2087,6 +2091,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuthBatch(
 		return nil, err
 	}
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), responseHeaders, s.responseHeaderFilter)
+	c.Header("Content-Type", "application/json; charset=utf-8")
 	c.Data(http.StatusOK, "application/json; charset=utf-8", responseBody)
 	if len(results) < parsed.N {
 		logger.LegacyPrintf(

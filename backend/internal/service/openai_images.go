@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -26,6 +27,9 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// ErrOpenAIImagesStreamingBatchUnsupported preserves the API-key passthrough contract.
+var ErrOpenAIImagesStreamingBatchUnsupported = errors.New("streaming image generation supports n=1 only")
 
 const (
 	openAIImagesGenerationsEndpoint = "/v1/images/generations"
@@ -90,6 +94,26 @@ type OpenAIImagesRequest struct {
 	MaskUpload         *OpenAIImagesUpload
 	Body               []byte
 	bodyHash           string
+}
+
+// EffectiveStream reports the client-facing response mode. OAuth-like batches
+// consume SSE internally but return one aggregated JSON response.
+func (r *OpenAIImagesRequest) EffectiveStream() bool {
+	return r != nil && r.Stream && r.N == 1
+}
+
+// ValidateForAccount enforces account-specific image transport constraints.
+func (r *OpenAIImagesRequest) ValidateForAccount(account *Account) error {
+	if r == nil {
+		return fmt.Errorf("parsed images request is required")
+	}
+	if account == nil {
+		return fmt.Errorf("images account is required")
+	}
+	if account.Type == AccountTypeAPIKey && r.Stream && r.N > 1 {
+		return ErrOpenAIImagesStreamingBatchUnsupported
+	}
+	return nil
 }
 
 func (r *OpenAIImagesRequest) ModerationBody() []byte {
@@ -217,9 +241,6 @@ func (s *OpenAIGatewayService) ParseOpenAIImagesRequest(c *gin.Context, body []b
 	}
 
 	applyOpenAIImagesDefaults(req)
-	if req.Stream && req.N > 1 {
-		return nil, fmt.Errorf("streaming image generation supports n=1 only")
-	}
 	if err := validateOpenAIImagesModel(req.Model); err != nil {
 		return nil, err
 	}
@@ -562,8 +583,8 @@ func (s *OpenAIGatewayService) ForwardImages(
 	parsed *OpenAIImagesRequest,
 	channelMappedModel string,
 ) (*OpenAIForwardResult, error) {
-	if parsed == nil {
-		return nil, fmt.Errorf("parsed images request is required")
+	if err := parsed.ValidateForAccount(account); err != nil {
+		return nil, err
 	}
 	switch account.Type {
 	case AccountTypeAPIKey:
