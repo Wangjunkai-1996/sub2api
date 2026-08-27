@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -27,9 +26,6 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
-
-// ErrOpenAIImagesStreamingBatchUnsupported preserves the API-key passthrough contract.
-var ErrOpenAIImagesStreamingBatchUnsupported = errors.New("streaming image generation supports n=1 only")
 
 const (
 	openAIImagesGenerationsEndpoint = "/v1/images/generations"
@@ -96,24 +92,10 @@ type OpenAIImagesRequest struct {
 	bodyHash           string
 }
 
-// EffectiveStream reports the client-facing response mode. OAuth-like batches
-// consume SSE internally but return one aggregated JSON response.
+// EffectiveStream reports the downstream response mode. Multi-image requests
+// are buffered into one JSON response regardless of the selected account type.
 func (r *OpenAIImagesRequest) EffectiveStream() bool {
 	return r != nil && r.Stream && r.N == 1
-}
-
-// ValidateForAccount enforces account-specific image transport constraints.
-func (r *OpenAIImagesRequest) ValidateForAccount(account *Account) error {
-	if r == nil {
-		return fmt.Errorf("parsed images request is required")
-	}
-	if account == nil {
-		return fmt.Errorf("images account is required")
-	}
-	if account.Type == AccountTypeAPIKey && r.Stream && r.N > 1 {
-		return ErrOpenAIImagesStreamingBatchUnsupported
-	}
-	return nil
 }
 
 func (r *OpenAIImagesRequest) ModerationBody() []byte {
@@ -583,8 +565,11 @@ func (s *OpenAIGatewayService) ForwardImages(
 	parsed *OpenAIImagesRequest,
 	channelMappedModel string,
 ) (*OpenAIForwardResult, error) {
-	if err := parsed.ValidateForAccount(account); err != nil {
-		return nil, err
+	if parsed == nil {
+		return nil, fmt.Errorf("parsed images request is required")
+	}
+	if account == nil {
+		return nil, fmt.Errorf("images account is required")
 	}
 	switch account.Type {
 	case AccountTypeAPIKey:
@@ -625,7 +610,8 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 		parsed.Endpoint,
 		account.Type,
 	)
-	forwardBody, forwardContentType, err := rewriteOpenAIImagesModel(body, parsed.ContentType, upstreamModel)
+	forceNonStreamingBatch := parsed.Stream && parsed.N > 1
+	forwardBody, forwardContentType, err := rewriteOpenAIImagesRequest(body, parsed.ContentType, upstreamModel, forceNonStreamingBatch)
 	if err != nil {
 		return nil, err
 	}
@@ -644,6 +630,9 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	upstreamReq, err := s.buildOpenAIImagesRequest(upstreamCtx, c, account, forwardBody, forwardContentType, token, parsed.Endpoint)
 	if err != nil {
 		return nil, err
+	}
+	if forceNonStreamingBatch {
+		upstreamReq.Header.Set("Accept", "application/json")
 	}
 
 	proxyURL := ""
@@ -702,7 +691,8 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	var usage OpenAIUsage
 	imageCount := parsed.N
 	var firstTokenMs *int
-	if parsed.Stream && isEventStreamResponse(resp.Header) {
+	upstreamStream := parsed.Stream && !forceNonStreamingBatch
+	if upstreamStream && isEventStreamResponse(resp.Header) {
 		streamUsage, streamCount, streamSizes, ttft, err := s.handleOpenAIImagesStreamingResponse(resp, c, startTime)
 		if err != nil {
 			if streamCount > 0 {
@@ -711,7 +701,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 					Usage:            streamUsage,
 					Model:            requestModel,
 					UpstreamModel:    upstreamModel,
-					Stream:           parsed.Stream,
+					Stream:           upstreamStream,
 					ResponseHeaders:  resp.Header.Clone(),
 					Duration:         time.Since(startTime),
 					FirstTokenMs:     ttft,
@@ -732,7 +722,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			Usage:            usage,
 			Model:            requestModel,
 			UpstreamModel:    upstreamModel,
-			Stream:           parsed.Stream,
+			Stream:           upstreamStream,
 			ResponseHeaders:  resp.Header.Clone(),
 			Duration:         time.Since(startTime),
 			FirstTokenMs:     firstTokenMs,
@@ -755,7 +745,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			Usage:            usage,
 			Model:            requestModel,
 			UpstreamModel:    upstreamModel,
-			Stream:           parsed.Stream,
+			Stream:           upstreamStream,
 			ResponseHeaders:  resp.Header.Clone(),
 			Duration:         time.Since(startTime),
 			FirstTokenMs:     firstTokenMs,
@@ -827,24 +817,33 @@ func buildOpenAIImagesURL(base string, endpoint string) string {
 	return buildOpenAIEndpointURL(base, endpoint)
 }
 
-func rewriteOpenAIImagesModel(body []byte, contentType string, model string) ([]byte, string, error) {
+func rewriteOpenAIImagesRequest(body []byte, contentType string, model string, forceNonStreaming bool) ([]byte, string, error) {
 	model = strings.TrimSpace(model)
-	if model == "" {
+	if model == "" && !forceNonStreaming {
 		return body, contentType, nil
 	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
-		rewrittenBody, rewrittenType, rewriteErr := rewriteOpenAIImagesMultipartModel(body, contentType, model)
+		rewrittenBody, rewrittenType, rewriteErr := rewriteOpenAIImagesMultipartRequest(body, contentType, model, forceNonStreaming)
 		return rewrittenBody, rewrittenType, rewriteErr
 	}
-	rewritten, err := sjson.SetBytes(body, "model", model)
-	if err != nil {
-		return nil, "", fmt.Errorf("rewrite image request model: %w", err)
+	rewritten := body
+	if model != "" {
+		rewritten, err = sjson.SetBytes(rewritten, "model", model)
+		if err != nil {
+			return nil, "", fmt.Errorf("rewrite image request model: %w", err)
+		}
+	}
+	if forceNonStreaming {
+		rewritten, err = sjson.SetBytes(rewritten, "stream", false)
+		if err != nil {
+			return nil, "", fmt.Errorf("rewrite image request stream: %w", err)
+		}
 	}
 	return rewritten, contentType, nil
 }
 
-func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model string) ([]byte, string, error) {
+func rewriteOpenAIImagesMultipartRequest(body []byte, contentType string, model string, forceNonStreaming bool) ([]byte, string, error) {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return nil, "", fmt.Errorf("parse multipart content-type: %w", err)
@@ -858,6 +857,7 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 	var buffer bytes.Buffer
 	writer := multipart.NewWriter(&buffer)
 	modelWritten := false
+	streamWritten := false
 
 	for {
 		part, err := reader.NextPart()
@@ -876,12 +876,21 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 			return nil, "", fmt.Errorf("create multipart part: %w", err)
 		}
 
-		if formName == "model" && part.FileName() == "" {
+		if formName == "model" && part.FileName() == "" && model != "" {
 			if _, err := target.Write([]byte(model)); err != nil {
 				_ = part.Close()
 				return nil, "", fmt.Errorf("rewrite multipart model: %w", err)
 			}
 			modelWritten = true
+			_ = part.Close()
+			continue
+		}
+		if formName == "stream" && part.FileName() == "" && forceNonStreaming {
+			if _, err := target.Write([]byte("false")); err != nil {
+				_ = part.Close()
+				return nil, "", fmt.Errorf("rewrite multipart stream: %w", err)
+			}
+			streamWritten = true
 			_ = part.Close()
 			continue
 		}
@@ -892,9 +901,14 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 		_ = part.Close()
 	}
 
-	if !modelWritten {
+	if model != "" && !modelWritten {
 		if err := writer.WriteField("model", model); err != nil {
 			return nil, "", fmt.Errorf("append multipart model field: %w", err)
+		}
+	}
+	if forceNonStreaming && !streamWritten {
+		if err := writer.WriteField("stream", "false"); err != nil {
+			return nil, "", fmt.Errorf("append multipart stream field: %w", err)
 		}
 	}
 	if err := writer.Close(); err != nil {
