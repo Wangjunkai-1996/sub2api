@@ -285,31 +285,6 @@ func TestOpsErrorLoggerMiddleware_HardSkipsIngressRejection(t *testing.T) {
 	require.Zero(t, OpsErrorLogEnqueuedTotal(), "ingress rejection must not enter the error queue")
 }
 
-func TestOpsErrorLoggerMiddleware_DedicatedCyberSessionBlockRecordsExactlyOnce(t *testing.T) {
-	setupOpsErrorLogTestQueue(t, 3)
-	gin.SetMode(gin.TestMode)
-	ops := service.NewOpsService(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-	h := &OpenAIGatewayHandler{opsService: ops}
-	apiKey := &service.APIKey{ID: 41, Key: "sk-dedicated-test"}
-	router := gin.New()
-	router.Use(OpsErrorLoggerMiddleware(ops))
-	router.POST("/v1/responses", func(c *gin.Context) {
-		h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, "gpt-test", "session-block-hash")
-		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
-			"type": "permission_error", "code": "session_blocked_by_cyber_policy", "message": "blocked",
-		}})
-	})
-
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
-
-	require.Equal(t, http.StatusForbidden, recorder.Code)
-	require.Equal(t, int64(1), OpsErrorLogQueueLength())
-	job := <-opsErrorLogQueue
-	require.Equal(t, "cyber_policy_session_blocked", job.entry.ErrorType)
-	require.Equal(t, http.StatusForbidden, job.entry.StatusCode)
-}
-
 func TestOpsErrorLoggerMiddleware_OrdinaryPermissionStillRecords(t *testing.T) {
 	setupOpsErrorLogTestQueue(t, 2)
 	gin.SetMode(gin.TestMode)

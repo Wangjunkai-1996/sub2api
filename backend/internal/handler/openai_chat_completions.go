@@ -277,11 +277,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
-		var cyberBlockBodyChat []byte
-		if service.GetOpsCyberPolicy(c) != nil {
-			cyberBlockBodyChat = body
-		}
-		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyChat, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
+		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
 		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
