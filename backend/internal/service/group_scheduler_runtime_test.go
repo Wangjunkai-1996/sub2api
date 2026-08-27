@@ -199,7 +199,7 @@ func TestOpenAIAdvancedSchedulerRequestSettingsDriveRuntimeControls(t *testing.T
 	require.Equal(t, 3.0, weights.Load)
 
 	ttft := 125
-	svc.ReportOpenAIAccountScheduleResult(99, "gpt-5", true, &ttft)
+	svc.ReportOpenAIAccountScheduleResult(&Account{ID: 99}, "gpt-5", true, &ttft)
 	svc.RecordOpenAIAccountSwitch()
 	metrics := svc.SnapshotOpenAIAccountSchedulerMetrics()
 	require.Equal(t, int64(1), metrics.AccountSwitchTotal)

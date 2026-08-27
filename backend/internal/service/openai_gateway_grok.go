@@ -1506,12 +1506,29 @@ func addOpenAIUsage(dst *OpenAIUsage, usage OpenAIUsage) {
 	if dst == nil {
 		return
 	}
-	dst.InputTokens += usage.InputTokens
-	dst.ImageInputTokens += usage.ImageInputTokens
-	dst.OutputTokens += usage.OutputTokens
-	dst.CacheCreationInputTokens += usage.CacheCreationInputTokens
-	dst.CacheReadInputTokens += usage.CacheReadInputTokens
-	dst.ImageOutputTokens += usage.ImageOutputTokens
+	dst.InputTokens = saturatingAddOpenAIUsage(dst.InputTokens, usage.InputTokens)
+	dst.ImageInputTokens = saturatingAddOpenAIUsage(dst.ImageInputTokens, usage.ImageInputTokens)
+	dst.OutputTokens = saturatingAddOpenAIUsage(dst.OutputTokens, usage.OutputTokens)
+	dst.CacheCreationInputTokens = saturatingAddOpenAIUsage(dst.CacheCreationInputTokens, usage.CacheCreationInputTokens)
+	dst.CacheReadInputTokens = saturatingAddOpenAIUsage(dst.CacheReadInputTokens, usage.CacheReadInputTokens)
+	dst.ImageOutputTokens = saturatingAddOpenAIUsage(dst.ImageOutputTokens, usage.ImageOutputTokens)
+}
+
+func saturatingAddOpenAIUsage(current, delta int) int {
+	if current < 0 {
+		slog.Warn("openai_usage_aggregation_clamped", "reason", "negative_current", "value", current)
+		current = 0
+	}
+	if delta < 0 {
+		slog.Warn("openai_usage_aggregation_clamped", "reason", "negative_delta", "value", delta)
+		return current
+	}
+	maxInt := int(^uint(0) >> 1)
+	if current > maxInt-delta {
+		slog.Warn("openai_usage_aggregation_clamped", "reason", "integer_overflow")
+		return maxInt
+	}
+	return current + delta
 }
 
 func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Account, body []byte, token, cacheIdentity string, cfg *config.Config, settings ...*SettingService) (*http.Request, error) {
