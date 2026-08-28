@@ -723,7 +723,7 @@ func TestImportCodexSessionsAccessTokenOnlySameUserUpdatesExisting(t *testing.T)
 	}
 }
 
-func TestImportCodexSessionsExplicitOffClearsExistingWarmupPolicy(t *testing.T) {
+func TestImportCodexSessionsExplicitOffPersistsCanonicalWarmupPolicy(t *testing.T) {
 	existingToken := buildCodexAccessToken(t, "workspace-1", "user-1", time.Now().Add(time.Hour))
 	svc := newCodexImportMemoryAdminService([]service.Account{{
 		ID:       10,
@@ -755,8 +755,8 @@ func TestImportCodexSessionsExplicitOffClearsExistingWarmupPolicy(t *testing.T) 
 		t.Fatalf("result = %+v, want one updated account", result)
 	}
 	updatedExtra := svc.updatedAccounts[0].input.Extra
-	if _, exists := updatedExtra[service.OpenAICodexWarmupPolicyExtraKey]; exists {
-		t.Fatalf("warmup policy still present after explicit off: %+v", updatedExtra)
+	if got := updatedExtra[service.OpenAICodexWarmupPolicyExtraKey]; got != service.OpenAIWindowWarmupPolicyOff {
+		t.Fatalf("canonical warmup policy = %v, want off", got)
 	}
 	if got := updatedExtra["preserved"]; got != true {
 		t.Fatalf("preserved extra = %v, want true", got)

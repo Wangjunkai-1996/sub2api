@@ -168,12 +168,12 @@ const shouldShowResetTime = computed(() => {
 
 // Format reset time
 const formatResetTime = computed(() => {
-  // For rolling windows, when utilization is 0%, treat as immediately available.
-  if (props.showNowWhenIdle && props.utilization <= 0) {
-    return t('usage.resetNow')
+  // An absent reset on an idle rolling window means immediately available. A
+  // future authoritative reset still represents an armed/active window even
+  // when upstream rounds its tiny utilization to 0%, so show its countdown.
+  if (!props.resetsAt) {
+    return props.showNowWhenIdle && props.utilization <= 0 ? t('usage.resetNow') : '-'
   }
-
-  if (!props.resetsAt) return '-'
 
   const date = new Date(props.resetsAt)
   const diffMs = date.getTime() - now.value.getTime()

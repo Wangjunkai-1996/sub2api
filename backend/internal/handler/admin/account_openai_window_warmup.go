@@ -120,9 +120,9 @@ func withOpenAIWindowWarmupPolicy(extra map[string]any, policy service.OpenAIWin
 	delete(out, service.OpenAICodexWarmupPolicyExtraKey)
 	delete(out, service.CodexWarmupPolicyExtraKey)
 	delete(out, service.OpenAIWindowWarmupPolicyExtraKey)
-	if policy.Enabled() {
-		out[service.OpenAICodexWarmupPolicyExtraKey] = string(policy)
-	}
+	// Persist off explicitly so exports and later imports can distinguish an
+	// intentional account override from a missing policy that inherits defaults.
+	out[service.OpenAICodexWarmupPolicyExtraKey] = string(policy)
 	return out
 }
 

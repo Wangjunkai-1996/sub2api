@@ -374,7 +374,7 @@ func warmupResetFromHeaders(headers http.Header) *time.Time {
 		return nil
 	}
 	seconds := *normalized.Reset5hSeconds
-	if seconds < 0 {
+	if seconds <= 0 {
 		return nil
 	}
 	reset := time.Now().UTC().Add(time.Duration(seconds) * time.Second)

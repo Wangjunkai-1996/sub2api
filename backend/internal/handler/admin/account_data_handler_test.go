@@ -2,15 +2,60 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type accountDataSettingRepo struct {
+	values      map[string]string
+	getAllErr   error
+	getAllCalls int
+}
+
+func (r *accountDataSettingRepo) Get(context.Context, string) (*service.Setting, error) {
+	panic("unexpected Get call")
+}
+
+func (r *accountDataSettingRepo) GetValue(context.Context, string) (string, error) {
+	panic("unexpected GetValue call")
+}
+
+func (r *accountDataSettingRepo) Set(context.Context, string, string) error {
+	panic("unexpected Set call")
+}
+
+func (r *accountDataSettingRepo) GetMultiple(context.Context, []string) (map[string]string, error) {
+	panic("unexpected GetMultiple call")
+}
+
+func (r *accountDataSettingRepo) SetMultiple(context.Context, map[string]string) error {
+	panic("unexpected SetMultiple call")
+}
+
+func (r *accountDataSettingRepo) GetAll(context.Context) (map[string]string, error) {
+	r.getAllCalls++
+	if r.getAllErr != nil {
+		return nil, r.getAllErr
+	}
+	out := make(map[string]string, len(r.values))
+	for key, value := range r.values {
+		out[key] = value
+	}
+	return out, nil
+}
+
+func (r *accountDataSettingRepo) Delete(context.Context, string) error {
+	panic("unexpected Delete call")
+}
 
 type dataResponse struct {
 	Code int         `json:"code"`
@@ -48,6 +93,13 @@ type dataAccount struct {
 }
 
 func setupAccountDataRouter() (*gin.Engine, *stubAdminService) {
+	router, adminSvc, _ := setupAccountDataRouterWithSettings(&accountDataSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAIWindowWarmupDefaultPolicy: service.OpenAIWindowWarmupPolicyOff,
+	}})
+	return router, adminSvc
+}
+
+func setupAccountDataRouterWithSettings(settingRepo *accountDataSettingRepo) (*gin.Engine, *stubAdminService, *AccountHandler) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	adminSvc := newStubAdminService()
@@ -68,10 +120,11 @@ func setupAccountDataRouter() (*gin.Engine, *stubAdminService) {
 		nil,
 		nil,
 	)
+	h.SetOpenAIWindowWarmupService(nil, service.NewSettingService(settingRepo, &config.Config{}))
 
 	router.GET("/api/v1/admin/accounts/data", h.ExportData)
 	router.POST("/api/v1/admin/accounts/data", h.ImportData)
-	return router, adminSvc
+	return router, adminSvc, h
 }
 
 func TestExportDataIncludesSecrets(t *testing.T) {
@@ -316,4 +369,146 @@ func TestImportDataReusesProxyAndSkipsDefaultGroup(t *testing.T) {
 	require.Len(t, adminSvc.createdProxies, 0)
 	require.Len(t, adminSvc.createdAccounts, 1)
 	require.True(t, adminSvc.createdAccounts[0].SkipDefaultGroupBind)
+}
+
+func TestImportDataOpenAIOAuthInheritsContinuousWarmupDefaultOncePerBatch(t *testing.T) {
+	settingRepo := &accountDataSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAIWindowWarmupDefaultPolicy: service.OpenAIWindowWarmupPolicyContinuous,
+	}}
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(settingRepo)
+
+	result, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Accounts: []DataAccount{
+			{
+				Name: "openai-1", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "token-1"},
+			},
+			{
+				Name: "openai-2", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "token-2"}, Extra: map[string]any{"preserved": true},
+			},
+		},
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, result.AccountCreated)
+	require.Equal(t, 1, settingRepo.getAllCalls, "the batch must read global settings only once")
+	require.Len(t, adminSvc.createdAccounts, 2)
+	for _, input := range adminSvc.createdAccounts {
+		require.Equal(t, service.OpenAIWindowWarmupPolicyContinuous, input.Extra[service.OpenAICodexWarmupPolicyExtraKey])
+	}
+	require.Equal(t, true, adminSvc.createdAccounts[1].Extra["preserved"])
+}
+
+func TestImportDataOpenAIOAuthPreservesExplicitWarmupPolicies(t *testing.T) {
+	settingRepo := &accountDataSettingRepo{getAllErr: errors.New("settings must not be read")}
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(settingRepo)
+	accounts := []DataAccount{
+		{
+			Name: "canonical-off", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token-1"},
+			Extra:       map[string]any{service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyOff},
+		},
+		{
+			Name: "legacy-once", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token-2"},
+			Extra:       map[string]any{service.CodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyInitialOnce},
+		},
+		{
+			Name: "legacy-continuous", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token-3"},
+			Extra:       map[string]any{service.OpenAIWindowWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous},
+		},
+	}
+
+	result, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{Accounts: accounts}})
+
+	require.NoError(t, err)
+	require.Equal(t, 3, result.AccountCreated)
+	require.Zero(t, settingRepo.getAllCalls)
+	require.Len(t, adminSvc.createdAccounts, 3)
+	want := []string{
+		service.OpenAIWindowWarmupPolicyOff,
+		service.OpenAIWindowWarmupPolicyInitialOnce,
+		service.OpenAIWindowWarmupPolicyContinuous,
+	}
+	for i, input := range adminSvc.createdAccounts {
+		require.Equal(t, want[i], input.Extra[service.OpenAICodexWarmupPolicyExtraKey])
+		require.NotContains(t, input.Extra, service.CodexWarmupPolicyExtraKey)
+		require.NotContains(t, input.Extra, service.OpenAIWindowWarmupPolicyExtraKey)
+	}
+}
+
+func TestImportDataNonOpenAIAccountsDoNotReadOrRewriteWarmupPolicy(t *testing.T) {
+	settingRepo := &accountDataSettingRepo{getAllErr: errors.New("settings unavailable")}
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(settingRepo)
+	extra := map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: "not-an-openai-policy",
+		"preserved":                             true,
+	}
+
+	result, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Accounts: []DataAccount{
+			{
+				Name: "anthropic-oauth", Platform: service.PlatformAnthropic, Type: service.AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "token-1"}, Extra: extra,
+			},
+			{
+				Name: "openai-apikey", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "key-1"},
+			},
+		},
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, result.AccountCreated)
+	require.Zero(t, settingRepo.getAllCalls)
+	require.Len(t, adminSvc.createdAccounts, 2)
+	require.Equal(t, extra, adminSvc.createdAccounts[0].Extra)
+	require.Nil(t, adminSvc.createdAccounts[1].Extra)
+}
+
+func TestImportDataWarmupSettingReadFailurePreventsAllWrites(t *testing.T) {
+	settingRepo := &accountDataSettingRepo{getAllErr: errors.New("settings database unavailable")}
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(settingRepo)
+
+	_, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Proxies: []DataProxy{{
+			Name: "proxy", Protocol: "http", Host: "127.0.0.1", Port: 8080, Status: service.StatusActive,
+		}},
+		Accounts: []DataAccount{{
+			Name: "openai", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token"},
+		}},
+	}})
+
+	require.ErrorContains(t, err, "settings database unavailable")
+	require.Equal(t, 1, settingRepo.getAllCalls)
+	require.Empty(t, adminSvc.createdProxies)
+	require.Empty(t, adminSvc.updatedProxies)
+	require.Empty(t, adminSvc.createdAccounts)
+}
+
+func TestImportDataInvalidExplicitWarmupPolicyPreventsAllWrites(t *testing.T) {
+	settingRepo := &accountDataSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAIWindowWarmupDefaultPolicy: service.OpenAIWindowWarmupPolicyContinuous,
+	}}
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(settingRepo)
+
+	_, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Proxies: []DataProxy{{
+			Name: "proxy", Protocol: "http", Host: "127.0.0.1", Port: 8080, Status: service.StatusActive,
+		}},
+		Accounts: []DataAccount{{
+			Name: "openai", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token"},
+			Extra:       map[string]any{service.OpenAICodexWarmupPolicyExtraKey: "sometimes"},
+		}},
+	}})
+
+	require.Error(t, err)
+	require.Zero(t, settingRepo.getAllCalls)
+	require.Empty(t, adminSvc.createdProxies)
+	require.Empty(t, adminSvc.updatedProxies)
+	require.Empty(t, adminSvc.createdAccounts)
 }

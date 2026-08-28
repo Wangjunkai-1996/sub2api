@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,23 +19,27 @@ type warmupRepositorySpy struct {
 	OpenAIWindowWarmupRepository
 	mu sync.Mutex
 
-	claims          []OpenAIWindowWarmupClaim
-	claimCalls      int
-	enqueues        []OpenAIWindowWarmupEnqueue
-	cycles          map[string]*OpenAIWindowWarmupJob
-	action          string
-	state           string
-	code            string
-	status          int
-	next            time.Time
-	reset           *time.Time
-	started         int
-	successCalls    int
-	suppressedCalls int
-	reserve         bool
-	rejectSuccess   bool
-	rejectRenew     bool
-	queueStats      OpenAIWindowWarmupQueueStats
+	claims            []OpenAIWindowWarmupClaim
+	claimCalls        int
+	enqueues          []OpenAIWindowWarmupEnqueue
+	cycles            map[string]*OpenAIWindowWarmupJob
+	action            string
+	state             string
+	code              string
+	status            int
+	next              time.Time
+	reset             *time.Time
+	startEvidence     OpenAIWindowWarmupStartEvidence
+	uncertainEvidence OpenAIWindowWarmupUncertainEvidence
+	started           int
+	successCalls      int
+	suppressedCalls   int
+	reserve           bool
+	rejectSuccess     bool
+	rejectStarted     bool
+	rejectRenew       bool
+	onMarkStarted     func()
+	queueStats        OpenAIWindowWarmupQueueStats
 }
 
 func (r *warmupRepositorySpy) Enqueue(_ context.Context, in OpenAIWindowWarmupEnqueue) (*OpenAIWindowWarmupJob, bool, error) {
@@ -91,12 +96,18 @@ func (r *warmupRepositorySpy) RenewLease(context.Context, int64, string, string,
 	return !r.rejectRenew, nil
 }
 
-func (r *warmupRepositorySpy) MarkStarted(_ context.Context, _ int64, _, _ string, _ time.Time) (bool, error) {
+func (r *warmupRepositorySpy) MarkStarted(_ context.Context, _ int64, _, _ string, _ time.Time, evidence OpenAIWindowWarmupStartEvidence) (bool, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.started++
+	r.startEvidence = evidence
 	r.action = "started"
-	return true, nil
+	onMarkStarted := r.onMarkStarted
+	rejectStarted := r.rejectStarted
+	r.mu.Unlock()
+	if onMarkStarted != nil {
+		onMarkStarted()
+	}
+	return !rejectStarted, nil
 }
 
 func (r *warmupRepositorySpy) MarkSuccess(_ context.Context, _ int64, _, _ string, _ time.Time, reset *time.Time, status int, code string) (bool, error) {
@@ -139,7 +150,10 @@ func (r *warmupRepositorySpy) MarkRateLimited(_ context.Context, _ int64, _, _ s
 	return true, nil
 }
 
-func (r *warmupRepositorySpy) MarkUncertain(_ context.Context, _ int64, _, _ string, _, next time.Time, status int, code, _ string) (bool, error) {
+func (r *warmupRepositorySpy) MarkUncertain(_ context.Context, _ int64, _, _ string, _, next time.Time, status int, code, _ string, evidence OpenAIWindowWarmupUncertainEvidence) (bool, error) {
+	r.mu.Lock()
+	r.uncertainEvidence = evidence
+	r.mu.Unlock()
 	r.capture("uncertain", OpenAIWindowWarmupStateUncertain, status, code, next, nil)
 	return true, nil
 }
@@ -213,6 +227,7 @@ type warmupAccountRepositoryStub struct {
 	account  *Account
 	getCalls int
 	err      error
+	updates  []map[string]any
 }
 
 func (r *warmupAccountRepositoryStub) GetByID(_ context.Context, id int64) (*Account, error) {
@@ -238,6 +253,24 @@ func (r *warmupAccountRepositoryStub) ListSchedulableByPlatform(context.Context,
 		return nil, nil
 	}
 	return []Account{*r.account}, nil
+}
+
+func (r *warmupAccountRepositoryStub) UpdateExtra(_ context.Context, id int64, updates map[string]any) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.account == nil || r.account.ID != id {
+		return errors.New("account not found")
+	}
+	copy := make(map[string]any, len(updates))
+	for key, value := range updates {
+		copy[key] = value
+		if r.account.Extra == nil {
+			r.account.Extra = make(map[string]any)
+		}
+		r.account.Extra[key] = value
+	}
+	r.updates = append(r.updates, copy)
+	return nil
 }
 
 type warmupProbeStub struct {
@@ -344,6 +377,23 @@ func TestOpenAIWindowWarmupScheduleUsesStableInitialCycle(t *testing.T) {
 	require.Equal(t, first.ID, second.ID)
 	require.Len(t, repo.enqueues, 1)
 	require.Len(t, service.audit.queue, 1, "idempotent import must not duplicate the initial enqueue audit")
+}
+
+func TestOpenAIWindowWarmupScheduleDoesNotDelayIdleRollingReset(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	rollingReset := now.Add(5 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Extra["codex_5h_used_percent"] = float64(0)
+	account.Extra["codex_5h_reset_at"] = rollingReset.Format(time.RFC3339)
+	repo := &warmupRepositorySpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+
+	job, inserted, err := service.ScheduleAccountWarmup(context.Background(), account, OpenAIWindowWarmupTriggerImport)
+
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.Equal(t, now, job.NextAttemptAt)
+	require.Equal(t, rollingReset, *job.ObservedResetAt)
 }
 
 func TestOpenAIWindowWarmupScheduleRearmsPausedPolicyCycle(t *testing.T) {
@@ -474,6 +524,8 @@ func TestOpenAIWindowWarmupSuppressesProbeWhenBusinessAdvancedReset(t *testing.T
 	newReset := now.Add(5 * time.Hour)
 	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
 	account.Extra["codex_5h_reset_at"] = newReset.Format(time.RFC3339)
+	lastUsed := oldReset.Add(time.Second)
+	account.LastUsedAt = &lastUsed
 	repo := &warmupRepositorySpy{}
 	probe := &warmupProbeStub{}
 	service := newWarmupTestService(repo, account, probe, nil, now, true)
@@ -510,6 +562,53 @@ func TestOpenAIWindowWarmupAmbiguousReconcileSuppressesWithoutSuccess(t *testing
 	require.Zero(t, repo.successCalls)
 	require.Zero(t, service.Metrics().Success)
 	require.Zero(t, service.Metrics().RealTrafficSuppressed)
+	require.Len(t, repo.enqueues, 1)
+	require.Equal(t, warmupResetCycleKey(newReset), repo.enqueues[0].CycleKey)
+}
+
+func TestOpenAIWindowWarmupAmbiguousIdleRollingResetRecordsEvidenceBeforeReplay(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedReset := now.Add(-time.Minute)
+	rollingReset := now.Add(5 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, usage, now, true)
+	claim := warmupTestClaim(account.ID, observedReset)
+	claim.Job.AttemptCount = 1
+
+	service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+		StatusCode: http.StatusOK,
+	}, nil)
+
+	require.Equal(t, "uncertain", repo.action)
+	require.Equal(t, OpenAIWindowWarmupStateUncertain, repo.state)
+	require.Equal(t, "possibly_sent", repo.code)
+	require.True(t, repo.uncertainEvidence.Authoritative)
+	require.Equal(t, rollingReset, *repo.uncertainEvidence.ResetAt)
+	require.Zero(t, repo.suppressedCalls)
+	require.Zero(t, repo.successCalls)
+	require.Empty(t, repo.enqueues)
+}
+
+func TestOpenAIWindowWarmupCompletedTerminalCanConfirmResetFromUsage(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedReset := now.Add(-time.Minute)
+	newReset := now.Add(5 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	usage := &warmupUsageStub{usage: warmupUsage(newReset, 1, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, usage, now, true)
+	claim := warmupTestClaim(account.ID, observedReset)
+	claim.Job.AttemptCount = 1
+
+	service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+		StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.completed",
+	}, errors.New("possibly_sent: terminal response omitted reset metadata"))
+
+	require.Equal(t, 1, repo.successCalls)
+	require.Zero(t, repo.suppressedCalls)
+	require.Equal(t, "completed_reconciled", repo.code)
 	require.Len(t, repo.enqueues, 1)
 	require.Equal(t, warmupResetCycleKey(newReset), repo.enqueues[0].CycleKey)
 }
@@ -553,6 +652,289 @@ func TestOpenAIWindowWarmupUsagePreflightSuppressesStaleAccountSnapshot(t *testi
 	require.Equal(t, int64(1), service.Metrics().RealTrafficSuppressed)
 }
 
+func TestOpenAIWindowWarmupUsagePreflightSendsForIdleRollingReset(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	oldReset := now.Add(-time.Minute)
+	rollingReset := now.Add(5 * time.Hour)
+	confirmedReset := rollingReset.Add(time.Minute)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Extra["codex_5h_used_percent"] = float64(0)
+	account.Extra["codex_5h_reset_at"] = rollingReset.Format(time.RFC3339)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{result: &OpenAIWindowProbeResult{
+		StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.completed", ResetAt: &confirmedReset,
+	}}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), warmupTestClaim(account.ID, oldReset))
+
+	require.Equal(t, 1, usage.calls)
+	require.Equal(t, 1, probe.calls)
+	require.Equal(t, 1, repo.started)
+	require.True(t, repo.startEvidence.Authoritative)
+	require.Zero(t, repo.startEvidence.UsedPercent)
+	require.Equal(t, rollingReset, *repo.startEvidence.ResetAt)
+	require.Equal(t, 1, repo.successCalls)
+	require.Equal(t, "completed", repo.code)
+	require.Len(t, repo.enqueues, 1)
+	require.Equal(t, warmupResetCycleKey(confirmedReset), repo.enqueues[0].CycleKey)
+	accountRepo := service.accounts.(*warmupAccountRepositoryStub)
+	require.Len(t, accountRepo.updates, 1)
+	require.Equal(t, float64(0), accountRepo.updates[0]["codex_5h_used_percent"])
+	require.Equal(t, confirmedReset.Format(time.RFC3339Nano), accountRepo.updates[0]["codex_5h_reset_at"])
+}
+
+func TestOpenAIWindowWarmupMarkStartedCASRejectsNewerIdleRollingResetWithoutSuppressing(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	oldReset := now.Add(-time.Minute)
+	preflightReset := now.Add(5 * time.Hour)
+	racedReset := preflightReset.Add(time.Minute)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{rejectStarted: true}
+	repo.onMarkStarted = func() {
+		account.Extra["codex_5h_used_percent"] = float64(0)
+		account.Extra["codex_5h_reset_at"] = racedReset.Format(time.RFC3339Nano)
+	}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{usage: warmupUsage(preflightReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), warmupTestClaim(account.ID, oldReset))
+
+	require.Equal(t, 1, usage.calls)
+	require.Equal(t, 1, repo.started, "the final repository CAS was attempted")
+	require.Equal(t, "reschedule", repo.action)
+	require.Equal(t, OpenAIWindowWarmupStateRetrying, repo.state)
+	require.Equal(t, now.Add(service.options.ScanInterval), repo.next)
+	require.Nil(t, repo.reset)
+	require.Zero(t, repo.suppressedCalls)
+	require.Zero(t, probe.calls)
+	require.Empty(t, repo.enqueues)
+}
+
+func TestOpenAIWindowWarmupIdleRollingResetHonorsRecentBusinessUse(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	oldReset := now.Add(-time.Minute)
+	rollingReset := now.Add(5 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Extra["codex_5h_reset_at"] = rollingReset.Format(time.RFC3339)
+	claim := warmupTestClaim(account.ID, oldReset)
+	lastUsed := oldReset.Add(time.Second)
+	account.LastUsedAt = &lastUsed
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, "real_traffic_suppressed", repo.code)
+	require.Zero(t, usage.calls)
+	require.Zero(t, probe.calls)
+	require.Zero(t, repo.started)
+}
+
+func TestOpenAIWindowWarmupIdleRollingResetIgnoresUseBeforeObservedReset(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	oldReset := now.Add(-time.Minute)
+	rollingReset := now.Add(5 * time.Hour)
+	confirmedReset := rollingReset.Add(time.Minute)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Extra["codex_5h_reset_at"] = rollingReset.Format(time.RFC3339)
+	claim := warmupTestClaim(account.ID, oldReset)
+	lastUsed := oldReset.Add(-time.Second)
+	account.LastUsedAt = &lastUsed
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{result: &OpenAIWindowProbeResult{
+		StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.done", ResetAt: &confirmedReset,
+	}}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, 1, probe.calls)
+	require.Equal(t, 1, repo.started)
+	require.Equal(t, 1, repo.successCalls)
+}
+
+func TestOpenAIWindowWarmupUncertainIdleRollingResetFirstObservationNeverReplays(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedReset := now.Add(-time.Minute)
+	rollingReset := now.Add(5 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+	claim := warmupTestClaim(account.ID, observedReset)
+	sentAt := now.Add(-time.Minute)
+	claim.Job.SentAt = &sentAt
+	claim.Job.AttemptCount = 1
+	claim.PreviousState = OpenAIWindowWarmupStateUncertain
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, "uncertain", repo.action)
+	require.Equal(t, "possibly_sent", repo.code)
+	require.Equal(t, 1, usage.calls)
+	require.True(t, repo.uncertainEvidence.Authoritative)
+	require.Equal(t, rollingReset, *repo.uncertainEvidence.ResetAt)
+	require.Zero(t, repo.suppressedCalls)
+	require.Zero(t, repo.successCalls)
+	require.Zero(t, repo.started)
+	require.Zero(t, probe.calls)
+	require.Empty(t, repo.enqueues)
+}
+
+func TestOpenAIWindowWarmupUncertainRollingResetAllowsReplayAfterSecondObservation(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedReset := now.Add(-time.Minute)
+	firstRollingReset := now.Add(5*time.Hour - 2*time.Minute)
+	secondRollingReset := now.Add(5 * time.Hour)
+	confirmedReset := secondRollingReset.Add(time.Minute)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{result: &OpenAIWindowProbeResult{
+		StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.completed", ResetAt: &confirmedReset,
+	}}
+	usage := &warmupUsageStub{usages: []*OpenAIQuotaUsage{
+		warmupUsage(secondRollingReset, 0, now.Add(24*time.Hour), 1),
+		warmupUsage(secondRollingReset, 0, now.Add(24*time.Hour), 1),
+	}}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+	claim := warmupTestClaim(account.ID, observedReset)
+	sentAt := now.Add(-3 * time.Minute)
+	firstObservedAt := now.Add(-2 * time.Minute)
+	claim.Job.SentAt = &sentAt
+	claim.Job.AttemptCount = 1
+	claim.Job.UncertainObservedResetAt = &firstRollingReset
+	claim.Job.UncertainObservedAt = &firstObservedAt
+	claim.PreviousState = OpenAIWindowWarmupStateUncertain
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, 2, usage.calls)
+	require.Equal(t, 1, probe.calls)
+	require.Equal(t, 1, repo.started)
+	require.Equal(t, 1, repo.successCalls)
+	require.Zero(t, repo.suppressedCalls)
+	require.Len(t, repo.enqueues, 1)
+	require.Equal(t, warmupResetCycleKey(confirmedReset), repo.enqueues[0].CycleKey)
+}
+
+func TestOpenAIWindowWarmupUncertainFixedResetSuppressesWithoutReplay(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedReset := now.Add(-time.Minute)
+	fixedReset := now.Add(4 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{usage: warmupUsage(fixedReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+	claim := warmupTestClaim(account.ID, observedReset)
+	sentAt := now.Add(-3 * time.Minute)
+	firstObservedAt := now.Add(-2 * time.Minute)
+	claim.Job.SentAt = &sentAt
+	claim.Job.AttemptCount = 1
+	claim.Job.UncertainObservedResetAt = &fixedReset
+	claim.Job.UncertainObservedAt = &firstObservedAt
+	claim.PreviousState = OpenAIWindowWarmupStateUncertain
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, 1, usage.calls)
+	require.Zero(t, probe.calls)
+	require.Zero(t, repo.started)
+	require.Zero(t, repo.successCalls)
+	require.Equal(t, 1, repo.suppressedCalls)
+	require.Equal(t, "possibly_sent_reconciled", repo.code)
+	require.Len(t, repo.enqueues, 1)
+	require.Equal(t, warmupResetCycleKey(fixedReset), repo.enqueues[0].CycleKey)
+}
+
+func TestOpenAIWindowWarmupUncertainTerminalFixedResetCompletesSuccess(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedReset := now.Add(-time.Minute)
+	fixedReset := now.Add(4 * time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	usage := &warmupUsageStub{usage: warmupUsage(fixedReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, usage, now, true)
+	claim := warmupTestClaim(account.ID, observedReset)
+	sentAt := now.Add(-3 * time.Minute)
+	firstObservedAt := now.Add(-2 * time.Minute)
+	status := http.StatusOK
+	claim.Job.SentAt = &sentAt
+	claim.Job.AttemptCount = 1
+	claim.Job.StatusCode = &status
+	claim.Job.UncertainObservedResetAt = &fixedReset
+	claim.Job.UncertainObservedAt = &firstObservedAt
+	claim.Job.UncertainTerminalObserved = true
+	claim.PreviousState = OpenAIWindowWarmupStateUncertain
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, 1, usage.calls)
+	require.Equal(t, 1, repo.successCalls)
+	require.Zero(t, repo.suppressedCalls)
+	require.Equal(t, "completed_reconciled", repo.code)
+	require.Len(t, repo.enqueues, 1)
+}
+
+func TestClassifyWarmupUncertainObservationDoesNotTreatResetRegressionAsFixed(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	observedAt := now.Add(-2 * time.Minute)
+	previousReset := now.Add(4 * time.Hour)
+	job := &OpenAIWindowWarmupJob{
+		UncertainObservedAt:      &observedAt,
+		UncertainObservedResetAt: &previousReset,
+	}
+
+	regressedReset := previousReset.Add(-time.Hour)
+	require.Equal(t, warmupUncertainRecordObservation,
+		classifyWarmupUncertainObservation(job, &regressedReset, now))
+
+	stableReset := previousReset.Add(-openAIWindowWarmupResetStabilityTolerance / 2)
+	require.Equal(t, warmupUncertainFixedReset,
+		classifyWarmupUncertainObservation(job, &stableReset, now))
+}
+
+func TestOpenAIWindowWarmupDefinitiveHTTPStatusPrecedesTransportAmbiguity(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name, wantAction, wantState, wantCode string
+		status                                int
+	}{
+		{name: "unauthorized", status: http.StatusUnauthorized, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlocked, wantCode: "needs_reauth"},
+		{name: "forbidden", status: http.StatusForbidden, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlocked, wantCode: "blocked"},
+		{name: "bad request", status: http.StatusBadRequest, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlockedConfig, wantCode: "blocked_config"},
+		{name: "not found", status: http.StatusNotFound, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlockedConfig, wantCode: "blocked_config"},
+		{name: "server error", status: http.StatusServiceUnavailable, wantAction: "retry", wantState: OpenAIWindowWarmupStateRetrying, wantCode: "http_503"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+			repo := &warmupRepositorySpy{}
+			usage := &warmupUsageStub{}
+			service := newWarmupTestService(repo, account, &warmupProbeStub{}, usage, now, true)
+			claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+			claim.Job.AttemptCount = 1
+
+			service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+				StatusCode: test.status,
+			}, errors.New("possibly_sent: unexpected EOF while reading response"))
+
+			require.Equal(t, test.wantAction, repo.action)
+			require.Equal(t, test.wantState, repo.state)
+			require.Equal(t, test.wantCode, repo.code)
+			require.Zero(t, usage.calls)
+			require.Zero(t, repo.suppressedCalls)
+		})
+	}
+}
+
 func TestOpenAIWindowWarmupSuppressionMetricClassification(t *testing.T) {
 	for _, code := range []string{"real_traffic_suppressed", "usage_preflight_suppressed", "mark_started_reset_cas"} {
 		require.True(t, isRealTrafficWarmupSuppression(code), code)
@@ -578,6 +960,55 @@ func TestOpenAIWindowWarmupUsagePreflightFailsClosed(t *testing.T) {
 	require.Equal(t, 1, claim.Job.AttemptCount)
 	require.Zero(t, repo.started)
 	require.Zero(t, probe.calls)
+}
+
+func TestOpenAIWindowWarmupUsagePreflightRejectsUnknownSchema(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{}}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, "retry", repo.action)
+	require.Equal(t, "usage_preflight_failed", repo.code)
+	require.Zero(t, repo.started)
+	require.Zero(t, probe.calls)
+}
+
+func TestOpenAIWindowWarmupUsagePreflightAcceptsOptionalWeeklyWindow(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	rollingReset := now.Add(5 * time.Hour)
+	confirmedReset := rollingReset.Add(time.Minute)
+	for _, secondary := range []struct {
+		name, field string
+	}{
+		{name: "omitted"},
+		{name: "null", field: `,"secondary_window":null`},
+	} {
+		t.Run(secondary.name, func(t *testing.T) {
+			var usageValue OpenAIQuotaUsage
+			body := fmt.Sprintf(`{"fetched_at":%d,"rate_limit":{"allowed":true,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":%d}%s}}`,
+				now.Unix(), rollingReset.Unix(), secondary.field)
+			require.NoError(t, json.Unmarshal([]byte(body), &usageValue))
+			account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+			repo := &warmupRepositorySpy{}
+			probe := &warmupProbeStub{result: &OpenAIWindowProbeResult{
+				StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.completed", ResetAt: &confirmedReset,
+			}}
+			usage := &warmupUsageStub{usage: &usageValue}
+			service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+			service.processClaim(context.Background(), warmupTestClaim(account.ID, now.Add(-time.Minute)))
+
+			require.Equal(t, 1, probe.calls)
+			require.Equal(t, 1, repo.started)
+			require.Equal(t, 1, repo.successCalls)
+		})
+	}
 }
 
 func TestOpenAIWindowWarmupUsagePreflightPermanentErrorsBlock(t *testing.T) {
@@ -673,12 +1104,53 @@ func TestOpenAIWindowWarmupUsagePreflightWaitsForBlockedSevenDayReset(t *testing
 	require.Zero(t, probe.calls)
 }
 
+func TestOpenAIWindowWarmupWaitsWhenBlockedWeeklyResetIsEarlierThanIdleFiveHourReset(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	fiveHourReset := now.Add(5 * time.Hour)
+	sevenDayReset := now.Add(time.Hour)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{usage: warmupUsage(fiveHourReset, 0, sevenDayReset, 100)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), warmupTestClaim(account.ID, now.Add(-time.Minute)))
+
+	require.Equal(t, "retry", repo.action)
+	require.Equal(t, OpenAIWindowWarmupStateArmed, repo.state)
+	require.Equal(t, "weekly_limit_preflight", repo.code)
+	require.Equal(t, fiveHourReset, *repo.reset)
+	require.Equal(t, fiveHourReset.Add(openAIWindowWarmupDefaultGrace), repo.next)
+	require.Zero(t, probe.calls)
+}
+
+func TestOpenAIWindowWarmupFailsClosedWhenBlockedWeeklyResetIsMissing(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usageValue := warmupUsage(now.Add(5*time.Hour), 0, now.Add(time.Hour), 100)
+	usageValue.RateLimit.SecondaryWindow.ResetAt = 0
+	usageValue.RateLimit.SecondaryWindow.ResetAfterSeconds = 0
+	usage := &warmupUsageStub{usage: usageValue}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), warmupTestClaim(account.ID, now.Add(-time.Minute)))
+
+	require.Equal(t, "retry", repo.action)
+	require.Equal(t, "usage_preflight_failed", repo.code)
+	require.Zero(t, repo.started)
+	require.Zero(t, probe.calls)
+}
+
 func TestOpenAIWindowWarmupBusyAccountNeverQueriesUsageOrSends(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
 	repo := &warmupRepositorySpy{}
 	probe := &warmupProbeStub{}
-	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{}}}
+	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
+		primaryWindowPresent: true, secondaryWindowPresent: true,
+	}}}
 	service := newWarmupTestService(repo, account, probe, usage, now, true)
 	service.options.Concurrency = &warmupConcurrencyStub{acquired: false, lease: &warmupExclusiveCacheStub{refresh: true}}
 
@@ -965,12 +1437,16 @@ func TestOpenAIWindowWarmupUncertainReplayAllowsAuthoritativeEmptyWindow(t *test
 		Terminal:     true,
 		TerminalType: "response.failed",
 	}}
-	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{}}}
+	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
+		primaryWindowPresent: true, secondaryWindowPresent: true,
+	}}}
 	service := newWarmupTestService(repo, account, probe, usage, now, true)
 	claim := warmupTestClaim(account.ID, now.Add(-time.Hour))
 	sent := now.Add(-2 * time.Minute)
 	claim.Job.SentAt = &sent
 	claim.Job.AttemptCount = 1
+	firstObservedAt := now.Add(-time.Minute)
+	claim.Job.UncertainObservedAt = &firstObservedAt
 	claim.PreviousState = OpenAIWindowWarmupStateUncertain
 
 	service.processClaim(context.Background(), claim)
@@ -986,12 +1462,16 @@ func TestOpenAIWindowWarmupUncertainReplayStopsAtAttemptLimit(t *testing.T) {
 	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
 	repo := &warmupRepositorySpy{}
 	probe := &warmupProbeStub{}
-	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{}}}
+	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
+		primaryWindowPresent: true, secondaryWindowPresent: true,
+	}}}
 	service := newWarmupTestService(repo, account, probe, usage, now, true)
 	claim := warmupTestClaim(account.ID, now.Add(-time.Hour))
 	sent := now.Add(-2 * time.Minute)
 	claim.Job.SentAt = &sent
 	claim.Job.AttemptCount = service.options.MaxAttempts
+	firstObservedAt := now.Add(-time.Minute)
+	claim.Job.UncertainObservedAt = &firstObservedAt
 	claim.PreviousState = OpenAIWindowWarmupStateUncertain
 
 	service.processClaim(context.Background(), claim)
@@ -1039,6 +1519,61 @@ func TestWarmupResetFromUsageSeparatesFiveHourAndBlockedSevenDay(t *testing.T) {
 	require.Equal(t, fiveHourReset, *warmupResetFromUsage(usage, true))
 }
 
+func TestWarmupFiveHourObservationUsesFetchedAtForRelativeReset(t *testing.T) {
+	fetchedAt := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	usage := &OpenAIQuotaUsage{
+		FetchedAt: fetchedAt.Unix(),
+		RateLimit: &OpenAIRateLimit{primaryWindowPresent: true, PrimaryWindow: &OpenAIRateLimitWindow{
+			UsedPercent: 0, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 18000,
+			usedPercentPresent: true, resetAfterSecondsPresent: true,
+		}},
+	}
+
+	observation, authoritative := warmupFiveHourObservation(usage)
+
+	require.True(t, authoritative)
+	require.Zero(t, observation.UsedPercent)
+	require.Equal(t, fetchedAt.Add(5*time.Hour), *observation.ResetAt)
+}
+
+func TestWarmupFiveHourObservationDistinguishesEmptyAndUnknown(t *testing.T) {
+	var explicitEmpty OpenAIQuotaUsage
+	require.NoError(t, json.Unmarshal([]byte(`{"rate_limit":{"primary_window":null,"secondary_window":null}}`), &explicitEmpty))
+	observation, authoritative := warmupFiveHourObservation(&explicitEmpty)
+	require.True(t, authoritative)
+	require.Nil(t, observation.ResetAt)
+
+	_, authoritative = warmupFiveHourObservation(&OpenAIQuotaUsage{})
+	require.False(t, authoritative)
+	_, authoritative = warmupFiveHourObservation(&OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{}})
+	require.False(t, authoritative, "missing window fields are schema-unknown, not explicitly empty")
+
+	_, authoritative = warmupFiveHourObservation(&OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
+		primaryWindowPresent: true,
+		PrimaryWindow: &OpenAIRateLimitWindow{
+			LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 18000,
+			usedPercentPresent: true, resetAfterSecondsPresent: true,
+		},
+	}})
+	require.False(t, authoritative, "relative reset without an upstream observation time is unknown")
+
+	var missingUtilization OpenAIQuotaUsage
+	require.NoError(t, json.Unmarshal([]byte(`{"fetched_at":1787900000,"rate_limit":{"primary_window":{"limit_window_seconds":18000,"reset_after_seconds":18000},"secondary_window":null}}`), &missingUtilization))
+	_, authoritative = warmupFiveHourObservation(&missingUtilization)
+	require.False(t, authoritative, "missing used_percent must not become an implicit zero")
+}
+
+func TestAccountCodexGlobalResetAtUsesLatestValidCandidate(t *testing.T) {
+	older := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	newer := older.Add(5 * time.Hour)
+	account := &Account{Extra: map[string]any{
+		"codex_5h_reset_at":        older.Format(time.RFC3339),
+		"codex_global_5h_reset_at": newer.Format(time.RFC3339),
+	}}
+
+	require.Equal(t, newer, *accountCodexGlobalResetAt(account))
+}
+
 func TestWarmupEligibilityUsesInjectedClock(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
@@ -1061,7 +1596,9 @@ func TestOpenAIWindowWarmupOptionsPreserveExplicitZeroGrace(t *testing.T) {
 func newWarmupTestService(repo *warmupRepositorySpy, account *Account, probe *warmupProbeStub, usage *warmupUsageStub, now time.Time, enabled bool) *OpenAIWindowWarmupService {
 	repo.reserve = true
 	if usage == nil {
-		usage = &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{}}}
+		usage = &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
+			primaryWindowPresent: true, secondaryWindowPresent: true,
+		}}}
 	}
 	accounts := &warmupAccountRepositoryStub{account: account}
 	exclusiveCache := &warmupExclusiveCacheStub{refresh: true}
@@ -1101,7 +1638,7 @@ func warmupTestClaim(accountID int64, observed time.Time) OpenAIWindowWarmupClai
 		Job: &OpenAIWindowWarmupJob{
 			ID: 7, AccountID: accountID, State: OpenAIWindowWarmupStateRunning,
 			QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal, CycleKey: warmupResetCycleKey(observed),
-			CycleGeneration: 1, ObservedResetAt: &observed,
+			CycleGeneration: 1, ObservedResetAt: &observed, CreatedAt: observed.Add(-time.Hour),
 		},
 		Owner: "worker-a", LeaseToken: "1:test", LeaseUntil: observed.Add(2 * time.Minute),
 		PreviousState: OpenAIWindowWarmupStatePending,
@@ -1110,12 +1647,15 @@ func warmupTestClaim(accountID int64, observed time.Time) OpenAIWindowWarmupClai
 
 func warmupUsage(fiveHourReset time.Time, fiveHourUsed float64, sevenDayReset time.Time, sevenDayUsed float64) *OpenAIQuotaUsage {
 	return &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
-		LimitReached: fiveHourUsed >= 100 || sevenDayUsed >= 100,
+		LimitReached:         fiveHourUsed >= 100 || sevenDayUsed >= 100,
+		primaryWindowPresent: true, secondaryWindowPresent: true,
 		PrimaryWindow: &OpenAIRateLimitWindow{
 			UsedPercent: fiveHourUsed, LimitWindowSeconds: 5 * 60 * 60, ResetAt: fiveHourReset.Unix(),
+			usedPercentPresent: true, resetAtPresent: true,
 		},
 		SecondaryWindow: &OpenAIRateLimitWindow{
 			UsedPercent: sevenDayUsed, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAt: sevenDayReset.Unix(),
+			usedPercentPresent: true, resetAtPresent: true,
 		},
 	}}
 }

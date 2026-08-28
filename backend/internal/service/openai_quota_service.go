@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,6 +47,10 @@ type OpenAIRateLimitWindow struct {
 	LimitWindowSeconds int64   `json:"limit_window_seconds"`
 	ResetAfterSeconds  int64   `json:"reset_after_seconds"`
 	ResetAt            int64   `json:"reset_at"`
+
+	usedPercentPresent       bool
+	resetAfterSecondsPresent bool
+	resetAtPresent           bool
 }
 
 // OpenAIRateLimit is a rate-limit envelope (primary + optional secondary window).
@@ -54,6 +59,87 @@ type OpenAIRateLimit struct {
 	LimitReached    bool                   `json:"limit_reached"`
 	PrimaryWindow   *OpenAIRateLimitWindow `json:"primary_window,omitempty"`
 	SecondaryWindow *OpenAIRateLimitWindow `json:"secondary_window,omitempty"`
+
+	primaryWindowPresent   bool
+	secondaryWindowPresent bool
+}
+
+func (w *OpenAIRateLimitWindow) UnmarshalJSON(data []byte) error {
+	if w == nil {
+		return errors.New("nil OpenAIRateLimitWindow")
+	}
+	*w = OpenAIRateLimitWindow{}
+	var raw struct {
+		UsedPercent        json.RawMessage `json:"used_percent"`
+		LimitWindowSeconds int64           `json:"limit_window_seconds"`
+		ResetAfterSeconds  json.RawMessage `json:"reset_after_seconds"`
+		ResetAt            json.RawMessage `json:"reset_at"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	w.LimitWindowSeconds = raw.LimitWindowSeconds
+	w.usedPercentPresent = warmupJSONFieldPresent(raw.UsedPercent)
+	w.resetAfterSecondsPresent = warmupJSONFieldPresent(raw.ResetAfterSeconds)
+	w.resetAtPresent = warmupJSONFieldPresent(raw.ResetAt)
+	if w.usedPercentPresent {
+		if err := json.Unmarshal(raw.UsedPercent, &w.UsedPercent); err != nil {
+			return err
+		}
+	}
+	if w.resetAfterSecondsPresent {
+		if err := json.Unmarshal(raw.ResetAfterSeconds, &w.ResetAfterSeconds); err != nil {
+			return err
+		}
+	}
+	if w.resetAtPresent {
+		if err := json.Unmarshal(raw.ResetAt, &w.ResetAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *OpenAIRateLimit) UnmarshalJSON(data []byte) error {
+	if r == nil {
+		return errors.New("nil OpenAIRateLimit")
+	}
+	*r = OpenAIRateLimit{}
+	var raw struct {
+		Allowed         bool            `json:"allowed"`
+		LimitReached    bool            `json:"limit_reached"`
+		PrimaryWindow   json.RawMessage `json:"primary_window"`
+		SecondaryWindow json.RawMessage `json:"secondary_window"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	r.Allowed = raw.Allowed
+	r.LimitReached = raw.LimitReached
+	r.primaryWindowPresent = len(raw.PrimaryWindow) > 0
+	r.secondaryWindowPresent = len(raw.SecondaryWindow) > 0
+	if warmupJSONFieldPresent(raw.PrimaryWindow) {
+		r.PrimaryWindow = &OpenAIRateLimitWindow{}
+		if err := json.Unmarshal(raw.PrimaryWindow, r.PrimaryWindow); err != nil {
+			return err
+		}
+	} else {
+		r.PrimaryWindow = nil
+	}
+	if warmupJSONFieldPresent(raw.SecondaryWindow) {
+		r.SecondaryWindow = &OpenAIRateLimitWindow{}
+		if err := json.Unmarshal(raw.SecondaryWindow, r.SecondaryWindow); err != nil {
+			return err
+		}
+	} else {
+		r.SecondaryWindow = nil
+	}
+	return nil
+}
+
+func warmupJSONFieldPresent(raw json.RawMessage) bool {
+	value := strings.TrimSpace(string(raw))
+	return value != "" && value != "null"
 }
 
 // OpenAIAdditionalRateLimit describes a per-feature rate limit (e.g. Codex Spark).

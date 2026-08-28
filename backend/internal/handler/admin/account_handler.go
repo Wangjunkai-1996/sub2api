@@ -854,6 +854,8 @@ func (h *AccountHandler) Create(c *gin.Context) {
 			response.ErrorFrom(c, policyErr)
 			return
 		}
+		policyValue := string(policy)
+		req.OpenAICodexWarmupPolicy = &policyValue
 		req.Extra = withOpenAIWindowWarmupPolicy(req.Extra, policy)
 	} else if req.OpenAICodexWarmupPolicy != nil {
 		response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
@@ -1927,6 +1929,10 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 			return
 		}
 	}
+	if err := h.prepareOpenAIWindowWarmupBatchCreate(c.Request.Context(), req.Accounts); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 
 	executeAdminIdempotentJSON(c, "admin.accounts.batch_create", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
 		success := 0
@@ -2034,6 +2040,48 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 			"results": results,
 		}, nil
 	})
+}
+
+// prepareOpenAIWindowWarmupBatchCreate resolves the complete batch before the
+// idempotent write closure starts. Eligible requests that omit the field share
+// one settings read; explicit values are validated without consulting settings.
+func (h *AccountHandler) prepareOpenAIWindowWarmupBatchCreate(ctx context.Context, accounts []CreateAccountRequest) error {
+	policies := make(map[int]service.OpenAIWindowWarmupPolicy)
+	missing := make([]int, 0)
+	for i := range accounts {
+		eligible := accounts[i].Platform == service.PlatformOpenAI && accounts[i].Type == service.AccountTypeOAuth
+		if !eligible {
+			if accounts[i].OpenAICodexWarmupPolicy != nil {
+				return infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts")
+			}
+			continue
+		}
+		if accounts[i].OpenAICodexWarmupPolicy == nil {
+			missing = append(missing, i)
+			continue
+		}
+		policy, err := validateOpenAIWindowWarmupPolicy(*accounts[i].OpenAICodexWarmupPolicy)
+		if err != nil {
+			return err
+		}
+		policies[i] = policy
+	}
+
+	if len(missing) > 0 {
+		policy, err := resolveOpenAIWindowWarmupImportPolicy(ctx, nil, h.settingService)
+		if err != nil {
+			return err
+		}
+		for _, i := range missing {
+			policies[i] = policy
+		}
+	}
+	for i, policy := range policies {
+		policyValue := string(policy)
+		accounts[i].OpenAICodexWarmupPolicy = &policyValue
+		accounts[i].Extra = withOpenAIWindowWarmupPolicy(accounts[i].Extra, policy)
+	}
+	return nil
 }
 
 // BatchUpdateCredentialsRequest represents batch credentials update request

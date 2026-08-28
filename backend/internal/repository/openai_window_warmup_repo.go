@@ -32,9 +32,11 @@ func NewOpenAIWindowWarmupRepository(db *sql.DB) service.OpenAIWindowWarmupRepos
 
 const warmupJobSelectColumns = `
     id, account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
-    observed_reset_at, next_attempt_at, attempt_count, sent_at, lease_owner,
-    lease_token, lease_until, last_attempt_at, last_success_at, status_code,
-    last_error_code, last_error, created_at, updated_at`
+    observed_reset_at, uncertain_observed_reset_at, uncertain_observed_at,
+    uncertain_terminal_observed,
+    next_attempt_at, attempt_count, sent_at, lease_owner, lease_token,
+    lease_until, last_attempt_at, last_success_at, status_code, last_error_code,
+    last_error, created_at, updated_at`
 
 func (r *openAIWindowWarmupRepository) Enqueue(ctx context.Context, in service.OpenAIWindowWarmupEnqueue) (*service.OpenAIWindowWarmupJob, bool, error) {
 	if r == nil || r.db == nil {
@@ -148,15 +150,16 @@ ORDER BY next_attempt_at ASC, id ASC`
 	claims := make([]service.OpenAIWindowWarmupClaim, 0, limit)
 	for rows.Next() {
 		var (
-			job                                             service.OpenAIWindowWarmupJob
-			observed, sent, until, lastAttempt, lastSuccess sql.NullTime
-			leaseOwner, leaseToken, errorCode, lastError    sql.NullString
-			statusCode                                      sql.NullInt64
-			previousState                                   string
+			job                                                                          service.OpenAIWindowWarmupJob
+			observed, uncertainReset, uncertainAt, sent, until, lastAttempt, lastSuccess sql.NullTime
+			leaseOwner, leaseToken, errorCode, lastError                                 sql.NullString
+			statusCode                                                                   sql.NullInt64
+			previousState                                                                string
 		)
 		if err := rows.Scan(
 			&job.ID, &job.AccountID, &job.QuotaScope, &job.State, &job.Trigger,
-			&job.CycleKey, &job.CycleGeneration, &observed, &job.NextAttemptAt,
+			&job.CycleKey, &job.CycleGeneration, &observed, &uncertainReset, &uncertainAt,
+			&job.UncertainTerminalObserved, &job.NextAttemptAt,
 			&job.AttemptCount, &sent, &leaseOwner, &leaseToken, &until,
 			&lastAttempt, &lastSuccess, &statusCode, &errorCode, &lastError,
 			&job.CreatedAt, &job.UpdatedAt, &previousState,
@@ -164,6 +167,14 @@ ORDER BY next_attempt_at ASC, id ASC`
 			return nil, err
 		}
 		warmupAssignNullable(&job, observed, sent, until, lastAttempt, lastSuccess, statusCode, leaseOwner, leaseToken, lastError, errorCode)
+		if uncertainReset.Valid {
+			v := uncertainReset.Time.UTC()
+			job.UncertainObservedResetAt = &v
+		}
+		if uncertainAt.Valid {
+			v := uncertainAt.Time.UTC()
+			job.UncertainObservedAt = &v
+		}
 		claims = append(claims, service.OpenAIWindowWarmupClaim{
 			Job: &job, Owner: owner, LeaseToken: job.LeaseToken,
 			LeaseUntil: nullableTime(until), PreviousState: previousState,
@@ -261,6 +272,11 @@ func (r *openAIWindowWarmupRepository) ReserveGlobalSend(ctx context.Context, mi
 		                 COUNT(*) FILTER (WHERE outcome IN ('failed', 'retry', 'uncertain')) AS bad
 		          FROM openai_window_warmup_attempts
 		          WHERE finished_at >= NOW() - INTERVAL '10 minutes'
+		            AND (status_code IS NULL OR status_code NOT IN (400, 401, 403, 404))
+		            AND lower(trim(COALESCE(error_code, ''))) NOT IN (
+		                'needs_reauth', 'blocked', 'blocked_config',
+		                'account_not_found', 'account_ineligible', 'policy_cycle_disabled'
+		            )
 		      ) recent
 		      WHERE recent.total >= 10 AND recent.bad * 2 >= recent.total
 		  )
@@ -293,23 +309,26 @@ SET lease_until = NOW() + ($4 * INTERVAL '1 microsecond'), updated_at = NOW()
 	  AND lease_until IS NOT NULL AND lease_until > NOW()`, id, owner, token, lease.Microseconds())
 }
 
-func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64, owner, token string, at time.Time) (bool, error) {
+func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64, owner, token string, at time.Time, evidence service.OpenAIWindowWarmupStartEvidence) (bool, error) {
 	return r.fencedUpdate(ctx, `
 	UPDATE openai_window_warmup_jobs AS j
 	SET last_attempt_at = COALESCE($4, NOW()), attempt_count = attempt_count + 1,
-	    sent_at = COALESCE($4, NOW()), updated_at = NOW()
+	    sent_at = COALESCE($4, NOW()), uncertain_observed_reset_at = NULL,
+	    uncertain_observed_at = NULL, uncertain_terminal_observed = FALSE,
+	    updated_at = NOW()
 	WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
 	  AND split_part(lease_token, ':', 1) = cycle_generation::text
 	  AND lease_until IS NOT NULL AND lease_until > NOW()
-	  AND EXISTS (
-		      SELECT 1
-		      FROM accounts a
-		      CROSS JOIN LATERAL (
-			          SELECT COALESCE(
-			              public.openai_window_warmup_parse_reset(a.extra ->> 'codex_5h_reset_at'),
-			              public.openai_window_warmup_parse_reset(a.extra ->> 'codex_global_5h_reset_at')
-			          ) AS reset_at
-		      ) latest
+		  AND EXISTS (
+			      SELECT 1
+			      FROM accounts a
+			      CROSS JOIN LATERAL (
+				          SELECT MAX(candidate) AS reset_at
+				          FROM (VALUES
+				              (public.openai_window_warmup_parse_reset(a.extra ->> 'codex_5h_reset_at')),
+				              (public.openai_window_warmup_parse_reset(a.extra ->> 'codex_global_5h_reset_at'))
+				          ) AS resets(candidate)
+			      ) latest
 	      CROSS JOIN LATERAL (
 	          SELECT lower(trim(COALESCE(
 	              CASE WHEN jsonb_typeof(a.extra -> 'openai_codex_warmup_policy') = 'string'
@@ -330,24 +349,35 @@ func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64
 	        AND a.schedulable
 	        AND a.deleted_at IS NULL
 	        AND (a.expires_at IS NULL OR a.expires_at > NOW())
-	        AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
-		        AND warmup.policy IN ('initial_once', 'continuous')
-		        AND (warmup.policy = 'continuous' OR j.cycle_key LIKE 'initial:%')
-	        -- Never start a synthetic request while the account already exposes
-	        -- any future authoritative reset.  The service re-arms the current
-	        -- cycle (or suppresses it when the reset advanced) after this CAS
-		-- fails, so an equal-to-observed reset cannot race into a send.
-	        AND NOT (latest.reset_at IS NOT NULL AND latest.reset_at > NOW())
-	  )`, id, owner, token, nullableTimeValue(at))
+		        AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
+			        AND warmup.policy IN ('initial_once', 'continuous')
+			        AND (warmup.policy = 'continuous' OR j.cycle_key LIKE 'initial:%')
+		        AND $5::boolean
+		        AND $6::double precision <= 0
+		        -- Only activity in the current durable window suppresses a send.
+		        -- Usage before an observed reset belongs to the preceding window.
+		        AND (a.last_used_at IS NULL OR NOT (
+		            a.last_used_at > GREATEST(j.created_at, COALESCE(j.observed_reset_at, j.created_at))
+		        ))
+		        -- A still-current observed reset remains armed. A newer 0% reset may
+		        -- be /wham's natural rolling reset and is allowed only when it is the
+		        -- same or newer than the account snapshot seen by this final CAS.
+		        AND ($7::timestamptz IS NULL OR $7 <= NOW() OR
+		             j.observed_reset_at IS NULL OR $7 > j.observed_reset_at)
+		        AND (latest.reset_at IS NULL OR latest.reset_at <= NOW() OR
+		             ($7::timestamptz IS NOT NULL AND latest.reset_at <= $7))
+			  )`, id, owner, token, nullableTimeValue(at), evidence.Authoritative, evidence.UsedPercent, nullWarmupTime(evidence.ResetAt))
 }
 
 func (r *openAIWindowWarmupRepository) MarkSuccess(ctx context.Context, id int64, owner, token string, at time.Time, resetAt *time.Time, status int, code string) (bool, error) {
 	return r.fencedQuery(ctx, `
 		WITH updated AS (
 		    UPDATE openai_window_warmup_jobs
-		    SET state = 'completed', sent_at = COALESCE(sent_at, $4),
-		        last_success_at = $4, observed_reset_at = COALESCE($5, observed_reset_at),
-		        status_code = NULLIF($6, 0), last_error_code = NULL, last_error = NULL,
+			    SET state = 'completed', sent_at = COALESCE(sent_at, $4),
+			        last_success_at = $4, observed_reset_at = COALESCE($5, observed_reset_at),
+			        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
+			        uncertain_terminal_observed = FALSE,
+			        status_code = NULLIF($6, 0), last_error_code = NULL, last_error = NULL,
 		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
 		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 		      AND split_part(lease_token, ':', 1) = cycle_generation::text
@@ -356,10 +386,16 @@ func (r *openAIWindowWarmupRepository) MarkSuccess(ctx context.Context, id int64
 		), attempt AS (
 		    INSERT INTO openai_window_warmup_attempts
 		        (job_id, attempt_no, outcome, status_code, error_code, observed_reset_at, started_at, finished_at)
-		    SELECT id, attempt_count, 'success', NULLIF($6, 0), NULLIF($7, ''), $5,
-		           COALESCE(last_attempt_at, $4), $4
-		    FROM updated WHERE attempt_count > 0
-		    ON CONFLICT (job_id, attempt_no) DO NOTHING
+			    SELECT id, attempt_count, 'success', NULLIF($6, 0), NULLIF($7, ''), $5,
+			           COALESCE(last_attempt_at, $4), $4
+			    FROM updated WHERE attempt_count > 0
+			    ON CONFLICT (job_id, attempt_no) DO UPDATE
+			    SET outcome = EXCLUDED.outcome,
+			        status_code = EXCLUDED.status_code,
+			        error_code = EXCLUDED.error_code,
+			        observed_reset_at = EXCLUDED.observed_reset_at,
+			        finished_at = EXCLUDED.finished_at
+			    WHERE openai_window_warmup_attempts.outcome IN ('started', 'uncertain')
 		)
 		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token,
 		nullableTimeValue(at), nullWarmupTime(resetAt), status, code)
@@ -369,8 +405,10 @@ func (r *openAIWindowWarmupRepository) MarkSuppressed(ctx context.Context, id in
 	return r.fencedQuery(ctx, `
 		WITH updated AS (
 		    UPDATE openai_window_warmup_jobs
-		    SET state = 'completed', observed_reset_at = COALESCE($4, observed_reset_at),
-		        status_code = NULL, last_error_code = NULL, last_error = NULL,
+			    SET state = 'completed', observed_reset_at = COALESCE($4, observed_reset_at),
+			        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
+			        uncertain_terminal_observed = FALSE,
+			        status_code = NULL, last_error_code = NULL, last_error = NULL,
 		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
 		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 		      AND split_part(lease_token, ':', 1) = cycle_generation::text
@@ -393,7 +431,7 @@ func (r *openAIWindowWarmupRepository) MarkSuppressed(ctx context.Context, id in
 }
 
 func (r *openAIWindowWarmupRepository) MarkRetry(ctx context.Context, id int64, owner, token string, at, next time.Time, status int, code, message string) (bool, error) {
-	return r.markNonterminal(ctx, id, owner, token, service.OpenAIWindowWarmupStateRetrying, at, next, status, code, message, nil)
+	return r.markNonterminal(ctx, id, owner, token, service.OpenAIWindowWarmupStateRetrying, at, next, status, code, message, nil, service.OpenAIWindowWarmupUncertainEvidence{})
 }
 
 // MarkObservationFailure records a failed authoritative usage check without
@@ -430,21 +468,23 @@ func (r *openAIWindowWarmupRepository) MarkObservationFailure(ctx context.Contex
 }
 
 func (r *openAIWindowWarmupRepository) MarkRateLimited(ctx context.Context, id int64, owner, token string, at, next time.Time, resetAt *time.Time, status int, code string) (bool, error) {
-	return r.markNonterminal(ctx, id, owner, token, service.OpenAIWindowWarmupStateArmed, at, next, status, code, "rate limited until authoritative reset", resetAt)
+	return r.markNonterminal(ctx, id, owner, token, service.OpenAIWindowWarmupStateArmed, at, next, status, code, "rate limited until authoritative reset", resetAt, service.OpenAIWindowWarmupUncertainEvidence{})
 }
 
-func (r *openAIWindowWarmupRepository) MarkUncertain(ctx context.Context, id int64, owner, token string, at, next time.Time, status int, code, message string) (bool, error) {
-	return r.markNonterminal(ctx, id, owner, token, service.OpenAIWindowWarmupStateUncertain, at, next, status, code, message, nil)
+func (r *openAIWindowWarmupRepository) MarkUncertain(ctx context.Context, id int64, owner, token string, at, next time.Time, status int, code, message string, evidence service.OpenAIWindowWarmupUncertainEvidence) (bool, error) {
+	return r.markNonterminal(ctx, id, owner, token, service.OpenAIWindowWarmupStateUncertain, at, next, status, code, message, nil, evidence)
 }
 
 func (r *openAIWindowWarmupRepository) MarkBlocked(ctx context.Context, id int64, owner, token string, at time.Time, status int, code, message string) (bool, error) {
 	return r.fencedQuery(ctx, `
 		WITH updated AS (
 		    UPDATE openai_window_warmup_jobs
-		    SET state = CASE WHEN $4 IN (400, 404) OR $5 = 'blocked_config' THEN 'blocked_config' ELSE 'blocked' END,
-		        status_code = NULLIF($4, 0), last_error_code = NULLIF($5, ''),
-		        last_error = NULLIF($6, ''), last_attempt_at = COALESCE(last_attempt_at, $7),
-		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+			    SET state = CASE WHEN $4 IN (400, 404) OR $5 = 'blocked_config' THEN 'blocked_config' ELSE 'blocked' END,
+			        status_code = NULLIF($4, 0), last_error_code = NULLIF($5, ''),
+			        last_error = NULLIF($6, ''), last_attempt_at = COALESCE(last_attempt_at, $7),
+			        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
+			        uncertain_terminal_observed = FALSE,
+			        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
 		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 		      AND split_part(lease_token, ':', 1) = cycle_generation::text
 		      AND lease_until IS NOT NULL AND lease_until > NOW()
@@ -464,8 +504,10 @@ func (r *openAIWindowWarmupRepository) MarkPaused(ctx context.Context, id int64,
 	return r.fencedQuery(ctx, `
 		WITH updated AS (
 		    UPDATE openai_window_warmup_jobs
-		    SET state = 'paused', last_error_code = NULLIF($4, ''), last_error = NULL,
-		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+			    SET state = 'paused', last_error_code = NULLIF($4, ''), last_error = NULL,
+			        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
+			        uncertain_terminal_observed = FALSE,
+			        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
 		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 		      AND split_part(lease_token, ':', 1) = cycle_generation::text
 		      AND lease_until IS NOT NULL AND lease_until > NOW()
@@ -484,35 +526,53 @@ func (r *openAIWindowWarmupRepository) Reschedule(ctx context.Context, id int64,
 	state = normalizeWarmupState(state)
 	return r.fencedUpdate(ctx, `
 UPDATE openai_window_warmup_jobs
-SET state = $4, next_attempt_at = $5, observed_reset_at = COALESCE($6, observed_reset_at),
+SET state = $4::varchar, next_attempt_at = $5, observed_reset_at = COALESCE($6, observed_reset_at),
+	uncertain_observed_reset_at = CASE WHEN $4::varchar = 'uncertain' THEN uncertain_observed_reset_at ELSE NULL END,
+	uncertain_observed_at = CASE WHEN $4::varchar = 'uncertain' THEN uncertain_observed_at ELSE NULL END,
+	uncertain_terminal_observed = CASE WHEN $4::varchar = 'uncertain' THEN uncertain_terminal_observed ELSE FALSE END,
     lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
 	WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 	  AND split_part(lease_token, ':', 1) = cycle_generation::text
 	  AND lease_until IS NOT NULL AND lease_until > NOW()`, id, owner, token, state, next.UTC(), nullWarmupTime(resetAt))
 }
 
-func (r *openAIWindowWarmupRepository) markNonterminal(ctx context.Context, id int64, owner, token, state string, at, next time.Time, status int, code, message string, resetAt *time.Time) (bool, error) {
+func (r *openAIWindowWarmupRepository) markNonterminal(ctx context.Context, id int64, owner, token, state string, at, next time.Time, status int, code, message string, resetAt *time.Time, uncertain service.OpenAIWindowWarmupUncertainEvidence) (bool, error) {
 	return r.fencedQuery(ctx, `
-		WITH updated AS (
-		    UPDATE openai_window_warmup_jobs
-		    SET state = $4, next_attempt_at = $5, status_code = NULLIF($6, 0),
-		        last_error_code = NULLIF($7, ''), last_error = NULLIF($8, ''),
-		        observed_reset_at = COALESCE($9, observed_reset_at),
-		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+			WITH updated AS (
+			    UPDATE openai_window_warmup_jobs
+				    SET state = $4::varchar, next_attempt_at = $5, status_code = NULLIF($6, 0),
+			        last_error_code = NULLIF($7, ''), last_error = NULLIF($8, ''),
+			        observed_reset_at = COALESCE($9, observed_reset_at),
+			        uncertain_observed_reset_at = CASE
+				            WHEN $4::varchar = 'uncertain' AND $10::boolean THEN $11::timestamptz
+				            WHEN $4::varchar = 'uncertain' THEN uncertain_observed_reset_at
+			            ELSE NULL
+			        END,
+			        uncertain_observed_at = CASE
+				            WHEN $4::varchar = 'uncertain' AND $10::boolean THEN NOW()
+				            WHEN $4::varchar = 'uncertain' THEN uncertain_observed_at
+			            ELSE NULL
+			        END,
+			        uncertain_terminal_observed = CASE
+				            WHEN $4::varchar = 'uncertain' THEN uncertain_terminal_observed OR $12::boolean
+			            ELSE FALSE
+			        END,
+			        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
 		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 		      AND split_part(lease_token, ':', 1) = cycle_generation::text
 		      AND lease_until IS NOT NULL AND lease_until > NOW()
 		    RETURNING id, attempt_count, last_attempt_at
-		), attempt AS (
-		    INSERT INTO openai_window_warmup_attempts
-		        (job_id, attempt_no, outcome, status_code, error_code, observed_reset_at, started_at, finished_at)
-		    SELECT id, attempt_count, $11, NULLIF($6, 0), NULLIF($7, ''), $9,
-		           COALESCE(last_attempt_at, $10), $10
-		    FROM updated WHERE attempt_count > 0
-		    ON CONFLICT (job_id, attempt_no) DO NOTHING
-		)
-		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, state, next.UTC(), status, code, message,
-		nullWarmupTime(resetAt), nullableTimeValue(at), normalizeAttemptOutcome(state))
+			), attempt AS (
+			    INSERT INTO openai_window_warmup_attempts
+			        (job_id, attempt_no, outcome, status_code, error_code, observed_reset_at, started_at, finished_at)
+			    SELECT id, attempt_count, $14, NULLIF($6, 0), NULLIF($7, ''), COALESCE($9, $11),
+			           COALESCE(last_attempt_at, $13), $13
+			    FROM updated WHERE attempt_count > 0
+			    ON CONFLICT (job_id, attempt_no) DO NOTHING
+			)
+			SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, state, next.UTC(), status, code, message,
+		nullWarmupTime(resetAt), uncertain.Authoritative, nullWarmupTime(uncertain.ResetAt),
+		uncertain.Terminal, nullableTimeValue(at), normalizeAttemptOutcome(state))
 }
 
 func (r *openAIWindowWarmupRepository) GetByID(ctx context.Context, id int64) (*service.OpenAIWindowWarmupJob, error) {
@@ -666,12 +726,13 @@ type warmupRowScanner interface{ Scan(...any) error }
 
 func scanWarmupJob(row warmupRowScanner) (*service.OpenAIWindowWarmupJob, error) {
 	job := &service.OpenAIWindowWarmupJob{}
-	var observed, sent, until, lastAttempt, lastSuccess sql.NullTime
+	var observed, uncertainReset, uncertainAt, sent, until, lastAttempt, lastSuccess sql.NullTime
 	var owner, token, errorCode, lastError sql.NullString
 	var statusCode sql.NullInt64
 	err := row.Scan(
 		&job.ID, &job.AccountID, &job.QuotaScope, &job.State, &job.Trigger,
-		&job.CycleKey, &job.CycleGeneration, &observed, &job.NextAttemptAt,
+		&job.CycleKey, &job.CycleGeneration, &observed, &uncertainReset, &uncertainAt,
+		&job.UncertainTerminalObserved, &job.NextAttemptAt,
 		&job.AttemptCount, &sent, &owner, &token, &until, &lastAttempt,
 		&lastSuccess, &statusCode, &errorCode, &lastError, &job.CreatedAt, &job.UpdatedAt,
 	)
@@ -679,6 +740,14 @@ func scanWarmupJob(row warmupRowScanner) (*service.OpenAIWindowWarmupJob, error)
 		return nil, err
 	}
 	warmupAssignNullable(job, observed, sent, until, lastAttempt, lastSuccess, statusCode, owner, token, lastError, errorCode)
+	if uncertainReset.Valid {
+		v := uncertainReset.Time.UTC()
+		job.UncertainObservedResetAt = &v
+	}
+	if uncertainAt.Valid {
+		v := uncertainAt.Time.UTC()
+		job.UncertainObservedAt = &v
+	}
 	return job, nil
 }
 

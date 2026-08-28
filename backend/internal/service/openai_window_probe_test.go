@@ -206,6 +206,16 @@ func TestParseOpenAIWindowWarmupResultRejectsGenericAndWeeklyResetJSON(t *testin
 	}
 }
 
+func TestWarmupResetFromHeadersIgnoresZeroResetAfter(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("x-codex-primary-window-minutes", "10080")
+	headers.Set("x-codex-primary-reset-after-seconds", "604800")
+	headers.Set("x-codex-secondary-window-minutes", "300")
+	headers.Set("x-codex-secondary-reset-after-seconds", "0")
+
+	require.Nil(t, warmupResetFromHeaders(headers))
+}
+
 func TestOpenAICodexWindowProbeMarksPostSendEOFUncertain(t *testing.T) {
 	executor := &openAIWindowProbeExecutorStub{
 		result: &OpenAIOutboundResult{StatusCode: http.StatusOK, Started: true, EOF: true},
