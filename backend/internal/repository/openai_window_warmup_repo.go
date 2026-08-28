@@ -359,11 +359,16 @@ func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64
 		        AND (a.last_used_at IS NULL OR NOT (
 		            a.last_used_at > GREATEST(j.created_at, COALESCE(j.observed_reset_at, j.created_at))
 		        ))
-		        -- A still-current observed reset remains armed. A newer 0% reset may
-		        -- be /wham's natural rolling reset and is allowed only when it is the
-		        -- same or newer than the account snapshot seen by this final CAS.
-		        AND ($7::timestamptz IS NULL OR $7 <= NOW() OR
-		             j.observed_reset_at IS NULL OR $7 > j.observed_reset_at)
+			        -- A still-current observed reset remains armed except for an initial
+			        -- cycle with authoritative 0% evidence. That equality is the normal
+			        -- first idle projection and the probe must advance it to succeed.
+			        AND ($7::timestamptz IS NULL OR $7 <= NOW() OR
+			             j.observed_reset_at IS NULL OR $7 > j.observed_reset_at OR
+			             (j.cycle_key LIKE 'initial:%' AND $7 = j.observed_reset_at AND
+			              CASE WHEN jsonb_typeof(a.extra -> 'codex_5h_used_percent') = 'number'
+			                  THEN (a.extra ->> 'codex_5h_used_percent')::NUMERIC <= 0
+			                  ELSE FALSE
+			              END))
 		        AND (latest.reset_at IS NULL OR latest.reset_at <= NOW() OR
 		             ($7::timestamptz IS NOT NULL AND latest.reset_at <= $7))
 			  )`, id, owner, token, nullableTimeValue(at), evidence.Authoritative, evidence.UsedPercent, nullWarmupTime(evidence.ResetAt))

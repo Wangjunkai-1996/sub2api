@@ -685,6 +685,31 @@ func TestOpenAIWindowWarmupUsagePreflightSendsForIdleRollingReset(t *testing.T) 
 	require.Equal(t, confirmedReset.Format(time.RFC3339Nano), accountRepo.updates[0]["codex_5h_reset_at"])
 }
 
+func TestOpenAIWindowWarmupFreshIdleInitialCycleDoesNotRearmEqualReset(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	rollingReset := now.Add(5 * time.Hour)
+	confirmedReset := rollingReset.Add(time.Minute)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Extra["codex_5h_used_percent"] = float64(0)
+	account.Extra["codex_5h_reset_at"] = rollingReset.Format(time.RFC3339)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{result: &OpenAIWindowProbeResult{
+		StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.completed", ResetAt: &confirmedReset,
+	}}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+	claim := warmupTestClaim(account.ID, rollingReset)
+	claim.Job.CycleKey = warmupInitialCycleKey(account, warmupAccountGeneration(account))
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, 1, usage.calls)
+	require.Equal(t, 1, repo.started)
+	require.Equal(t, 1, probe.calls)
+	require.Equal(t, 1, repo.successCalls)
+	require.Equal(t, "completed", repo.code)
+}
+
 func TestOpenAIWindowWarmupMarkStartedCASRejectsNewerIdleRollingResetWithoutSuppressing(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	oldReset := now.Add(-time.Minute)

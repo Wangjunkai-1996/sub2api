@@ -838,7 +838,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 				s.completeSuppressedCycle(ctx, claim, account, latestReset, "real_traffic_suppressed")
 				return
 			}
-		} else {
+		} else if !warmupInitialCycleHasIdleSnapshot(account, job) {
 			s.reschedule(ctx, claim, s.warmupDueAt(job.CycleKey, latestReset), OpenAIWindowWarmupStateArmed, latestReset)
 			return
 		}
@@ -976,7 +976,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 				s.completeSuppressedCycle(ctx, claim, account, fiveHourReset, "usage_preflight_suppressed")
 				return
 			}
-		} else {
+		} else if !warmupInitialCycleHasIdleObservation(job, fiveHour.UsedPercent) {
 			next := s.warmupDueAt(warmupResetCycleKey(*fiveHourReset), fiveHourReset)
 			s.reschedule(ctx, claim, next, OpenAIWindowWarmupStateArmed, fiveHourReset)
 			return
@@ -1778,6 +1778,18 @@ func warmupAccountShouldWaitForReset(a *Account, resetAt *time.Time, now time.Ti
 	}
 	usedPercent, present := resolveAccountExtraNumber(a.Extra, "codex_5h_used_percent")
 	return !present || usedPercent > 0
+}
+
+func warmupInitialCycleHasIdleSnapshot(account *Account, job *OpenAIWindowWarmupJob) bool {
+	if account == nil || job == nil || !strings.HasPrefix(job.CycleKey, "initial:") {
+		return false
+	}
+	usedPercent, present := resolveAccountExtraNumber(account.Extra, "codex_5h_used_percent")
+	return present && usedPercent <= 0
+}
+
+func warmupInitialCycleHasIdleObservation(job *OpenAIWindowWarmupJob, usedPercent float64) bool {
+	return job != nil && strings.HasPrefix(job.CycleKey, "initial:") && usedPercent <= 0
 }
 
 func parseWarmupTime(value any) time.Time {

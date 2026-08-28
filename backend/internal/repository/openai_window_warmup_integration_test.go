@@ -114,7 +114,8 @@ func TestOpenAIWindowWarmupMigrationDoesNotArmIdleRollingReset(t *testing.T) {
 		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
 	})
 
-	job, err := NewOpenAIWindowWarmupRepository(integrationDB).GetCurrent(
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, err := repo.GetCurrent(
 		ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal,
 	)
 	require.NoError(t, err)
@@ -122,6 +123,17 @@ func TestOpenAIWindowWarmupMigrationDoesNotArmIdleRollingReset(t *testing.T) {
 	require.WithinDuration(t, reset, *job.ObservedResetAt, time.Second)
 	require.False(t, job.NextAttemptAt.Before(now))
 	require.LessOrEqual(t, job.NextAttemptAt.Sub(now), 31*time.Second)
+
+	_, err = integrationDB.ExecContext(ctx,
+		`UPDATE openai_window_warmup_jobs SET next_attempt_at = NOW() WHERE id = $1`, job.ID)
+	require.NoError(t, err)
+	claims, err := repo.ClaimDue(ctx, "idle-initial-"+uuid.NewString(), 2*time.Minute, 1, []int64{account.ID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	started, err := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, now,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true, UsedPercent: 0, ResetAt: &reset})
+	require.NoError(t, err)
+	require.True(t, started, "a fresh initial 0%% projection must reach the probe without a second account refresh")
 }
 
 func TestOpenAIWindowWarmupMigrationBackfillsOnlyUntouchedIdleArmedJobs(t *testing.T) {
@@ -276,6 +288,172 @@ func TestOpenAIWindowWarmupMigrationBackfillsOnlyUntouchedIdleArmedJobs(t *testi
 		require.Equal(t, service.OpenAIWindowWarmupStateArmed, state, seeded.name)
 		require.WithinDuration(t, seeded.nextBefore, nextAttemptAt, time.Microsecond, seeded.name)
 	}
+}
+
+func TestOpenAIWindowWarmupMigrationPreservesIdleResetBaselineAcrossAccountRefresh(t *testing.T) {
+	ctx := context.Background()
+	previousSQL, err := appmigrations.FS.ReadFile("232_openai_window_warmup_latest_reset.sql")
+	require.NoError(t, err)
+	fixedSQL, err := appmigrations.FS.ReadFile("233_openai_window_warmup_idle_reset_baseline.sql")
+	require.NoError(t, err)
+
+	const (
+		previousReplay = "996_test_openai_window_warmup_previous_idle_trigger.sql"
+		firstReplay    = "997_test_openai_window_warmup_idle_baseline.sql"
+		secondReplay   = "998_test_openai_window_warmup_idle_baseline_idempotent.sql"
+	)
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), string(fixedSQL))
+		_, _ = integrationDB.ExecContext(context.Background(),
+			`DELETE FROM schema_migrations WHERE filename IN ($1, $2, $3)`,
+			previousReplay, firstReplay, secondReplay)
+	})
+	require.NoError(t, applyMigrationsFS(ctx, integrationDB, fstest.MapFS{
+		previousReplay: &fstest.MapFile{Data: previousSQL},
+	}))
+
+	now := time.Now().UTC().Truncate(time.Second)
+	resetOne := now.Add(5 * time.Hour)
+	account := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name: "warmup-idle-baseline-" + uuid.NewString(), Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Extra: map[string]any{
+			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			"codex_5h_used_percent":                 float64(0),
+			"codex_5h_reset_at":                     resetOne.Format(time.RFC3339Nano),
+		},
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
+	})
+
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, err := repo.GetCurrent(ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, job.State)
+	require.WithinDuration(t, resetOne, *job.ObservedResetAt, time.Microsecond)
+	attemptedAccount := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name: "warmup-idle-baseline-attempted-" + uuid.NewString(), Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Extra: map[string]any{
+			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			"codex_5h_used_percent":                 float64(0),
+			"codex_5h_reset_at":                     resetOne.Format(time.RFC3339Nano),
+		},
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, attemptedAccount.ID)
+	})
+	attemptedJob, err := repo.GetCurrent(ctx, attemptedAccount.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	sentAccount := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name: "warmup-idle-baseline-sent-" + uuid.NewString(), Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Extra: map[string]any{
+			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			"codex_5h_used_percent":                 float64(0),
+			"codex_5h_reset_at":                     resetOne.Format(time.RFC3339Nano),
+		},
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, sentAccount.ID)
+	})
+	sentJob, err := repo.GetCurrent(ctx, sentAccount.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+
+	resetTwo := resetOne.Add(2 * time.Minute)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE accounts
+		SET extra = jsonb_set(
+			jsonb_set(extra, '{codex_5h_used_percent}', '0'::jsonb, true),
+			'{codex_5h_reset_at}', to_jsonb($2::text), true
+		)
+		WHERE id = $1`, account.ID, resetTwo.Format(time.RFC3339Nano))
+	require.NoError(t, err)
+	job, err = repo.GetCurrent(ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	// This assertion proves the test first reproduced the migration-232 bug.
+	require.WithinDuration(t, resetTwo, *job.ObservedResetAt, time.Microsecond)
+
+	staleNext := resetTwo.Add(time.Hour)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET state = 'armed', next_attempt_at = $2
+		WHERE id = $1`, job.ID, staleNext)
+	require.NoError(t, err)
+	attemptedNext := staleNext.Add(time.Minute)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET state = 'armed', next_attempt_at = $2, attempt_count = 1
+		WHERE id = $1`, attemptedJob.ID, attemptedNext)
+	require.NoError(t, err)
+	sentNext := attemptedNext.Add(time.Minute)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET state = 'armed', next_attempt_at = $2, sent_at = NOW()
+		WHERE id = $1`, sentJob.ID, sentNext)
+	require.NoError(t, err)
+
+	replayFS := fstest.MapFS{
+		firstReplay:  &fstest.MapFile{Data: fixedSQL},
+		secondReplay: &fstest.MapFile{Data: fixedSQL},
+	}
+	var dbBefore time.Time
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `SELECT NOW()`).Scan(&dbBefore))
+	require.NoError(t, applyMigrationsFS(ctx, integrationDB, replayFS))
+	var dbAfter time.Time
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `SELECT NOW()`).Scan(&dbAfter))
+
+	job, err = repo.GetCurrent(ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, job.State)
+	require.WithinDuration(t, resetTwo, *job.ObservedResetAt, time.Microsecond)
+	require.False(t, job.NextAttemptAt.Before(dbBefore))
+	require.LessOrEqual(t, job.NextAttemptAt.Sub(dbAfter), 30*time.Second)
+	attemptedJob, err = repo.GetCurrent(ctx, attemptedAccount.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateArmed, attemptedJob.State)
+	require.Equal(t, 1, attemptedJob.AttemptCount)
+	require.WithinDuration(t, attemptedNext, attemptedJob.NextAttemptAt, time.Microsecond,
+		"an attempted cycle must retain its state and schedule")
+	sentJob, err = repo.GetCurrent(ctx, sentAccount.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateArmed, sentJob.State)
+	require.NotNil(t, sentJob.SentAt)
+	require.WithinDuration(t, sentNext, sentJob.NextAttemptAt, time.Microsecond,
+		"a sent cycle must retain its state and schedule")
+
+	resetThree := resetTwo.Add(2 * time.Minute)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE accounts
+		SET extra = jsonb_set(
+			jsonb_set(extra, '{codex_5h_used_percent}', '0'::jsonb, true),
+			'{codex_5h_reset_at}', to_jsonb($2::text), true
+		)
+		WHERE id = $1`, account.ID, resetThree.Format(time.RFC3339Nano))
+	require.NoError(t, err)
+	job, err = repo.GetCurrent(ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, job.State)
+	require.WithinDuration(t, resetTwo, *job.ObservedResetAt, time.Microsecond,
+		"a later rolling 0%% reset must not replace the durable comparison baseline")
+
+	resetActive := resetThree.Add(2 * time.Minute)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE accounts
+		SET extra = jsonb_set(
+			jsonb_set(extra, '{codex_5h_used_percent}', '1'::jsonb, true),
+			'{codex_5h_reset_at}', to_jsonb($2::text), true
+		)
+		WHERE id = $1`, account.ID, resetActive.Format(time.RFC3339Nano))
+	require.NoError(t, err)
+	job, err = repo.GetCurrent(ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateArmed, job.State)
+	require.WithinDuration(t, resetActive, *job.ObservedResetAt, time.Microsecond,
+		"positive usage must still replace the baseline with the authoritative reset")
+	require.True(t, job.NextAttemptAt.After(resetActive.Add(89*time.Second)))
+	require.LessOrEqual(t, job.NextAttemptAt.Sub(resetActive), 120*time.Second)
 }
 
 func TestOpenAIWindowWarmupMigrationCurrentJobIndexMatchesLookupOrder(t *testing.T) {
@@ -577,6 +755,7 @@ func TestOpenAIWindowWarmupRepositoryMarkStartedPolicyAndResetCAS(t *testing.T) 
 		name          string
 		policy        string
 		policyExtra   map[string]any
+		initialCycle  bool
 		observedReset *time.Time
 		accountReset  *time.Time
 		evidence      service.OpenAIWindowWarmupStartEvidence
@@ -613,6 +792,16 @@ func TestOpenAIWindowWarmupRepositoryMarkStartedPolicyAndResetCAS(t *testing.T) 
 			evidence: service.OpenAIWindowWarmupStartEvidence{Authoritative: true, ResetAt: &newerReset}, wantStarted: false,
 		},
 		{
+			name: "initial idle equal reset starts", policy: service.OpenAIWindowWarmupPolicyContinuous,
+			initialCycle: true, observedReset: &newerReset, accountReset: &newerReset,
+			evidence: service.OpenAIWindowWarmupStartEvidence{Authoritative: true, ResetAt: &newerReset}, wantStarted: true,
+		},
+		{
+			name: "initial active equal reset stays armed", policy: service.OpenAIWindowWarmupPolicyContinuous,
+			initialCycle: true, observedReset: &newerReset, accountReset: &newerReset,
+			evidence: service.OpenAIWindowWarmupStartEvidence{Authoritative: true, UsedPercent: 1, ResetAt: &newerReset}, wantStarted: false,
+		},
+		{
 			name: "idle rolling reset allows start", policy: service.OpenAIWindowWarmupPolicyContinuous,
 			observedReset: &olderReset, accountReset: &newerReset,
 			evidence: service.OpenAIWindowWarmupStartEvidence{Authoritative: true, ResetAt: &newerReset}, wantStarted: true,
@@ -644,9 +833,13 @@ func TestOpenAIWindowWarmupRepositoryMarkStartedPolicyAndResetCAS(t *testing.T) 
 			ctx := context.Background()
 			accountID := createWarmupIntegrationAccount(t)
 			repo := NewOpenAIWindowWarmupRepository(integrationDB)
+			cycleKey := "cas:" + uuid.NewString()
+			if tc.initialCycle {
+				cycleKey = "initial:41"
+			}
 			job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
 				AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
-				CycleKey: "cas:" + uuid.NewString(), CycleGeneration: 41,
+				CycleKey: cycleKey, CycleGeneration: 41,
 				Trigger: service.OpenAIWindowWarmupTriggerReset, ObservedResetAt: tc.observedReset,
 				NextAttemptAt: now.Add(-time.Minute),
 			})
@@ -660,6 +853,9 @@ func TestOpenAIWindowWarmupRepositoryMarkStartedPolicyAndResetCAS(t *testing.T) 
 				}
 				if tc.policy != "" {
 					extra[service.OpenAICodexWarmupPolicyExtraKey] = tc.policy
+				}
+				if tc.initialCycle {
+					extra["codex_5h_used_percent"] = tc.evidence.UsedPercent
 				}
 				if tc.accountReset != nil {
 					extra["codex_5h_reset_at"] = tc.accountReset.Format(time.RFC3339Nano)
