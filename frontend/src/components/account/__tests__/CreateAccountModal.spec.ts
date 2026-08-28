@@ -7,12 +7,20 @@ const {
   probeUpstreamBillingMock,
   importCodexSessionMock,
   createOpenAICodexPATMock,
+  getSettingsMock,
+  generateAuthUrlMock,
+  exchangeCodeMock,
+  refreshOpenAITokenMock,
   authIsSimpleMode,
 } = vi.hoisted(() => ({
   createAccountMock: vi.fn(),
   probeUpstreamBillingMock: vi.fn(),
   importCodexSessionMock: vi.fn(),
   createOpenAICodexPATMock: vi.fn(),
+  getSettingsMock: vi.fn(),
+  generateAuthUrlMock: vi.fn(),
+  exchangeCodeMock: vi.fn(),
+  refreshOpenAITokenMock: vi.fn(),
   authIsSimpleMode: { value: true },
 }))
 
@@ -40,10 +48,13 @@ vi.mock('@/api/admin', () => ({
       checkMixedChannelRisk: vi.fn().mockResolvedValue({ has_risk: false }),
       importCodexSession: importCodexSessionMock,
       createOpenAICodexPAT: createOpenAICodexPATMock,
+      generateAuthUrl: generateAuthUrlMock,
+      exchangeCode: exchangeCodeMock,
+      refreshOpenAIToken: refreshOpenAITokenMock,
     },
     settings: {
       getWebSearchEmulationConfig: vi.fn().mockResolvedValue({ enabled: false, providers: [] }),
-      getSettings: vi.fn().mockResolvedValue({}),
+      getSettings: getSettingsMock,
     },
     tlsFingerprintProfiles: {
       list: vi.fn().mockResolvedValue([]),
@@ -80,10 +91,17 @@ const OAuthAuthorizationFlowStub = defineComponent({
     showCodexPatOption: Boolean,
     initialInputMethod: String,
   },
-  data: () => ({ inputMethod: 'manual' }),
-  emits: ['import-codex-session', 'import-codex-pat'],
+  data: () => ({ inputMethod: 'manual', authCode: '', oauthState: '' }),
+  emits: [
+    'generate-url',
+    'validate-refresh-token',
+    'import-codex-session',
+    'import-codex-pat',
+  ],
   template: `
     <div>
+      <button data-testid="generate-auth-url" @click="$emit('generate-url')">generate</button>
+      <button data-testid="validate-refresh-token" @click="$emit('validate-refresh-token', 'refresh-token')">refresh</button>
       <button data-testid="import-codex-session" @click="$emit('import-codex-session', 'session-json')">session</button>
       <button data-testid="import-codex-pat" @click="$emit('import-codex-pat', 'pat-token')">pat</button>
     </div>
@@ -199,6 +217,21 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       warnings: [],
     })
     createOpenAICodexPATMock.mockReset().mockResolvedValue({})
+    getSettingsMock.mockReset().mockResolvedValue({})
+    generateAuthUrlMock.mockReset().mockResolvedValue({
+      auth_url: 'https://auth.example/authorize?state=oauth-state',
+      session_id: 'oauth-session',
+    })
+    exchangeCodeMock.mockReset().mockResolvedValue({
+      access_token: 'access-token',
+      refresh_token: 'refresh-token',
+      expires_at: 123,
+    })
+    refreshOpenAITokenMock.mockReset().mockResolvedValue({
+      access_token: 'access-token',
+      refresh_token: 'refresh-token',
+      expires_at: 123,
+    })
   })
 
   it('hides only the redundant account toggle when every selected group enables tier pricing', async () => {
@@ -443,5 +476,111 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     await flushPromises()
 
     expect(createOpenAICodexPATMock.mock.calls[0]?.[0]?.extra?.openai_long_context_billing_enabled).toBe(false)
+  })
+
+  it('uses the global continuous warmup default for normal OpenAI OAuth creation', async () => {
+    getSettingsMock.mockResolvedValue({
+      openai_window_warmup_default_policy: 'continuous',
+    })
+    const wrapper = mountModal()
+    await flushPromises()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('OpenAI OAuth')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="validate-refresh-token"]').trigger('click')
+    await flushPromises()
+
+    expect(createAccountMock).toHaveBeenCalledTimes(1)
+    expect(createAccountMock.mock.calls[0]?.[0]).toMatchObject({
+      platform: 'openai',
+      type: 'oauth',
+      openai_codex_warmup_policy: 'continuous',
+    })
+    expect(createAccountMock.mock.calls[0]?.[0]?.extra).not.toHaveProperty(
+      'openai_codex_warmup_policy'
+    )
+  })
+
+  it('omits the warmup policy when loading global settings fails', async () => {
+    getSettingsMock.mockRejectedValue(new Error('settings unavailable'))
+    const wrapper = await openCodexImportStep()
+    await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
+    await flushPromises()
+
+    expect(importCodexSessionMock).toHaveBeenCalledTimes(1)
+    expect(importCodexSessionMock.mock.calls[0]?.[0]).not.toHaveProperty(
+      'openai_codex_warmup_policy'
+    )
+  })
+
+  it('sends an explicit off warmup policy selected by the user', async () => {
+    getSettingsMock.mockResolvedValue({
+      openai_window_warmup_default_policy: 'continuous',
+    })
+    const wrapper = mountModal()
+    await flushPromises()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('[data-testid="create-codex-warmup-off"]').trigger('click')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex PAT')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="import-codex-pat"]').trigger('click')
+    await flushPromises()
+
+    expect(createOpenAICodexPATMock).toHaveBeenCalledTimes(1)
+    expect(createOpenAICodexPATMock.mock.calls[0]?.[0]?.openai_codex_warmup_policy).toBe('off')
+  })
+
+  it('does not let a slow global default overwrite a user selection', async () => {
+    let resolveSettings: ((value: Record<string, unknown>) => void) | undefined
+    getSettingsMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSettings = resolve
+      })
+    )
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('[data-testid="create-codex-warmup-initial_once"]').trigger('click')
+
+    resolveSettings?.({ openai_window_warmup_default_policy: 'continuous' })
+    await flushPromises()
+
+    expect(
+      wrapper.get('[data-testid="create-codex-warmup-initial_once"]').attributes('aria-pressed')
+    ).toBe('true')
+    expect(
+      wrapper.get('[data-testid="create-codex-warmup-continuous"]').attributes('aria-pressed')
+    ).toBe('false')
+
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex session')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
+    await flushPromises()
+
+    expect(importCodexSessionMock.mock.calls[0]?.[0]?.openai_codex_warmup_policy).toBe(
+      'initial_once'
+    )
+  })
+
+  it('passes the resolved warmup policy through the authorization-code exchange path', async () => {
+    getSettingsMock.mockResolvedValue({
+      openai_window_warmup_default_policy: 'initial_once',
+    })
+    const wrapper = mountModal()
+    await flushPromises()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('OAuth exchange')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+
+    const flow = wrapper.getComponent(OAuthAuthorizationFlowStub)
+    await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')
+    await flushPromises()
+    flow.vm.authCode = 'authorization-code'
+    flow.vm.oauthState = 'oauth-state'
+    await wrapper.vm.$nextTick()
+    await selectButtonByText(wrapper, 'admin.accounts.oauth.completeAuth')
+    await flushPromises()
+
+    expect(exchangeCodeMock).toHaveBeenCalledTimes(1)
+    expect(createAccountMock.mock.calls[0]?.[0]?.openai_codex_warmup_policy).toBe('initial_once')
   })
 })

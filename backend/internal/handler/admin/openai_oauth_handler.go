@@ -22,6 +22,20 @@ type OpenAIOAuthHandler struct {
 	adminService       service.AdminService
 	quotaService       openAIQuotaService
 	rateLimitService   openAIAccountStateRecoverer
+	openAIWindowWarmup *service.OpenAIWindowWarmupService
+	settingService     *service.SettingService
+}
+
+func (h *OpenAIOAuthHandler) SetOpenAIWindowWarmupService(warmup *service.OpenAIWindowWarmupService, settings *service.SettingService) {
+	h.openAIWindowWarmup = warmup
+	h.settingService = settings
+}
+
+type openAIAccountWithWarmupResponse struct {
+	*dto.Account
+	WarmupQueued       bool                              `json:"warmup_queued"`
+	WarmupStatus       string                            `json:"warmup_status"`
+	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
 }
 
 type openAIQuotaService interface {
@@ -184,6 +198,7 @@ type OpenAICodexPATCreateRequest struct {
 	Extra                   map[string]any `json:"extra"`
 	SkipDefaultGroupBind    *bool          `json:"skip_default_group_bind"`
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"`
+	OpenAICodexWarmupPolicy *string        `json:"openai_codex_warmup_policy"`
 }
 
 // RefreshToken refreshes an OpenAI OAuth token
@@ -293,15 +308,16 @@ func (h *OpenAIOAuthHandler) RefreshAccountToken(c *gin.Context) {
 // POST /api/v1/admin/openai/create-from-oauth
 func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 	var req struct {
-		SessionID   string  `json:"session_id" binding:"required"`
-		Code        string  `json:"code" binding:"required"`
-		State       string  `json:"state" binding:"required"`
-		RedirectURI string  `json:"redirect_uri"`
-		ProxyID     *int64  `json:"proxy_id"`
-		Name        string  `json:"name"`
-		Concurrency int     `json:"concurrency"`
-		Priority    int     `json:"priority"`
-		GroupIDs    []int64 `json:"group_ids"`
+		SessionID               string  `json:"session_id" binding:"required"`
+		Code                    string  `json:"code" binding:"required"`
+		State                   string  `json:"state" binding:"required"`
+		RedirectURI             string  `json:"redirect_uri"`
+		ProxyID                 *int64  `json:"proxy_id"`
+		Name                    string  `json:"name"`
+		Concurrency             int     `json:"concurrency"`
+		Priority                int     `json:"priority"`
+		GroupIDs                []int64 `json:"group_ids"`
+		OpenAICodexWarmupPolicy *string `json:"openai_codex_warmup_policy"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request: "+err.Error())
@@ -336,12 +352,17 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 	}
 
 	// Create account
+	policy, err := resolveOpenAIWindowWarmupImportPolicy(c.Request.Context(), req.OpenAICodexWarmupPolicy, h.settingService)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 	account, err := h.adminService.CreateAccount(c.Request.Context(), &service.CreateAccountInput{
 		Name:        name,
 		Platform:    platform,
 		Type:        "oauth",
 		Credentials: credentials,
-		Extra:       nil,
+		Extra:       withOpenAIWindowWarmupPolicy(nil, policy),
 		ProxyID:     req.ProxyID,
 		Concurrency: req.Concurrency,
 		Priority:    req.Priority,
@@ -352,7 +373,15 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, dto.AccountFromService(account))
+	warmupStatus, err := scheduleOpenAIWindowWarmup(c.Request.Context(), h.openAIWindowWarmup, account, service.OpenAIWindowWarmupTriggerImport)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, openAIAccountWithWarmupResponse{
+		Account: dto.AccountFromService(account), WarmupQueued: warmupStatus != nil && warmupStatus.Queued,
+		WarmupStatus: openAIWindowWarmupImportStatus(warmupStatus), OpenAIWindowWarmup: warmupStatus,
+	})
 }
 
 // CreateAccountFromCodexPAT creates an OpenAI OAuth account from a Codex at-* personal access token.
@@ -406,6 +435,12 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		"imported_at":         time.Now().UTC().Format(time.RFC3339),
 		"access_token_sha256": codexTokenFingerprint(req.AccessToken),
 	})
+	policy, err := resolveOpenAIWindowWarmupImportPolicy(c.Request.Context(), req.OpenAICodexWarmupPolicy, h.settingService)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	extra = withOpenAIWindowWarmupPolicy(extra, policy)
 
 	concurrency := 3
 	if req.Concurrency != nil {
@@ -443,7 +478,15 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, dto.AccountFromService(account))
+	warmupStatus, err := scheduleOpenAIWindowWarmup(c.Request.Context(), h.openAIWindowWarmup, account, service.OpenAIWindowWarmupTriggerImport)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, openAIAccountWithWarmupResponse{
+		Account: dto.AccountFromService(account), WarmupQueued: warmupStatus != nil && warmupStatus.Queued,
+		WarmupStatus: openAIWindowWarmupImportStatus(warmupStatus), OpenAIWindowWarmup: warmupStatus,
+	})
 }
 
 func buildOpenAICodexPATAccountName(name string, tokenInfo *service.OpenAITokenInfo) string {

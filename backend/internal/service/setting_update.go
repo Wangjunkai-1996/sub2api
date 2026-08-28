@@ -492,6 +492,24 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyCodexCLIOnlyWhitelist] = strings.TrimSpace(settings.CodexCLIOnlyWhitelist)
 	updates[SettingKeyCodexCLIOnlyAllowAppServerClients] = strconv.FormatBool(settings.CodexCLIOnlyAllowAppServerClients)
 	updates[SettingKeyCodexCLIOnlyEngineFingerprintSignals] = strings.TrimSpace(settings.CodexCLIOnlyEngineFingerprintSignals)
+	if err := validateOpenAIWindowWarmupSettings(settings); err != nil {
+		return nil, err
+	}
+	warmupAllowlist, err := json.Marshal(settings.OpenAIWindowWarmupAllowlist)
+	if err != nil {
+		return nil, fmt.Errorf("marshal OpenAI window warmup allowlist: %w", err)
+	}
+	updates[SettingKeyOpenAIWindowWarmupEnabled] = strconv.FormatBool(settings.OpenAIWindowWarmupEnabled)
+	updates[SettingKeyOpenAIWindowWarmupDefaultPolicy] = settings.OpenAIWindowWarmupDefaultPolicy
+	updates[SettingKeyOpenAIWindowWarmupAllowlist] = string(warmupAllowlist)
+	updates[SettingKeyOpenAIWindowWarmupProbeModel] = strings.TrimSpace(settings.OpenAIWindowWarmupProbeModel)
+	updates[SettingKeyOpenAIWindowWarmupWorkerConcurrency] = strconv.Itoa(settings.OpenAIWindowWarmupWorkerConcurrency)
+	updates[SettingKeyOpenAIWindowWarmupGlobalQPS] = strconv.FormatFloat(settings.OpenAIWindowWarmupGlobalQPS, 'f', -1, 64)
+	updates[SettingKeyOpenAIWindowWarmupBatchSize] = strconv.Itoa(settings.OpenAIWindowWarmupBatchSize)
+	updates[SettingKeyOpenAIWindowWarmupScanSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupScanSeconds)
+	updates[SettingKeyOpenAIWindowWarmupRequestTimeoutSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupRequestTimeoutSeconds)
+	updates[SettingKeyOpenAIWindowWarmupLeaseSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupLeaseSeconds)
+	updates[SettingKeyOpenAIWindowWarmupResetGraceSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupResetGraceSeconds)
 	updates[SettingPaymentVisibleMethodAlipaySource] = settings.PaymentVisibleMethodAlipaySource
 	updates[SettingPaymentVisibleMethodWxpaySource] = settings.PaymentVisibleMethodWxpaySource
 	updates[SettingPaymentVisibleMethodAlipayEnabled] = strconv.FormatBool(settings.PaymentVisibleMethodAlipayEnabled)

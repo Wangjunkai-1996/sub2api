@@ -641,6 +641,17 @@ export interface SystemSettings {
   codex_cli_only_whitelist: string;
   codex_cli_only_allow_app_server_clients: boolean;
   codex_cli_only_engine_fingerprint_signals: string;
+  openai_window_warmup_enabled: boolean;
+  openai_window_warmup_default_policy: "off" | "initial_once" | "continuous";
+  openai_window_warmup_allowlist: number[];
+  openai_window_warmup_probe_model: string;
+  openai_window_warmup_worker_concurrency: number;
+  openai_window_warmup_global_qps: number;
+  openai_window_warmup_batch_size: number;
+  openai_window_warmup_scan_seconds: number;
+  openai_window_warmup_request_timeout_seconds: number;
+  openai_window_warmup_lease_seconds: number;
+  openai_window_warmup_reset_grace_seconds: number;
   web_search_emulation_enabled?: boolean;
 
   // Payment configuration
@@ -958,6 +969,17 @@ export interface UpdateSettingsRequest {
   codex_cli_only_whitelist?: string;
   codex_cli_only_allow_app_server_clients?: boolean;
   codex_cli_only_engine_fingerprint_signals?: string;
+  openai_window_warmup_enabled?: boolean;
+  openai_window_warmup_default_policy?: "off" | "initial_once" | "continuous";
+  openai_window_warmup_allowlist?: number[];
+  openai_window_warmup_probe_model?: string;
+  openai_window_warmup_worker_concurrency?: number;
+  openai_window_warmup_global_qps?: number;
+  openai_window_warmup_batch_size?: number;
+  openai_window_warmup_scan_seconds?: number;
+  openai_window_warmup_request_timeout_seconds?: number;
+  openai_window_warmup_lease_seconds?: number;
+  openai_window_warmup_reset_grace_seconds?: number;
   // Payment configuration
   payment_enabled?: boolean;
   risk_control_enabled?: boolean;

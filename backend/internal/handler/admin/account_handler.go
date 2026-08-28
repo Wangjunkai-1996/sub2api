@@ -64,6 +64,8 @@ type AccountHandler struct {
 	grokImportProber        grokImportProber
 	upstreamBillingProbe    *service.UpstreamBillingProbeService
 	ollamaCloudUsage        *service.OllamaCloudUsageService
+	openAIWindowWarmup      *service.OpenAIWindowWarmupService
+	settingService          *service.SettingService
 }
 
 // SetUpstreamBillingProbeService attaches the optional remote billing probe service.
@@ -73,6 +75,11 @@ func (h *AccountHandler) SetUpstreamBillingProbeService(probe *service.UpstreamB
 
 func (h *AccountHandler) SetOllamaCloudUsageService(usage *service.OllamaCloudUsageService) {
 	h.ollamaCloudUsage = usage
+}
+
+func (h *AccountHandler) SetOpenAIWindowWarmupService(warmup *service.OpenAIWindowWarmupService, settings *service.SettingService) {
+	h.openAIWindowWarmup = warmup
+	h.settingService = settings
 }
 
 // NewAccountHandler creates a new admin account handler
@@ -128,6 +135,7 @@ type CreateAccountRequest struct {
 	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
 	ProbeEnabled            *bool          `json:"upstream_billing_probe_enabled"`
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	OpenAICodexWarmupPolicy *string        `json:"openai_codex_warmup_policy"`
 }
 
 // UpdateAccountRequest represents update account request
@@ -150,6 +158,7 @@ type UpdateAccountRequest struct {
 	ProbeEnabled            *bool          `json:"upstream_billing_probe_enabled"`
 	RateSyncEnabled         *bool          `json:"upstream_billing_rate_sync_enabled"`
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	OpenAICodexWarmupPolicy *string        `json:"openai_codex_warmup_policy"`
 }
 
 // BulkUpdateAccountsRequest represents the payload for bulk editing accounts
@@ -194,9 +203,10 @@ type AccountWithConcurrency struct {
 	SchedulerScore     *AccountSchedulerScore       `json:"scheduler_score,omitempty"`
 	SchedulerScores    []AccountSchedulerGroupScore `json:"scheduler_scores,omitempty"`
 	// 以下字段仅对 Anthropic OAuth/SetupToken 账号有效，且仅在启用相应功能时返回
-	CurrentWindowCost *float64 `json:"current_window_cost,omitempty"` // 当前窗口费用
-	ActiveSessions    *int     `json:"active_sessions,omitempty"`     // 当前活跃会话数
-	CurrentRPM        *int     `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
+	CurrentWindowCost  *float64                          `json:"current_window_cost,omitempty"` // 当前窗口费用
+	ActiveSessions     *int                              `json:"active_sessions,omitempty"`     // 当前活跃会话数
+	CurrentRPM         *int                              `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
+	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
 }
 
 type AccountSchedulerScore struct {
@@ -264,9 +274,11 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 		}
 	}
 
-	h.enrichShadowParents(ctx, []AccountWithConcurrency{item})
+	items := []AccountWithConcurrency{item}
+	h.enrichShadowParents(ctx, items)
+	h.enrichOpenAIWindowWarmup(ctx, []service.Account{*account}, items)
 
-	return item
+	return items[0]
 }
 
 // scoreOpenAIAccountSchedulerPool 对池内 OpenAI 账号计算调度分数快照。
@@ -682,6 +694,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	h.enrichShadowParents(c.Request.Context(), result)
+	h.enrichOpenAIWindowWarmup(c.Request.Context(), accounts, result)
 
 	etag := buildAccountsListETag(result, total, page, pageSize, platform, accountType, status, search, lite)
 	if etag != "" {
@@ -835,6 +848,17 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "rate_multiplier must be >= 0")
 		return
 	}
+	if req.Platform == service.PlatformOpenAI && req.Type == service.AccountTypeOAuth {
+		policy, policyErr := resolveOpenAIWindowWarmupImportPolicy(c.Request.Context(), req.OpenAICodexWarmupPolicy, h.settingService)
+		if policyErr != nil {
+			response.ErrorFrom(c, policyErr)
+			return
+		}
+		req.Extra = withOpenAIWindowWarmupPolicy(req.Extra, policy)
+	} else if req.OpenAICodexWarmupPolicy != nil {
+		response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
+		return
+	}
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 
@@ -872,6 +896,9 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		h.adminService.ForceAntigravityPrivacy(ctx, account)
 		// OpenAI OAuth: 新账号直接设置隐私
 		h.adminService.ForceOpenAIPrivacy(ctx, account)
+		if _, scheduleErr := h.scheduleOpenAIWindowWarmup(ctx, account, service.OpenAIWindowWarmupTriggerImport); scheduleErr != nil {
+			return nil, scheduleErr
+		}
 		return h.buildAccountResponseWithRuntime(ctx, account), nil
 	})
 	if err != nil {
@@ -968,6 +995,27 @@ func (h *AccountHandler) Update(c *gin.Context) {
 		response.BadRequest(c, "rate_multiplier must be >= 0")
 		return
 	}
+	if req.OpenAICodexWarmupPolicy != nil {
+		policy, policyErr := validateOpenAIWindowWarmupPolicy(*req.OpenAICodexWarmupPolicy)
+		if policyErr != nil {
+			response.ErrorFrom(c, policyErr)
+			return
+		}
+		current, currentErr := h.adminService.GetAccount(c.Request.Context(), accountID)
+		if currentErr != nil {
+			response.ErrorFrom(c, currentErr)
+			return
+		}
+		if !isOpenAIWindowWarmupAccount(current) {
+			response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
+			return
+		}
+		baseExtra := current.Extra
+		if req.Extra != nil {
+			baseExtra = req.Extra
+		}
+		req.Extra = withOpenAIWindowWarmupPolicy(baseExtra, policy)
+	}
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 
@@ -1013,6 +1061,10 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	// 异步执行，探测失败不影响账号更新响应。
 	if len(req.Credentials) > 0 {
 		h.scheduleOpenAIResponsesProbe(account)
+	}
+	if _, scheduleErr := h.scheduleOpenAIWindowWarmup(c.Request.Context(), account, service.OpenAIWindowWarmupTriggerImport); scheduleErr != nil {
+		response.ErrorFrom(c, scheduleErr)
+		return
 	}
 
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))

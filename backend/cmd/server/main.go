@@ -158,6 +158,12 @@ func runMainServer() {
 			log.Printf("Plugin manager started in degraded state: %v", err)
 		}
 	}
+	// Warmup starts after the plugin manager so the first scan can transparently
+	// reuse an enabled OpenAI OAuth transport plugin. Start is unconditional;
+	// the persisted kill switch controls claiming and sending, not lifecycle.
+	if app.OpenAIWindowWarmup != nil {
+		app.OpenAIWindowWarmup.Start()
+	}
 	if app.PromptAudit != nil {
 		if err := app.PromptAudit.Start(context.Background()); err != nil {
 			// Startup continues so unrelated APIs stay up. Fail-closed (unavailable)

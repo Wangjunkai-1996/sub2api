@@ -307,6 +307,7 @@ type Account struct {
 	ParentPrivacyMode           string `json:"parent_privacy_mode,omitempty"`
 	ParentSubscriptionExpiresAt string `json:"parent_subscription_expires_at,omitempty"`
 	ParentChatGPTAccountID      string `json:"parent_chatgpt_account_id,omitempty"`
+	OpenAICodexWarmupPolicy     string `json:"openai_codex_warmup_policy,omitempty"`
 
 	Proxy         *Proxy         `json:"proxy,omitempty"`
 	AccountGroups []AccountGroup `json:"account_groups,omitempty"`

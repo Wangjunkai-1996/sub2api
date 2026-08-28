@@ -3097,6 +3097,40 @@
         </div>
       </div>
 
+      <!-- OpenAI Codex five-hour window warmup policy (OAuth imports and OAuth create). -->
+      <div
+        v-if="form.platform === 'openai' && accountCategory === 'oauth-based'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        data-testid="openai-codex-warmup-policy"
+      >
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.codexWarmupPolicy') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.codexWarmupPolicyDesc') }}
+            </p>
+          </div>
+          <div class="flex shrink-0 rounded-lg bg-gray-100 p-1 dark:bg-dark-700" role="group" :aria-label="t('admin.accounts.openai.codexWarmupPolicy')">
+            <button
+              v-for="option in codexWarmupPolicyOptions"
+              :key="option.value"
+              type="button"
+              :data-testid="`create-codex-warmup-${option.value}`"
+              :aria-pressed="openAICodexWarmupPolicy === option.value"
+              :class="[
+                'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                openAICodexWarmupPolicy === option.value
+                  ? 'bg-white text-primary-700 shadow-sm dark:bg-dark-600 dark:text-primary-300'
+                  : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-200'
+              ]"
+              @click="selectOpenAICodexWarmupPolicy(option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div
         v-if="form.platform === 'openai' && accountCategory === 'oauth-based'"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3742,6 +3776,7 @@ import type {
   CheckMixedChannelResponse,
   CreateAccountRequest,
   CodexSessionImportMessage,
+  OpenAICodexWarmupPolicy,
   OpenAICompactMode,
   OpenAIResponsesMode,
   OpenAIEndpointCapability
@@ -4179,6 +4214,43 @@ const codexFingerprintModeOptions = computed(() => [
   { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
   { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
 ])
+const openAICodexWarmupPolicy = ref<OpenAICodexWarmupPolicy>()
+const openAICodexWarmupPolicyTouched = ref(false)
+let openAICodexWarmupPolicyLoadGeneration = 0
+const codexWarmupPolicyOptions = computed(() => [
+  { value: 'off' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyOff') },
+  { value: 'initial_once' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyInitialOnce') },
+  { value: 'continuous' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyContinuous') }
+])
+const isOpenAICodexWarmupPolicy = (value: unknown): value is OpenAICodexWarmupPolicy => {
+  return value === 'off' || value === 'initial_once' || value === 'continuous'
+}
+const selectOpenAICodexWarmupPolicy = (policy: OpenAICodexWarmupPolicy) => {
+  openAICodexWarmupPolicyTouched.value = true
+  openAICodexWarmupPolicy.value = policy
+}
+const buildOpenAICodexWarmupPolicyPayload = () => {
+  return openAICodexWarmupPolicy.value
+    ? { openai_codex_warmup_policy: openAICodexWarmupPolicy.value }
+    : {}
+}
+const loadOpenAICodexWarmupDefaultPolicy = async () => {
+  const generation = ++openAICodexWarmupPolicyLoadGeneration
+  try {
+    const settings = await adminAPI.settings.getSettings()
+    const policy = settings?.openai_window_warmup_default_policy
+    if (
+      generation === openAICodexWarmupPolicyLoadGeneration &&
+      props.show &&
+      !openAICodexWarmupPolicyTouched.value &&
+      isOpenAICodexWarmupPolicy(policy)
+    ) {
+      openAICodexWarmupPolicy.value = policy
+    }
+  } catch {
+    // Omit the request field so the backend remains the source of truth.
+  }
+}
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
 const anthropicPassthroughEnabled = ref(false)
 const anthropicAPIKeyAuthScheme = ref<AnthropicAPIKeyAuthScheme>('x_api_key')
@@ -4511,6 +4583,7 @@ watch(
   () => props.show,
   (newVal) => {
     if (newVal) {
+      void loadOpenAICodexWarmupDefaultPolicy()
       // Load TLS fingerprint profiles
       adminAPI.tlsFingerprintProfiles.list()
         .then(profiles => { tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name })) })
@@ -4532,7 +4605,8 @@ watch(
     } else {
       resetForm()
     }
-  }
+  },
+  { immediate: true }
 )
 
 // Sync form.type based on accountCategory, addMethod, and platform-specific type
@@ -5066,6 +5140,9 @@ const resetForm = () => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  openAICodexWarmupPolicy.value = undefined
+  openAICodexWarmupPolicyTouched.value = false
+  openAICodexWarmupPolicyLoadGeneration++
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
   webSearchEmulationMode.value = 'default'
@@ -5147,6 +5224,8 @@ const buildOpenAIExtra = (base?: Record<string, unknown>): Record<string, unknow
   } else {
     delete extra.openai_responses_flatten_namespaces
   }
+  // The backend resolves the global default from the top-level request field.
+  delete extra.openai_codex_warmup_policy
   extra.openai_long_context_billing_enabled = openAILongContextBillingEnabled.value
 
   if (accountCategory.value === 'oauth-based' && codexCLIOnlyEnabled.value) {
@@ -5692,7 +5771,10 @@ const createAccountAndFinish = async (
     // 上游倍率探测对全部 API-key 平台开放（antigravity upstream 走本 helper）；
     // 非 apikey 类型（bedrock/oauth）不传，后端不动作。
     upstream_billing_probe_enabled: type === 'apikey' ? upstreamBillingAutoProbeEnabled.value : undefined,
-    auto_pause_on_expired: autoPauseOnExpired.value
+    auto_pause_on_expired: autoPauseOnExpired.value,
+    ...(platform === 'openai' && type === 'oauth'
+      ? buildOpenAICodexWarmupPolicyPayload()
+      : {})
   })
 }
 
@@ -6032,7 +6114,8 @@ const handleOpenAIExchange = async (authCode: string) => {
         rate_multiplier: form.rate_multiplier,
         group_ids: form.group_ids,
         expires_at: form.expires_at,
-        auto_pause_on_expired: autoPauseOnExpired.value
+        auto_pause_on_expired: autoPauseOnExpired.value,
+        ...buildOpenAICodexWarmupPolicyPayload()
       })
       appStore.showSuccess(t('admin.accounts.accountCreated'))
     }
@@ -6140,7 +6223,8 @@ const handleOpenAIImportCodexSession = async (content: string) => {
       auto_pause_on_expired: autoPauseOnExpired.value,
       credential_extras: Object.keys(credentialExtras).length > 0 ? credentialExtras : undefined,
       extra,
-      update_existing: true
+      update_existing: true,
+      ...buildOpenAICodexWarmupPolicyPayload()
     })
 
     const successCount = result.created + result.updated
@@ -6217,7 +6301,8 @@ const handleOpenAIImportCodexPAT = async (accessToken: string) => {
       expires_at: form.expires_at,
       auto_pause_on_expired: autoPauseOnExpired.value,
       credential_extras: Object.keys(credentialExtras).length > 0 ? credentialExtras : undefined,
-      extra
+      extra,
+      ...buildOpenAICodexWarmupPolicyPayload()
     })
 
     appStore.showSuccess(t('admin.accounts.messages.accountCreated'))
@@ -6313,7 +6398,8 @@ const handleOpenAIBatchRT = async (refreshTokenInput: string, clientId?: string)
             rate_multiplier: form.rate_multiplier,
             group_ids: form.group_ids,
             expires_at: form.expires_at,
-            auto_pause_on_expired: autoPauseOnExpired.value
+            auto_pause_on_expired: autoPauseOnExpired.value,
+            ...buildOpenAICodexWarmupPolicyPayload()
           })
         }
 

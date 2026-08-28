@@ -890,6 +890,59 @@ export type AccountType = 'oauth' | 'setup-token' | 'apikey' | 'upstream' | 'bed
 export type OAuthAddMethod = 'oauth' | 'setup-token'
 export type ProxyProtocol = 'http' | 'https' | 'socks5' | 'socks5h'
 
+/** OpenAI ChatGPT/Codex five-hour window warmup policy. */
+export type OpenAICodexWarmupPolicy = 'off' | 'initial_once' | 'continuous'
+
+/** Durable warmup job states returned by the admin API. */
+export type OpenAIWindowWarmupState =
+  | 'pending'
+  | 'armed'
+  | 'due'
+  | 'running'
+  | 'retrying'
+  | 'uncertain'
+  | 'possibly_sent'
+  | 'paused'
+  | 'blocked'
+  | 'blocked_config'
+  | 'completed'
+
+export interface OpenAIWindowWarmupJob {
+  id: number
+  account_id: number
+  quota_scope: 'global' | string
+  state: OpenAIWindowWarmupState | string
+  trigger: string
+  cycle_key: string
+  cycle_generation: number
+  observed_reset_at?: string | null
+  next_attempt_at?: string | null
+  attempt_count: number
+  sent_at?: string | null
+  lease_until?: string | null
+  last_attempt_at?: string | null
+  last_success_at?: string | null
+  status_code?: number | null
+  last_error_code?: string | null
+  last_error?: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** Redacted account-level warmup status; no credential or response content. */
+export interface OpenAIWindowWarmupStatus {
+  policy: OpenAICodexWarmupPolicy
+  state?: OpenAIWindowWarmupState | string | null
+  next_run_at?: string | null
+  next_attempt_at?: string | null
+  last_success_at?: string | null
+  observed_reset_at?: string | null
+  attempt_count?: number
+  last_error_code?: string | null
+  last_error?: string | null
+  job?: OpenAIWindowWarmupJob | null
+}
+
 // Claude Model type (returned by /v1/models and account models API)
 export interface ClaudeModel {
   id: string
@@ -1247,6 +1300,11 @@ export interface Account {
   parent_privacy_mode?: string
   parent_subscription_expires_at?: string
   parent_chatgpt_account_id?: string
+
+  // OpenAI Codex five-hour window warmup (runtime state is job-backed).
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
+  openai_window_warmup?: OpenAIWindowWarmupStatus | null
+  codex_warmup?: OpenAIWindowWarmupStatus | null
 }
 
 export interface AccountSchedulerGroupScore {
@@ -1438,6 +1496,8 @@ export interface CreateAccountRequest {
   auto_pause_on_expired?: boolean
   upstream_billing_probe_enabled?: boolean
   confirm_mixed_channel_risk?: boolean
+  /** Optional explicit policy; backend also accepts the extra key for older clients. */
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface UpdateAccountRequest {
@@ -1459,6 +1519,7 @@ export interface UpdateAccountRequest {
   upstream_billing_probe_enabled?: boolean
   upstream_billing_rate_sync_enabled?: boolean
   confirm_mixed_channel_risk?: boolean
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface CheckMixedChannelRequest {
@@ -1578,6 +1639,7 @@ export interface CodexSessionImportRequest {
   update_existing?: boolean
   skip_default_group_bind?: boolean
   confirm_mixed_channel_risk?: boolean
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface OpenAICodexPATCreateRequest {
@@ -1596,6 +1658,7 @@ export interface OpenAICodexPATCreateRequest {
   extra?: Record<string, unknown>
   skip_default_group_bind?: boolean
   confirm_mixed_channel_risk?: boolean
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface CodexSessionImportMessage {
@@ -1610,6 +1673,8 @@ export interface CodexSessionImportItem {
   action: 'created' | 'updated' | 'skipped' | 'failed'
   account_id?: number
   message?: string
+  warmup_queued: boolean
+  warmup_status: string
 }
 
 export interface CodexSessionImportResult {

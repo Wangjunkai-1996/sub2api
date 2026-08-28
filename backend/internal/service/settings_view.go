@@ -252,6 +252,20 @@ type SystemSettings struct {
 	CodexCLIOnlyAllowAppServerClients      bool   // codex_cli_only App Server 开关：对未列名客户端开闸（默认 false）
 	CodexCLIOnlyEngineFingerprintSignals   string // codex_cli_only 引擎指纹门信号列表 JSON（[]EngineFingerprintSignal）
 
+	// OpenAI Codex five-hour window warmup. Enabled is the global kill switch;
+	// false prevents workers from claiming or sending new probes.
+	OpenAIWindowWarmupEnabled               bool
+	OpenAIWindowWarmupDefaultPolicy         string
+	OpenAIWindowWarmupAllowlist             []int64
+	OpenAIWindowWarmupProbeModel            string
+	OpenAIWindowWarmupWorkerConcurrency     int
+	OpenAIWindowWarmupGlobalQPS             float64
+	OpenAIWindowWarmupBatchSize             int
+	OpenAIWindowWarmupScanSeconds           int
+	OpenAIWindowWarmupRequestTimeoutSeconds int
+	OpenAIWindowWarmupLeaseSeconds          int
+	OpenAIWindowWarmupResetGraceSeconds     int
+
 	// Web Search Emulation
 	WebSearchEmulationEnabled bool // 是否启用 web search 模拟
 

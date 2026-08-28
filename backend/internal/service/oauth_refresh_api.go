@@ -171,6 +171,29 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	executor OAuthRefreshExecutor,
 	refreshWindow time.Duration,
 ) (*OAuthRefreshResult, error) {
+	return api.refresh(ctx, account, executor, refreshWindow, false, "")
+}
+
+// RefreshAfterUnauthorized performs one lock-protected refresh after an
+// upstream 401. Unlike the normal proactive path, it does not trust expires_at:
+// an access token can be revoked while its local expiry is still in the future.
+func (api *OAuthRefreshAPI) RefreshAfterUnauthorized(
+	ctx context.Context,
+	account *Account,
+	executor OAuthRefreshExecutor,
+	rejectedAccessToken string,
+) (*OAuthRefreshResult, error) {
+	return api.refresh(ctx, account, executor, 0, true, rejectedAccessToken)
+}
+
+func (api *OAuthRefreshAPI) refresh(
+	ctx context.Context,
+	account *Account,
+	executor OAuthRefreshExecutor,
+	refreshWindow time.Duration,
+	force bool,
+	rejectedAccessToken string,
+) (*OAuthRefreshResult, error) {
 	if api == nil || api.accountRepo == nil {
 		return nil, errors.New("oauth refresh account repository is not configured")
 	}
@@ -236,6 +259,15 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 			return nil, withGrokCredentialFailureSnapshot(eligibilityErr, freshAccount)
 		}
 	}
+	// A concurrent refresher may already have replaced the bearer rejected by
+	// upstream. The comparison must happen after both refresh locks and the DB
+	// reread; checking the caller's stale account before the locks is racy.
+	if force && strings.TrimSpace(rejectedAccessToken) != "" {
+		freshAccessToken := strings.TrimSpace(freshAccount.GetCredential("access_token"))
+		if freshAccessToken != "" && freshAccessToken != strings.TrimSpace(rejectedAccessToken) {
+			return &OAuthRefreshResult{Account: freshAccount}, nil
+		}
+	}
 	if !executor.CanRefresh(freshAccount) {
 		if requestPath && freshAccount.IsGrokOAuth() && strings.TrimSpace(freshAccount.GetGrokRefreshToken()) == "" {
 			return nil, withGrokCredentialFailureSnapshot(errGrokOAuthRefreshTokenMissing, freshAccount)
@@ -247,7 +279,7 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	}
 
 	// 3. 二次检查是否仍需刷新（另一条路径可能已刷新）
-	if !executor.NeedsRefresh(freshAccount, refreshWindow) {
+	if !force && !executor.NeedsRefresh(freshAccount, refreshWindow) {
 		return &OAuthRefreshResult{
 			Account: freshAccount,
 		}, nil

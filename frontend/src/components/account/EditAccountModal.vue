@@ -1727,6 +1727,36 @@
         </div>
       </div>
 
+      <!-- OpenAI Codex five-hour window warmup policy. -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        data-testid="edit-openai-codex-warmup-policy"
+      >
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.codexWarmupPolicy') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.openai.codexWarmupPolicyDesc') }}</p>
+          </div>
+          <div class="flex shrink-0 rounded-lg bg-gray-100 p-1 dark:bg-dark-700" role="group" :aria-label="t('admin.accounts.openai.codexWarmupPolicy')">
+            <button
+              v-for="option in codexWarmupPolicyOptions"
+              :key="option.value"
+              type="button"
+              :data-testid="`edit-codex-warmup-${option.value}`"
+              :aria-pressed="openAICodexWarmupPolicy === option.value"
+              :class="[
+                'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                openAICodexWarmupPolicy === option.value
+                  ? 'bg-white text-primary-700 shadow-sm dark:bg-dark-600 dark:text-primary-300'
+                  : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-200'
+              ]"
+              @click="openAICodexWarmupPolicy = option.value"
+            >{{ option.label }}</button>
+          </div>
+        </div>
+      </div>
+
       <!-- OpenAI APIKey Responses API support mode -->
       <div
         v-if="account?.platform === 'openai' && account?.type === 'apikey'"
@@ -2849,7 +2879,8 @@ import type {
   OpenAICompactMode,
   OpenAIResponsesMode,
   OpenAIEndpointCapability,
-  OllamaCloudUsageState
+  OllamaCloudUsageState,
+  OpenAICodexWarmupPolicy
 } from '@/types'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
@@ -3233,6 +3264,14 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
+const openAICodexWarmupPolicy = ref<OpenAICodexWarmupPolicy>('off')
+const normalizeOpenAICodexWarmupPolicy = (value: unknown): OpenAICodexWarmupPolicy =>
+  value === 'initial_once' || value === 'continuous' ? value : 'off'
+const codexWarmupPolicyOptions = computed(() => [
+  { value: 'off' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyOff') },
+  { value: 'initial_once' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyInitialOnce') },
+  { value: 'continuous' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyContinuous') }
+])
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
@@ -3712,6 +3751,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  openAICodexWarmupPolicy.value = 'off'
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
@@ -3769,6 +3809,11 @@ const syncFormFromAccount = (newAccount: Account | null) => {
       codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
         ? fpMode as CodexFingerprintMode
         : 'off')
+      openAICodexWarmupPolicy.value = normalizeOpenAICodexWarmupPolicy(
+        extra?.openai_codex_warmup_policy ??
+          extra?.codex_warmup_policy ??
+          extra?.openai_window_warmup_policy
+      )
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
     const compactMappings = credentials?.compact_model_mapping as Record<string, string> | undefined
@@ -5207,6 +5252,17 @@ const handleSubmit = async () => {
         } else {
           delete newExtra.codex_fingerprint_mode
         }
+
+        // Persist only the canonical strategy key. Remove aliases even when
+        // switching off so an old value cannot silently keep the worker armed.
+        delete newExtra.codex_warmup_policy
+        delete newExtra.openai_window_warmup_policy
+        if (!isSparkShadow.value && openAICodexWarmupPolicy.value !== 'off') {
+          newExtra.openai_codex_warmup_policy = openAICodexWarmupPolicy.value
+        } else {
+          delete newExtra.openai_codex_warmup_policy
+        }
+        updatePayload.openai_codex_warmup_policy = openAICodexWarmupPolicy.value
       }
 
       updatePayload.extra = newExtra

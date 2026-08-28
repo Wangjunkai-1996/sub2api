@@ -596,6 +596,20 @@ const (
 	// 勾选(required)信号之间 AND;每条 match 变体行内 OR;缺失/空/非法 → 默认种子(只勾 x-codex-)。
 	SettingKeyCodexCLIOnlyEngineFingerprintSignals = "codex_cli_only_engine_fingerprint_signals"
 
+	// OpenAI Codex five-hour window warmup. The feature is fail-closed and all
+	// worker parameters are stored as explicit admin settings.
+	SettingKeyOpenAIWindowWarmupEnabled               = "openai_window_warmup_enabled"
+	SettingKeyOpenAIWindowWarmupDefaultPolicy         = "openai_window_warmup_default_policy"
+	SettingKeyOpenAIWindowWarmupAllowlist             = "openai_window_warmup_allowlist"
+	SettingKeyOpenAIWindowWarmupProbeModel            = "openai_window_warmup_probe_model"
+	SettingKeyOpenAIWindowWarmupWorkerConcurrency     = "openai_window_warmup_worker_concurrency"
+	SettingKeyOpenAIWindowWarmupGlobalQPS             = "openai_window_warmup_global_qps"
+	SettingKeyOpenAIWindowWarmupBatchSize             = "openai_window_warmup_batch_size"
+	SettingKeyOpenAIWindowWarmupScanSeconds           = "openai_window_warmup_scan_seconds"
+	SettingKeyOpenAIWindowWarmupRequestTimeoutSeconds = "openai_window_warmup_request_timeout_seconds"
+	SettingKeyOpenAIWindowWarmupLeaseSeconds          = "openai_window_warmup_lease_seconds"
+	SettingKeyOpenAIWindowWarmupResetGraceSeconds     = "openai_window_warmup_reset_grace_seconds"
+
 	// SettingKeyMaxClaudeCodeVersion 最高 Claude Code 版本号限制 (semver, 如 "3.0.0"，空值=不检查)
 	SettingKeyMaxClaudeCodeVersion = "max_claude_code_version"
 

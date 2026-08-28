@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -144,6 +145,23 @@ func NewOpenAIQuotaService(
 // OAuth account. Returns infraerrors so the handler layer can map them to
 // stable error codes / HTTP statuses.
 func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*OpenAIQuotaUsage, error) {
+	return s.queryUsage(ctx, accountID, openAIQuotaQueryOptions{includeResetCreditDetails: true})
+}
+
+// QueryUsageForWarmup is the passive, metadata-only quota path used immediately
+// before a warmup send. It never logs or returns an upstream response body and
+// does not make the unrelated reset-credit details request.
+func (s *OpenAIQuotaService) QueryUsageForWarmup(ctx context.Context, accountID int64) (*OpenAIQuotaUsage, error) {
+	return s.queryUsage(ctx, accountID, openAIQuotaQueryOptions{sanitizedErrors: true, source: "window_warmup"})
+}
+
+type openAIQuotaQueryOptions struct {
+	includeResetCreditDetails bool
+	sanitizedErrors           bool
+	source                    string
+}
+
+func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, options openAIQuotaQueryOptions) (*OpenAIQuotaUsage, error) {
 	accessToken, chatGPTAccountID, proxyURL, fedRAMP, err := s.prepareUpstreamCall(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -181,9 +199,36 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 				continue
 			}
 			status := resp.StatusCode
-			if isOpenAIAutoResetContext(ctx) {
-				slog.Warn("openai_quota_query_failed", "account_id", accountID, "status", status, "source", "auto_reset")
-				return nil, infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned %d", status)
+			if options.source == "window_warmup" && status == http.StatusUnauthorized && !agentIdentity && !recovered {
+				recovered = true
+				account, loadErr := s.accountRepo.GetByID(ctx, accountID)
+				if loadErr == nil && account != nil && !account.IsOpenAIPersonalAccessToken() &&
+					strings.TrimSpace(account.GetOpenAIRefreshToken()) != "" && s.tokenProvider != nil {
+					refreshedToken, refreshErr := s.tokenProvider.RefreshAfterUnauthorized(callCtx, account, accessToken)
+					if refreshErr == nil && strings.TrimSpace(refreshedToken) != "" {
+						accessToken = refreshedToken
+						continue
+					}
+					if errors.Is(refreshErr, errOpenAITokenRefreshInProgress) {
+						return nil, infraerrors.New(
+							http.StatusServiceUnavailable,
+							"OPENAI_QUOTA_REFRESH_IN_PROGRESS",
+							"openai oauth refresh is in progress",
+						)
+					}
+				}
+			}
+			if options.sanitizedErrors || isOpenAIAutoResetContext(ctx) {
+				source := options.source
+				if source == "" {
+					source = "auto_reset"
+				}
+				slog.Warn("openai_quota_query_failed", "account_id", accountID, "status", status, "source", source)
+				mappedStatus := mapUpstreamStatus(status)
+				if options.source == "window_warmup" {
+					mappedStatus = status
+				}
+				return nil, infraerrors.Newf(mappedStatus, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned %d", status)
 			}
 			body := truncate(s.redactQuotaErrorBody(ctx, accountID, resp.String()), 240)
 			slog.Warn("openai_quota_query_failed", "account_id", accountID, "status", status, "body", body)
@@ -193,7 +238,10 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 	}
 
 	payload.FetchedAt = time.Now().Unix()
-	details := s.queryResetCreditDetails(callCtx, client, accessToken, chatGPTAccountID, fedRAMP, accountID)
+	var details *openAIRateLimitResetCreditDetails
+	if options.includeResetCreditDetails {
+		details = s.queryResetCreditDetails(callCtx, client, accessToken, chatGPTAccountID, fedRAMP, accountID)
+	}
 	if details != nil {
 		payload.autoResetCandidates = details.AutoResetCandidates
 		hasDetailCount := details.AvailableCount != nil

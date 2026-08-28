@@ -49,10 +49,14 @@ func ProvideAdminHandlers(
 	auditLogHandler *admin.AuditLogHandler,
 	upstreamBillingProbe *service.UpstreamBillingProbeService,
 	ollamaCloudUsage *service.OllamaCloudUsageService,
+	openAIWindowWarmup *service.OpenAIWindowWarmupService,
+	settingService *service.SettingService,
 	trafficDirectorHandler *admin.TrafficDirectorHandler,
 ) *AdminHandlers {
 	accountHandler.SetUpstreamBillingProbeService(upstreamBillingProbe)
 	accountHandler.SetOllamaCloudUsageService(ollamaCloudUsage)
+	accountHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
+	openaiOAuthHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
 	return &AdminHandlers{
 		Dashboard:              dashboardHandler,
 		User:                   userHandler,

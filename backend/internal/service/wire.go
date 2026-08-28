@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -174,6 +176,90 @@ func ProvideOpenAITokenProvider(
 	p.SetRefreshAPI(refreshAPI, executor)
 	p.SetRefreshPolicy(OpenAIProviderRefreshPolicy())
 	return p
+}
+
+// ProvideOpenAIWindowWarmupOptions loads the bounded worker parameters once at
+// startup. The kill switch and allowlist remain dynamic and fail closed when
+// settings cannot be read.
+func ProvideOpenAIWindowWarmupOptions(settingService *SettingService) OpenAIWindowWarmupOptions {
+	settings, err := loadOpenAIWindowWarmupSettings(context.Background(), settingService)
+	if err != nil {
+		slog.Warn("openai_window_warmup_initial_settings_failed", "error", err)
+		settings = &SystemSettings{}
+		applyDefaultOpenAIWindowWarmupSettings(settings)
+	}
+
+	return OpenAIWindowWarmupOptions{
+		WorkerConcurrency: settings.OpenAIWindowWarmupWorkerConcurrency,
+		GlobalQPS:         settings.OpenAIWindowWarmupGlobalQPS,
+		BatchSize:         settings.OpenAIWindowWarmupBatchSize,
+		ScanInterval:      time.Duration(settings.OpenAIWindowWarmupScanSeconds) * time.Second,
+		RequestTimeout:    time.Duration(settings.OpenAIWindowWarmupRequestTimeoutSeconds) * time.Second,
+		LeaseDuration:     time.Duration(settings.OpenAIWindowWarmupLeaseSeconds) * time.Second,
+		ResetGrace:        time.Duration(settings.OpenAIWindowWarmupResetGraceSeconds) * time.Second,
+		ResetGraceSet:     true,
+		Model:             settings.OpenAIWindowWarmupProbeModel,
+		KillSwitch: OpenAIWindowWarmupKillSwitchFunc(func(ctx context.Context) (bool, error) {
+			current, settingsErr := loadOpenAIWindowWarmupSettings(ctx, settingService)
+			if settingsErr != nil {
+				return false, settingsErr
+			}
+			return current.OpenAIWindowWarmupEnabled, nil
+		}),
+		Allowlist: OpenAIWindowWarmupAllowlistFunc(func(ctx context.Context) ([]int64, error) {
+			current, settingsErr := loadOpenAIWindowWarmupSettings(ctx, settingService)
+			if settingsErr != nil {
+				return nil, settingsErr
+			}
+			return append([]int64(nil), current.OpenAIWindowWarmupAllowlist...), nil
+		}),
+	}
+}
+
+func loadOpenAIWindowWarmupSettings(ctx context.Context, settingService *SettingService) (*SystemSettings, error) {
+	if settingService == nil {
+		return nil, fmt.Errorf("openai window warmup setting service is not configured")
+	}
+	return settingService.GetAllSettings(ctx)
+}
+
+// ProvideOpenAIWindowOutboundAdapter wires the narrow outbound port to the
+// existing token, TLS, Agent Identity, and optional plugin transport paths.
+func ProvideOpenAIWindowOutboundAdapter(
+	accountRepo AccountRepository,
+	tokenProvider *OpenAITokenProvider,
+	httpUpstream HTTPUpstream,
+	tlsProfiles *TLSFingerprintProfileService,
+	pluginManager *PluginManager,
+	openAIGateway *OpenAIGatewayService,
+) *OpenAIWindowOutboundAdapter {
+	adapter := NewOpenAIWindowOutboundAdapter(accountRepo, tokenProvider, httpUpstream, tlsProfiles)
+	adapter.SetPluginManager(pluginManager)
+	adapter.SetAgentIdentityWSInvalidator(openAIGateway)
+	return adapter
+}
+
+func ProvideOpenAICodexWindowProbe(executor OpenAIOutboundExecutor, options OpenAIWindowWarmupOptions) *OpenAICodexWindowProbe {
+	return NewOpenAICodexWindowProbe(executor, options.Model)
+}
+
+// ProvideOpenAIWindowWarmupService constructs the worker unconditionally.
+// Application startup controls its lifecycle after PluginManager.Start.
+func ProvideOpenAIWindowWarmupService(
+	repo OpenAIWindowWarmupRepository,
+	accountRepo AccountRepository,
+	executor OpenAIOutboundExecutor,
+	probe OpenAIWindowProbe,
+	audit *AuditLogService,
+	options OpenAIWindowWarmupOptions,
+	concurrency *ConcurrencyService,
+	quota *OpenAIQuotaService,
+) *OpenAIWindowWarmupService {
+	options.Concurrency = concurrency
+	if quota != nil {
+		options.UsageReconciler = OpenAIWindowWarmupUsageReconcilerFunc(quota.QueryUsageForWarmup)
+	}
+	return NewOpenAIWindowWarmupService(repo, accountRepo, executor, probe, audit, options)
 }
 
 // ProvideOpenAIQuotaService wires the OpenAI quota query/reset service.
@@ -945,6 +1031,12 @@ var ProviderSet = wire.NewSet(
 	ProvideAntigravityTokenProvider,
 	ProvideGrokTokenProvider,
 	ProvideOpenAITokenProvider,
+	ProvideOpenAIWindowWarmupOptions,
+	ProvideOpenAIWindowOutboundAdapter,
+	wire.Bind(new(OpenAIOutboundExecutor), new(*OpenAIWindowOutboundAdapter)),
+	ProvideOpenAICodexWindowProbe,
+	wire.Bind(new(OpenAIWindowProbe), new(*OpenAICodexWindowProbe)),
+	ProvideOpenAIWindowWarmupService,
 	ProvideOpenAIQuotaService,
 	ProvideOpenAIQuotaAutoResetService,
 	ProvideGrokQuotaService,
