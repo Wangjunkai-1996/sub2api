@@ -505,6 +505,40 @@ func (r *openAIWindowWarmupRepository) MarkBlocked(ctx context.Context, id int64
 		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, status, code, message, nullableTimeValue(at))
 }
 
+// RequeueAuthStateUpdateFailure rearms only the exact terminal transition whose
+// account-state side effect failed. MarkBlocked/MarkObservationFailure already
+// fenced the original owner; the remaining generation, attempt, state, status,
+// and error-code CAS prevents a delayed caller from undoing later work.
+func (r *openAIWindowWarmupRepository) RequeueAuthStateUpdateFailure(ctx context.Context, retry service.OpenAIWindowWarmupAuthStateRetry) (bool, error) {
+	if retry.JobID <= 0 || retry.AttemptCount <= 0 || retry.NextAttemptAt.IsZero() {
+		return false, nil
+	}
+	if retry.BlockedState != service.OpenAIWindowWarmupStateBlocked &&
+		retry.BlockedState != service.OpenAIWindowWarmupStateBlockedConfig {
+		return false, nil
+	}
+	if retry.RetryCode != "account_state_update_failed" && retry.RetryCode != "credentials_changed" {
+		return false, nil
+	}
+	return r.fencedUpdate(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET state = 'retrying', next_attempt_at = $7,
+		    last_error_code = $8::varchar,
+		    last_error = CASE WHEN $8::varchar = 'credentials_changed'
+		        THEN 'credentials changed; retry scheduled'
+		        ELSE 'account state update failed; retry scheduled' END,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND cycle_generation = $2
+		  AND attempt_count = $3
+		  AND state = $4
+		  AND status_code IS NOT DISTINCT FROM NULLIF($5, 0)
+		  AND last_error_code IS NOT DISTINCT FROM NULLIF($6, '')
+		  AND lease_owner IS NULL AND lease_token IS NULL AND lease_until IS NULL`,
+		retry.JobID, retry.CycleGeneration, retry.AttemptCount, retry.BlockedState,
+		retry.StatusCode, retry.ErrorCode, retry.NextAttemptAt.UTC(), retry.RetryCode)
+}
+
 func (r *openAIWindowWarmupRepository) MarkPaused(ctx context.Context, id int64, owner, token string, at time.Time, reason string) (bool, error) {
 	return r.fencedQuery(ctx, `
 		WITH updated AS (

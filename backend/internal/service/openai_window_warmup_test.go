@@ -38,6 +38,11 @@ type warmupRepositorySpy struct {
 	rejectSuccess     bool
 	rejectStarted     bool
 	rejectRenew       bool
+	rejectBlocked     bool
+	rejectAuthRetry   bool
+	authRetryCalls    int
+	authRetry         OpenAIWindowWarmupAuthStateRetry
+	consumeClaims     bool
 	onMarkStarted     func()
 	queueStats        OpenAIWindowWarmupQueueStats
 }
@@ -67,10 +72,15 @@ func (r *warmupRepositorySpy) ClaimDue(_ context.Context, _ string, _ time.Durat
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.claimCalls++
-	if limit < len(r.claims) {
-		return append([]OpenAIWindowWarmupClaim(nil), r.claims[:limit]...), nil
+	count := len(r.claims)
+	if limit < count {
+		count = limit
 	}
-	return append([]OpenAIWindowWarmupClaim(nil), r.claims...), nil
+	claims := append([]OpenAIWindowWarmupClaim(nil), r.claims[:count]...)
+	if r.consumeClaims {
+		r.claims = append([]OpenAIWindowWarmupClaim(nil), r.claims[count:]...)
+	}
+	return claims, nil
 }
 
 func (r *warmupRepositorySpy) QueueStats(context.Context, []int64) (OpenAIWindowWarmupQueueStats, error) {
@@ -159,12 +169,43 @@ func (r *warmupRepositorySpy) MarkUncertain(_ context.Context, _ int64, _, _ str
 }
 
 func (r *warmupRepositorySpy) MarkBlocked(_ context.Context, _ int64, _, _ string, _ time.Time, status int, code, _ string) (bool, error) {
+	if r.rejectBlocked {
+		return false, nil
+	}
 	state := OpenAIWindowWarmupStateBlocked
 	if status == http.StatusBadRequest || status == http.StatusNotFound || code == "blocked_config" {
 		state = OpenAIWindowWarmupStateBlockedConfig
 	}
 	r.capture("blocked", state, status, code, time.Time{}, nil)
 	return true, nil
+}
+
+func (r *warmupRepositorySpy) RequeueAuthStateUpdateFailure(_ context.Context, retry OpenAIWindowWarmupAuthStateRetry) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rejectAuthRetry {
+		return false, nil
+	}
+	r.authRetryCalls++
+	r.authRetry = retry
+	r.action = "auth_state_retry"
+	r.state = OpenAIWindowWarmupStateRetrying
+	r.code = retry.RetryCode
+	r.next = retry.NextAttemptAt
+	return true, nil
+}
+
+type warmupAuthFailureHandlerSpy struct {
+	mu       sync.Mutex
+	failures []OpenAIWindowWarmupAuthFailure
+	err      error
+}
+
+func (s *warmupAuthFailureHandlerSpy) HandleOpenAIWindowWarmupAuthFailure(_ context.Context, failure OpenAIWindowWarmupAuthFailure) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failures = append(s.failures, *cloneOpenAIWindowWarmupAuthFailure(&failure))
+	return s.err
 }
 
 func (r *warmupRepositorySpy) MarkPaused(_ context.Context, _ int64, _, _ string, _ time.Time, reason string) (bool, error) {
@@ -225,6 +266,7 @@ type warmupAccountRepositoryStub struct {
 	AccountRepository
 	mu       sync.Mutex
 	account  *Account
+	accounts map[int64]*Account
 	getCalls int
 	err      error
 	updates  []map[string]any
@@ -236,6 +278,9 @@ func (r *warmupAccountRepositoryStub) GetByID(_ context.Context, id int64) (*Acc
 	r.getCalls++
 	if r.err != nil {
 		return nil, r.err
+	}
+	if account := r.accounts[id]; account != nil {
+		return account, nil
 	}
 	if r.account == nil || r.account.ID != id {
 		return nil, errors.New("account not found")
@@ -249,6 +294,13 @@ func (r *warmupAccountRepositoryStub) ListSchedulableByPlatform(context.Context,
 	if r.err != nil {
 		return nil, r.err
 	}
+	if len(r.accounts) > 0 {
+		accounts := make([]Account, 0, len(r.accounts))
+		for _, account := range r.accounts {
+			accounts = append(accounts, *account)
+		}
+		return accounts, nil
+	}
 	if r.account == nil {
 		return nil, nil
 	}
@@ -258,32 +310,46 @@ func (r *warmupAccountRepositoryStub) ListSchedulableByPlatform(context.Context,
 func (r *warmupAccountRepositoryStub) UpdateExtra(_ context.Context, id int64, updates map[string]any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.account == nil || r.account.ID != id {
+	account := r.accounts[id]
+	if account == nil && r.account != nil && r.account.ID == id {
+		account = r.account
+	}
+	if account == nil {
 		return errors.New("account not found")
 	}
 	copy := make(map[string]any, len(updates))
 	for key, value := range updates {
 		copy[key] = value
-		if r.account.Extra == nil {
-			r.account.Extra = make(map[string]any)
+		if account.Extra == nil {
+			account.Extra = make(map[string]any)
 		}
-		r.account.Extra[key] = value
+		account.Extra[key] = value
 	}
 	r.updates = append(r.updates, copy)
 	return nil
 }
 
 type warmupProbeStub struct {
-	mu     sync.Mutex
-	calls  int
-	result *OpenAIWindowProbeResult
-	err    error
+	mu      sync.Mutex
+	calls   int
+	result  *OpenAIWindowProbeResult
+	err     error
+	results []*OpenAIWindowProbeResult
+	errs    []error
 }
 
 func (p *warmupProbeStub) Probe(context.Context, *Account, *time.Time) (*OpenAIWindowProbeResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	index := p.calls
 	p.calls++
+	if index < len(p.results) {
+		var err error
+		if index < len(p.errs) {
+			err = p.errs[index]
+		}
+		return p.results[index], err
+	}
 	return p.result, p.err
 }
 
@@ -958,6 +1024,214 @@ func TestOpenAIWindowWarmupDefinitiveHTTPStatusPrecedesTransportAmbiguity(t *tes
 			require.Zero(t, repo.suppressedCalls)
 		})
 	}
+}
+
+func TestOpenAIWindowWarmupAuthStateSideEffectRequiresFencedJobTransition(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Credentials = map[string]any{"access_token": "rejected", "refresh_token": "refresh"}
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthReplayRejected,
+		ExpectedCredentials: shallowCopyMap(account.Credentials),
+	}
+
+	for _, test := range []struct {
+		name          string
+		rejectBlocked bool
+		wantCalls     int
+	}{
+		{name: "current owner", wantCalls: 1},
+		{name: "stale owner", rejectBlocked: true, wantCalls: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &warmupRepositorySpy{rejectBlocked: test.rejectBlocked}
+			handler := &warmupAuthFailureHandlerSpy{}
+			service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+			service.options.AuthFailureHandler = handler
+			claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+			claim.Job.AttemptCount = 1
+
+			service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+				StatusCode: http.StatusUnauthorized, AuthFailure: failure,
+			}, ErrOpenAIWindowWarmupNeedsReauth)
+
+			require.Len(t, handler.failures, test.wantCalls)
+			require.Zero(t, repo.authRetryCalls)
+		})
+	}
+}
+
+func TestOpenAIWindowWarmupAuthStateWriteFailureRequeuesOnlyExactFencedTransition(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Credentials = map[string]any{"access_token": "rejected", "refresh_token": "refresh"}
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthReplayRejected,
+		ExpectedCredentials: shallowCopyMap(account.Credentials),
+	}
+
+	for _, test := range []struct {
+		name          string
+		rejectBlocked bool
+		attemptCount  int
+		handlerErr    error
+		retryCode     string
+		wantHandler   int
+		wantRetry     int
+	}{
+		{name: "current owner retries account state", attemptCount: 1, handlerErr: errors.New("database unavailable"), retryCode: "account_state_update_failed", wantHandler: 1, wantRetry: 1},
+		{name: "credentials changed rearms cycle", attemptCount: 1, handlerErr: ErrOpenAIWindowWarmupCredentialsChanged, retryCode: "credentials_changed", wantHandler: 1, wantRetry: 1},
+		{name: "stale owner cannot retry", rejectBlocked: true, attemptCount: 1, handlerErr: errors.New("database unavailable")},
+		{name: "attempt limit remains blocked", attemptCount: openAIWindowWarmupDefaultMaxAttempts, handlerErr: errors.New("database unavailable"), wantHandler: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &warmupRepositorySpy{rejectBlocked: test.rejectBlocked}
+			handler := &warmupAuthFailureHandlerSpy{err: test.handlerErr}
+			service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+			service.options.AuthFailureHandler = handler
+			claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+			claim.Job.AttemptCount = test.attemptCount
+
+			service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+				StatusCode: http.StatusUnauthorized, AuthFailure: failure,
+			}, ErrOpenAIWindowWarmupNeedsReauth)
+
+			require.Len(t, handler.failures, test.wantHandler)
+			require.Equal(t, test.wantRetry, repo.authRetryCalls)
+			if test.wantRetry == 1 {
+				require.Equal(t, claim.Job.ID, repo.authRetry.JobID)
+				require.Equal(t, claim.Job.CycleGeneration, repo.authRetry.CycleGeneration)
+				require.Equal(t, claim.Job.AttemptCount, repo.authRetry.AttemptCount)
+				require.Equal(t, OpenAIWindowWarmupStateBlocked, repo.authRetry.BlockedState)
+				require.Equal(t, http.StatusUnauthorized, repo.authRetry.StatusCode)
+				require.Equal(t, "needs_reauth", repo.authRetry.ErrorCode)
+				require.Equal(t, test.retryCode, repo.authRetry.RetryCode)
+			}
+		})
+	}
+}
+
+func TestOpenAIWindowWarmupRefreshTransientRetriesAndTemporarilyIsolates(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	handler := &warmupAuthFailureHandlerSpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.options.AuthFailureHandler = handler
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+	claim.Job.AttemptCount = 1
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthRefreshTransient,
+		ExpectedCredentials: map[string]any{"access_token": "rejected"},
+	}
+
+	service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+		StatusCode: http.StatusUnauthorized, AuthFailure: failure,
+	}, errors.New("possibly_sent: refresh failed"))
+
+	require.Equal(t, "retry", repo.action)
+	require.Equal(t, string(OpenAIWindowWarmupAuthRefreshTransient), repo.code)
+	require.Len(t, handler.failures, 1)
+}
+
+func TestOpenAIWindowWarmupUsageAuthFailureUpdatesStateAfterDurableOutcome(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	handler := &warmupAuthFailureHandlerSpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.options.AuthFailureHandler = handler
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthNotRefreshable,
+		ExpectedCredentials: map[string]any{"access_token": "pat"},
+	}
+	err := withOpenAIWindowWarmupAuthFailure(
+		infraerrors.New(http.StatusUnauthorized, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned 401"), failure,
+	)
+
+	service.handleUsageObservationFailure(context.Background(), claim, now, OpenAIWindowWarmupStateRetrying, "preflight", err)
+
+	require.Equal(t, "blocked", repo.action)
+	require.Len(t, handler.failures, 1)
+	require.Equal(t, OpenAIWindowWarmupAuthNotRefreshable, handler.failures[0].Disposition)
+}
+
+func TestOpenAIWindowWarmupUsageAuthStateWriteFailureDurablyRetries(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	handler := &warmupAuthFailureHandlerSpy{err: errors.New("database unavailable")}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.options.AuthFailureHandler = handler
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthNotRefreshable,
+		ExpectedCredentials: map[string]any{"access_token": "pat"},
+	}
+	err := withOpenAIWindowWarmupAuthFailure(
+		infraerrors.New(http.StatusUnauthorized, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned 401"), failure,
+	)
+
+	service.handleUsageObservationFailure(context.Background(), claim, now, OpenAIWindowWarmupStateRetrying, "preflight", err)
+
+	require.Equal(t, 1, repo.authRetryCalls)
+	require.Equal(t, 1, repo.authRetry.AttemptCount)
+	require.Equal(t, OpenAIWindowWarmupStateBlocked, repo.authRetry.BlockedState)
+	require.Equal(t, "needs_reauth", repo.authRetry.ErrorCode)
+	require.Equal(t, "account_state_update_failed", repo.authRetry.RetryCode)
+}
+
+func TestOpenAIWindowWarmupScanContinuesAfterAuthStateWriteFailure(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	first := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	first.Credentials = map[string]any{"access_token": "rejected", "refresh_token": "refresh"}
+	second := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	second.ID = first.ID + 1
+	second.Name = "warmup-next-account"
+
+	firstClaim := warmupTestClaim(first.ID, now.Add(-time.Minute))
+	secondClaim := warmupTestClaim(second.ID, now.Add(-time.Minute))
+	secondClaim.Job.ID = firstClaim.Job.ID + 1
+	newReset := now.Add(5 * time.Hour)
+	authFailure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: first.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthReplayRejected,
+		ExpectedCredentials: shallowCopyMap(first.Credentials),
+	}
+	repo := &warmupRepositorySpy{
+		claims: []OpenAIWindowWarmupClaim{firstClaim, secondClaim}, consumeClaims: true,
+	}
+	probe := &warmupProbeStub{
+		results: []*OpenAIWindowProbeResult{
+			{StatusCode: http.StatusUnauthorized, AuthFailure: authFailure},
+			{StatusCode: http.StatusOK, Terminal: true, TerminalType: "response.completed", ResetAt: &newReset},
+		},
+		errs: []error{ErrOpenAIWindowWarmupNeedsReauth, nil},
+	}
+	service := newWarmupTestService(repo, first, probe, nil, now, true)
+	service.accounts = &warmupAccountRepositoryStub{accounts: map[int64]*Account{first.ID: first, second.ID: second}}
+	service.options.Allowlist = OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) {
+		return []int64{first.ID, second.ID}, nil
+	})
+	service.options.AuthFailureHandler = &warmupAuthFailureHandlerSpy{err: errors.New("database unavailable")}
+
+	service.scanOnce(context.Background())
+	require.Eventually(t, func() bool { return service.workerInflight.Load() == 0 }, time.Second, time.Millisecond)
+	service.limiter.mu.Lock()
+	service.limiter.next = time.Time{}
+	service.limiter.mu.Unlock()
+	service.scanOnce(context.Background())
+	require.Eventually(t, func() bool { return service.workerInflight.Load() == 0 }, time.Second, time.Millisecond)
+
+	require.Equal(t, 2, probe.calls)
+	require.Equal(t, 1, repo.authRetryCalls)
+	require.Equal(t, 1, repo.successCalls)
 }
 
 func TestOpenAIWindowWarmupSuppressionMetricClassification(t *testing.T) {

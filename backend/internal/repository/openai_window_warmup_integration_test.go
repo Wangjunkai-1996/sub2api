@@ -1219,6 +1219,75 @@ func TestOpenAIWindowWarmupRepositoryObservationFailureIsCountedAndFenced(t *tes
 	assertWarmupIntegrationAttempt(t, job.ID, 1, "retry", 502, "usage_observation_failed")
 }
 
+func TestOpenAIWindowWarmupRepositoryAuthStateRetryUsesExactTransitionCAS(t *testing.T) {
+	ctx := context.Background()
+	accountID := createWarmupIntegrationAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "auth-state-retry:" + uuid.NewString(), CycleGeneration: 91,
+		Trigger: service.OpenAIWindowWarmupTriggerReset, NextAttemptAt: time.Now().UTC().Add(-time.Second),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	claims, err := repo.ClaimDue(ctx, "auth-state-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	startedAt := time.Now().UTC()
+	started, err := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, startedAt,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+	require.NoError(t, err)
+	require.True(t, started)
+	blocked, err := repo.MarkBlocked(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken,
+		startedAt.Add(time.Second), 401, "needs_reauth", "warmup blocked")
+	require.NoError(t, err)
+	require.True(t, blocked)
+
+	next := time.Now().UTC().Add(time.Minute)
+	exact := service.OpenAIWindowWarmupAuthStateRetry{
+		JobID: job.ID, CycleGeneration: 91, AttemptCount: 1,
+		BlockedState: service.OpenAIWindowWarmupStateBlocked,
+		StatusCode:   401, ErrorCode: "needs_reauth",
+		RetryCode: "account_state_update_failed", NextAttemptAt: next,
+	}
+	for _, stale := range []service.OpenAIWindowWarmupAuthStateRetry{
+		func() service.OpenAIWindowWarmupAuthStateRetry { value := exact; value.CycleGeneration++; return value }(),
+		func() service.OpenAIWindowWarmupAuthStateRetry { value := exact; value.AttemptCount++; return value }(),
+		func() service.OpenAIWindowWarmupAuthStateRetry {
+			value := exact
+			value.ErrorCode = "blocked"
+			return value
+		}(),
+	} {
+		updated, retryErr := repo.RequeueAuthStateUpdateFailure(ctx, stale)
+		require.NoError(t, retryErr)
+		require.False(t, updated)
+	}
+
+	updated, err := repo.RequeueAuthStateUpdateFailure(ctx, exact)
+	require.NoError(t, err)
+	require.True(t, updated)
+	retrying, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateRetrying, retrying.State)
+	require.Equal(t, 1, retrying.AttemptCount)
+	require.NotNil(t, retrying.StatusCode)
+	require.Equal(t, 401, *retrying.StatusCode)
+	require.Equal(t, "account_state_update_failed", retrying.LastErrorCode)
+	require.WithinDuration(t, next, retrying.NextAttemptAt, time.Microsecond)
+	require.Empty(t, retrying.LeaseOwner)
+	require.Empty(t, retrying.LeaseToken)
+	require.Nil(t, retrying.LeaseUntil)
+
+	updated, err = repo.RequeueAuthStateUpdateFailure(ctx, exact)
+	require.NoError(t, err)
+	require.False(t, updated, "a delayed owner must not rearm a job that already left the blocked transition")
+}
+
 func TestOpenAIWindowWarmupRepositorySuppressionUsesRealAttemptNumber(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)

@@ -254,11 +254,13 @@ func ProvideOpenAIWindowWarmupService(
 	options OpenAIWindowWarmupOptions,
 	concurrency *ConcurrencyService,
 	quota *OpenAIQuotaService,
+	rateLimit *RateLimitService,
 ) *OpenAIWindowWarmupService {
 	options.Concurrency = concurrency
 	if quota != nil {
 		options.UsageReconciler = OpenAIWindowWarmupUsageReconcilerFunc(quota.QueryUsageForWarmup)
 	}
+	options.AuthFailureHandler = rateLimit
 	return NewOpenAIWindowWarmupService(repo, accountRepo, executor, probe, audit, options)
 }
 

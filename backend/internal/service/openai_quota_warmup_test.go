@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -151,6 +152,36 @@ func TestQueryUsageForWarmupRefreshesOAuthOnceAfterUnauthorized(t *testing.T) {
 	require.Equal(t, 1, repo.updateCalls)
 }
 
+func TestQueryUsageForWarmupClassifiesRejectedReplay(t *testing.T) {
+	account := &Account{
+		ID: 100, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
+		Credentials: map[string]any{
+			"access_token": "rejected-token", "refresh_token": "refresh-token", "chatgpt_account_id": "org-warmup",
+		},
+	}
+	repo := &openAIWindowForcedRefreshRepo{account: account}
+	cache := &openAIWindowForcedRefreshCache{token: "rejected-token"}
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), &openAIWindowForcedRefreshExecutor{})
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	service := NewOpenAIQuotaService(repo, nil, provider, newQuotaRedirectingFactory(server))
+
+	_, err := service.QueryUsageForWarmup(context.Background(), account.ID)
+
+	require.Error(t, err)
+	require.Equal(t, http.StatusUnauthorized, infraerrors.Code(err))
+	failure := openAIWindowWarmupAuthFailureFromError(err)
+	require.NotNil(t, failure)
+	require.Equal(t, OpenAIWindowWarmupAuthReplayRejected, failure.Disposition)
+	require.Equal(t, account.Credentials, failure.ExpectedCredentials)
+	require.Equal(t, 2, calls)
+}
+
 func TestQueryUsageForWarmupPATDoesNotReplayUnauthorized(t *testing.T) {
 	account := &Account{
 		ID: 100, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
@@ -175,7 +206,46 @@ func TestQueryUsageForWarmupPATDoesNotReplayUnauthorized(t *testing.T) {
 
 	require.Error(t, err)
 	require.Equal(t, http.StatusUnauthorized, infraerrors.Code(err))
+	require.Equal(t, OpenAIWindowWarmupAuthNotRefreshable, openAIWindowWarmupAuthFailureFromError(err).Disposition)
 	require.Equal(t, 1, calls)
+}
+
+func TestQueryUsageForWarmupClassifiesRefreshFailure(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		refreshErr error
+		wantStatus int
+		want       OpenAIWindowWarmupAuthDisposition
+	}{
+		{name: "terminal", refreshErr: errors.New("invalid_grant: revoked"), wantStatus: http.StatusUnauthorized, want: OpenAIWindowWarmupAuthRefreshTerminal},
+		{name: "transient", refreshErr: errors.New("oauth endpoint unavailable"), wantStatus: http.StatusServiceUnavailable, want: OpenAIWindowWarmupAuthRefreshTransient},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			account := &Account{
+				ID: 100, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
+				Credentials: map[string]any{"access_token": "rejected-token", "refresh_token": "refresh-token", "chatgpt_account_id": "org-warmup"},
+			}
+			repo := &openAIWindowForcedRefreshRepo{account: account}
+			cache := &openAIWindowForcedRefreshCache{token: "rejected-token"}
+			refreshExecutor := &warmupQuotaRefreshExecutor{err: test.refreshErr}
+			provider := NewOpenAITokenProvider(repo, cache, nil)
+			provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), refreshExecutor)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			defer server.Close()
+			service := NewOpenAIQuotaService(repo, nil, provider, newQuotaRedirectingFactory(server))
+
+			_, err := service.QueryUsageForWarmup(context.Background(), account.ID)
+
+			require.Error(t, err)
+			require.Equal(t, test.wantStatus, infraerrors.Code(err))
+			failure := openAIWindowWarmupAuthFailureFromError(err)
+			require.NotNil(t, failure)
+			require.Equal(t, test.want, failure.Disposition)
+			require.Equal(t, account.Credentials, failure.ExpectedCredentials)
+		})
+	}
 }
 
 func TestQueryUsageForWarmupRefreshContentionIsRetryable(t *testing.T) {

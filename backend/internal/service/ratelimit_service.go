@@ -44,6 +44,10 @@ type AccountRuntimeBlocker interface {
 	ClearAccountSchedulingBlock(accountID int64)
 }
 
+type openAIAuthErrorConditionalRepository interface {
+	SetOpenAIAuthErrorIfCredentialsUnchanged(context.Context, int64, map[string]any, string) (bool, error)
+}
+
 // SuccessfulTestRecoveryResult 表示测试成功后恢复了哪些运行时状态。
 type SuccessfulTestRecoveryResult struct {
 	ClearedError     bool
@@ -905,6 +909,91 @@ func (s *RateLimitService) handleAuthError(ctx context.Context, account *Account
 	slog.Warn("account_disabled_auth_error", "account_id", account.ID, "error", errorMsg)
 }
 
+// HandleOpenAIWindowWarmupAuthFailure adapts sanitized warmup evidence to the
+// existing account 401/403 policy. Permanent 401 mutations use a credentials
+// CAS so a stale worker cannot quarantine an account that was reauthorized
+// while the upstream request was in flight.
+func (s *RateLimitService) HandleOpenAIWindowWarmupAuthFailure(ctx context.Context, failure OpenAIWindowWarmupAuthFailure) error {
+	if s == nil || s.accountRepo == nil || failure.AccountID <= 0 {
+		return fmt.Errorf("openai warmup auth handler is not configured")
+	}
+	account, err := s.accountRepo.GetByID(ctx, failure.AccountID)
+	if err != nil {
+		return err
+	}
+	if account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return nil
+	}
+	if !openAIWarmupCredentialsMatch(account.Credentials, failure.ExpectedCredentials) {
+		slog.Info("openai_window_warmup_auth_state_skipped_stale_credentials",
+			"account_id", failure.AccountID,
+			"status", failure.StatusCode,
+			"disposition", failure.Disposition,
+		)
+		return ErrOpenAIWindowWarmupCredentialsChanged
+	}
+
+	switch failure.Disposition {
+	case OpenAIWindowWarmupAuthRefreshTransient:
+		if account.IsOpenAIAgentIdentity() {
+			until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
+			s.notifyAccountSchedulingBlocked(account, until, "openai_agent_identity_recovery")
+			return s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, "OpenAI Agent Identity recovery temporarily failed")
+		}
+		// Reuse ordinary OAuth 401 invalidation and temporary cooldown. The body is
+		// fixed locally and contains no upstream content.
+		s.HandleUpstreamError(ctx, account, http.StatusUnauthorized, nil, []byte(`{"error":{"message":"credential refresh temporarily failed"}}`))
+		return nil
+	case OpenAIWindowWarmupAuthRefreshInProgress, OpenAIWindowWarmupAuthForbiddenHTML:
+		return nil
+	case OpenAIWindowWarmupAuthForbidden:
+		// Reuse HTML exemption, 403 counter, temporary cooldown and threshold
+		// semantics without passing the real warmup response body into raw logging.
+		var permanentErr error
+		s.handleOpenAI403WithPermanentHandler(ctx, account, "", []byte(`{"error":{"message":"access forbidden"}}`), func(message string) {
+			_, permanentErr = s.setOpenAIWindowAuthError(ctx, account, failure.ExpectedCredentials, message)
+		})
+		return permanentErr
+	case OpenAIWindowWarmupAuthNotRefreshable, OpenAIWindowWarmupAuthReplayRejected,
+		OpenAIWindowWarmupAuthRefreshTerminal:
+		message := "OpenAI authentication failed (401): reauthorization required"
+		_, err = s.setOpenAIWindowAuthError(ctx, account, failure.ExpectedCredentials, message)
+		return err
+	}
+	return nil
+}
+
+func (s *RateLimitService) setOpenAIWindowAuthError(ctx context.Context, account *Account, expectedCredentials map[string]any, message string) (bool, error) {
+	conditionalRepo, ok := s.accountRepo.(openAIAuthErrorConditionalRepository)
+	if !ok {
+		return false, fmt.Errorf("openai auth credentials CAS repository is not configured")
+	}
+	applied, err := conditionalRepo.SetOpenAIAuthErrorIfCredentialsUnchanged(ctx, account.ID, expectedCredentials, message)
+	if err != nil {
+		return applied, err
+	}
+	if !applied {
+		return false, ErrOpenAIWindowWarmupCredentialsChanged
+	}
+	s.notifyAccountSchedulingBlocked(account, time.Time{}, "auth_error")
+	if s.tokenCacheInvalidator != nil {
+		if invalidateErr := s.tokenCacheInvalidator.InvalidateToken(ctx, account); invalidateErr != nil {
+			slog.Warn("openai_window_warmup_auth_cache_invalidate_failed", "account_id", account.ID, "error", invalidateErr)
+		}
+	}
+	slog.Warn("account_disabled_auth_error", "account_id", account.ID, "source", "openai_window_warmup")
+	return true, nil
+}
+
+func openAIWarmupCredentialsMatch(current, expected map[string]any) bool {
+	if expected == nil {
+		return false
+	}
+	currentJSON, currentErr := json.Marshal(current)
+	expectedJSON, expectedErr := json.Marshal(expected)
+	return currentErr == nil && expectedErr == nil && bytes.Equal(currentJSON, expectedJSON)
+}
+
 func buildForbiddenErrorMessage(prefix string, upstreamMsg string, responseBody []byte, fallback string) string {
 	prefix = strings.TrimSpace(prefix)
 	if prefix != "" && !strings.HasSuffix(prefix, " ") {
@@ -961,6 +1050,18 @@ func (s *RateLimitService) handle403(ctx context.Context, account *Account, upst
 }
 
 func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account, upstreamMsg string, responseBody []byte) (shouldDisable bool) {
+	return s.handleOpenAI403WithPermanentHandler(ctx, account, upstreamMsg, responseBody, func(message string) {
+		s.handleAuthError(ctx, account, message)
+	})
+}
+
+func (s *RateLimitService) handleOpenAI403WithPermanentHandler(
+	ctx context.Context,
+	account *Account,
+	upstreamMsg string,
+	responseBody []byte,
+	handlePermanent func(string),
+) (shouldDisable bool) {
 	// 上游代理 / CDN 在请求到达 OpenAI API 之前就拦下时，回的是 HTML 403 页面而不是
 	// {"error":{...}} 结构化错误。这类响应描述的是「这条链路 / 这个端点被挡了」，
 	// 不构成账号凭据或权限失效的证据——例如无效的 /v1/responses 子路径（#5334）。
@@ -991,20 +1092,20 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 	)
 
 	if s.openAI403CounterCache == nil {
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
 	count, err := s.openAI403CounterCache.IncrementOpenAI403Count(ctx, account.ID, openAI403CounterWindowMinutes)
 	if err != nil {
 		slog.Warn("openai_403_increment_failed", "account_id", account.ID, "error", err)
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
 	if count >= openAI403DisableThreshold {
 		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, openAI403DisableThreshold)
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
@@ -1013,7 +1114,7 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 	s.notifyAccountSchedulingBlocked(account, until, "openai_403_temp")
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
 		slog.Warn("openai_403_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 

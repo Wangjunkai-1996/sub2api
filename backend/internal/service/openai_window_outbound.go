@@ -89,18 +89,27 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 
 	auth, err := e.authorizationHeaders(execCtx, request.Account)
 	if err != nil {
-		return nil, fmt.Errorf("resolve openai warmup authorization: %w", err)
+		wrapped := fmt.Errorf("resolve openai warmup authorization: %w", err)
+		if errors.Is(err, ErrOpenAIWindowWarmupNeedsReauth) {
+			disposition := OpenAIWindowWarmupAuthRefreshTerminal
+			if !request.Account.IsOpenAIAgentIdentity() && (request.Account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(request.Account.GetOpenAIRefreshToken()) == "") {
+				disposition = OpenAIWindowWarmupAuthNotRefreshable
+			}
+			failure := newOpenAIWindowWarmupAuthFailure(request.Account, http.StatusUnauthorized, disposition)
+			return &OpenAIOutboundResult{AuthFailure: failure}, withOpenAIWindowWarmupAuthFailure(wrapped, failure)
+		}
+		return nil, wrapped
 	}
 	result, err := e.executeOnce(execCtx, request, auth)
 	if err != nil || result == nil || result.StatusCode != http.StatusUnauthorized {
-		return result, err
+		return annotateOpenAIWindowAuthResult(result, request.Account, ""), err
 	}
 
 	// A 401 is authoritative evidence that the warmup request was rejected, so
 	// one credential recovery and replay is safe. No other response is replayed.
 	if request.Account.IsOpenAIAgentIdentity() {
 		if !isAgentIdentityTaskInvalidHTTPResponse(result.StatusCode, result.Body) {
-			return result, nil
+			return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthRefreshTerminal), nil
 		}
 		expectedTaskID := strings.TrimSpace(request.Account.GetCredential("task_id"))
 		if recoverErr := ensureAgentIdentityTaskForAccount(
@@ -111,13 +120,21 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 			request.Account,
 			expectedTaskID,
 		); recoverErr != nil {
+			disposition := OpenAIWindowWarmupAuthRefreshTransient
+			if isPermanentWarmupAgentIdentityError(recoverErr) {
+				disposition = OpenAIWindowWarmupAuthRefreshTerminal
+			}
+			result = annotateOpenAIWindowAuthResult(result, request.Account, disposition)
+			if disposition == OpenAIWindowWarmupAuthRefreshTransient {
+				return result, withOpenAIWindowWarmupAuthFailure(errors.New("openai agent identity recovery failed"), result.AuthFailure)
+			}
 			return result, nil
 		}
 		auth, err = e.authorizationHeaders(execCtx, request.Account)
 	} else {
 		if e.tokenProvider == nil || request.Account.IsOpenAIPersonalAccessToken() ||
 			strings.TrimSpace(request.Account.GetOpenAIRefreshToken()) == "" {
-			return result, nil
+			return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthNotRefreshable), nil
 		}
 		var token string
 		rejectedToken := strings.TrimSpace(strings.TrimPrefix(auth.Get("Authorization"), "Bearer "))
@@ -129,11 +146,68 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 	}
 	if err != nil {
 		if errors.Is(err, errOpenAITokenRefreshInProgress) {
-			return &OpenAIOutboundResult{}, fmt.Errorf("token_refresh_in_progress: %w", err)
+			failure := newOpenAIWindowWarmupAuthFailure(request.Account, http.StatusUnauthorized, OpenAIWindowWarmupAuthRefreshInProgress)
+			return &OpenAIOutboundResult{AuthFailure: failure}, withOpenAIWindowWarmupAuthFailure(fmt.Errorf("token_refresh_in_progress: %w", err), failure)
+		}
+		disposition := OpenAIWindowWarmupAuthRefreshTransient
+		if isOpenAIWindowTerminalRefreshError(err) {
+			disposition = OpenAIWindowWarmupAuthRefreshTerminal
+		}
+		result = annotateOpenAIWindowAuthResult(result, request.Account, disposition)
+		if disposition == OpenAIWindowWarmupAuthRefreshTransient {
+			return result, withOpenAIWindowWarmupAuthFailure(errors.New("openai oauth refresh failed"), result.AuthFailure)
 		}
 		return result, nil
 	}
-	return e.executeOnce(execCtx, request, auth)
+	result, err = e.executeOnce(execCtx, request, auth)
+	return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthReplayRejected), err
+}
+
+func newOpenAIWindowWarmupAuthFailure(account *Account, status int, disposition OpenAIWindowWarmupAuthDisposition) *OpenAIWindowWarmupAuthFailure {
+	failure := &OpenAIWindowWarmupAuthFailure{StatusCode: status, Disposition: disposition}
+	if account != nil {
+		failure.AccountID = account.ID
+		failure.ExpectedCredentials = shallowCopyMap(account.Credentials)
+	}
+	return failure
+}
+
+func annotateOpenAIWindowAuthResult(result *OpenAIOutboundResult, account *Account, disposition OpenAIWindowWarmupAuthDisposition) *OpenAIOutboundResult {
+	if result == nil {
+		return nil
+	}
+	switch result.StatusCode {
+	case http.StatusUnauthorized:
+		if disposition == "" {
+			disposition = OpenAIWindowWarmupAuthRefreshTerminal
+		}
+	case http.StatusForbidden:
+		if isHTMLResponse(result.Body) {
+			disposition = OpenAIWindowWarmupAuthForbiddenHTML
+		} else {
+			disposition = OpenAIWindowWarmupAuthForbidden
+		}
+	default:
+		return result
+	}
+	result.AuthFailure = newOpenAIWindowWarmupAuthFailure(account, result.StatusCode, disposition)
+	return result
+}
+
+func isOpenAIWindowTerminalRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"invalid_grant", "invalid_refresh_token", "token_expired", "app_session_terminated",
+		"refresh_token_reused", "refresh_token_invalidated", "access_denied",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateOpenAIWindowOutboundRequest(request OpenAIOutboundRequest) error {

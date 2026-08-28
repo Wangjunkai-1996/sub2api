@@ -263,10 +263,22 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 	agentIdentity := s.isAgentIdentityAccount(ctx, accountID)
 
 	var payload OpenAIQuotaUsage
+	var warmupAuthCredentials map[string]any
 	for recovered := false; ; {
 		quotaHeaders, expectedTaskID, headerErr := s.buildCodexQuotaHeaders(callCtx, accountID, accessToken, chatGPTAccountID, fedRAMP)
 		if headerErr != nil {
-			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "failed to build upstream authentication: %v", headerErr)
+			if options.source != "window_warmup" {
+				return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "failed to build upstream authentication: %v", headerErr)
+			}
+			baseErr := infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "failed to build upstream authentication")
+			if isPermanentWarmupAgentIdentityError(headerErr) {
+				account, _ := s.accountRepo.GetByID(ctx, accountID)
+				failure := newOpenAIWindowWarmupAuthFailure(account, http.StatusUnauthorized, OpenAIWindowWarmupAuthRefreshTerminal)
+				return nil, withOpenAIWindowWarmupAuthFailure(
+					fmt.Errorf("%w: %w", ErrOpenAIWindowWarmupNeedsReauth, baseErr), failure,
+				)
+			}
+			return nil, baseErr
 		}
 		resp, err := client.R().
 			SetContext(callCtx).
@@ -280,6 +292,19 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 			if agentIdentity && !recovered && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, []byte(resp.String())) {
 				recovered = true
 				if err := s.recoverAgentIdentityTask(ctx, accountID, expectedTaskID); err != nil {
+					disposition := OpenAIWindowWarmupAuthRefreshTransient
+					mappedStatus := http.StatusServiceUnavailable
+					if isPermanentWarmupAgentIdentityError(err) {
+						disposition = OpenAIWindowWarmupAuthRefreshTerminal
+						mappedStatus = http.StatusUnauthorized
+					}
+					if options.source == "window_warmup" {
+						account, _ := s.accountRepo.GetByID(ctx, accountID)
+						failure := newOpenAIWindowWarmupAuthFailure(account, http.StatusUnauthorized, disposition)
+						return nil, withOpenAIWindowWarmupAuthFailure(
+							infraerrors.New(mappedStatus, "OPENAI_QUOTA_AUTH_FAILED", "agent identity task recovery failed"), failure,
+						)
+					}
 					return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "agent identity task recovery failed: %v", err)
 				}
 				continue
@@ -288,20 +313,45 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 			if options.source == "window_warmup" && status == http.StatusUnauthorized && !agentIdentity && !recovered {
 				recovered = true
 				account, loadErr := s.accountRepo.GetByID(ctx, accountID)
-				if loadErr == nil && account != nil && !account.IsOpenAIPersonalAccessToken() &&
-					strings.TrimSpace(account.GetOpenAIRefreshToken()) != "" && s.tokenProvider != nil {
+				if loadErr != nil || account == nil {
+					return nil, infraerrors.New(http.StatusServiceUnavailable, "OPENAI_QUOTA_ACCOUNT_REFRESH_STATE_FAILED", "openai oauth refresh state is unavailable")
+				}
+				if account != nil {
+					warmupAuthCredentials = shallowCopyMap(account.Credentials)
+					if account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+						failure := newOpenAIWindowWarmupAuthFailure(account, status, OpenAIWindowWarmupAuthNotRefreshable)
+						return nil, withOpenAIWindowWarmupAuthFailure(
+							infraerrors.New(status, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned 401"), failure,
+						)
+					}
+					if s.tokenProvider == nil {
+						failure := newOpenAIWindowWarmupAuthFailure(account, status, OpenAIWindowWarmupAuthRefreshTransient)
+						return nil, withOpenAIWindowWarmupAuthFailure(
+							infraerrors.New(http.StatusServiceUnavailable, "OPENAI_QUOTA_REFRESH_FAILED", "openai oauth refresh is unavailable"), failure,
+						)
+					}
 					refreshedToken, refreshErr := s.tokenProvider.RefreshAfterUnauthorized(callCtx, account, accessToken)
 					if refreshErr == nil && strings.TrimSpace(refreshedToken) != "" {
 						accessToken = refreshedToken
+						warmupAuthCredentials = shallowCopyMap(account.Credentials)
 						continue
 					}
+					disposition := OpenAIWindowWarmupAuthRefreshTransient
+					retryStatus := http.StatusServiceUnavailable
+					reason := "OPENAI_QUOTA_REFRESH_FAILED"
+					message := "openai oauth refresh failed"
 					if errors.Is(refreshErr, errOpenAITokenRefreshInProgress) {
-						return nil, infraerrors.New(
-							http.StatusServiceUnavailable,
-							"OPENAI_QUOTA_REFRESH_IN_PROGRESS",
-							"openai oauth refresh is in progress",
-						)
+						disposition = OpenAIWindowWarmupAuthRefreshInProgress
+						reason = "OPENAI_QUOTA_REFRESH_IN_PROGRESS"
+						message = "openai oauth refresh is in progress"
+					} else if isOpenAIWindowTerminalRefreshError(refreshErr) {
+						disposition = OpenAIWindowWarmupAuthRefreshTerminal
+						retryStatus = http.StatusUnauthorized
+						reason = "OPENAI_QUOTA_UPSTREAM_ERROR"
+						message = "upstream returned 401"
 					}
+					failure := newOpenAIWindowWarmupAuthFailure(account, http.StatusUnauthorized, disposition)
+					return nil, withOpenAIWindowWarmupAuthFailure(infraerrors.New(retryStatus, reason, message), failure)
 				}
 			}
 			if options.sanitizedErrors || isOpenAIAutoResetContext(ctx) {
@@ -314,7 +364,29 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 				if options.source == "window_warmup" {
 					mappedStatus = status
 				}
-				return nil, infraerrors.Newf(mappedStatus, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned %d", status)
+				mappedErr := infraerrors.Newf(mappedStatus, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned %d", status)
+				if options.source == "window_warmup" && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
+					account, _ := s.accountRepo.GetByID(ctx, accountID)
+					if account != nil && len(warmupAuthCredentials) == 0 {
+						warmupAuthCredentials = shallowCopyMap(account.Credentials)
+					}
+					disposition := OpenAIWindowWarmupAuthReplayRejected
+					if status == http.StatusUnauthorized && agentIdentity && !recovered {
+						disposition = OpenAIWindowWarmupAuthRefreshTerminal
+					}
+					if status == http.StatusForbidden {
+						disposition = OpenAIWindowWarmupAuthForbidden
+						if isHTMLResponse([]byte(resp.String())) {
+							disposition = OpenAIWindowWarmupAuthForbiddenHTML
+						}
+					}
+					failure := &OpenAIWindowWarmupAuthFailure{
+						AccountID: accountID, StatusCode: status, Disposition: disposition,
+						ExpectedCredentials: shallowCopyMap(warmupAuthCredentials),
+					}
+					return nil, withOpenAIWindowWarmupAuthFailure(mappedErr, failure)
+				}
+				return nil, mappedErr
 			}
 			body := truncate(s.redactQuotaErrorBody(ctx, accountID, resp.String()), 240)
 			slog.Warn("openai_quota_query_failed", "account_id", accountID, "status", status, "body", body)

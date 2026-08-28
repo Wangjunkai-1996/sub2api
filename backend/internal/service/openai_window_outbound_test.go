@@ -324,6 +324,56 @@ func TestOpenAIWindowOutboundAdapterRefreshesOAuthOnceAfter401(t *testing.T) {
 	require.Len(t, upstream.requests, 2)
 	require.Equal(t, "Bearer rejected-token", upstream.requests[0].Header.Get("Authorization"))
 	require.Equal(t, "Bearer refreshed-token", upstream.requests[1].Header.Get("Authorization"))
+	require.Nil(t, result.AuthFailure)
+}
+
+func TestOpenAIWindowOutboundAdapterClassifiesRejectedReplay(t *testing.T) {
+	account := openAIWindowOutboundAccount()
+	tokens := &openAIWindowOutboundTokenStub{token: "rejected-token", refreshed: "refreshed-token"}
+	upstream := &openAIWindowOutboundHTTPStub{responses: []*http.Response{
+		{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"unauthorized"}`))},
+		{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"still unauthorized"}`))},
+	}}
+	adapter := &OpenAIWindowOutboundAdapter{tokenProvider: tokens, httpUpstream: upstream}
+
+	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(account))
+
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, result.StatusCode)
+	require.Equal(t, OpenAIWindowWarmupAuthReplayRejected, result.AuthFailure.Disposition)
+	require.Equal(t, account.Credentials, result.AuthFailure.ExpectedCredentials)
+	require.Len(t, upstream.requests, 2)
+}
+
+func TestOpenAIWindowOutboundAdapterClassifiesRefreshFailure(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want OpenAIWindowWarmupAuthDisposition
+	}{
+		{name: "terminal", err: errors.New("invalid_grant: revoked"), want: OpenAIWindowWarmupAuthRefreshTerminal},
+		{name: "transient", err: errors.New("oauth endpoint temporarily unavailable"), want: OpenAIWindowWarmupAuthRefreshTransient},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			account := openAIWindowOutboundAccount()
+			tokens := &openAIWindowOutboundTokenStub{token: "rejected-token", refreshErr: test.err}
+			upstream := &openAIWindowOutboundHTTPStub{responses: []*http.Response{{
+				StatusCode: http.StatusUnauthorized,
+				Header:     make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"unauthorized"}`)),
+			}}}
+			adapter := &OpenAIWindowOutboundAdapter{tokenProvider: tokens, httpUpstream: upstream}
+
+			result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(account))
+
+			require.NotNil(t, result)
+			require.Equal(t, test.want, result.AuthFailure.Disposition)
+			if test.want == OpenAIWindowWarmupAuthRefreshTransient {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestOpenAITokenProviderRefreshAfterUnauthorizedIgnoresFutureExpiry(t *testing.T) {
@@ -404,6 +454,7 @@ func TestOpenAIWindowOutboundAdapterRefreshContentionIsTransient(t *testing.T) {
 	require.NotNil(t, result)
 	require.Zero(t, result.StatusCode)
 	require.False(t, result.Started)
+	require.Equal(t, OpenAIWindowWarmupAuthRefreshInProgress, result.AuthFailure.Disposition)
 	require.Len(t, upstream.requests, 1)
 }
 
@@ -422,6 +473,7 @@ func TestOpenAIWindowOutboundAdapterPATUsesBearerAndDoesNotReplay401(t *testing.
 	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(account))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUnauthorized, result.StatusCode)
+	require.Equal(t, OpenAIWindowWarmupAuthNotRefreshable, result.AuthFailure.Disposition)
 	require.Len(t, upstream.requests, 1)
 	require.Equal(t, "Bearer pat-token", upstream.requests[0].Header.Get("Authorization"))
 	require.Zero(t, tokens.refreshCalls)
@@ -444,7 +496,8 @@ func TestOpenAIWindowOutboundAdapterEmptyStaticCredentialsNeedReauth(t *testing.
 			result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(account))
 
 			require.ErrorIs(t, err, ErrOpenAIWindowWarmupNeedsReauth)
-			require.Nil(t, result)
+			require.NotNil(t, result)
+			require.Equal(t, OpenAIWindowWarmupAuthNotRefreshable, result.AuthFailure.Disposition)
 			require.Empty(t, upstream.requests)
 		})
 	}
@@ -462,7 +515,8 @@ func TestOpenAIWindowOutboundAdapterInvalidAgentIdentityNeedsReauth(t *testing.T
 	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(account))
 
 	require.ErrorIs(t, err, ErrOpenAIWindowWarmupNeedsReauth)
-	require.Nil(t, result)
+	require.NotNil(t, result)
+	require.Equal(t, OpenAIWindowWarmupAuthRefreshTerminal, result.AuthFailure.Disposition)
 	require.Empty(t, upstream.requests)
 }
 

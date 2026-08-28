@@ -1141,6 +1141,77 @@ func (s *AccountRepoSuite) TestSetGrokOAuthErrorIfCredentialsUnchanged_AppliesAn
 	s.Require().Equal(1, outboxCount)
 }
 
+func (s *AccountRepoSuite) TestSetOpenAIAuthErrorIfCredentialsUnchanged_AppliesAndSyncsSchedulerState() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name: "openai-conditional-auth-error-applied", Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: map[string]any{"access_token": "observed", "refresh_token": "refresh", "_token_version": int64(7)},
+	})
+	observed, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	cacheRecorder := &schedulerCacheRecorder{}
+	s.repo.schedulerCache = cacheRecorder
+	_, err = s.repo.sql.ExecContext(s.ctx, "TRUNCATE scheduler_outbox")
+	s.Require().NoError(err)
+
+	applied, err := s.repo.SetOpenAIAuthErrorIfCredentialsUnchanged(
+		s.ctx, account.ID, observed.Credentials, "reauthorization required",
+	)
+
+	s.Require().NoError(err)
+	s.Require().True(applied)
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(service.StatusError, got.Status)
+	s.Require().False(got.Schedulable)
+	s.Require().Equal("reauthorization required", got.ErrorMessage)
+	s.Require().Len(cacheRecorder.setAccounts, 1)
+	var outboxCount int
+	s.Require().NoError(scanSingleRow(
+		s.ctx, s.repo.sql,
+		"SELECT COUNT(*) FROM scheduler_outbox WHERE event_type = $1 AND account_id = $2",
+		[]any{service.SchedulerOutboxEventAccountChanged, account.ID}, &outboxCount,
+	))
+	s.Require().Equal(1, outboxCount)
+}
+
+func (s *AccountRepoSuite) TestSetOpenAIAuthErrorIfCredentialsUnchanged_SkipsConcurrentReauthorization() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name: "openai-conditional-auth-error-stale", Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: map[string]any{"access_token": "observed", "refresh_token": "old-refresh", "_token_version": int64(7)},
+	})
+	observed, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().NoError(s.repo.UpdateCredentials(s.ctx, account.ID, map[string]any{
+		"access_token": "fresh-access", "refresh_token": "fresh-refresh", "_token_version": int64(8),
+	}))
+	cacheRecorder := &schedulerCacheRecorder{}
+	s.repo.schedulerCache = cacheRecorder
+	_, err = s.repo.sql.ExecContext(s.ctx, "TRUNCATE scheduler_outbox")
+	s.Require().NoError(err)
+
+	applied, err := s.repo.SetOpenAIAuthErrorIfCredentialsUnchanged(
+		s.ctx, account.ID, observed.Credentials, "stale warmup failure",
+	)
+
+	s.Require().NoError(err)
+	s.Require().False(applied)
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(service.StatusActive, got.Status)
+	s.Require().True(got.Schedulable)
+	s.Require().Equal("fresh-refresh", got.GetOpenAIRefreshToken())
+	s.Require().Empty(cacheRecorder.setAccounts)
+	var outboxCount int
+	s.Require().NoError(scanSingleRow(
+		s.ctx, s.repo.sql,
+		"SELECT COUNT(*) FROM scheduler_outbox WHERE event_type = $1 AND account_id = $2",
+		[]any{service.SchedulerOutboxEventAccountChanged, account.ID}, &outboxCount,
+	))
+	s.Require().Zero(outboxCount)
+}
+
 func (s *AccountRepoSuite) TestSetGrokOAuthErrorIfCredentialsUnchanged_SkipsConcurrentReauthorization() {
 	account := mustCreateAccount(s.T(), s.client, &service.Account{
 		Name:        "grok-conditional-error-reauthorized",

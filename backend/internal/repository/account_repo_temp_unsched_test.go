@@ -151,6 +151,45 @@ func TestAccountRepository_SetGrokOAuthErrorIfCredentialsUnchanged_RequiresActiv
 	require.Contains(t, exec.execArgs[0][6], `"_token_version":7`)
 }
 
+func TestAccountRepository_SetOpenAIAuthErrorIfCredentialsUnchanged_UsesAtomicCredentialCAS(t *testing.T) {
+	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
+	repo := newAccountRepositoryWithSQL(nil, exec, nil)
+
+	applied, err := repo.SetOpenAIAuthErrorIfCredentialsUnchanged(
+		context.Background(),
+		42,
+		map[string]any{"access_token": "observed", "refresh_token": "refresh", "_token_version": int64(7)},
+		"reauthorization required",
+	)
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Len(t, exec.execQueries, 1)
+	normalized := normalizeSQLWhitespace(exec.execQueries[0])
+	require.Contains(t, normalized, "WITH updated AS")
+	require.Contains(t, normalized, "INSERT INTO scheduler_outbox")
+	require.Contains(t, normalized, "platform = $4")
+	require.Contains(t, normalized, "type = $5")
+	require.Contains(t, normalized, "status = $6")
+	require.Contains(t, normalized, "credentials = $7::jsonb")
+	require.NotContains(t, normalized, "refresh_token'), '') IS NULL")
+	require.Contains(t, exec.execArgs[0][6], `"_token_version":7`)
+	require.Equal(t, service.SchedulerOutboxEventAccountChanged, exec.execArgs[0][7])
+}
+
+func TestAccountRepository_SetOpenAIAuthErrorIfCredentialsUnchanged_CASMissHasNoSnapshotSideEffect(t *testing.T) {
+	exec := &recordingSQLExecutor{result: rowsAffectedResult(0)}
+	repo := newAccountRepositoryWithSQL(nil, exec, nil)
+
+	applied, err := repo.SetOpenAIAuthErrorIfCredentialsUnchanged(
+		context.Background(), 42, map[string]any{"access_token": "stale"}, "reauthorization required",
+	)
+
+	require.NoError(t, err)
+	require.False(t, applied)
+	require.Len(t, exec.execQueries, 1)
+}
+
 func TestAccountRepository_SetGrokOAuthErrorIfCredentialsUnchanged_AppliedWritesOutbox(t *testing.T) {
 	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
 	repo := newAccountRepositoryWithSQL(nil, exec, nil)

@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -149,6 +150,62 @@ type OpenAIOutboundResult struct {
 	Started      bool
 	EOF          bool
 	RequestID    string
+	AuthFailure  *OpenAIWindowWarmupAuthFailure
+}
+
+// OpenAIWindowWarmupAuthDisposition is bounded metadata describing how an
+// authentication failure behaved. It never contains credential or response
+// content and lets the account-state adapter reuse existing 401/403 policy
+// without logging a warmup response body.
+type OpenAIWindowWarmupAuthDisposition string
+
+const (
+	OpenAIWindowWarmupAuthNotRefreshable    OpenAIWindowWarmupAuthDisposition = "not_refreshable"
+	OpenAIWindowWarmupAuthReplayRejected    OpenAIWindowWarmupAuthDisposition = "replay_rejected"
+	OpenAIWindowWarmupAuthRefreshTerminal   OpenAIWindowWarmupAuthDisposition = "refresh_terminal"
+	OpenAIWindowWarmupAuthRefreshTransient  OpenAIWindowWarmupAuthDisposition = "refresh_transient"
+	OpenAIWindowWarmupAuthRefreshInProgress OpenAIWindowWarmupAuthDisposition = "refresh_in_progress"
+	OpenAIWindowWarmupAuthForbiddenHTML     OpenAIWindowWarmupAuthDisposition = "forbidden_html"
+	OpenAIWindowWarmupAuthForbidden         OpenAIWindowWarmupAuthDisposition = "forbidden"
+)
+
+type OpenAIWindowWarmupAuthFailure struct {
+	AccountID           int64
+	StatusCode          int
+	Disposition         OpenAIWindowWarmupAuthDisposition
+	ExpectedCredentials map[string]any `json:"-"`
+}
+
+type openAIWindowWarmupAuthError struct {
+	err     error
+	failure *OpenAIWindowWarmupAuthFailure
+}
+
+func (e *openAIWindowWarmupAuthError) Error() string { return e.err.Error() }
+func (e *openAIWindowWarmupAuthError) Unwrap() error { return e.err }
+
+func withOpenAIWindowWarmupAuthFailure(err error, failure *OpenAIWindowWarmupAuthFailure) error {
+	if err == nil || failure == nil {
+		return err
+	}
+	return &openAIWindowWarmupAuthError{err: err, failure: cloneOpenAIWindowWarmupAuthFailure(failure)}
+}
+
+func openAIWindowWarmupAuthFailureFromError(err error) *OpenAIWindowWarmupAuthFailure {
+	var authErr *openAIWindowWarmupAuthError
+	if !errors.As(err, &authErr) || authErr == nil {
+		return nil
+	}
+	return cloneOpenAIWindowWarmupAuthFailure(authErr.failure)
+}
+
+func cloneOpenAIWindowWarmupAuthFailure(failure *OpenAIWindowWarmupAuthFailure) *OpenAIWindowWarmupAuthFailure {
+	if failure == nil {
+		return nil
+	}
+	cloned := *failure
+	cloned.ExpectedCredentials = shallowCopyMap(failure.ExpectedCredentials)
+	return &cloned
 }
 
 // OpenAIOutboundExecutor is implemented by the built-in HTTP/TLS adapter and
@@ -170,6 +227,7 @@ type OpenAIWindowProbeResult struct {
 	ObservedResetAt *time.Time
 	EOF             bool
 	Outcome         string
+	AuthFailure     *OpenAIWindowWarmupAuthFailure
 }
 
 // OpenAIWindowProbe is the probe port consumed by the service.  A concrete
@@ -192,6 +250,10 @@ func (f OpenAIWindowWarmupUsageReconcilerFunc) QueryUsage(ctx context.Context, a
 		return nil, errors.New("warmup usage reconciler is unavailable")
 	}
 	return f(ctx, accountID)
+}
+
+type OpenAIWindowWarmupAuthFailureHandler interface {
+	HandleOpenAIWindowWarmupAuthFailure(context.Context, OpenAIWindowWarmupAuthFailure) error
 }
 
 // OpenAIWindowWarmupKillSwitch is deliberately tiny so settings can be read
@@ -298,6 +360,21 @@ type OpenAIWindowWarmupUncertainEvidence struct {
 	Terminal      bool
 }
 
+// OpenAIWindowWarmupAuthStateRetry identifies one completed blocked transition
+// that may be rearmed when its account-state side effect failed. The evidence
+// is deliberately credential-free and lets the repository reject stale owners,
+// later cycles, later attempts, and administrator state changes.
+type OpenAIWindowWarmupAuthStateRetry struct {
+	JobID           int64
+	CycleGeneration int64
+	AttemptCount    int
+	BlockedState    string
+	StatusCode      int
+	ErrorCode       string
+	RetryCode       string
+	NextAttemptAt   time.Time
+}
+
 // OpenAIWindowWarmupRepository is the durable port. Implementations must use
 // PostgreSQL's DB clock and SELECT ... FOR UPDATE SKIP LOCKED in ClaimDue.
 type OpenAIWindowWarmupRepository interface {
@@ -316,6 +393,7 @@ type OpenAIWindowWarmupRepository interface {
 	MarkRateLimited(context.Context, int64, string, string, time.Time, time.Time, *time.Time, int, string) (bool, error)
 	MarkUncertain(context.Context, int64, string, string, time.Time, time.Time, int, string, string, OpenAIWindowWarmupUncertainEvidence) (bool, error)
 	MarkBlocked(context.Context, int64, string, string, time.Time, int, string, string) (bool, error)
+	RequeueAuthStateUpdateFailure(context.Context, OpenAIWindowWarmupAuthStateRetry) (bool, error)
 	MarkPaused(context.Context, int64, string, string, time.Time, string) (bool, error)
 	Reschedule(context.Context, int64, string, string, time.Time, string, *time.Time) (bool, error)
 	GetByID(context.Context, int64) (*OpenAIWindowWarmupJob, error)
@@ -396,9 +474,10 @@ type OpenAIWindowWarmupOptions struct {
 	Concurrency       interface {
 		TryAcquireAccountExclusive(context.Context, int64, time.Duration) (*AccountExclusiveLease, bool, error)
 	}
-	UsageReconciler OpenAIWindowWarmupUsageReconciler
-	Now             func() time.Time
-	RandomJitter    func(string, time.Duration) time.Duration
+	UsageReconciler    OpenAIWindowWarmupUsageReconciler
+	AuthFailureHandler OpenAIWindowWarmupAuthFailureHandler
+	Now                func() time.Time
+	RandomJitter       func(string, time.Duration) time.Duration
 }
 
 func (o OpenAIWindowWarmupOptions) withDefaults() OpenAIWindowWarmupOptions {
@@ -1049,6 +1128,19 @@ func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim
 	if result != nil {
 		statusCode = result.StatusCode
 	}
+	authFailure := openAIWindowWarmupProbeAuthFailure(result, probeErr)
+	if authFailure != nil && (authFailure.Disposition == OpenAIWindowWarmupAuthRefreshTransient ||
+		authFailure.Disposition == OpenAIWindowWarmupAuthRefreshInProgress) {
+		if job.AttemptCount >= s.options.MaxAttempts {
+			s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached")
+			return
+		}
+		if s.markRetry(ctx, claim, now, now.Add(warmupBackoff(job.AttemptCount-1)), statusCode,
+			string(authFailure.Disposition), "transient credential recovery failure") {
+			_ = s.handleAuthFailure(ctx, authFailure)
+		}
+		return
+	}
 	if statusCode == http.StatusTooManyRequests {
 		if job.AttemptCount >= s.options.MaxAttempts {
 			s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached")
@@ -1070,7 +1162,10 @@ func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim
 		return
 	}
 	if isWarmupBlockedError(probeErr, statusCode) {
-		s.markBlocked(ctx, claim, now, statusCode, warmupBlockedCode(probeErr, statusCode), "warmup blocked")
+		code := warmupBlockedCode(probeErr, statusCode)
+		if s.markBlocked(ctx, claim, now, statusCode, code, "warmup blocked") {
+			s.handleTerminalAuthFailure(ctx, claim, authFailure, statusCode, code)
+		}
 		return
 	}
 	if probeErr != nil {
@@ -1203,6 +1298,7 @@ func (s *OpenAIWindowWarmupService) markRetry(ctx context.Context, claim OpenAIW
 
 func (s *OpenAIWindowWarmupService) handleUsageObservationFailure(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, retryState, phase string, observationErr error) bool {
 	status, code, terminalState := classifyWarmupUsageObservationError(observationErr)
+	authFailure := openAIWindowWarmupAuthFailureFromError(observationErr)
 	if code == "usage_observation_failed" {
 		code = "usage_" + phase + "_failed"
 	}
@@ -1234,7 +1330,91 @@ func (s *OpenAIWindowWarmupService) handleUsageObservationFailure(ctx context.Co
 		s.metrics.retry.Add(1)
 	}
 	s.recordWarmupAudit(claim.Job, state, status, code, claim.Job.ObservedResetAt)
+	if state == OpenAIWindowWarmupStateBlocked || state == OpenAIWindowWarmupStateBlockedConfig {
+		s.handleTerminalAuthFailure(ctx, claim, authFailure, status, code)
+	} else {
+		_ = s.handleAuthFailure(ctx, authFailure)
+	}
 	return true
+}
+
+func openAIWindowWarmupProbeAuthFailure(result *OpenAIWindowProbeResult, err error) *OpenAIWindowWarmupAuthFailure {
+	if result != nil && result.AuthFailure != nil {
+		return cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure)
+	}
+	return openAIWindowWarmupAuthFailureFromError(err)
+}
+
+func (s *OpenAIWindowWarmupService) handleAuthFailure(ctx context.Context, failure *OpenAIWindowWarmupAuthFailure) error {
+	if s == nil || failure == nil || s.options.AuthFailureHandler == nil {
+		return nil
+	}
+	if err := s.options.AuthFailureHandler.HandleOpenAIWindowWarmupAuthFailure(ctx, *cloneOpenAIWindowWarmupAuthFailure(failure)); err != nil {
+		if errors.Is(err, ErrOpenAIWindowWarmupCredentialsChanged) {
+			return err
+		}
+		slog.Warn("openai_window_warmup_auth_state_update_failed",
+			"account_id", failure.AccountID,
+			"status", failure.StatusCode,
+			"disposition", failure.Disposition,
+			"error", err,
+		)
+		return err
+	}
+	return nil
+}
+
+func (s *OpenAIWindowWarmupService) handleTerminalAuthFailure(
+	ctx context.Context,
+	claim OpenAIWindowWarmupClaim,
+	failure *OpenAIWindowWarmupAuthFailure,
+	status int,
+	code string,
+) {
+	if failure == nil || claim.Job == nil {
+		return
+	}
+	authStateErr := s.handleAuthFailure(ctx, failure)
+	if authStateErr == nil {
+		return
+	}
+	// A definitive 401/403 was rejected before producing content, so one
+	// bounded retry is safe. The repository CAS below refuses to rearm a job
+	// changed by an administrator, a later attempt, or a later cycle.
+	if claim.Job.AttemptCount >= s.options.MaxAttempts {
+		return
+	}
+	blockedState := OpenAIWindowWarmupStateBlocked
+	if status == http.StatusBadRequest || status == http.StatusNotFound || code == "blocked_config" {
+		blockedState = OpenAIWindowWarmupStateBlockedConfig
+	}
+	next := s.now().Add(warmupBackoff(claim.Job.AttemptCount))
+	retryCode := "account_state_update_failed"
+	if errors.Is(authStateErr, ErrOpenAIWindowWarmupCredentialsChanged) {
+		retryCode = "credentials_changed"
+	}
+	ok, err := s.repo.RequeueAuthStateUpdateFailure(ctx, OpenAIWindowWarmupAuthStateRetry{
+		JobID:           claim.Job.ID,
+		CycleGeneration: claim.Job.CycleGeneration,
+		AttemptCount:    claim.Job.AttemptCount,
+		BlockedState:    blockedState,
+		StatusCode:      status,
+		ErrorCode:       code,
+		RetryCode:       retryCode,
+		NextAttemptAt:   next,
+	})
+	if err != nil {
+		slog.Warn("openai_window_warmup_auth_state_retry_failed",
+			"job_id", claim.Job.ID,
+			"cycle_generation", claim.Job.CycleGeneration,
+			"error", err,
+		)
+		return
+	}
+	if ok {
+		s.metrics.retry.Add(1)
+		s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStateRetrying, status, retryCode, claim.Job.ObservedResetAt)
+	}
 }
 
 func classifyWarmupUsageObservationError(err error) (status int, code, terminalState string) {

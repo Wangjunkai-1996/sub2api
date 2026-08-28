@@ -34,9 +34,10 @@ const (
 )
 
 var (
-	ErrOpenAIWindowWarmupNeedsReauth   = errors.New("needs_reauth")
-	ErrOpenAIWindowWarmupBlocked       = errors.New("blocked")
-	ErrOpenAIWindowWarmupBlockedConfig = errors.New("blocked_config")
+	ErrOpenAIWindowWarmupNeedsReauth        = errors.New("needs_reauth")
+	ErrOpenAIWindowWarmupBlocked            = errors.New("blocked")
+	ErrOpenAIWindowWarmupBlockedConfig      = errors.New("blocked_config")
+	ErrOpenAIWindowWarmupCredentialsChanged = errors.New("credentials_changed")
 )
 
 // OpenAICodexWindowProbe creates the one-shot request used to advance a
@@ -289,6 +290,7 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 		ObservedResetAt: cloneWarmupTime(resetAt),
 		EOF:             result.EOF,
 		Outcome:         outcome,
+		AuthFailure:     cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure),
 	}
 }
 
