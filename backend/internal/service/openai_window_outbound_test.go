@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +45,45 @@ type openAIWindowOutboundHTTPStub struct {
 	proxyURLs   []string
 	profiles    []*tlsfingerprint.Profile
 	markWritten bool
+}
+
+// openAIWindowPartialWriteUpstream runs a real net/http Transport against a
+// local listener, then closes the connection after receiving only a prefix of
+// the request. The body reader also fails after a short prefix so the transport
+// exercises WroteRequestInfo.Err rather than the clean success callback.
+type openAIWindowPartialWriteUpstream struct {
+	listener net.Listener
+}
+
+func (s *openAIWindowPartialWriteUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	return s.DoWithTLS(req, "", 0, 0, nil)
+}
+
+func (s *openAIWindowPartialWriteUpstream) DoWithTLS(req *http.Request, _ string, _ int64, _ int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	target := &url.URL{Scheme: "http", Host: s.listener.Addr().String(), Path: "/"}
+	clone.URL = target
+	clone.Host = "chatgpt.com"
+	clone.Body = &openAIWindowFailingBody{ReadCloser: clone.Body, remaining: 8}
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	return client.Do(clone)
+}
+
+type openAIWindowFailingBody struct {
+	io.ReadCloser
+	remaining int
+}
+
+func (b *openAIWindowFailingBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if len(p) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= n
+	return n, err
 }
 
 func (s *openAIWindowOutboundHTTPStub) Do(req *http.Request, proxyURL string, accountID int64, concurrency int) (*http.Response, error) {
@@ -278,6 +319,7 @@ func TestOpenAIWindowOutboundAdapterUsesPluginWithoutBuiltInFallback(t *testing.
 	require.Empty(t, upstream.requests)
 	require.Equal(t, "Bearer plugin-oauth-token", plugin.request.Header.Get("Authorization"))
 	require.Equal(t, account.Proxy.URL(), plugin.proxyURL)
+	require.True(t, HTTPUpstreamRedirectsDisabled(plugin.request.Context()))
 }
 
 func TestOpenAIWindowOutboundAdapterPluginRequestSentErrorIsUncertainWithoutFallback(t *testing.T) {
@@ -299,6 +341,50 @@ func TestOpenAIWindowOutboundAdapterPluginRequestSentErrorIsUncertainWithoutFall
 	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(openAIWindowOutboundAccount()))
 	require.Error(t, err)
 	require.True(t, result.Started)
+	require.Empty(t, upstream.requests)
+}
+
+func TestOpenAIWindowOutboundAdapterPluginEmptyResponseIsPossiblySent(t *testing.T) {
+	plugin := &openAIWindowOutboundPluginStub{handled: true}
+	upstream := &openAIWindowOutboundHTTPStub{}
+	adapter := &OpenAIWindowOutboundAdapter{
+		tokenProvider:   &openAIWindowOutboundTokenStub{token: "plugin-token"},
+		httpUpstream:    upstream,
+		pluginTransport: plugin,
+	}
+
+	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(openAIWindowOutboundAccount()))
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Started)
+	var transportErr *PluginTransportError
+	require.ErrorAs(t, err, &transportErr)
+	require.True(t, transportErr.RequestSent)
+	require.Equal(t, "PLUGIN_EMPTY_RESPONSE", transportErr.Code)
+	require.Empty(t, upstream.requests)
+}
+
+func TestOpenAIWindowOutboundAdapterPluginExplicitNotSentOverridesContextTimeout(t *testing.T) {
+	plugin := &openAIWindowOutboundPluginStub{
+		handled: true,
+		err: errors.Join(
+			context.DeadlineExceeded,
+			&PluginTransportError{Code: "PLUGIN_CONNECT_TIMEOUT", Message: "before upstream", RequestSent: false},
+		),
+	}
+	upstream := &openAIWindowOutboundHTTPStub{}
+	adapter := &OpenAIWindowOutboundAdapter{
+		tokenProvider:   &openAIWindowOutboundTokenStub{token: "plugin-token"},
+		httpUpstream:    upstream,
+		pluginTransport: plugin,
+	}
+
+	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(openAIWindowOutboundAccount()))
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.Started)
 	require.Empty(t, upstream.requests)
 }
 
@@ -585,6 +671,56 @@ func TestOpenAIWindowOutboundAdapterPreservesPostWriteEOF(t *testing.T) {
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	require.True(t, result.Started)
 	require.True(t, result.EOF)
+}
+
+func TestOpenAIWindowOutboundAdapterMarksRealPartialWriteAsPossiblySent(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	readN := make(chan int, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			readN <- 0
+			return
+		}
+		buf := make([]byte, 128)
+		n, _ := conn.Read(buf)
+		readN <- n
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}()
+
+	upstream := &openAIWindowPartialWriteUpstream{listener: listener}
+	adapter := &OpenAIWindowOutboundAdapter{
+		tokenProvider: &openAIWindowOutboundTokenStub{token: "oauth-token"},
+		httpUpstream:  upstream,
+	}
+
+	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(openAIWindowOutboundAccount()))
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Started, "a real transport error after request bytes were written must be possibly_sent")
+	require.Greater(t, <-readN, 0, "the listener must observe a request prefix")
+}
+
+func TestOpenAIWindowOutboundAdapterKeepsExplicitPreSendFailureRetryable(t *testing.T) {
+	upstream := &openAIWindowOutboundHTTPStub{
+		err: MarkHTTPUpstreamRequestNotSent(errors.New("proxy pool is exhausted")),
+	}
+	adapter := &OpenAIWindowOutboundAdapter{
+		tokenProvider: &openAIWindowOutboundTokenStub{token: "oauth-token"},
+		httpUpstream:  upstream,
+	}
+
+	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(openAIWindowOutboundAccount()))
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.Started)
+	require.NotContains(t, err.Error(), "possibly_sent")
 }
 
 func TestOpenAIWindowOutboundAdapterRejectsMutableOrSparkProbeContracts(t *testing.T) {

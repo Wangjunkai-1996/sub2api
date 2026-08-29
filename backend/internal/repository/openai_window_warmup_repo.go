@@ -365,10 +365,9 @@ func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64
 			        AND ($7::timestamptz IS NULL OR $7 <= NOW() OR
 			             j.observed_reset_at IS NULL OR $7 > j.observed_reset_at OR
 			             (j.cycle_key LIKE 'initial:%' AND $7 = j.observed_reset_at AND
-			              CASE WHEN jsonb_typeof(a.extra -> 'codex_5h_used_percent') = 'number'
-			                  THEN (a.extra ->> 'codex_5h_used_percent')::NUMERIC <= 0
-			                  ELSE FALSE
-			              END))
+			             public.openai_window_warmup_json_number_nonpositive(
+			                 a.extra -> 'codex_5h_used_percent'
+			             )))
 		        AND (latest.reset_at IS NULL OR latest.reset_at <= NOW() OR
 		             ($7::timestamptz IS NOT NULL AND latest.reset_at <= $7))
 			  )`, id, owner, token, nullableTimeValue(at), evidence.Authoritative, evidence.UsedPercent, nullWarmupTime(evidence.ResetAt))
@@ -628,7 +627,11 @@ func (r *openAIWindowWarmupRepository) GetCurrent(ctx context.Context, accountID
 	return scanWarmupJob(r.db.QueryRowContext(ctx, `
 SELECT `+warmupJobSelectColumns+` FROM openai_window_warmup_jobs
 WHERE account_id = $1 AND quota_scope = $2
-ORDER BY id DESC LIMIT 1`, accountID, scope))
+-- Legacy migrations may have quarantined a newer duplicate row as blocked.
+-- Current means the live cycle first; id is only the tie-breaker within a
+-- state so admin/reconciler callers never project the quarantined row.
+ORDER BY CASE WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
+         id DESC LIMIT 1`, accountID, scope))
 }
 
 func (r *openAIWindowWarmupRepository) GetCurrentForAccounts(ctx context.Context, accountIDs []int64, scope string) (map[int64]*service.OpenAIWindowWarmupJob, error) {
@@ -646,7 +649,9 @@ func (r *openAIWindowWarmupRepository) GetCurrentForAccounts(ctx context.Context
 	SELECT DISTINCT ON (account_id) `+warmupJobSelectColumns+`
 	FROM openai_window_warmup_jobs
 	WHERE account_id = ANY($1) AND quota_scope = $2
-	ORDER BY account_id, id DESC`, pq.Array(accountIDs), scope)
+	ORDER BY account_id,
+	         CASE WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
+	         id DESC`, pq.Array(accountIDs), scope)
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +716,10 @@ func (r *openAIWindowWarmupRepository) UnblockAccount(ctx context.Context, accou
 	    SELECT id
 	    FROM openai_window_warmup_jobs
 	    WHERE account_id = $1
-	    ORDER BY id DESC
+	    -- Prefer a live row. A newer quarantined duplicate must not hide or
+	    -- accidentally compete with the real active cycle.
+	    ORDER BY CASE WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
+	             id DESC
 	    LIMIT 1
 	    FOR UPDATE
 	), updated AS (

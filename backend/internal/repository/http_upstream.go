@@ -199,7 +199,7 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	applyGrokCLIProxyHeaders(req)
 	if err := s.validateRequestHost(req); err != nil {
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 	profile := service.HTTPUpstreamProfileDefault
 	if req != nil {
@@ -209,7 +209,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 获取或创建对应的客户端，并标记请求占用
 	entry, err := s.acquireClientWithProfile(proxyURL, accountID, accountConcurrency, profile)
 	if err != nil {
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 
 	// 执行请求
@@ -268,13 +268,13 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	slog.Debug("tls_fingerprint_enabled", "account_id", accountID, "target", targetHost, "proxy", proxyInfo, "profile", profile.Name)
 
 	if err := s.validateRequestHost(req); err != nil {
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 
 	entry, err := s.acquireClientWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile)
 	if err != nil {
 		slog.Debug("tls_fingerprint_acquire_client_failed", "account_id", accountID, "error", err)
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 
 	client := httpClientForUpstreamRequest(entry.client, req)

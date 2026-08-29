@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -206,6 +207,7 @@ type OpenAIQuotaService struct {
 	proxyRepo            ProxyRepository
 	tokenProvider        *OpenAITokenProvider
 	privacyClientFactory PrivacyClientFactory
+	pluginTransport      openAIWindowPluginTransport
 	agentIdentityTaskMu  sync.Mutex
 	agentIdentityWS      agentIdentityWSConnectionInvalidator
 }
@@ -224,6 +226,15 @@ func NewOpenAIQuotaService(
 		proxyRepo:            proxyRepo,
 		tokenProvider:        tokenProvider,
 		privacyClientFactory: privacyClientFactory,
+	}
+}
+
+// SetPluginTransport wires the optional OpenAI OAuth transport used by the
+// warmup usage preflight. A plugin that does not claim the request returns
+// handled=false and the caller keeps the built-in privacy client path.
+func (s *OpenAIQuotaService) SetPluginTransport(transport openAIWindowPluginTransport) {
+	if s != nil {
+		s.pluginTransport = transport
 	}
 }
 
@@ -248,19 +259,38 @@ type openAIQuotaQueryOptions struct {
 }
 
 func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, options openAIQuotaQueryOptions) (*OpenAIQuotaUsage, error) {
+	// Non-warmup quota calls have no plugin transport fallback.  Check the
+	// required HTTP client before prepareUpstreamCall can refresh OAuth state;
+	// a misconfigured service must not perform credential side effects before
+	// reporting that it cannot make the request.
+	if options.source != "window_warmup" && (s == nil || s.privacyClientFactory == nil) {
+		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota HTTP client is not configured")
+	}
 	accessToken, chatGPTAccountID, proxyURL, fedRAMP, err := s.prepareUpstreamCall(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := s.privacyClientFactory(proxyURL)
-	if err != nil {
-		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
-	}
-
 	callCtx, cancel := context.WithTimeout(ctx, openaiQuotaUpstreamTimeout)
 	defer cancel()
 	agentIdentity := s.isAgentIdentityAccount(ctx, accountID)
+	var client *req.Client
+	if options.source != "window_warmup" {
+		if s.privacyClientFactory == nil {
+			return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota HTTP client is not configured")
+		}
+		client, err = s.privacyClientFactory(proxyURL)
+		if err != nil {
+			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
+		}
+	}
+	var transportAccount *Account
+	if options.source == "window_warmup" && s.pluginTransport != nil {
+		transportAccount, err = s.loadQuotaTransportAccount(callCtx, accountID)
+		if err != nil {
+			return nil, infraerrors.New(http.StatusServiceUnavailable, "OPENAI_QUOTA_ACCOUNT_REFRESH_STATE_FAILED", "openai oauth account state is unavailable")
+		}
+	}
 
 	var payload OpenAIQuotaUsage
 	var warmupAuthCredentials map[string]any
@@ -280,16 +310,55 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 			}
 			return nil, baseErr
 		}
-		resp, err := client.R().
-			SetContext(callCtx).
-			SetHeaders(quotaHeaders).
-			SetSuccessResult(&payload).
-			Get(chatGPTUsageURL)
-		if err != nil {
-			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_REQUEST_FAILED", "upstream request failed: %v", err)
+		status := 0
+		responseBody := ""
+		usedPlugin := false
+		if options.source == "window_warmup" && s.pluginTransport != nil {
+			pluginResp, handled, transportErr := s.roundTripWarmupUsage(callCtx, quotaHeaders, proxyURL, transportAccount)
+			if handled {
+				usedPlugin = true
+				if transportErr != nil {
+					return nil, infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_REQUEST_FAILED", "upstream request failed")
+				}
+				if pluginResp == nil {
+					return nil, infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_REQUEST_FAILED", "upstream response was empty")
+				}
+				status = pluginResp.StatusCode
+				body, readErr := readWarmupQuotaResponseBody(pluginResp)
+				if readErr != nil {
+					return nil, infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_REQUEST_FAILED", "upstream response could not be read")
+				}
+				responseBody = string(body)
+				if status >= 200 && status < 300 {
+					if err := json.Unmarshal(body, &payload); err != nil {
+						return nil, infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_RESPONSE_INVALID", "upstream returned invalid usage response")
+					}
+				}
+			}
 		}
-		if !resp.IsSuccessState() {
-			if agentIdentity && !recovered && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, []byte(resp.String())) {
+		if !usedPlugin {
+			if client == nil {
+				if s.privacyClientFactory == nil {
+					return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota transport is not configured")
+				}
+				client, err = s.privacyClientFactory(proxyURL)
+				if err != nil {
+					return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
+				}
+			}
+			resp, requestErr := client.R().
+				SetContext(callCtx).
+				SetHeaders(quotaHeaders).
+				SetSuccessResult(&payload).
+				Get(chatGPTUsageURL)
+			if requestErr != nil {
+				return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_REQUEST_FAILED", "upstream request failed: %v", requestErr)
+			}
+			status = resp.StatusCode
+			responseBody = resp.String()
+		}
+		if status < 200 || status >= 300 {
+			if agentIdentity && !recovered && isAgentIdentityTaskInvalidHTTPResponse(status, []byte(responseBody)) {
 				recovered = true
 				if err := s.recoverAgentIdentityTask(ctx, accountID, expectedTaskID); err != nil {
 					disposition := OpenAIWindowWarmupAuthRefreshTransient
@@ -309,7 +378,6 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 				}
 				continue
 			}
-			status := resp.StatusCode
 			if options.source == "window_warmup" && status == http.StatusUnauthorized && !agentIdentity && !recovered {
 				recovered = true
 				account, loadErr := s.accountRepo.GetByID(ctx, accountID)
@@ -376,7 +444,7 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 					}
 					if status == http.StatusForbidden {
 						disposition = OpenAIWindowWarmupAuthForbidden
-						if isHTMLResponse([]byte(resp.String())) {
+						if isHTMLResponse([]byte(responseBody)) {
 							disposition = OpenAIWindowWarmupAuthForbiddenHTML
 						}
 					}
@@ -388,7 +456,7 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 				}
 				return nil, mappedErr
 			}
-			body := truncate(s.redactQuotaErrorBody(ctx, accountID, resp.String()), 240)
+			body := truncate(s.redactQuotaErrorBody(ctx, accountID, responseBody), 240)
 			slog.Warn("openai_quota_query_failed", "account_id", accountID, "status", status, "body", body)
 			return nil, infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned %d: %s", status, body)
 		}
@@ -417,6 +485,68 @@ func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, op
 		}
 	}
 	return &payload, nil
+}
+
+// loadQuotaTransportAccount returns the credential-bearing account object that
+// the plugin contract expects. Spark shadows are resolved to their parent just
+// like prepareUpstreamCall, so the plugin never receives a row without tokens.
+func (s *OpenAIQuotaService) loadQuotaTransportAccount(ctx context.Context, accountID int64) (*Account, error) {
+	if s == nil || s.accountRepo == nil {
+		return nil, errors.New("account repository is unavailable")
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil || account == nil {
+		if err == nil {
+			err = errors.New("account not found")
+		}
+		return nil, err
+	}
+	if account.IsShadow() {
+		return resolveCredentialAccount(ctx, s.accountRepo, account)
+	}
+	return account, nil
+}
+
+// roundTripWarmupUsage sends the passive /wham/usage request through the same
+// OAuth plugin route as the real warmup probe. handled=false is the explicit
+// contract for "this account is not bound to a plugin"; once handled=true, an
+// error is returned to the caller and no second transport is attempted.
+func (s *OpenAIQuotaService) roundTripWarmupUsage(
+	ctx context.Context,
+	headers map[string]string,
+	proxyURL string,
+	account *Account,
+) (*http.Response, bool, error) {
+	if s == nil || s.pluginTransport == nil {
+		return nil, false, nil
+	}
+	requestCtx := WithHTTPUpstreamRedirectsDisabled(WithHTTPUpstreamProfile(ctx, HTTPUpstreamProfileOpenAI))
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, chatGPTUsageURL, nil)
+	if err != nil {
+		return nil, true, err
+	}
+	request.Host = "chatgpt.com"
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	return s.pluginTransport.RoundTripOpenAIOAuth(requestCtx, request, proxyURL, account)
+}
+
+const maxWarmupQuotaResponseBytes = 4 << 20
+
+func readWarmupQuotaResponseBody(response *http.Response) ([]byte, error) {
+	if response == nil || response.Body == nil {
+		return nil, errors.New("upstream response body is missing")
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxWarmupQuotaResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxWarmupQuotaResponseBytes {
+		return nil, errors.New("upstream usage response is too large")
+	}
+	return body, nil
 }
 
 // CacheResetCreditsSnapshot persists a complete reset-credit snapshot after an
@@ -513,14 +643,26 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 	// must NOT fall through to prepareUpstreamCall. That function resolves a
 	// shadow to its parent and would perform a parent-level reset — exactly
 	// what this guard must prevent. Return the load error instead.
-	if s.accountRepo != nil {
-		acc, loadErr := s.accountRepo.GetByID(ctx, accountID)
-		if loadErr != nil {
-			return nil, infraerrors.Newf(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found: %v", loadErr)
-		}
-		if acc.IsShadow() {
-			return nil, ErrSparkShadowResetNotSupported
-		}
+	if s == nil || s.accountRepo == nil {
+		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
+	}
+	acc, loadErr := s.accountRepo.GetByID(ctx, accountID)
+	if loadErr != nil {
+		return nil, infraerrors.Newf(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found: %v", loadErr)
+	}
+	if acc == nil {
+		return nil, infraerrors.New(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found")
+	}
+	if acc.IsShadow() {
+		return nil, ErrSparkShadowResetNotSupported
+	}
+
+	// ResetCredit is intentionally HTTP-only (the OAuth plugin route is used
+	// for passive warmup usage, not for credit consumption). Check the client
+	// after the account guard so shadow and load failures keep their fail-closed
+	// error contracts and cannot trigger an upstream side effect.
+	if s.privacyClientFactory == nil {
+		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota HTTP client is not configured")
 	}
 
 	accessToken, chatGPTAccountID, proxyURL, fedRAMP, err := s.prepareUpstreamCall(ctx, accountID)
@@ -589,7 +731,7 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 // token via the shared TokenProvider, and resolves the chatgpt-account-id and
 // proxy URL. Centralized so QueryUsage / ResetCredit share validation.
 func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID int64) (accessToken, chatGPTAccountID, proxyURL string, fedRAMP bool, err error) {
-	if s == nil || s.accountRepo == nil || s.privacyClientFactory == nil {
+	if s == nil || s.accountRepo == nil {
 		return "", "", "", false, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
 	}
 

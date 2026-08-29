@@ -296,6 +296,8 @@ func TestOpenAIWindowWarmupMigrationPreservesIdleResetBaselineAcrossAccountRefre
 	require.NoError(t, err)
 	fixedSQL, err := appmigrations.FS.ReadFile("233_openai_window_warmup_idle_reset_baseline.sql")
 	require.NoError(t, err)
+	numericGuardSQL, err := appmigrations.FS.ReadFile("234_openai_window_warmup_numeric_guard.sql")
+	require.NoError(t, err)
 
 	const (
 		previousReplay = "996_test_openai_window_warmup_previous_idle_trigger.sql"
@@ -303,7 +305,10 @@ func TestOpenAIWindowWarmupMigrationPreservesIdleResetBaselineAcrossAccountRefre
 		secondReplay   = "998_test_openai_window_warmup_idle_baseline_idempotent.sql"
 	)
 	t.Cleanup(func() {
-		_, _ = integrationDB.ExecContext(context.Background(), string(fixedSQL))
+		// This test intentionally replays migration 233 to reproduce the old
+		// baseline behavior. Restore the current 234 trigger afterward so later
+		// tests observe the same schema that TestMain applied initially.
+		_, _ = integrationDB.ExecContext(context.Background(), string(numericGuardSQL))
 		_, _ = integrationDB.ExecContext(context.Background(),
 			`DELETE FROM schema_migrations WHERE filename IN ($1, $2, $3)`,
 			previousReplay, firstReplay, secondReplay)
@@ -465,6 +470,134 @@ func TestOpenAIWindowWarmupMigrationCurrentJobIndexMatchesLookupOrder(t *testing
 	require.NoError(t, err)
 	require.Contains(t, definition, "(account_id, quota_scope, id DESC)")
 	require.NotContains(t, definition, "updated_at")
+}
+
+func TestOpenAIWindowWarmupRepositoryCurrentPrefersActiveOverNewerBlocked(t *testing.T) {
+	ctx := context.Background()
+	accountID := createWarmupIntegrationAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+
+	active, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "active:" + uuid.NewString(), CycleGeneration: 1,
+		Trigger: service.OpenAIWindowWarmupTriggerImport, NextAttemptAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	// A legacy 231 cleanup can leave a newer quarantined row behind the real
+	// active cycle. Read/update APIs must continue to project the live row.
+	_, err = integrationDB.ExecContext(ctx, `
+		INSERT INTO openai_window_warmup_jobs
+		    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
+		     next_attempt_at, last_error_code, last_error, created_at, updated_at)
+		VALUES ($1, 'global', 'blocked', 'migration', $2, 2, NOW(),
+		        'migration_duplicate_active_job', 'legacy duplicate', NOW(), NOW())`,
+		accountID, "blocked:"+uuid.NewString())
+	require.NoError(t, err)
+
+	current, err := repo.GetCurrent(ctx, accountID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, active.ID, current.ID)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, current.State)
+
+	byAccount, err := repo.GetCurrentForAccounts(ctx, []int64{accountID}, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Contains(t, byAccount, accountID)
+	require.Equal(t, active.ID, byAccount[accountID].ID)
+
+	// Unblock is a no-op while an active row exists; it must not try to mutate
+	// the newer blocked row (or collide with the partial unique index).
+	unblocked, changed, err := repo.UnblockAccount(ctx, accountID, time.Now().UTC(), nil)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, active.ID, unblocked.ID)
+}
+
+func TestOpenAIWindowWarmupNumericGuardHandlesOversizedJSONNumbers(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		number    string
+		wantState string
+		wantIdle  bool
+	}{
+		{name: "oversized positive", number: "1e100000", wantState: service.OpenAIWindowWarmupStateArmed, wantIdle: false},
+		{name: "oversized negative", number: "-1e100000", wantState: service.OpenAIWindowWarmupStatePending, wantIdle: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accountID := createWarmupIntegrationAccount(t)
+			reset := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339Nano)
+			_, err := integrationDB.ExecContext(ctx, fmt.Sprintf(`
+				UPDATE accounts
+				SET extra = '{"openai_codex_warmup_policy":"continuous",
+				               "codex_5h_used_percent":%s,
+				               "codex_5h_reset_at":"%s"}'::jsonb
+				WHERE id = $1`, tc.number, reset), accountID)
+			require.NoError(t, err, "the trigger must not cast the oversized number")
+
+			job, err := NewOpenAIWindowWarmupRepository(integrationDB).GetCurrent(
+				ctx, accountID, service.OpenAIWindowWarmupQuotaScopeGlobal,
+			)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantState, job.State)
+			if tc.wantIdle {
+				require.NotNil(t, job.ObservedResetAt)
+				require.LessOrEqual(t, job.NextAttemptAt.Sub(time.Now().UTC()), 31*time.Second)
+			} else {
+				require.NotNil(t, job.ObservedResetAt)
+				require.True(t, job.NextAttemptAt.After(*job.ObservedResetAt))
+			}
+		})
+	}
+}
+
+func TestOpenAIWindowWarmupNumericGuardDoesNotRearmResetCycle(t *testing.T) {
+	ctx := context.Background()
+	numericGuardSQL, err := appmigrations.FS.ReadFile("234_openai_window_warmup_numeric_guard.sql")
+	require.NoError(t, err)
+	const replay = "995_test_openai_window_warmup_numeric_guard_reset_cycle.sql"
+
+	accountID := createWarmupIntegrationAccount(t)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+		"codex_5h_used_percent":                 float64(0),
+		"codex_5h_reset_at":                     time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339Nano),
+	})
+	// Remove the trigger-created initial row so the synthetic reset-cycle row can
+	// be isolated from the partial unique active-job index.
+	_, err = integrationDB.ExecContext(ctx, `
+		DELETE FROM openai_window_warmup_jobs WHERE account_id = $1`, accountID)
+	require.NoError(t, err)
+	reset := time.Now().UTC().Add(90 * time.Minute).Truncate(time.Microsecond)
+	next := reset.Add(90 * time.Second)
+	cycleKey := "reset:" + reset.Format(time.RFC3339Nano)
+	_, err = integrationDB.ExecContext(ctx, `
+		INSERT INTO openai_window_warmup_jobs
+		    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
+		     observed_reset_at, next_attempt_at, attempt_count, created_at, updated_at)
+		VALUES ($1, 'global', 'armed', 'reset', $2, 1, $3, $4, 0, NOW(), NOW())`,
+		accountID, cycleKey, reset, next)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(),
+			`DELETE FROM schema_migrations WHERE filename = $1`, replay)
+	})
+
+	require.NoError(t, applyMigrationsFS(ctx, integrationDB, fstest.MapFS{
+		replay: &fstest.MapFile{Data: numericGuardSQL},
+	}))
+
+	var state string
+	var gotNext, gotReset time.Time
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT state, next_attempt_at, observed_reset_at
+		FROM openai_window_warmup_jobs
+		WHERE account_id = $1 AND cycle_key = $2`, accountID, cycleKey).Scan(&state, &gotNext, &gotReset))
+	require.Equal(t, service.OpenAIWindowWarmupStateArmed, state)
+	require.WithinDuration(t, next, gotNext, time.Microsecond,
+		"a completed continuous reset cycle must remain armed until its authoritative reset")
+	require.WithinDuration(t, reset, gotReset, time.Microsecond)
 }
 
 func TestOpenAIWindowWarmupMigrationReconcilesEarlyDuplicateActiveJobs(t *testing.T) {

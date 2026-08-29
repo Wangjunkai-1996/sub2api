@@ -188,6 +188,100 @@ func TestParseOpenAIWindowWarmupResultRecognizesDoneAliasAndExplicitResetJSON(t 
 	require.Equal(t, reset.Unix(), parsed.ResetAt.Unix())
 }
 
+func TestParseOpenAIWindowWarmupResultRejectsDoneWithFailedOrIncompleteStatus(t *testing.T) {
+	reset := time.Now().UTC().Add(time.Hour)
+	for _, test := range []struct {
+		name   string
+		status string
+		want   string
+	}{
+		{name: "failed", status: "failed", want: openAIWindowWarmupOutcomeFailed},
+		{name: "incomplete", status: "incomplete", want: openAIWindowWarmupOutcomeIncomplete},
+		{name: "in-progress", status: "in_progress", want: openAIWindowWarmupOutcomeIncomplete},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`data: {"type":"response.done","response":{"status":"` + test.status + `","codex_5h_reset_at":"` + reset.Format(time.RFC3339) + `"}}` + "\n\n")
+			parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				ResetAt:    &reset,
+			}, nil)
+			require.NotNil(t, parsed)
+			require.Equal(t, test.want, parsed.Outcome)
+			wantType := "response." + test.status
+			if test.status == "in_progress" {
+				wantType = "response.incomplete"
+			}
+			require.Equal(t, wantType, parsed.TerminalType)
+			require.Error(t, validateOpenAIWindowWarmupOutcome(parsed, nil))
+		})
+	}
+}
+
+func TestParseOpenAIWindowWarmupResultRejectsRawDoneWithNestedFailure(t *testing.T) {
+	reset := time.Now().UTC().Add(time.Hour)
+	for _, test := range []struct {
+		name   string
+		status string
+		want   string
+	}{
+		{name: "failed", status: "failed", want: openAIWindowWarmupOutcomeFailed},
+		{name: "incomplete", status: "incomplete", want: openAIWindowWarmupOutcomeIncomplete},
+		{name: "in-progress", status: "in_progress", want: openAIWindowWarmupOutcomeIncomplete},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"type":"response.done","response":{"status":"` + test.status + `","codex_5h_reset_at":"` + reset.Format(time.RFC3339) + `"}}`)
+			parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+				StatusCode: http.StatusOK,
+				Body:       body,
+			}, nil)
+			require.NotNil(t, parsed)
+			require.Equal(t, test.want, parsed.Outcome)
+			wantType := "response." + test.status
+			if test.status == "in_progress" {
+				wantType = "response.incomplete"
+			}
+			require.Equal(t, wantType, parsed.TerminalType)
+			require.Error(t, validateOpenAIWindowWarmupOutcome(parsed, nil))
+		})
+	}
+}
+
+func TestParseOpenAIWindowWarmupResultBodyStatusFencesPrefilledTerminalType(t *testing.T) {
+	reset := time.Now().UTC().Add(time.Hour)
+	for _, test := range []struct {
+		name       string
+		bodyStatus string
+		prefilled  string
+		wantType   string
+		wantResult string
+	}{
+		{name: "body failed beats prefilled done", bodyStatus: "failed", prefilled: "response.done", wantType: "response.failed", wantResult: openAIWindowWarmupOutcomeFailed},
+		{name: "body incomplete beats prefilled completed", bodyStatus: "incomplete", prefilled: "response.completed", wantType: "response.incomplete", wantResult: openAIWindowWarmupOutcomeIncomplete},
+		{name: "prefilled failure beats contradictory body completed", bodyStatus: "completed", prefilled: "response.failed", wantType: "response.failed", wantResult: openAIWindowWarmupOutcomeFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`data: {"type":"response.done","response":{"status":"` + test.bodyStatus + `","codex_5h_reset_at":"` + reset.Format(time.RFC3339) + `"}}` + "\n\n")
+			parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+				StatusCode:   http.StatusOK,
+				Body:         body,
+				Terminal:     true,
+				TerminalType: test.prefilled,
+				ResetAt:      &reset,
+			}, nil)
+			require.NotNil(t, parsed)
+			require.Equal(t, test.wantType, parsed.TerminalType)
+			require.Equal(t, test.wantResult, parsed.Outcome)
+			require.Error(t, validateOpenAIWindowWarmupOutcome(parsed, nil))
+		})
+	}
+}
+
+func TestWarmupTerminalTypePreservesExplicitFailureOverContradictoryStatus(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"status":"completed"}}`)
+	require.Equal(t, "response.failed", warmupTerminalTypeWithStatus(payload, "response.failed"))
+}
+
 func TestParseOpenAIWindowWarmupResultRejectsGenericAndWeeklyResetJSON(t *testing.T) {
 	reset := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
 	for _, body := range []string{
@@ -227,6 +321,55 @@ func TestOpenAICodexWindowProbeMarksPostSendEOFUncertain(t *testing.T) {
 	require.NotNil(t, result)
 	require.True(t, result.EOF)
 	require.Equal(t, openAIWindowWarmupOutcomeUncertain, result.Outcome)
+}
+
+func TestOpenAICodexWindowProbeHonorsPluginExplicitNotSent(t *testing.T) {
+	executor := &openAIWindowProbeExecutorStub{
+		err: &PluginTransportError{
+			Code:        "PLUGIN_CONNECT_TIMEOUT",
+			Message:     "upstream timeout before connect",
+			RequestSent: false,
+		},
+	}
+	probe := NewOpenAICodexWindowProbe(executor)
+
+	result, err := probe.Probe(context.Background(), openAIWarmupProbeAccount(), nil)
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "possibly_sent")
+	require.NotNil(t, result)
+	require.Equal(t, openAIWindowWarmupOutcomeUncertain, result.Outcome)
+}
+
+func TestOpenAICodexWindowProbeHandlesTypedNilPluginError(t *testing.T) {
+	var pluginErr *PluginTransportError
+	executor := &openAIWindowProbeExecutorStub{err: pluginErr}
+	probe := NewOpenAICodexWindowProbe(executor)
+
+	result, err := probe.Probe(context.Background(), openAIWarmupProbeAccount(), nil)
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, openAIWindowWarmupOutcomeUncertain, result.Outcome)
+	require.Contains(t, err.Error(), "possibly_sent")
+}
+
+func TestOpenAICodexWindowProbeRejectsPluginNotSentFlagAfterResponseEvidence(t *testing.T) {
+	executor := &openAIWindowProbeExecutorStub{
+		result: &OpenAIOutboundResult{Started: true, StatusCode: http.StatusOK},
+		err: &PluginTransportError{
+			Code:        "PLUGIN_BODY_ERROR",
+			Message:     "stream ended",
+			RequestSent: false,
+		},
+	}
+	probe := NewOpenAICodexWindowProbe(executor)
+
+	result, err := probe.Probe(context.Background(), openAIWarmupProbeAccount(), nil)
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.Contains(t, err.Error(), "possibly_sent")
 }
 
 func TestOpenAICodexWindowProbeClassifiesHTTPFailures(t *testing.T) {

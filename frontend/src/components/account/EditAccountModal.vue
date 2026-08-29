@@ -1729,7 +1729,7 @@
 
       <!-- OpenAI Codex five-hour window warmup policy. -->
       <div
-        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
         data-testid="edit-openai-codex-warmup-policy"
       >
@@ -5262,7 +5262,9 @@ const handleSubmit = async () => {
         } else {
           delete newExtra.openai_codex_warmup_policy
         }
-        updatePayload.openai_codex_warmup_policy = openAICodexWarmupPolicy.value
+        if (!isSparkShadow.value) {
+          updatePayload.openai_codex_warmup_policy = openAICodexWarmupPolicy.value
+        }
       }
 
       updatePayload.extra = newExtra

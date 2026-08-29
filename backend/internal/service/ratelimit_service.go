@@ -940,10 +940,11 @@ func (s *RateLimitService) HandleOpenAIWindowWarmupAuthFailure(ctx context.Conte
 			s.notifyAccountSchedulingBlocked(account, until, "openai_agent_identity_recovery")
 			return s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, "OpenAI Agent Identity recovery temporarily failed")
 		}
-		// Reuse ordinary OAuth 401 invalidation and temporary cooldown. The body is
-		// fixed locally and contains no upstream content.
-		s.HandleUpstreamError(ctx, account, http.StatusUnauthorized, nil, []byte(`{"error":{"message":"credential refresh temporarily failed"}}`))
-		return nil
+		// Keep the warmup path independent from HandleUpstreamError's legacy
+		// bool-only API. In particular, do not swallow a failed durable
+		// SetTempUnschedulable write: after a process restart that would otherwise
+		// leave the account active and repeatedly refresh the same credentials.
+		return s.persistOpenAIWarmupTransientAuthState(ctx, account)
 	case OpenAIWindowWarmupAuthRefreshInProgress, OpenAIWindowWarmupAuthForbiddenHTML:
 		return nil
 	case OpenAIWindowWarmupAuthForbidden:
@@ -961,6 +962,30 @@ func (s *RateLimitService) HandleOpenAIWindowWarmupAuthFailure(ctx context.Conte
 		return err
 	}
 	return nil
+}
+
+// persistOpenAIWarmupTransientAuthState applies the OAuth-401 temporary state
+// transition used by ordinary traffic and returns the persistence error to the
+// durable warmup worker. The in-memory notification happens before the DB write
+// so a failed write still takes effect for the current process, while callers
+// can retry the state transition on a later job attempt.
+func (s *RateLimitService) persistOpenAIWarmupTransientAuthState(ctx context.Context, account *Account) error {
+	if s == nil || s.accountRepo == nil || account == nil {
+		return fmt.Errorf("openai warmup auth state repository is unavailable")
+	}
+	if s.tokenCacheInvalidator != nil {
+		if err := s.tokenCacheInvalidator.InvalidateToken(ctx, account); err != nil {
+			slog.Warn("openai_window_warmup_auth_cache_invalidate_failed", "account_id", account.ID, "error", err)
+		}
+	}
+	cooldownMinutes := openAI403CooldownMinutesDefault
+	if s.cfg != nil && s.cfg.RateLimit.OAuth401CooldownMinutes > 0 {
+		cooldownMinutes = s.cfg.RateLimit.OAuth401CooldownMinutes
+	}
+	until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
+	message := "OAuth 401: credential refresh temporarily failed"
+	s.notifyAccountSchedulingBlocked(account, until, "oauth_401")
+	return s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, message)
 }
 
 func (s *RateLimitService) setOpenAIWindowAuthError(ctx context.Context, account *Account, expectedCredentials map[string]any, message string) (bool, error) {

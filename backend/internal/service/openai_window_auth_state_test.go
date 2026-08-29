@@ -16,6 +16,7 @@ type openAIWindowAuthStateRepo struct {
 	account      *Account
 	casApplied   bool
 	casErr       error
+	tempErr      error
 	casCalls     int
 	tempCalls    int
 	expected     map[string]any
@@ -39,7 +40,7 @@ func (r *openAIWindowAuthStateRepo) SetTempUnschedulable(_ context.Context, _ in
 	r.tempCalls++
 	r.tempUntil = until
 	r.tempReason = reason
-	return nil
+	return r.tempErr
 }
 
 type openAIWindowAuthRuntimeBlocker struct {
@@ -160,6 +161,25 @@ func TestRateLimitServiceOpenAIWindowTransient401ReusesTemporaryCooldown(t *test
 	require.Zero(t, repo.casCalls)
 	require.Contains(t, repo.tempReason, "OAuth 401")
 	require.True(t, repo.tempUntil.After(time.Now()))
+}
+
+func TestRateLimitServiceOpenAIWindowTransient401PropagatesCooldownPersistenceFailure(t *testing.T) {
+	account := openAIWindowAuthStateAccount()
+	repo := &openAIWindowAuthStateRepo{account: account, tempErr: errors.New("database unavailable")}
+	blocker := &openAIWindowAuthRuntimeBlocker{}
+	service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	service.SetAccountRuntimeBlocker(blocker)
+
+	err := service.HandleOpenAIWindowWarmupAuthFailure(context.Background(), OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthRefreshTransient,
+		ExpectedCredentials: shallowCopyMap(account.Credentials),
+	})
+
+	require.ErrorContains(t, err, "database unavailable")
+	require.Equal(t, 1, repo.tempCalls)
+	require.Equal(t, 1, blocker.calls)
+	require.Equal(t, "oauth_401", blocker.reason)
 }
 
 func TestRateLimitServiceOpenAIWindowAgentIdentityTransientRecoveryDoesNotPermanentlyDisable(t *testing.T) {

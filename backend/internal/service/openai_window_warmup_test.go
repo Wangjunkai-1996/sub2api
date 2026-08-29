@@ -1002,7 +1002,9 @@ func TestOpenAIWindowWarmupDefinitiveHTTPStatusPrecedesTransportAmbiguity(t *tes
 		{name: "forbidden", status: http.StatusForbidden, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlocked, wantCode: "blocked"},
 		{name: "bad request", status: http.StatusBadRequest, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlockedConfig, wantCode: "blocked_config"},
 		{name: "not found", status: http.StatusNotFound, wantAction: "blocked", wantState: OpenAIWindowWarmupStateBlockedConfig, wantCode: "blocked_config"},
-		{name: "server error", status: http.StatusServiceUnavailable, wantAction: "retry", wantState: OpenAIWindowWarmupStateRetrying, wantCode: "http_503"},
+		// A 5xx response does not prove that the upstream rejected the POST;
+		// it must be fenced through passive usage reconciliation first.
+		{name: "server error", status: http.StatusServiceUnavailable, wantAction: "uncertain", wantState: OpenAIWindowWarmupStateUncertain, wantCode: "possibly_sent"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1020,7 +1022,11 @@ func TestOpenAIWindowWarmupDefinitiveHTTPStatusPrecedesTransportAmbiguity(t *tes
 			require.Equal(t, test.wantAction, repo.action)
 			require.Equal(t, test.wantState, repo.state)
 			require.Equal(t, test.wantCode, repo.code)
-			require.Zero(t, usage.calls)
+			if test.status >= 500 && test.status <= 599 {
+				require.Equal(t, 1, usage.calls)
+			} else {
+				require.Zero(t, usage.calls)
+			}
 			require.Zero(t, repo.suppressedCalls)
 		})
 	}
@@ -1134,6 +1140,86 @@ func TestOpenAIWindowWarmupRefreshTransientRetriesAndTemporarilyIsolates(t *test
 
 	require.Equal(t, "retry", repo.action)
 	require.Equal(t, string(OpenAIWindowWarmupAuthRefreshTransient), repo.code)
+	require.Len(t, handler.failures, 1)
+}
+
+func TestOpenAIWindowWarmupRefreshTransientAtAttemptLimitStillIsolates(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	handler := &warmupAuthFailureHandlerSpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.options.AuthFailureHandler = handler
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+	claim.Job.AttemptCount = service.options.MaxAttempts
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusUnauthorized,
+		Disposition:         OpenAIWindowWarmupAuthRefreshTransient,
+		ExpectedCredentials: map[string]any{"access_token": "rejected"},
+	}
+
+	service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+		StatusCode: http.StatusUnauthorized, AuthFailure: failure,
+	}, errors.New("possibly_sent: refresh failed"))
+
+	require.Equal(t, "blocked", repo.action)
+	require.Equal(t, OpenAIWindowWarmupStateBlocked, repo.state)
+	require.Len(t, handler.failures, 1)
+	require.Equal(t, OpenAIWindowWarmupAuthRefreshTransient, handler.failures[0].Disposition)
+}
+
+func TestOpenAIWindowWarmupForbiddenAuthUsesBoundedRetry(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+
+	for _, disposition := range []OpenAIWindowWarmupAuthDisposition{
+		OpenAIWindowWarmupAuthForbidden,
+		OpenAIWindowWarmupAuthForbiddenHTML,
+	} {
+		t.Run(string(disposition), func(t *testing.T) {
+			repo := &warmupRepositorySpy{}
+			handler := &warmupAuthFailureHandlerSpy{}
+			service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+			service.options.AuthFailureHandler = handler
+			claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+			claim.Job.AttemptCount = 1
+			failure := &OpenAIWindowWarmupAuthFailure{
+				AccountID: account.ID, StatusCode: http.StatusForbidden,
+				Disposition: disposition, ExpectedCredentials: map[string]any{"access_token": "rejected"},
+			}
+
+			service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+				StatusCode: http.StatusForbidden, AuthFailure: failure,
+			}, ErrOpenAIWindowWarmupBlocked)
+
+			require.Equal(t, "retry", repo.action)
+			require.Equal(t, OpenAIWindowWarmupStateRetrying, repo.state)
+			require.Equal(t, string(disposition), repo.code)
+			require.Len(t, handler.failures, 1)
+		})
+	}
+}
+
+func TestOpenAIWindowWarmupForbiddenAuthAtAttemptLimitBlocks(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	handler := &warmupAuthFailureHandlerSpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.options.AuthFailureHandler = handler
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+	claim.Job.AttemptCount = service.options.MaxAttempts
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusForbidden,
+		Disposition: OpenAIWindowWarmupAuthForbiddenHTML,
+	}
+
+	service.handleProbeResult(context.Background(), claim, account, &OpenAIWindowProbeResult{
+		StatusCode: http.StatusForbidden, AuthFailure: failure,
+	}, ErrOpenAIWindowWarmupBlocked)
+
+	require.Equal(t, "blocked", repo.action)
+	require.Equal(t, "attempt_limit", repo.code)
 	require.Len(t, handler.failures, 1)
 }
 
@@ -1339,6 +1425,30 @@ func TestOpenAIWindowWarmupUsagePreflightPermanentErrorsBlock(t *testing.T) {
 			require.Zero(t, probe.calls)
 		})
 	}
+}
+
+func TestOpenAIWindowWarmupUsagePreflightRetryableForbiddenDoesNotPermanentlyBlock(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	handler := &warmupAuthFailureHandlerSpy{}
+	failure := &OpenAIWindowWarmupAuthFailure{
+		AccountID: account.ID, StatusCode: http.StatusForbidden,
+		Disposition:         OpenAIWindowWarmupAuthForbidden,
+		ExpectedCredentials: shallowCopyMap(account.Credentials),
+	}
+	usage := &warmupUsageStub{err: withOpenAIWindowWarmupAuthFailure(
+		infraerrors.New(http.StatusForbidden, "OPENAI_QUOTA_UPSTREAM_ERROR", "upstream returned 403"), failure,
+	)}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, usage, now, true)
+	service.options.AuthFailureHandler = handler
+
+	service.processClaim(context.Background(), warmupTestClaim(account.ID, now.Add(-time.Minute)))
+
+	require.Equal(t, "retry", repo.action)
+	require.Equal(t, OpenAIWindowWarmupStateRetrying, repo.state)
+	require.Equal(t, string(OpenAIWindowWarmupAuthForbidden), repo.code)
+	require.Len(t, handler.failures, 1)
 }
 
 func TestOpenAIWindowWarmupUsagePreflightFailureHonorsAttemptLimit(t *testing.T) {
@@ -1750,10 +1860,10 @@ func TestOpenAIWindowWarmupUncertainReplayAllowsAuthoritativeEmptyWindow(t *test
 
 	service.processClaim(context.Background(), claim)
 
-	require.Equal(t, 2, usage.calls, "takeover reconciliation and final preflight must both be passive")
+	require.Equal(t, 3, usage.calls, "takeover reconciliation, final preflight, and post-5xx fencing must all be passive")
 	require.Equal(t, 1, probe.calls)
 	require.Equal(t, 1, repo.started)
-	require.Equal(t, "retry", repo.action)
+	require.Equal(t, "uncertain", repo.action)
 }
 
 func TestOpenAIWindowWarmupUncertainReplayStopsAtAttemptLimit(t *testing.T) {

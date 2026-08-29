@@ -51,6 +51,17 @@ func TestHTTPUpstreamDoCanDisableRedirectsPerRequest(t *testing.T) {
 	require.Zero(t, redirectedCalls.Load())
 }
 
+func TestHTTPUpstreamMarksSetupFailuresAsNotSent(t *testing.T) {
+	client := NewHTTPUpstream(nil)
+	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	require.NoError(t, err)
+
+	_, err = client.Do(req, "http://[invalid-proxy", 1, 1)
+
+	require.Error(t, err)
+	require.True(t, service.IsHTTPUpstreamRequestNotSent(err))
+}
+
 func TestHTTPUpstreamDoWithTLSPlainHTTPUsesConfiguredHTTPProxy(t *testing.T) {
 	var upstreamCalls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

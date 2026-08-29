@@ -286,14 +286,23 @@ func (e *OpenAIWindowOutboundAdapter) executeOnce(
 	var gotFirstByte atomic.Bool
 	trace := &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
-			if info.Err == nil {
-				wroteRequest.Store(true)
-			}
+			// WroteRequest is called after net/http has attempted to write the
+			// request.  A non-nil Err can mean that only a prefix was written;
+			// treating that callback as "not sent" would permit a duplicate POST.
+			// The error itself is retained by the transport path, while this bit
+			// deliberately records the conservative "may have been sent" fact.
+			_ = info
+			wroteRequest.Store(true)
 		},
 		GotFirstResponseByte: func() { gotFirstByte.Store(true) },
 	}
 	requestCtx := httptrace.WithClientTrace(ctx, trace)
 	requestCtx = WithHTTPUpstreamProfile(requestCtx, HTTPUpstreamProfileOpenAI)
+	// This request carries an OAuth bearer/agent assertion and must never be
+	// replayed by a redirecting client.  The built-in HTTP adapter enforces the
+	// marker; plugin transports receive the same marker and must honor the host
+	// contract before opening their upstream connection.
+	requestCtx = WithHTTPUpstreamRedirectsDisabled(requestCtx)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, chatgptCodexURL, bytes.NewReader(request.Payload))
 	if err != nil {
 		return nil, fmt.Errorf("create openai warmup request: %w", err)
@@ -322,15 +331,33 @@ func (e *OpenAIWindowOutboundAdapter) executeOnce(
 		var handled bool
 		resp, handled, err = e.pluginTransport.RoundTripOpenAIOAuth(requestCtx, req, proxyURL, request.Account)
 		if handled {
+			if err == nil && resp == nil {
+				// Once a plugin claims the request, an empty response is a protocol
+				// failure rather than evidence that no upstream call happened. Fence
+				// any replay conservatively because the plugin may have submitted the
+				// POST before losing its response stream.
+				err = &PluginTransportError{
+					Code:        "PLUGIN_EMPTY_RESPONSE",
+					Message:     "plugin claimed the request but returned no response",
+					RequestSent: true,
+				}
+			}
 			if err != nil {
 				var pluginErr *PluginTransportError
-				if errors.As(err, &pluginErr) && pluginErr.RequestSent {
+				if errors.As(err, &pluginErr) && pluginErr != nil && pluginErr.RequestSent {
 					wroteRequest.Store(true)
 				}
-				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				if (pluginErr == nil || pluginErr.RequestSent) &&
+					(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 					wroteRequest.Store(true)
 				}
-				return outboundTransportFailure(err, wroteRequest.Load(), gotFirstByte.Load())
+				knownNotSent := false
+				if pluginErr != nil && !pluginErr.RequestSent {
+					// The plugin protocol explicitly permits false only when it
+					// knows the upstream Transport was never called.
+					knownNotSent = true
+				}
+				return outboundTransportFailure(err, wroteRequest.Load(), gotFirstByte.Load(), knownNotSent)
 			}
 			return readOpenAIWindowOutboundResponse(resp)
 		}
@@ -344,14 +371,23 @@ func (e *OpenAIWindowOutboundAdapter) executeOnce(
 	}
 	resp, err = e.httpUpstream.DoWithTLS(req, proxyURL, request.Account.ID, request.Account.Concurrency, profile)
 	if err != nil {
-		return outboundTransportFailure(err, wroteRequest.Load(), gotFirstByte.Load())
+		return outboundTransportFailure(err, wroteRequest.Load(), gotFirstByte.Load(), IsHTTPUpstreamRequestNotSent(err))
 	}
 	return readOpenAIWindowOutboundResponse(resp)
 }
 
-func outboundTransportFailure(err error, wroteRequest, gotFirstByte bool) (*OpenAIOutboundResult, error) {
+func outboundTransportFailure(err error, wroteRequest, gotFirstByte, knownNotSent bool) (*OpenAIOutboundResult, error) {
+	started := wroteRequest || gotFirstByte
+	if !started && err != nil && !knownNotSent {
+		// The built-in HTTPUpstream exposes only a returned error, not the point
+		// at which its RoundTripper failed.  DNS/TLS/connection-reset failures
+		// can race with request transmission, so absence of a trace callback is
+		// not proof that the POST was never accepted.  Mark it as possibly sent
+		// and let the passive reconciliation path fence replay.
+		started = true
+	}
 	result := &OpenAIOutboundResult{
-		Started: wroteRequest || gotFirstByte,
+		Started: started,
 		EOF:     errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF),
 	}
 	return result, err

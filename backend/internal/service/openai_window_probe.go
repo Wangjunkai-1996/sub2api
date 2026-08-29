@@ -259,9 +259,11 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 	terminalType := strings.TrimSpace(result.TerminalType)
 	if bodyTerminal, bodyType, bodyReset := parseWarmupSSEEvidence(body); bodyTerminal {
 		terminal = true
-		if terminalType == "" {
-			terminalType = bodyType
-		}
+		// The response body is the raw upstream evidence.  An executor may set
+		// TerminalType before returning it, but a stale/contradictory success
+		// value must never override a failed or incomplete body status (and an
+		// explicit executor failure must not be promoted by a successful body).
+		terminalType = mergeWarmupTerminalTypes(terminalType, bodyType)
 		if resetAt == nil {
 			resetAt = bodyReset
 		}
@@ -327,6 +329,26 @@ func validateOpenAIWindowWarmupOutcome(result *OpenAIWindowProbeResult, expected
 }
 
 func isWarmupProbePossiblySent(result *OpenAIOutboundResult, err error) bool {
+	// A plugin can return an explicit negative acknowledgement only when it
+	// knows the upstream RoundTripper was never invoked.  That typed signal is
+	// stronger than the legacy error-text heuristic below (which intentionally
+	// treats timeout/EOF as ambiguous for transports without send evidence).
+	var pluginErr *PluginTransportError
+	if errors.As(err, &pluginErr) {
+		if pluginErr == nil {
+			// A typed-nil plugin error is malformed but may represent a request
+			// whose send state was lost. Treat it conservatively as possibly sent.
+			return true
+		}
+		if pluginErr.RequestSent {
+			return true
+		}
+		// A plugin's negative acknowledgement is valid only when no HTTP
+		// response evidence was delivered. Once headers/body bytes exist, the
+		// host has proof that the upstream was contacted even if the plugin's
+		// flag is stale or malformed.
+		return result != nil && (result.Started || result.EOF || result.StatusCode > 0)
+	}
 	if result != nil && (result.Started || result.EOF || result.StatusCode > 0) {
 		return true
 	}
@@ -403,7 +425,7 @@ func parseWarmupSSEEvidence(body []byte) (bool, string, *time.Time) {
 		switch typeName {
 		case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
 			terminal = true
-			terminalType = typeName
+			terminalType = warmupTerminalTypeWithStatus(payload, typeName)
 		}
 		if candidate := resetAtFromJSON(payload); candidate != nil {
 			if resetAt == nil || candidate.After(*resetAt) {
@@ -414,12 +436,16 @@ func parseWarmupSSEEvidence(body []byte) (bool, string, *time.Time) {
 	if !terminal && gjson.Valid(string(trimmed)) {
 		typeName := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())
 		if typeName == "response" {
-			typeName = strings.TrimSpace(gjson.GetBytes(trimmed, "status").String())
-			if typeName == "completed" {
-				typeName = "response.completed"
+			typeName = warmupTerminalTypeWithStatus(trimmed, "response."+strings.TrimSpace(gjson.GetBytes(trimmed, "status").String()))
+		} else {
+			switch typeName {
+			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+				typeName = warmupTerminalTypeWithStatus(trimmed, typeName)
 			}
 		}
-		if typeName == "response.completed" || typeName == "response.done" {
+		if typeName == "response.completed" || typeName == "response.done" ||
+			typeName == "response.incomplete" || typeName == "response.failed" ||
+			typeName == "response.cancelled" || typeName == "response.canceled" {
 			terminal, terminalType = true, typeName
 		}
 		if candidate := resetAtFromJSON(trimmed); candidate != nil {
@@ -427,6 +453,59 @@ func parseWarmupSSEEvidence(body []byte) (bool, string, *time.Time) {
 		}
 	}
 	return terminal, terminalType, resetAt
+}
+
+// warmupTerminalTypeWithStatus treats a terminal event's nested response.status
+// as authoritative when it contradicts the event name. Some proxies normalize
+// failed/incomplete responses to response.done; accepting those as completed
+// would advance the durable reset cycle without a successful request.
+func warmupTerminalTypeWithStatus(payload []byte, eventType string) string {
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
+	status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()))
+	if status == "" {
+		status = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "status").String()))
+	}
+	// An explicit failed/incomplete/cancelled event is stronger than a stale or
+	// contradictory nested status. Only completed/done aliases are normalized
+	// from nested status so a failed event cannot be promoted to success.
+	switch eventType {
+	case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		return eventType
+	}
+	switch status {
+	case "failed", "error":
+		return "response.failed"
+	case "incomplete", "cancelled", "canceled":
+		return "response." + status
+	case "completed", "complete":
+		return "response.completed"
+	default:
+		if status != "" && (eventType == "response.done" || eventType == "response.completed") {
+			// A terminal alias paired with an unknown non-empty status is not
+			// success evidence. Keep the cycle retryable/uncertain instead of
+			// allowing an in_progress or queued response to advance it.
+			return "response.incomplete"
+		}
+		return eventType
+	}
+}
+
+// mergeWarmupTerminalTypes combines executor metadata with independently
+// parsed body evidence.  Any non-success value wins over a success alias so a
+// conflicting producer cannot advance a durable warmup cycle.
+func mergeWarmupTerminalTypes(existing, observed string) string {
+	existing = strings.ToLower(strings.TrimSpace(existing))
+	observed = strings.ToLower(strings.TrimSpace(observed))
+	if existing == "" {
+		return observed
+	}
+	if observed == "" {
+		return existing
+	}
+	if existing != "response.completed" && existing != "response.done" {
+		return existing
+	}
+	return observed
 }
 
 func responseTerminalType(body []byte) string {

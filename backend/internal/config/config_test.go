@@ -79,6 +79,23 @@ func TestLoadServerTimingConfig(t *testing.T) {
 	})
 }
 
+func TestLoadOpenAIWindowWarmupWorkerRoleFromEnvironment(t *testing.T) {
+	t.Run("enabled by default", func(t *testing.T) {
+		resetViperWithJWTSecret(t)
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.True(t, cfg.OpenAIWindowWarmupWorkerEnabled)
+	})
+
+	t.Run("can disable image-only role", func(t *testing.T) {
+		resetViperWithJWTSecret(t)
+		t.Setenv("OPENAI_WINDOW_WARMUP_WORKER_ENABLED", "false")
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.False(t, cfg.OpenAIWindowWarmupWorkerEnabled)
+	})
+}
+
 func TestLoadRedisUsernameFromEnvironment(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("REDIS_USERNAME", "app-user")

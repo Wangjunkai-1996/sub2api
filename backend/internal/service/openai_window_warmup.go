@@ -1132,11 +1132,35 @@ func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim
 	if authFailure != nil && (authFailure.Disposition == OpenAIWindowWarmupAuthRefreshTransient ||
 		authFailure.Disposition == OpenAIWindowWarmupAuthRefreshInProgress) {
 		if job.AttemptCount >= s.options.MaxAttempts {
-			s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached")
+			// The durable job is terminal at the attempt cap, but a transient
+			// OAuth failure still needs the account-level cooldown so real traffic
+			// does not immediately select the same credential. Apply that side
+			// effect only after the fenced job transition succeeds.
+			if s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached") {
+				_ = s.handleAuthFailure(ctx, authFailure)
+			}
 			return
 		}
 		if s.markRetry(ctx, claim, now, now.Add(warmupBackoff(job.AttemptCount-1)), statusCode,
 			string(authFailure.Disposition), "transient credential recovery failure") {
+			_ = s.handleAuthFailure(ctx, authFailure)
+		}
+		return
+	}
+	if statusCode == http.StatusForbidden && warmupAuthFailureIsRetryableForbidden(authFailure) {
+		// HTML/proxy 403s are not credential evidence, while structured 403s are
+		// only a temporary account cooldown until the shared 403 policy reaches
+		// its threshold. Keep the durable cycle retryable so it can resume after
+		// that cooldown; a later eligibility check pauses it if the account was
+		// permanently quarantined by the shared policy.
+		if job.AttemptCount >= s.options.MaxAttempts {
+			if s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached") {
+				_ = s.handleAuthFailure(ctx, authFailure)
+			}
+			return
+		}
+		if s.markRetry(ctx, claim, now, now.Add(warmupBackoff(job.AttemptCount-1)), statusCode,
+			string(authFailure.Disposition), "retryable forbidden response") {
 			_ = s.handleAuthFailure(ctx, authFailure)
 		}
 		return
@@ -1169,6 +1193,15 @@ func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim
 		return
 	}
 	if probeErr != nil {
+		// A 5xx is an HTTP response, but it does not prove that the upstream
+		// failed before executing the POST.  OpenAI may have accepted the
+		// request and then failed while producing the response.  Route every
+		// server error through the same passive reconciliation/fencing path as
+		// timeout and EOF; retrying it directly can consume the window twice.
+		if statusCode >= 500 && statusCode <= 599 {
+			s.handleAmbiguousProbe(ctx, claim, account, result, statusCode, now)
+			return
+		}
 		// A received non-2xx status is a definitive rejection, even if reading
 		// the bounded response body later failed. Only status-less and 2xx
 		// transport ambiguity can be possibly_sent.
@@ -1197,6 +1230,13 @@ func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim
 		return
 	}
 	statusCode = result.StatusCode
+	if statusCode >= 500 && statusCode <= 599 {
+		// Keep the no-error test-double path consistent with the real probe path:
+		// any received 5xx is potentially post-acceptance and needs passive
+		// reconciliation before another synthetic POST is considered.
+		s.handleAmbiguousProbe(ctx, claim, account, result, statusCode, now)
+		return
+	}
 	reset := result.ResetAt
 	if reset == nil {
 		reset = result.ObservedResetAt
@@ -1299,6 +1339,10 @@ func (s *OpenAIWindowWarmupService) markRetry(ctx context.Context, claim OpenAIW
 func (s *OpenAIWindowWarmupService) handleUsageObservationFailure(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, retryState, phase string, observationErr error) bool {
 	status, code, terminalState := classifyWarmupUsageObservationError(observationErr)
 	authFailure := openAIWindowWarmupAuthFailureFromError(observationErr)
+	if status == http.StatusForbidden && warmupAuthFailureIsRetryableForbidden(authFailure) {
+		terminalState = ""
+		code = string(authFailure.Disposition)
+	}
 	if code == "usage_observation_failed" {
 		code = "usage_" + phase + "_failed"
 	}
@@ -1343,6 +1387,12 @@ func openAIWindowWarmupProbeAuthFailure(result *OpenAIWindowProbeResult, err err
 		return cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure)
 	}
 	return openAIWindowWarmupAuthFailureFromError(err)
+}
+
+func warmupAuthFailureIsRetryableForbidden(failure *OpenAIWindowWarmupAuthFailure) bool {
+	return failure != nil && failure.StatusCode == http.StatusForbidden &&
+		(failure.Disposition == OpenAIWindowWarmupAuthForbidden ||
+			failure.Disposition == OpenAIWindowWarmupAuthForbiddenHTML)
 }
 
 func (s *OpenAIWindowWarmupService) handleAuthFailure(ctx context.Context, failure *OpenAIWindowWarmupAuthFailure) error {

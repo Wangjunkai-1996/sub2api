@@ -243,8 +243,9 @@ func ProvideOpenAICodexWindowProbe(executor OpenAIOutboundExecutor, options Open
 	return NewOpenAICodexWindowProbe(executor, options.Model)
 }
 
-// ProvideOpenAIWindowWarmupService constructs the worker unconditionally.
-// Application startup controls its lifecycle after PluginManager.Start.
+// ProvideOpenAIWindowWarmupService constructs the service for dependency
+// wiring. Application startup controls its worker lifecycle after
+// PluginManager.Start and may disable it for image-only slots.
 func ProvideOpenAIWindowWarmupService(
 	repo OpenAIWindowWarmupRepository,
 	accountRepo AccountRepository,
@@ -272,9 +273,11 @@ func ProvideOpenAIQuotaService(
 	proxyRepo ProxyRepository,
 	tokenProvider *OpenAITokenProvider,
 	privacyClientFactory PrivacyClientFactory,
+	pluginManager *PluginManager,
 	openAIGatewayService *OpenAIGatewayService,
 ) *OpenAIQuotaService {
 	service := NewOpenAIQuotaService(accountRepo, proxyRepo, tokenProvider, privacyClientFactory)
+	service.SetPluginTransport(pluginManager)
 	service.agentIdentityWS = openAIGatewayService
 	return service
 }
