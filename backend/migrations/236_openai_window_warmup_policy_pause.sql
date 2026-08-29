@@ -1,6 +1,8 @@
 -- Synchronize durable warmup jobs with explicit account policy changes.
 -- Unsent work can be paused immediately, while a row with evidence that a
 -- synthetic POST may have started must retain the uncertain replay fence.
+SET LOCAL lock_timeout = '3s';
+
 CREATE OR REPLACE FUNCTION public.openai_window_warmup_sync_policy_state()
 RETURNS trigger
 LANGUAGE plpgsql
