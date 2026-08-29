@@ -44,13 +44,14 @@ func TestBuildOpenAIWindowWarmupPayloadIsFixedAndMinimal(t *testing.T) {
 	payload := BuildOpenAIWindowWarmupPayload("gpt-5.4")
 	require.True(t, gjson.ValidBytes(payload))
 	require.Equal(t, "gpt-5.4", gjson.GetBytes(payload, "model").String())
+	require.Equal(t, openAIWindowWarmupInstructions, gjson.GetBytes(payload, "instructions").String())
 	require.Equal(t, "ping", gjson.GetBytes(payload, "input.0.content.0.text").String())
 	require.True(t, gjson.GetBytes(payload, "stream").Bool())
 	require.True(t, gjson.GetBytes(payload, "store").Exists())
 	require.False(t, gjson.GetBytes(payload, "store").Bool())
 
 	for _, forbidden := range []string{
-		"instructions", "tools", "tool_choice", "previous_response_id",
+		"tools", "tool_choice", "previous_response_id",
 		"metadata", "prompt_cache_key", "max_output_tokens",
 	} {
 		require.Falsef(t, gjson.GetBytes(payload, forbidden).Exists(), "unexpected payload field %s", forbidden)

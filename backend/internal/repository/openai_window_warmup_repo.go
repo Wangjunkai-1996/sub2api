@@ -32,7 +32,8 @@ func NewOpenAIWindowWarmupRepository(db *sql.DB) service.OpenAIWindowWarmupRepos
 
 const warmupJobSelectColumns = `
     id, account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
-    observed_reset_at, uncertain_observed_reset_at, uncertain_observed_at,
+    observed_reset_at, preflight_reset_at, preflight_observed_at,
+    uncertain_observed_reset_at, uncertain_observed_at,
     uncertain_terminal_observed,
     next_attempt_at, attempt_count, sent_at, lease_owner, lease_token,
     lease_until, last_attempt_at, last_success_at, status_code, last_error_code,
@@ -150,15 +151,18 @@ ORDER BY next_attempt_at ASC, id ASC`
 	claims := make([]service.OpenAIWindowWarmupClaim, 0, limit)
 	for rows.Next() {
 		var (
-			job                                                                          service.OpenAIWindowWarmupJob
-			observed, uncertainReset, uncertainAt, sent, until, lastAttempt, lastSuccess sql.NullTime
-			leaseOwner, leaseToken, errorCode, lastError                                 sql.NullString
-			statusCode                                                                   sql.NullInt64
-			previousState                                                                string
+			job                                          service.OpenAIWindowWarmupJob
+			observed, preflightReset, preflightObserved  sql.NullTime
+			uncertainReset, uncertainAt, sent, until     sql.NullTime
+			lastAttempt, lastSuccess                     sql.NullTime
+			leaseOwner, leaseToken, errorCode, lastError sql.NullString
+			statusCode                                   sql.NullInt64
+			previousState                                string
 		)
 		if err := rows.Scan(
 			&job.ID, &job.AccountID, &job.QuotaScope, &job.State, &job.Trigger,
-			&job.CycleKey, &job.CycleGeneration, &observed, &uncertainReset, &uncertainAt,
+			&job.CycleKey, &job.CycleGeneration, &observed, &preflightReset, &preflightObserved,
+			&uncertainReset, &uncertainAt,
 			&job.UncertainTerminalObserved, &job.NextAttemptAt,
 			&job.AttemptCount, &sent, &leaseOwner, &leaseToken, &until,
 			&lastAttempt, &lastSuccess, &statusCode, &errorCode, &lastError,
@@ -167,6 +171,7 @@ ORDER BY next_attempt_at ASC, id ASC`
 			return nil, err
 		}
 		warmupAssignNullable(&job, observed, sent, until, lastAttempt, lastSuccess, statusCode, leaseOwner, leaseToken, lastError, errorCode)
+		warmupAssignPreflight(&job, preflightReset, preflightObserved)
 		if uncertainReset.Valid {
 			v := uncertainReset.Time.UTC()
 			job.UncertainObservedResetAt = &v
@@ -202,6 +207,7 @@ func (r *openAIWindowWarmupRepository) QueueStats(ctx context.Context, allowedAc
 		            OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= NOW())) AS is_due
 		    FROM openai_window_warmup_jobs
 		    WHERE account_id = ANY($1)
+		      AND state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent')
 		)
 		SELECT
 		    COUNT(*),
@@ -231,6 +237,36 @@ func (r *openAIWindowWarmupRepository) CleanupExpiredAttempts(ctx context.Contex
 		    SELECT id FROM openai_window_warmup_attempts
 		    WHERE expires_at <= NOW()
 		    ORDER BY expires_at, id
+		    LIMIT $1
+		)`, limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (r *openAIWindowWarmupRepository) CleanupSupersededTerminalJobs(ctx context.Context, limit int) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("nil openai warmup repository")
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	result, err := r.db.ExecContext(ctx, `
+		DELETE FROM openai_window_warmup_jobs
+		WHERE id IN (
+		    SELECT stale.id
+		    FROM openai_window_warmup_jobs AS stale
+		    WHERE stale.state IN ('completed', 'failed')
+		      AND stale.updated_at <= NOW() - INTERVAL '7 days'
+		      AND EXISTS (
+		          SELECT 1
+		          FROM openai_window_warmup_jobs AS newer
+		          WHERE newer.account_id = stale.account_id
+		            AND newer.quota_scope = stale.quota_scope
+		            AND newer.id > stale.id
+		      )
+		    ORDER BY stale.updated_at, stale.id
 		    LIMIT $1
 		)`, limit)
 	if err != nil {
@@ -313,7 +349,8 @@ func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64
 	return r.fencedUpdate(ctx, `
 	UPDATE openai_window_warmup_jobs AS j
 	SET last_attempt_at = COALESCE($4, NOW()), attempt_count = attempt_count + 1,
-	    sent_at = COALESCE($4, NOW()), uncertain_observed_reset_at = NULL,
+	    sent_at = COALESCE($4, NOW()), preflight_reset_at = $7::timestamptz,
+	    preflight_observed_at = COALESCE($4, NOW()), uncertain_observed_reset_at = NULL,
 	    uncertain_observed_at = NULL, uncertain_terminal_observed = FALSE,
 	    updated_at = NOW()
 	WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
@@ -398,7 +435,8 @@ func (r *openAIWindowWarmupRepository) MarkSuccess(ctx context.Context, id int64
 			        status_code = EXCLUDED.status_code,
 			        error_code = EXCLUDED.error_code,
 			        observed_reset_at = EXCLUDED.observed_reset_at,
-			        finished_at = EXCLUDED.finished_at
+			        finished_at = EXCLUDED.finished_at,
+			        expires_at = EXCLUDED.finished_at + INTERVAL '7 days'
 			    WHERE openai_window_warmup_attempts.outcome IN ('started', 'uncertain')
 		)
 		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token,
@@ -428,7 +466,8 @@ func (r *openAIWindowWarmupRepository) MarkSuppressed(ctx context.Context, id in
 		    SET outcome = EXCLUDED.outcome,
 		        error_code = EXCLUDED.error_code,
 		        observed_reset_at = EXCLUDED.observed_reset_at,
-		        finished_at = EXCLUDED.finished_at
+		        finished_at = EXCLUDED.finished_at,
+		        expires_at = EXCLUDED.finished_at + INTERVAL '7 days'
 		    WHERE openai_window_warmup_attempts.outcome IN ('started', 'uncertain')
 		)
 		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, nullWarmupTime(resetAt), code, nullableTimeValue(at))
@@ -666,18 +705,50 @@ func (r *openAIWindowWarmupRepository) GetCurrentForAccounts(ctx context.Context
 	return jobs, rows.Err()
 }
 
-func (r *openAIWindowWarmupRepository) List(ctx context.Context, options service.OpenAIWindowWarmupListOptions) ([]*service.OpenAIWindowWarmupJob, error) {
+func (r *openAIWindowWarmupRepository) ListPage(ctx context.Context, options service.OpenAIWindowWarmupListOptions) ([]*service.OpenAIWindowWarmupJob, int64, error) {
 	if r == nil || r.db == nil {
-		return nil, errors.New("nil openai warmup repository")
+		return nil, 0, errors.New("nil openai warmup repository")
 	}
 	limit := options.Limit
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 {
 		limit = 100
+	} else if limit > 1000 {
+		limit = 1000
 	}
 	offset := options.Offset
 	if offset < 0 {
 		offset = 0
 	}
+	where, args := openAIWindowWarmupListFilter(options)
+	var total int64
+	countQuery := `SELECT COUNT(*) FROM openai_window_warmup_jobs WHERE ` + where
+	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	listArgs := append(append([]any(nil), args...), limit, offset)
+	query := `SELECT ` + warmupJobSelectColumns + ` FROM openai_window_warmup_jobs WHERE ` + where +
+		fmt.Sprintf(" ORDER BY next_attempt_at ASC, id ASC LIMIT $%d OFFSET $%d", len(listArgs)-1, len(listArgs))
+	rows, err := r.db.QueryContext(ctx, query, listArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	jobs := make([]*service.OpenAIWindowWarmupJob, 0, limit)
+	for rows.Next() {
+		job, err := scanWarmupJobRows(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return jobs, total, nil
+}
+
+func openAIWindowWarmupListFilter(options service.OpenAIWindowWarmupListOptions) (string, []any) {
 	args := make([]any, 0, 4)
 	where := []string{"1=1"}
 	if options.AccountID > 0 {
@@ -688,23 +759,7 @@ func (r *openAIWindowWarmupRepository) List(ctx context.Context, options service
 		args = append(args, pq.Array(options.States))
 		where = append(where, fmt.Sprintf("state = ANY($%d)", len(args)))
 	}
-	args = append(args, limit, offset)
-	query := `SELECT ` + warmupJobSelectColumns + ` FROM openai_window_warmup_jobs WHERE ` + strings.Join(where, " AND ") +
-		fmt.Sprintf(" ORDER BY next_attempt_at ASC, id ASC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
-	rows, err := r.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	jobs := make([]*service.OpenAIWindowWarmupJob, 0, limit)
-	for rows.Next() {
-		job, err := scanWarmupJobRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, job)
-	}
-	return jobs, rows.Err()
+	return strings.Join(where, " AND "), args
 }
 
 func (r *openAIWindowWarmupRepository) UnblockAccount(ctx context.Context, accountID int64, next time.Time, resetAt *time.Time) (*service.OpenAIWindowWarmupJob, bool, error) {
@@ -724,8 +779,19 @@ func (r *openAIWindowWarmupRepository) UnblockAccount(ctx context.Context, accou
 	    FOR UPDATE
 	), updated AS (
 	    UPDATE openai_window_warmup_jobs AS j
-	    SET state = CASE WHEN $2 > NOW() THEN 'armed' ELSE 'pending' END,
-	        next_attempt_at = $2, observed_reset_at = COALESCE($3, observed_reset_at),
+	    SET state = CASE
+	            WHEN j.state = 'paused' AND j.sent_at IS NOT NULL THEN 'uncertain'
+	            WHEN $2 > NOW() THEN 'armed'
+	            ELSE 'pending'
+	        END,
+	        next_attempt_at = CASE
+	            WHEN j.state = 'paused' AND j.sent_at IS NOT NULL THEN NOW()
+	            ELSE $2
+	        END,
+	        observed_reset_at = CASE
+	            WHEN j.state = 'paused' AND j.sent_at IS NOT NULL THEN j.observed_reset_at
+	            ELSE COALESCE($3, j.observed_reset_at)
+	        END,
 	        lease_owner = NULL, lease_token = NULL, lease_until = NULL,
 	        last_error_code = NULL, last_error = NULL, updated_at = NOW()
 	    FROM target
@@ -773,12 +839,13 @@ type warmupRowScanner interface{ Scan(...any) error }
 
 func scanWarmupJob(row warmupRowScanner) (*service.OpenAIWindowWarmupJob, error) {
 	job := &service.OpenAIWindowWarmupJob{}
-	var observed, uncertainReset, uncertainAt, sent, until, lastAttempt, lastSuccess sql.NullTime
+	var observed, preflightReset, preflightObserved, uncertainReset, uncertainAt, sent, until, lastAttempt, lastSuccess sql.NullTime
 	var owner, token, errorCode, lastError sql.NullString
 	var statusCode sql.NullInt64
 	err := row.Scan(
 		&job.ID, &job.AccountID, &job.QuotaScope, &job.State, &job.Trigger,
-		&job.CycleKey, &job.CycleGeneration, &observed, &uncertainReset, &uncertainAt,
+		&job.CycleKey, &job.CycleGeneration, &observed, &preflightReset, &preflightObserved,
+		&uncertainReset, &uncertainAt,
 		&job.UncertainTerminalObserved, &job.NextAttemptAt,
 		&job.AttemptCount, &sent, &owner, &token, &until, &lastAttempt,
 		&lastSuccess, &statusCode, &errorCode, &lastError, &job.CreatedAt, &job.UpdatedAt,
@@ -787,6 +854,7 @@ func scanWarmupJob(row warmupRowScanner) (*service.OpenAIWindowWarmupJob, error)
 		return nil, err
 	}
 	warmupAssignNullable(job, observed, sent, until, lastAttempt, lastSuccess, statusCode, owner, token, lastError, errorCode)
+	warmupAssignPreflight(job, preflightReset, preflightObserved)
 	if uncertainReset.Valid {
 		v := uncertainReset.Time.UTC()
 		job.UncertainObservedResetAt = &v
@@ -838,6 +906,17 @@ func warmupAssignNullable(job *service.OpenAIWindowWarmupJob, observed, sent, un
 	}
 	if lastError.Valid {
 		job.LastError = lastError.String
+	}
+}
+
+func warmupAssignPreflight(job *service.OpenAIWindowWarmupJob, reset, observed sql.NullTime) {
+	if reset.Valid {
+		v := reset.Time.UTC()
+		job.PreflightResetAt = &v
+	}
+	if observed.Valid {
+		v := observed.Time.UTC()
+		job.PreflightObservedAt = &v
 	}
 }
 

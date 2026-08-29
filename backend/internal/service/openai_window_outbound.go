@@ -101,7 +101,14 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 		return nil, wrapped
 	}
 	result, err := e.executeOnce(execCtx, request, auth)
-	if err != nil || result == nil || result.StatusCode != http.StatusUnauthorized {
+	if result == nil || result.StatusCode != http.StatusUnauthorized {
+		return annotateOpenAIWindowAuthResult(result, request.Account, ""), err
+	}
+	// Only a refreshable OAuth bearer can recover from the status alone. Agent
+	// Identity recovery depends on a complete structured error body, while PAT
+	// and access-token-only accounts have no safe replay credential.
+	if err != nil && (request.Account.IsOpenAIAgentIdentity() || e.tokenProvider == nil ||
+		request.Account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(request.Account.GetOpenAIRefreshToken()) == "") {
 		return annotateOpenAIWindowAuthResult(result, request.Account, ""), err
 	}
 

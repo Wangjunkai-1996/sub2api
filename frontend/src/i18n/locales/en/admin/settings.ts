@@ -470,6 +470,7 @@ export default {
         requestTimeoutSeconds: 'Request timeout (seconds)',
         leaseSeconds: 'Lease (seconds)',
         resetGraceSeconds: 'Reset grace (seconds)',
+        runtimeApplyHint: 'The global switch and account scope apply immediately. Restart the service after changing the probe model or worker parameters.',
         leaseInvalid: 'The lease must be longer than the request timeout.'
       },
       upstreamBillingProbe: {

@@ -4999,6 +4999,12 @@
                   <input v-model.number="form.openai_window_warmup_reset_grace_seconds" type="number" min="0" max="900" step="1" class="input mt-1" data-testid="openai-window-warmup-grace" />
                 </label>
               </div>
+              <p
+                class="text-xs text-gray-500 dark:text-gray-400"
+                data-testid="openai-window-warmup-runtime-apply-hint"
+              >
+                {{ t("admin.settings.openAIWindowWarmup.runtimeApplyHint") }}
+              </p>
             </div>
           </div>
 

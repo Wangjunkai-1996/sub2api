@@ -31,6 +31,7 @@ const (
 	openAIWindowWarmupOutcomeUncertain  = "uncertain"
 	openAIWindowWarmupOutcomeBlocked    = "blocked"
 	openAIWindowWarmupMaxModelBytes     = 128
+	openAIWindowWarmupInstructions      = "Reply with OK."
 )
 
 var (
@@ -186,17 +187,19 @@ func warmupProbeAccountEligible(account *Account) bool {
 		!account.IsShadow() && account.IsActive() && account.Schedulable
 }
 
-// buildOpenAIWindowWarmupPayload is intentionally stable and tiny.  In
-// particular it has no instructions, tools, previous_response_id, or user
-// content from an inbound request.  `stream=true` is required by the Codex
-// internal endpoint, and `store=false` prevents server-side response storage.
+// buildOpenAIWindowWarmupPayload is intentionally stable and tiny. It carries
+// only the short, non-empty instructions required by the Responses contract;
+// it has no tools, previous_response_id, or content from an inbound request.
+// `stream=true` is required by the Codex internal endpoint, and `store=false`
+// prevents server-side response storage.
 func buildOpenAIWindowWarmupPayload(model string) ([]byte, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		model = openaiPkg.CodexUsageProbeModel
 	}
 	payload := map[string]any{
-		"model": model,
+		"model":        model,
+		"instructions": openAIWindowWarmupInstructions,
 		"input": []map[string]any{
 			{
 				"role": "user",
@@ -252,8 +255,10 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 	headers := cloneWarmupHeaders(result.Headers)
 	body := boundedWarmupBody(result.Body)
 	resetAt := cloneWarmupTime(result.ResetAt)
+	headerReset := warmupResetFromHeaders(headers)
+	resetFromRelativeHeader := headerReset != nil
 	if resetAt == nil {
-		resetAt = warmupResetFromHeaders(headers)
+		resetAt = headerReset
 	}
 	terminal := result.Terminal
 	terminalType := strings.TrimSpace(result.TerminalType)
@@ -283,16 +288,17 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 		outcome = openAIWindowWarmupOutcomeBlocked
 	}
 	return &OpenAIWindowProbeResult{
-		StatusCode:      result.StatusCode,
-		Headers:         headers,
-		Body:            body,
-		Terminal:        terminal,
-		TerminalType:    terminalType,
-		ResetAt:         cloneWarmupTime(resetAt),
-		ObservedResetAt: cloneWarmupTime(resetAt),
-		EOF:             result.EOF,
-		Outcome:         outcome,
-		AuthFailure:     cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure),
+		StatusCode:              result.StatusCode,
+		Headers:                 headers,
+		Body:                    body,
+		Terminal:                terminal,
+		TerminalType:            terminalType,
+		ResetAt:                 cloneWarmupTime(resetAt),
+		ObservedResetAt:         cloneWarmupTime(resetAt),
+		EOF:                     result.EOF,
+		Outcome:                 outcome,
+		AuthFailure:             cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure),
+		resetFromRelativeHeader: resetFromRelativeHeader,
 	}
 }
 

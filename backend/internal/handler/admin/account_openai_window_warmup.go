@@ -366,12 +366,11 @@ func (h *AccountHandler) ListOpenAIWindowWarmupJobs(c *gin.Context) {
 			states = append(states, state)
 		}
 	}
-	// The repository deliberately bounds operational listings to 500 rows. Read
-	// the bounded set once so the API can return an exact total for that window.
-	jobs, err := h.openAIWindowWarmup.ListJobs(c.Request.Context(), service.OpenAIWindowWarmupListOptions{
+	jobs, total, err := h.openAIWindowWarmup.ListJobsPage(c.Request.Context(), service.OpenAIWindowWarmupListOptions{
 		AccountID: accountID,
 		States:    states,
-		Limit:     500,
+		Limit:     pageSize,
+		Offset:    (page - 1) * pageSize,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)
@@ -382,15 +381,7 @@ func (h *AccountHandler) ListOpenAIWindowWarmupJobs(c *gin.Context) {
 			job.LastError = redactedWarmupError(job.LastError)
 		}
 	}
-	start := (page - 1) * pageSize
-	end := start + pageSize
-	if start > len(jobs) {
-		start = len(jobs)
-	}
-	if end > len(jobs) {
-		end = len(jobs)
-	}
-	response.Paginated(c, jobs[start:end], int64(len(jobs)), page, pageSize)
+	response.Paginated(c, jobs, total, page, pageSize)
 }
 
 func normalizeOpenAIWindowWarmupBatchIDs(ids []int64) ([]int64, error) {

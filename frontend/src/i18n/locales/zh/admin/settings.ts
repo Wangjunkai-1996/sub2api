@@ -463,6 +463,7 @@ export default {
         requestTimeoutSeconds: '请求超时（秒）',
         leaseSeconds: 'Lease（秒）',
         resetGraceSeconds: 'Reset Grace（秒）',
+        runtimeApplyHint: '总开关和账号范围立即生效；探针模型及 Worker 参数保存后需重启服务生效。',
         leaseInvalid: 'Lease 必须长于请求超时。'
       },
       upstreamBillingProbe: {

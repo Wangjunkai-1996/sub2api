@@ -341,6 +341,8 @@ func (l *AccountExclusiveLease) Refresh(ctx context.Context) (bool, error) {
 	if l == nil || l.cache == nil || l.accountID <= 0 || l.token == "" {
 		return false, errors.New("account exclusive lease is unavailable")
 	}
+	// The cache also fences refresh against newly arrived business demand, so a
+	// maintenance owner cannot extend its lease ahead of a real request.
 	return l.cache.RefreshAccountExclusive(ctx, l.accountID, l.token, l.ttl)
 }
 

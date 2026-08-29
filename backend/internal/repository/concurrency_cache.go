@@ -248,11 +248,24 @@ var (
 	`)
 
 	refreshAccountExclusiveScript = redis.NewScript(`
-		local key = KEYS[1]
+		redis.replicate_commands()
+		local regularKey = KEYS[1]
+		local liveKey = KEYS[2]
+		local waitKey = KEYS[3]
+		local exclusiveKey = KEYS[4]
 		local token = ARGV[1]
 		local ttl = tonumber(ARGV[2])
-		if redis.call('GET', key) ~= token then return 0 end
-		redis.call('EXPIRE', key, ttl)
+		local regularTTL = tonumber(ARGV[3])
+		local liveTTL = tonumber(ARGV[4])
+		if redis.call('GET', exclusiveKey) ~= token then return 0 end
+		local now = tonumber(redis.call('TIME')[1])
+		redis.call('ZREMRANGEBYSCORE', regularKey, '-inf', now - regularTTL)
+		redis.call('ZREMRANGEBYSCORE', liveKey, '-inf', now - liveTTL)
+		local waiting = tonumber(redis.call('GET', waitKey) or '0')
+		if redis.call('ZCARD', regularKey) > 0 or redis.call('ZCARD', liveKey) > 0 or waiting > 0 then
+			return 0
+		end
+		redis.call('EXPIRE', exclusiveKey, ttl)
 		return 1
 	`)
 
@@ -364,9 +377,6 @@ var (
 		-- Redis 3.2-4.x compat: opt into effects replication so redis.call('TIME')
 		-- replicates correctly. No-op on Redis 5.0+ (effects replication is default).
 		redis.replicate_commands()
-		if redis.call('EXISTS', KEYS[2]) == 1 then
-			return {0, tonumber(redis.call('TIME')[1])}
-		end
 		local current = redis.call('GET', KEYS[1])
 		if current == false then
 			current = 0
@@ -961,8 +971,11 @@ func (c *concurrencyCache) RefreshAccountExclusive(ctx context.Context, accountI
 		ttlSeconds = 1
 	}
 	result, err := refreshAccountExclusiveScript.Run(ctx, c.rdb, []string{
+		accountSlotKey(accountID),
+		liveAccountSlotKey(accountID),
+		accountWaitKey(accountID),
 		warmupAccountExclusiveKey(accountID),
-	}, token, ttlSeconds).Int()
+	}, token, ttlSeconds, c.slotTTLSeconds, liveLeaseTTLSeconds).Int()
 	return result == 1, err
 }
 
@@ -1046,7 +1059,7 @@ func (c *concurrencyCache) DecrementWaitCount(ctx context.Context, userID int64)
 
 func (c *concurrencyCache) IncrementAccountWaitCount(ctx context.Context, accountID int64, maxWait int) (bool, error) {
 	key := accountWaitKey(accountID)
-	result, now, err := runScriptInt64Pair(ctx, c.rdb, incrementAccountWaitScript, []string{key, warmupAccountExclusiveKey(accountID)}, maxWait, c.waitQueueTTLSeconds)
+	result, now, err := runScriptInt64Pair(ctx, c.rdb, incrementAccountWaitScript, []string{key}, maxWait, c.waitQueueTTLSeconds)
 	if err != nil {
 		return false, err
 	}

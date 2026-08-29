@@ -48,9 +48,21 @@ type warmupHandlerRepository struct {
 	mu              sync.Mutex
 	current         *service.OpenAIWindowWarmupJob
 	getCurrentErr   error
+	listJobs        []*service.OpenAIWindowWarmupJob
+	listTotal       int64
+	listOptions     service.OpenAIWindowWarmupListOptions
+	listCalls       int
 	enqueueCalls    int
 	unblockCalls    int
 	getCurrentCalls int
+}
+
+func (r *warmupHandlerRepository) ListPage(_ context.Context, options service.OpenAIWindowWarmupListOptions) ([]*service.OpenAIWindowWarmupJob, int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.listCalls++
+	r.listOptions = options
+	return r.listJobs, r.listTotal, nil
 }
 
 func (r *warmupHandlerRepository) GetCurrent(context.Context, int64, string) (*service.OpenAIWindowWarmupJob, error) {
@@ -134,11 +146,49 @@ func setupWarmupHandlerRouter(t *testing.T, repo *warmupHandlerRepository) (*gin
 		c.Next()
 	})
 	router.GET("/api/v1/admin/codex-window-warmup/metrics", handler.GetOpenAIWindowWarmupMetrics)
+	router.GET("/api/v1/admin/codex-window-warmup/jobs", handler.ListOpenAIWindowWarmupJobs)
 	router.POST("/api/v1/admin/accounts/:id/codex-warmup/requeue", handler.RequeueOpenAIWindowWarmup)
 	router.POST("/api/v1/admin/accounts/:id/codex-warmup/unblock", handler.UnblockOpenAIWindowWarmup)
 	router.POST("/api/v1/admin/codex-window-warmup/requeue-batch", handler.RequeueOpenAIWindowWarmupBatch)
 	router.POST("/api/v1/admin/codex-window-warmup/policy-batch", handler.UpdateOpenAIWindowWarmupPolicyBatch)
 	return router, adminService, accountRepo, warmup
+}
+
+func TestOpenAIWindowWarmupJobsHandlerUsesRepositoryPagination(t *testing.T) {
+	repo := &warmupHandlerRepository{
+		listJobs: []*service.OpenAIWindowWarmupJob{
+			{ID: 12, AccountID: 42, State: service.OpenAIWindowWarmupStatePending},
+			{ID: 13, AccountID: 42, State: service.OpenAIWindowWarmupStateRetrying},
+		},
+		listTotal: 713,
+	}
+	router, _, _, _ := setupWarmupHandlerRouter(t, repo)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/v1/admin/codex-window-warmup/jobs?page=2&page_size=2&account_id=42&state=pending,retrying", nil)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, 1, repo.listCalls)
+	require.Equal(t, int64(42), repo.listOptions.AccountID)
+	require.Equal(t, []string{service.OpenAIWindowWarmupStatePending, service.OpenAIWindowWarmupStateRetrying}, repo.listOptions.States)
+	require.Equal(t, 2, repo.listOptions.Limit)
+	require.Equal(t, 2, repo.listOptions.Offset)
+
+	var payload struct {
+		Data struct {
+			Items    []service.OpenAIWindowWarmupJob `json:"items"`
+			Total    int64                           `json:"total"`
+			Page     int                             `json:"page"`
+			PageSize int                             `json:"page_size"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &payload))
+	require.Equal(t, int64(713), payload.Data.Total)
+	require.Equal(t, 2, payload.Data.Page)
+	require.Equal(t, 2, payload.Data.PageSize)
+	require.Len(t, payload.Data.Items, 2)
+	require.Equal(t, []int64{12, 13}, []int64{payload.Data.Items[0].ID, payload.Data.Items[1].ID})
 }
 
 func TestOpenAIWindowWarmupMetricsHandlerReturnsBoundedSnapshot(t *testing.T) {

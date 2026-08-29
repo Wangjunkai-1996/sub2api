@@ -64,6 +64,7 @@ const (
 	openAIWindowWarmupDefaultTimeout               = 45 * time.Second
 	openAIWindowWarmupDefaultBatch                 = 20
 	openAIWindowWarmupDefaultMaxAttempts           = 8
+	openAIWindowWarmupClaimInterval                = 5 * time.Second
 	openAIWindowWarmupReconcileInterval            = 10 * time.Minute
 	openAIWindowWarmupUncertainObservationInterval = time.Minute
 	openAIWindowWarmupResetStabilityTolerance      = 5 * time.Second
@@ -228,6 +229,10 @@ type OpenAIWindowProbeResult struct {
 	EOF             bool
 	Outcome         string
 	AuthFailure     *OpenAIWindowWarmupAuthFailure
+	// resetFromRelativeHeader distinguishes x-codex reset-after evidence from an
+	// explicit absolute reset carried by a response event. An idle now+5h
+	// projection naturally moves forward while the request is in flight.
+	resetFromRelativeHeader bool
 }
 
 // OpenAIWindowProbe is the probe port consumed by the service.  A concrete
@@ -298,6 +303,11 @@ type OpenAIWindowWarmupJob struct {
 	CycleKey        string     `json:"cycle_key"`
 	CycleGeneration int64      `json:"cycle_generation"`
 	ObservedResetAt *time.Time `json:"observed_reset_at,omitempty"`
+	// Preflight* records the authoritative five-hour observation immediately
+	// before the current/last synthetic send. It is attempt evidence rather than
+	// the cycle baseline exposed to operators.
+	PreflightResetAt    *time.Time `json:"-"`
+	PreflightObservedAt *time.Time `json:"-"`
 	// UncertainObserved* is internal durable evidence used to distinguish a
 	// fixed active reset from /wham/usage's idle rolling now+5h projection.
 	UncertainObservedResetAt  *time.Time `json:"-"`
@@ -383,6 +393,7 @@ type OpenAIWindowWarmupRepository interface {
 	ClaimDue(context.Context, string, time.Duration, int, []int64) ([]OpenAIWindowWarmupClaim, error)
 	QueueStats(context.Context, []int64) (OpenAIWindowWarmupQueueStats, error)
 	CleanupExpiredAttempts(context.Context, int) (int64, error)
+	CleanupSupersededTerminalJobs(context.Context, int) (int64, error)
 	ReserveGlobalSend(context.Context, time.Duration, time.Duration) (string, bool, error)
 	ReleaseGlobalSend(context.Context, string) (bool, error)
 	RenewLease(context.Context, int64, string, string, time.Duration) (bool, error)
@@ -400,7 +411,7 @@ type OpenAIWindowWarmupRepository interface {
 	GetByID(context.Context, int64) (*OpenAIWindowWarmupJob, error)
 	GetCurrent(context.Context, int64, string) (*OpenAIWindowWarmupJob, error)
 	GetCurrentForAccounts(context.Context, []int64, string) (map[int64]*OpenAIWindowWarmupJob, error)
-	List(context.Context, OpenAIWindowWarmupListOptions) ([]*OpenAIWindowWarmupJob, error)
+	ListPage(context.Context, OpenAIWindowWarmupListOptions) ([]*OpenAIWindowWarmupJob, int64, error)
 	UnblockAccount(context.Context, int64, time.Time, *time.Time) (*OpenAIWindowWarmupJob, bool, error)
 }
 
@@ -538,6 +549,8 @@ type OpenAIWindowWarmupService struct {
 	options        OpenAIWindowWarmupOptions
 	metrics        openAIWindowWarmupMetricCounters
 	workerInflight atomic.Int64
+	cohortMu       sync.RWMutex
+	cohortIDs      []int64
 	owner          string
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -545,6 +558,7 @@ type OpenAIWindowWarmupService struct {
 	stopOnce       sync.Once
 	wg             sync.WaitGroup
 	limiter        *warmupRateLimiter
+	claimInterval  time.Duration
 }
 
 func NewOpenAIWindowWarmupService(repo OpenAIWindowWarmupRepository, accounts AccountRepository, executor OpenAIOutboundExecutor, probe OpenAIWindowProbe, audit *AuditLogService, options OpenAIWindowWarmupOptions) *OpenAIWindowWarmupService {
@@ -556,7 +570,7 @@ func NewOpenAIWindowWarmupService(repo OpenAIWindowWarmupRepository, accounts Ac
 	return &OpenAIWindowWarmupService{
 		repo: repo, accounts: accounts, executor: executor, probe: probe, audit: audit,
 		options: options, owner: "warmup-" + uuid.NewString(), ctx: ctx, cancel: cancel,
-		limiter: newWarmupRateLimiter(options.GlobalQPS),
+		limiter: newWarmupRateLimiter(options.GlobalQPS), claimInterval: openAIWindowWarmupClaimInterval,
 	}
 }
 
@@ -593,18 +607,27 @@ func (s *OpenAIWindowWarmupService) runScanner() {
 		return
 	case <-timer.C:
 		s.reconcileAccounts(s.ctx)
-		s.scanOnce(s.ctx)
+		s.claimDueOnce(s.ctx)
+		s.refreshCachedQueueStats(s.ctx)
 	}
-	ticker := time.NewTicker(s.options.ScanInterval)
-	defer ticker.Stop()
+	claimInterval := s.claimInterval
+	if claimInterval <= 0 {
+		claimInterval = openAIWindowWarmupClaimInterval
+	}
+	claimTicker := time.NewTicker(claimInterval)
+	defer claimTicker.Stop()
+	cohortTicker := time.NewTicker(s.options.ScanInterval)
+	defer cohortTicker.Stop()
 	reconcileTicker := time.NewTicker(openAIWindowWarmupReconcileInterval)
 	defer reconcileTicker.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-ticker.C:
-			s.scanOnce(s.ctx)
+		case <-claimTicker.C:
+			s.claimDueOnce(s.ctx)
+		case <-cohortTicker.C:
+			s.refreshCohortAndQueueStats(s.ctx)
 		case <-reconcileTicker.C:
 			s.reconcileAccounts(s.ctx)
 		}
@@ -616,7 +639,8 @@ func (s *OpenAIWindowWarmupService) reconcileAccounts(ctx context.Context) {
 		return
 	}
 	_, _ = s.repo.CleanupExpiredAttempts(ctx, 500)
-	accounts, accountIDs, ok := s.warmupCohort(ctx)
+	_, _ = s.repo.CleanupSupersededTerminalJobs(ctx, 500)
+	accounts, accountIDs, ok := s.refreshWarmupCohort(ctx)
 	if !ok || len(accountIDs) == 0 {
 		return
 	}
@@ -645,19 +669,22 @@ func (s *OpenAIWindowWarmupService) reconcileAccounts(ctx context.Context) {
 }
 
 func (s *OpenAIWindowWarmupService) scanOnce(ctx context.Context) {
-	_, cohortAccountIDs, ok := s.warmupCohort(ctx)
-	if !ok || len(cohortAccountIDs) == 0 {
-		s.applyQueueStats(OpenAIWindowWarmupQueueStats{})
+	s.refreshWarmupCohort(ctx)
+	s.claimDueOnce(ctx)
+	s.refreshCachedQueueStats(ctx)
+}
+
+func (s *OpenAIWindowWarmupService) claimDueOnce(ctx context.Context) {
+	cohortAccountIDs := s.cachedWarmupCohortIDs()
+	if len(cohortAccountIDs) == 0 {
 		return
 	}
 	// A disabled worker may still report backlog, but must never claim a lease.
 	if !s.killSwitchEnabled(ctx) {
-		s.refreshQueueStats(ctx, cohortAccountIDs)
 		return
 	}
 	available := s.options.WorkerConcurrency - int(s.workerInflight.Load())
 	if available <= 0 {
-		s.refreshQueueStats(ctx, cohortAccountIDs)
 		return
 	}
 	limit := s.options.BatchSize
@@ -668,7 +695,6 @@ func (s *OpenAIWindowWarmupService) scanOnce(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	s.refreshQueueStats(ctx, cohortAccountIDs)
 	for _, claim := range claims {
 		if claim.Job == nil {
 			continue
@@ -681,6 +707,43 @@ func (s *OpenAIWindowWarmupService) scanOnce(ctx context.Context) {
 			s.processClaim(ctx, c)
 		}(claim)
 	}
+}
+
+func (s *OpenAIWindowWarmupService) refreshCohortAndQueueStats(ctx context.Context) {
+	s.refreshWarmupCohort(ctx)
+	s.refreshCachedQueueStats(ctx)
+}
+
+func (s *OpenAIWindowWarmupService) refreshCachedQueueStats(ctx context.Context) {
+	cohortAccountIDs := s.cachedWarmupCohortIDs()
+	if len(cohortAccountIDs) == 0 {
+		s.applyQueueStats(OpenAIWindowWarmupQueueStats{})
+		return
+	}
+	s.refreshQueueStats(ctx, cohortAccountIDs)
+}
+
+func (s *OpenAIWindowWarmupService) refreshWarmupCohort(ctx context.Context) ([]Account, []int64, bool) {
+	if s == nil {
+		return nil, nil, false
+	}
+	accounts, accountIDs, ok := s.warmupCohort(ctx)
+	if !ok {
+		accountIDs = nil
+	}
+	s.cohortMu.Lock()
+	s.cohortIDs = append(s.cohortIDs[:0], accountIDs...)
+	s.cohortMu.Unlock()
+	return accounts, accountIDs, ok
+}
+
+func (s *OpenAIWindowWarmupService) cachedWarmupCohortIDs() []int64 {
+	if s == nil {
+		return nil
+	}
+	s.cohortMu.RLock()
+	defer s.cohortMu.RUnlock()
+	return append([]int64(nil), s.cohortIDs...)
 }
 
 // ScheduleAccountWarmup persists the strategy and creates the first/current
@@ -786,11 +849,11 @@ func (s *OpenAIWindowWarmupService) GetJob(ctx context.Context, id int64) (*Open
 	return s.repo.GetByID(ctx, id)
 }
 
-func (s *OpenAIWindowWarmupService) ListJobs(ctx context.Context, options OpenAIWindowWarmupListOptions) ([]*OpenAIWindowWarmupJob, error) {
+func (s *OpenAIWindowWarmupService) ListJobsPage(ctx context.Context, options OpenAIWindowWarmupListOptions) ([]*OpenAIWindowWarmupJob, int64, error) {
 	if s == nil || s.repo == nil {
-		return nil, errors.New("warmup service is not configured")
+		return nil, 0, errors.New("warmup service is not configured")
 	}
-	return s.repo.List(ctx, options)
+	return s.repo.ListPage(ctx, options)
 }
 
 func (s *OpenAIWindowWarmupService) CurrentJobsForAccounts(ctx context.Context, accountIDs []int64) (map[int64]*OpenAIWindowWarmupJob, error) {
@@ -948,7 +1011,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 			return
 		}
 		if authoritative && active && reset != nil && reset.After(now) {
-			if job.UncertainTerminalObserved && warmupResetAdvanced(reset, job.ObservedResetAt, now) {
+			if job.UncertainTerminalObserved && warmupAttemptResetAdvanced(reset, job, now) {
 				if s.markSuccess(ctx, claim, now, reset, warmupJobStatus(job), "completed_reconciled") {
 					s.enqueueNextContinuousCycle(ctx, account, reset)
 				}
@@ -975,7 +1038,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 				OpenAIWindowWarmupUncertainEvidence{Terminal: job.UncertainTerminalObserved})
 			return
 		case warmupUncertainFixedReset:
-			if job.UncertainTerminalObserved && warmupResetAdvanced(reset, job.ObservedResetAt, now) {
+			if job.UncertainTerminalObserved && warmupAttemptResetAdvanced(reset, job, now) {
 				if s.markSuccess(ctx, claim, now, reset, warmupJobStatus(job), "completed_reconciled") {
 					s.enqueueNextContinuousCycle(ctx, account, reset)
 				}
@@ -1128,12 +1191,16 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 	sentAt := s.now()
 	job.SentAt = &sentAt
 	probeCtx, probeCancel := context.WithTimeout(ctx, s.options.RequestTimeout)
-	result, probeErr := s.probe.Probe(probeCtx, account, job.ObservedResetAt)
+	result, probeErr := s.probe.Probe(probeCtx, account, job.PreflightResetAt)
 	probeCancel()
-	s.handleProbeResult(ctx, claim, account, result, probeErr)
+	s.handleProbeResultWithPreflight(ctx, claim, account, result, probeErr, fiveHour.UsedPercent <= 0)
 }
 
 func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim OpenAIWindowWarmupClaim, account *Account, result *OpenAIWindowProbeResult, probeErr error) {
+	s.handleProbeResultWithPreflight(ctx, claim, account, result, probeErr, false)
+}
+
+func (s *OpenAIWindowWarmupService) handleProbeResultWithPreflight(ctx context.Context, claim OpenAIWindowWarmupClaim, account *Account, result *OpenAIWindowProbeResult, probeErr error, idlePreflight bool) {
 	job := claim.Job
 	now := s.now()
 	statusCode := 0
@@ -1253,7 +1320,15 @@ func (s *OpenAIWindowWarmupService) handleProbeResult(ctx context.Context, claim
 	if reset == nil {
 		reset = result.ObservedResetAt
 	}
-	if statusCode >= 200 && statusCode < 300 && warmupTerminalSucceeded(result) && warmupResetAdvanced(reset, job.ObservedResetAt, now) {
+	if statusCode >= 200 && statusCode < 300 && warmupTerminalSucceeded(result) && warmupAttemptResetAdvanced(reset, job, now) {
+		if idlePreflight && result.resetFromRelativeHeader {
+			// A relative reset is reconstructed at response-read time. For an idle
+			// rolling now+5h projection it will therefore be slightly later than the
+			// preflight reset even when this model did not start the target window.
+			// Reuse the passive fixed-vs-rolling observation fence before success.
+			s.handleAmbiguousProbe(ctx, claim, account, result, statusCode, now)
+			return
+		}
 		ok := s.markSuccess(ctx, claim, now, reset, statusCode, "completed")
 		if ok {
 			s.enqueueNextContinuousCycle(ctx, account, reset)
@@ -1276,7 +1351,7 @@ func (s *OpenAIWindowWarmupService) handleAmbiguousProbe(ctx context.Context, cl
 	terminal := statusCode >= 200 && statusCode < 300 && warmupTerminalSucceeded(result)
 	reset, authoritative, active, reconcileErr := s.reconcileFiveHourObservation(ctx, account.ID, job)
 	if reconcileErr == nil && authoritative && active && reset != nil && reset.After(now) {
-		if terminal && warmupResetAdvanced(reset, job.ObservedResetAt, now) {
+		if terminal && warmupAttemptResetAdvanced(reset, job, now) {
 			if s.markSuccess(ctx, claim, now, reset, statusCode, "completed_reconciled") {
 				s.enqueueNextContinuousCycle(ctx, account, reset)
 			}
@@ -1313,6 +1388,9 @@ func (s *OpenAIWindowWarmupService) markStarted(ctx context.Context, claim OpenA
 	if err != nil || !ok {
 		return false
 	}
+	claim.Job.PreflightResetAt = cloneWarmupTime(evidence.ResetAt)
+	observedAt := at.UTC()
+	claim.Job.PreflightObservedAt = &observedAt
 	s.metrics.started.Add(1)
 	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStateRunning, 0, "started", claim.Job.ObservedResetAt)
 	return true
@@ -1842,6 +1920,24 @@ func warmupResetAdvanced(reset, expected *time.Time, now time.Time) bool {
 		return false
 	}
 	return expected == nil || reset.After(*expected)
+}
+
+// warmupAttemptResetAdvanced compares post-send evidence with the exact
+// authoritative preflight observation. Rows created before that evidence was
+// persisted may fall back to their durable cycle reset, but a row with neither
+// baseline cannot claim success merely because the response contains a future
+// reset.
+func warmupAttemptResetAdvanced(reset *time.Time, job *OpenAIWindowWarmupJob, now time.Time) bool {
+	if job == nil {
+		return false
+	}
+	if job.PreflightObservedAt != nil {
+		return warmupResetAdvanced(reset, job.PreflightResetAt, now)
+	}
+	if job.ObservedResetAt == nil {
+		return false
+	}
+	return warmupResetAdvanced(reset, job.ObservedResetAt, now)
 }
 
 func warmupAccountUsedSinceCycle(account *Account, job *OpenAIWindowWarmupJob) bool {

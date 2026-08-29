@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
@@ -405,6 +406,35 @@ func TestOpenAIWindowOutboundAdapterRefreshesOAuthOnceAfter401(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.Terminal)
 	require.Equal(t, 1, tokens.getCalls)
+	require.Equal(t, 1, tokens.refreshCalls)
+	require.Equal(t, "rejected-token", tokens.rejected)
+	require.Len(t, upstream.requests, 2)
+	require.Equal(t, "Bearer rejected-token", upstream.requests[0].Header.Get("Authorization"))
+	require.Equal(t, "Bearer refreshed-token", upstream.requests[1].Header.Get("Authorization"))
+	require.Nil(t, result.AuthFailure)
+}
+
+func TestOpenAIWindowOutboundAdapterRefreshesOAuthAfterPartialBody401(t *testing.T) {
+	account := openAIWindowOutboundAccount()
+	tokens := &openAIWindowOutboundTokenStub{token: "rejected-token", refreshed: "refreshed-token"}
+	partialBody := io.MultiReader(
+		strings.NewReader(`{"error":`),
+		iotest.ErrReader(io.ErrUnexpectedEOF),
+	)
+	upstream := &openAIWindowOutboundHTTPStub{responses: []*http.Response{
+		{
+			StatusCode: http.StatusUnauthorized,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(partialBody),
+		},
+		openAIWindowCompletedResponse(),
+	}}
+	adapter := &OpenAIWindowOutboundAdapter{tokenProvider: tokens, httpUpstream: upstream}
+
+	result, err := adapter.Execute(context.Background(), openAIWindowOutboundRequest(account))
+
+	require.NoError(t, err)
+	require.True(t, result.Terminal)
 	require.Equal(t, 1, tokens.refreshCalls)
 	require.Equal(t, "rejected-token", tokens.rejected)
 	require.Len(t, upstream.requests, 2)
