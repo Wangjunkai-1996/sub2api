@@ -199,6 +199,7 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	account.ID = created.ID
 	account.CreatedAt = created.CreatedAt
 	account.UpdatedAt = created.UpdatedAt
+	account.OpenAIWarmupIdentityGeneration = created.OpenaiWarmupIdentityGeneration
 	return nil
 }
 
@@ -1594,6 +1595,139 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	}
 	r.syncSchedulerAccountSnapshotDetached(ctx, id)
 	return true, nil
+}
+
+// UpdateOpenAIOAuthCredentialsIfUnchanged is the OpenAI counterpart to the
+// Grok refresh CAS. It is also used for Agent Identity task_id persistence, so
+// a delayed provider response cannot overwrite a concurrent reauthorization.
+func (r *accountRepository) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	if r == nil || r.sql == nil {
+		return false, errors.New("account repository SQL executor is not configured")
+	}
+	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
+	if err != nil {
+		return false, err
+	}
+	credentialsJSON, err := json.Marshal(normalizeJSONMap(credentials))
+	if err != nil {
+		return false, err
+	}
+	result, err := r.sql.ExecContext(ctx, `
+		WITH updated AS (
+		UPDATE accounts AS a
+		SET credentials = $1::jsonb,
+			updated_at = NOW()
+		WHERE a.id = $2
+			AND a.deleted_at IS NULL
+			AND a.platform = $3
+			AND a.type = $4
+			AND a.credentials = $5::jsonb
+			AND a.proxy_id IS NOT DISTINCT FROM $6
+		RETURNING a.id
+		)
+		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
+		SELECT $7, updated.id, NULL, NULL FROM updated
+	`,
+		string(credentialsJSON),
+		id,
+		service.PlatformOpenAI,
+		service.AccountTypeOAuth,
+		string(expectedJSON),
+		expectedProxyID,
+		service.SchedulerOutboxEventAccountChanged,
+	)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rowsAffected == 0 {
+		return false, nil
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
+// AcquireOpenAIWindowWarmupIdentityLease holds a PostgreSQL row-share lock for
+// the exact credentials used by a synthetic send. Account credential/proxy
+// updates conflict with this lock, closing the final read-to-POST race without
+// holding a lock during token refresh or task registration.
+func (r *accountRepository) AcquireOpenAIWindowWarmupIdentityLease(
+	ctx context.Context,
+	id int64,
+	identityGeneration int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+) (func(), bool, error) {
+	if r == nil || r.sql == nil {
+		return nil, false, errors.New("account repository SQL executor is not configured")
+	}
+	if id <= 0 || identityGeneration <= 0 {
+		return nil, false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	beginner, ok := r.sql.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return nil, false, errors.New("account repository transaction executor is not configured")
+	}
+	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
+	if err != nil {
+		return nil, false, err
+	}
+	// The acquisition query still honors the request deadline, but the lock's
+	// transaction must outlive that context until the transport actually
+	// returns. A plugin that is slow to observe cancellation must not release
+	// the reauthorization barrier early.
+	leaseCtx, cancelLease := context.WithCancel(context.WithoutCancel(ctx))
+	tx, err := beginner.BeginTx(leaseCtx, nil)
+	if err != nil {
+		cancelLease()
+		return nil, false, err
+	}
+	release := func() {
+		_ = tx.Rollback()
+		cancelLease()
+	}
+	var matchedID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT a.id
+		FROM accounts AS a
+		WHERE a.id = $1
+		  AND a.deleted_at IS NULL
+		  AND a.platform = $2
+		  AND a.type = $3
+		  AND a.openai_warmup_identity_generation = $4
+		  AND a.credentials = $5::jsonb
+		  AND a.proxy_id IS NOT DISTINCT FROM $6
+		FOR SHARE`,
+		id,
+		service.PlatformOpenAI,
+		service.AccountTypeOAuth,
+		identityGeneration,
+		string(expectedJSON),
+		expectedProxyID,
+	).Scan(&matchedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		release()
+		return nil, false, nil
+	}
+	if err != nil {
+		release()
+		return nil, false, err
+	}
+	return release, matchedID == id, nil
 }
 
 // SetGrokOAuthRefreshErrorIfCredentialsUnchanged is the background-refresh
@@ -3423,37 +3557,38 @@ func accountEntityToService(m *dbent.Account) *service.Account {
 	rateMultiplier := m.RateMultiplier
 
 	return &service.Account{
-		ID:                      m.ID,
-		Name:                    m.Name,
-		Notes:                   m.Notes,
-		Platform:                m.Platform,
-		Type:                    m.Type,
-		Credentials:             copyJSONMap(m.Credentials),
-		Extra:                   copyJSONMap(m.Extra),
-		ProxyID:                 m.ProxyID,
-		ProxyFallbackOriginID:   m.ProxyFallbackOriginID,
-		Concurrency:             m.Concurrency,
-		Priority:                m.Priority,
-		RateMultiplier:          &rateMultiplier,
-		LoadFactor:              m.LoadFactor,
-		Status:                  m.Status,
-		ErrorMessage:            derefString(m.ErrorMessage),
-		LastUsedAt:              m.LastUsedAt,
-		ExpiresAt:               m.ExpiresAt,
-		AutoPauseOnExpired:      m.AutoPauseOnExpired,
-		CreatedAt:               m.CreatedAt,
-		UpdatedAt:               m.UpdatedAt,
-		Schedulable:             m.Schedulable,
-		RateLimitedAt:           m.RateLimitedAt,
-		RateLimitResetAt:        m.RateLimitResetAt,
-		OverloadUntil:           m.OverloadUntil,
-		TempUnschedulableUntil:  m.TempUnschedulableUntil,
-		TempUnschedulableReason: derefString(m.TempUnschedulableReason),
-		SessionWindowStart:      m.SessionWindowStart,
-		SessionWindowEnd:        m.SessionWindowEnd,
-		SessionWindowStatus:     derefString(m.SessionWindowStatus),
-		ParentAccountID:         m.ParentAccountID,
-		QuotaDimension:          string(m.QuotaDimension),
+		ID:                             m.ID,
+		Name:                           m.Name,
+		Notes:                          m.Notes,
+		Platform:                       m.Platform,
+		Type:                           m.Type,
+		Credentials:                    copyJSONMap(m.Credentials),
+		OpenAIWarmupIdentityGeneration: m.OpenaiWarmupIdentityGeneration,
+		Extra:                          copyJSONMap(m.Extra),
+		ProxyID:                        m.ProxyID,
+		ProxyFallbackOriginID:          m.ProxyFallbackOriginID,
+		Concurrency:                    m.Concurrency,
+		Priority:                       m.Priority,
+		RateMultiplier:                 &rateMultiplier,
+		LoadFactor:                     m.LoadFactor,
+		Status:                         m.Status,
+		ErrorMessage:                   derefString(m.ErrorMessage),
+		LastUsedAt:                     m.LastUsedAt,
+		ExpiresAt:                      m.ExpiresAt,
+		AutoPauseOnExpired:             m.AutoPauseOnExpired,
+		CreatedAt:                      m.CreatedAt,
+		UpdatedAt:                      m.UpdatedAt,
+		Schedulable:                    m.Schedulable,
+		RateLimitedAt:                  m.RateLimitedAt,
+		RateLimitResetAt:               m.RateLimitResetAt,
+		OverloadUntil:                  m.OverloadUntil,
+		TempUnschedulableUntil:         m.TempUnschedulableUntil,
+		TempUnschedulableReason:        derefString(m.TempUnschedulableReason),
+		SessionWindowStart:             m.SessionWindowStart,
+		SessionWindowEnd:               m.SessionWindowEnd,
+		SessionWindowStatus:            derefString(m.SessionWindowStatus),
+		ParentAccountID:                m.ParentAccountID,
+		QuotaDimension:                 string(m.QuotaDimension),
 	}
 }
 

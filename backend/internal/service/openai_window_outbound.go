@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,20 +88,11 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	auth, err := e.authorizationHeaders(execCtx, request.Account)
+	request, auth, err := e.prepareAuthorizedAttempt(execCtx, request)
 	if err != nil {
-		wrapped := fmt.Errorf("resolve openai warmup authorization: %w", err)
-		if errors.Is(err, ErrOpenAIWindowWarmupNeedsReauth) {
-			disposition := OpenAIWindowWarmupAuthRefreshTerminal
-			if !request.Account.IsOpenAIAgentIdentity() && (request.Account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(request.Account.GetOpenAIRefreshToken()) == "") {
-				disposition = OpenAIWindowWarmupAuthNotRefreshable
-			}
-			failure := newOpenAIWindowWarmupAuthFailure(request.Account, http.StatusUnauthorized, disposition)
-			return &OpenAIOutboundResult{AuthFailure: failure}, withOpenAIWindowWarmupAuthFailure(wrapped, failure)
-		}
-		return nil, wrapped
+		return openAIWindowAuthorizationFailure(request.Account, err)
 	}
-	result, err := e.executeOnce(execCtx, request, auth)
+	result, err := e.executePrepared(execCtx, request, auth)
 	if result == nil || result.StatusCode != http.StatusUnauthorized {
 		return annotateOpenAIWindowAuthResult(result, request.Account, ""), err
 	}
@@ -114,6 +106,10 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 
 	// A 401 is authoritative evidence that the warmup request was rejected, so
 	// one credential recovery and replay is safe. No other response is replayed.
+	request, err = e.prepareAttempt(execCtx, request)
+	if err != nil {
+		return result, err
+	}
 	if request.Account.IsOpenAIAgentIdentity() {
 		if !isAgentIdentityTaskInvalidHTTPResponse(result.StatusCode, result.Body) {
 			return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthRefreshTerminal), nil
@@ -137,19 +133,13 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 			}
 			return result, nil
 		}
-		auth, err = e.authorizationHeaders(execCtx, request.Account)
 	} else {
 		if e.tokenProvider == nil || request.Account.IsOpenAIPersonalAccessToken() ||
 			strings.TrimSpace(request.Account.GetOpenAIRefreshToken()) == "" {
 			return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthNotRefreshable), nil
 		}
-		var token string
 		rejectedToken := strings.TrimSpace(strings.TrimPrefix(auth.Get("Authorization"), "Bearer "))
-		token, err = e.tokenProvider.RefreshAfterUnauthorized(execCtx, request.Account, rejectedToken)
-		if err == nil {
-			auth = make(http.Header)
-			auth.Set("Authorization", "Bearer "+token)
-		}
+		_, err = e.tokenProvider.RefreshAfterUnauthorized(execCtx, request.Account, rejectedToken)
 	}
 	if err != nil {
 		if errors.Is(err, errOpenAITokenRefreshInProgress) {
@@ -166,8 +156,34 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 		}
 		return result, nil
 	}
-	result, err = e.executeOnce(execCtx, request, auth)
-	return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthReplayRejected), err
+	replayRequest, replayAuth, prepareErr := e.prepareAuthorizedAttempt(execCtx, request)
+	if prepareErr != nil {
+		if errors.Is(prepareErr, ErrOpenAIWindowWarmupSendGuardClosed) ||
+			errors.Is(prepareErr, ErrOpenAIWindowWarmupCredentialsChanged) {
+			return result, prepareErr
+		}
+		failureResult, failureErr := openAIWindowAuthorizationFailure(request.Account, prepareErr)
+		if failureResult != nil && failureResult.AuthFailure != nil {
+			result.AuthFailure = failureResult.AuthFailure
+		}
+		return result, failureErr
+	}
+	result, err = e.executePrepared(execCtx, replayRequest, replayAuth)
+	return annotateOpenAIWindowAuthResult(result, replayRequest.Account, OpenAIWindowWarmupAuthReplayRejected), err
+}
+
+func openAIWindowAuthorizationFailure(account *Account, err error) (*OpenAIOutboundResult, error) {
+	wrapped := fmt.Errorf("resolve openai warmup authorization: %w", err)
+	if !errors.Is(err, ErrOpenAIWindowWarmupNeedsReauth) {
+		return nil, wrapped
+	}
+	disposition := OpenAIWindowWarmupAuthRefreshTerminal
+	if account != nil && !account.IsOpenAIAgentIdentity() &&
+		(account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(account.GetOpenAIRefreshToken()) == "") {
+		disposition = OpenAIWindowWarmupAuthNotRefreshable
+	}
+	failure := newOpenAIWindowWarmupAuthFailure(account, http.StatusUnauthorized, disposition)
+	return &OpenAIOutboundResult{AuthFailure: failure}, withOpenAIWindowWarmupAuthFailure(wrapped, failure)
 }
 
 func newOpenAIWindowWarmupAuthFailure(account *Account, status int, disposition OpenAIWindowWarmupAuthDisposition) *OpenAIWindowWarmupAuthFailure {
@@ -235,6 +251,59 @@ func validateOpenAIWindowOutboundRequest(request OpenAIOutboundRequest) error {
 	return nil
 }
 
+func (e *OpenAIWindowOutboundAdapter) prepareAttempt(ctx context.Context, request OpenAIOutboundRequest) (OpenAIOutboundRequest, error) {
+	if request.SendGuard != nil {
+		if err := request.SendGuard.Check(ctx, request.Account.ID); err != nil {
+			return request, fmt.Errorf("%w: %v", ErrOpenAIWindowWarmupSendGuardClosed, err)
+		}
+		if request.IdentityGeneration <= 0 || e.accountRepo == nil {
+			return request, fmt.Errorf("%w: guarded outbound identity fence is not configured", ErrOpenAIWindowWarmupBlockedConfig)
+		}
+	}
+	if request.IdentityGeneration <= 0 || e.accountRepo == nil {
+		return request, nil
+	}
+	latest, err := e.accountRepo.GetByID(ctx, request.Account.ID)
+	if err != nil || latest == nil {
+		if err == nil {
+			err = ErrAccountNotFound
+		}
+		return request, fmt.Errorf("reload openai warmup account: %w", err)
+	}
+	if latest.OpenAIWarmupIdentityGeneration != request.IdentityGeneration ||
+		openAIWindowWarmupIdentityKey(latest) != openAIWindowWarmupIdentityKey(request.Account) {
+		return request, ErrOpenAIWindowWarmupCredentialsChanged
+	}
+	request.Account = latest
+	return request, nil
+}
+
+func (e *OpenAIWindowOutboundAdapter) prepareAuthorizedAttempt(ctx context.Context, request OpenAIOutboundRequest) (OpenAIOutboundRequest, http.Header, error) {
+	prepared, err := e.prepareAttempt(ctx, request)
+	if err != nil {
+		return request, nil, err
+	}
+	credentialSnapshot := shallowCopyMap(prepared.Account.Credentials)
+	auth, err := e.authorizationHeaders(ctx, prepared.Account)
+	if err != nil {
+		return prepared, nil, err
+	}
+	// Token refresh and Agent Identity task registration may have persisted new
+	// credentials while authorization was being resolved. Reload once more and
+	// build the headers from that exact durable snapshot used for the send.
+	prepared, err = e.prepareAttempt(ctx, prepared)
+	if err != nil {
+		return prepared, nil, err
+	}
+	if !reflect.DeepEqual(credentialSnapshot, prepared.Account.Credentials) {
+		auth, err = e.authorizationHeaders(ctx, prepared.Account)
+		if err != nil {
+			return prepared, nil, err
+		}
+	}
+	return prepared, auth, nil
+}
+
 func (e *OpenAIWindowOutboundAdapter) authorizationHeaders(ctx context.Context, account *Account) (http.Header, error) {
 	if account == nil {
 		return nil, errors.New("account is nil")
@@ -284,11 +353,39 @@ func isPermanentWarmupAgentIdentityError(err error) bool {
 	return false
 }
 
-func (e *OpenAIWindowOutboundAdapter) executeOnce(
+func (e *OpenAIWindowOutboundAdapter) executePrepared(
 	ctx context.Context,
 	request OpenAIOutboundRequest,
 	auth http.Header,
 ) (*OpenAIOutboundResult, error) {
+	if request.SendGuard != nil {
+		if err := request.SendGuard.Check(ctx, request.Account.ID); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrOpenAIWindowWarmupSendGuardClosed, err)
+		}
+		leaseRepo, ok := e.accountRepo.(OpenAIWindowWarmupIdentityLeaseRepository)
+		if !ok {
+			return nil, fmt.Errorf("%w: guarded outbound identity lease is not configured", ErrOpenAIWindowWarmupBlockedConfig)
+		}
+		release, acquired, err := leaseRepo.AcquireOpenAIWindowWarmupIdentityLease(
+			ctx,
+			request.Account.ID,
+			request.IdentityGeneration,
+			request.Account.Credentials,
+			request.Account.ProxyID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("acquire openai warmup identity lease: %w", err)
+		}
+		if !acquired {
+			return nil, ErrOpenAIWindowWarmupCredentialsChanged
+		}
+		defer release()
+		// The row lock may have waited for an earlier credential update. Recheck
+		// dynamic policy only after the exact durable identity is locked.
+		if err := request.SendGuard.Check(ctx, request.Account.ID); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrOpenAIWindowWarmupSendGuardClosed, err)
+		}
+	}
 	var wroteRequest atomic.Bool
 	var gotFirstByte atomic.Bool
 	trace := &httptrace.ClientTrace{

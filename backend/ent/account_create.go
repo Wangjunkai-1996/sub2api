@@ -105,6 +105,20 @@ func (_c *AccountCreate) SetCredentials(v map[string]interface{}) *AccountCreate
 	return _c
 }
 
+// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
+func (_c *AccountCreate) SetOpenaiWarmupIdentityGeneration(v int64) *AccountCreate {
+	_c.mutation.SetOpenaiWarmupIdentityGeneration(v)
+	return _c
+}
+
+// SetNillableOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableOpenaiWarmupIdentityGeneration(v *int64) *AccountCreate {
+	if v != nil {
+		_c.SetOpenaiWarmupIdentityGeneration(*v)
+	}
+	return _c
+}
+
 // SetExtra sets the "extra" field.
 func (_c *AccountCreate) SetExtra(v map[string]interface{}) *AccountCreate {
 	_c.mutation.SetExtra(v)
@@ -546,6 +560,10 @@ func (_c *AccountCreate) defaults() error {
 		v := account.DefaultCredentials()
 		_c.mutation.SetCredentials(v)
 	}
+	if _, ok := _c.mutation.OpenaiWarmupIdentityGeneration(); !ok {
+		v := account.DefaultOpenaiWarmupIdentityGeneration
+		_c.mutation.SetOpenaiWarmupIdentityGeneration(v)
+	}
 	if _, ok := _c.mutation.Extra(); !ok {
 		if account.DefaultExtra == nil {
 			return fmt.Errorf("ent: uninitialized account.DefaultExtra (forgotten import ent/runtime?)")
@@ -618,6 +636,14 @@ func (_c *AccountCreate) check() error {
 	}
 	if _, ok := _c.mutation.Credentials(); !ok {
 		return &ValidationError{Name: "credentials", err: errors.New(`ent: missing required field "Account.credentials"`)}
+	}
+	if _, ok := _c.mutation.OpenaiWarmupIdentityGeneration(); !ok {
+		return &ValidationError{Name: "openai_warmup_identity_generation", err: errors.New(`ent: missing required field "Account.openai_warmup_identity_generation"`)}
+	}
+	if v, ok := _c.mutation.OpenaiWarmupIdentityGeneration(); ok {
+		if err := account.OpenaiWarmupIdentityGenerationValidator(v); err != nil {
+			return &ValidationError{Name: "openai_warmup_identity_generation", err: fmt.Errorf(`ent: validator failed for field "Account.openai_warmup_identity_generation": %w`, err)}
+		}
 	}
 	if _, ok := _c.mutation.Extra(); !ok {
 		return &ValidationError{Name: "extra", err: errors.New(`ent: missing required field "Account.extra"`)}
@@ -716,6 +742,10 @@ func (_c *AccountCreate) createSpec() (*Account, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.Credentials(); ok {
 		_spec.SetField(account.FieldCredentials, field.TypeJSON, value)
 		_node.Credentials = value
+	}
+	if value, ok := _c.mutation.OpenaiWarmupIdentityGeneration(); ok {
+		_spec.SetField(account.FieldOpenaiWarmupIdentityGeneration, field.TypeInt64, value)
+		_node.OpenaiWarmupIdentityGeneration = value
 	}
 	if value, ok := _c.mutation.Extra(); ok {
 		_spec.SetField(account.FieldExtra, field.TypeJSON, value)
@@ -1032,6 +1062,24 @@ func (u *AccountUpsert) SetCredentials(v map[string]interface{}) *AccountUpsert 
 // UpdateCredentials sets the "credentials" field to the value that was provided on create.
 func (u *AccountUpsert) UpdateCredentials() *AccountUpsert {
 	u.SetExcluded(account.FieldCredentials)
+	return u
+}
+
+// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
+func (u *AccountUpsert) SetOpenaiWarmupIdentityGeneration(v int64) *AccountUpsert {
+	u.Set(account.FieldOpenaiWarmupIdentityGeneration, v)
+	return u
+}
+
+// UpdateOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateOpenaiWarmupIdentityGeneration() *AccountUpsert {
+	u.SetExcluded(account.FieldOpenaiWarmupIdentityGeneration)
+	return u
+}
+
+// AddOpenaiWarmupIdentityGeneration adds v to the "openai_warmup_identity_generation" field.
+func (u *AccountUpsert) AddOpenaiWarmupIdentityGeneration(v int64) *AccountUpsert {
+	u.Add(account.FieldOpenaiWarmupIdentityGeneration, v)
 	return u
 }
 
@@ -1585,6 +1633,27 @@ func (u *AccountUpsertOne) SetCredentials(v map[string]interface{}) *AccountUpse
 func (u *AccountUpsertOne) UpdateCredentials() *AccountUpsertOne {
 	return u.Update(func(s *AccountUpsert) {
 		s.UpdateCredentials()
+	})
+}
+
+// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
+func (u *AccountUpsertOne) SetOpenaiWarmupIdentityGeneration(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetOpenaiWarmupIdentityGeneration(v)
+	})
+}
+
+// AddOpenaiWarmupIdentityGeneration adds v to the "openai_warmup_identity_generation" field.
+func (u *AccountUpsertOne) AddOpenaiWarmupIdentityGeneration(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddOpenaiWarmupIdentityGeneration(v)
+	})
+}
+
+// UpdateOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateOpenaiWarmupIdentityGeneration() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateOpenaiWarmupIdentityGeneration()
 	})
 }
 
@@ -2370,6 +2439,27 @@ func (u *AccountUpsertBulk) SetCredentials(v map[string]interface{}) *AccountUps
 func (u *AccountUpsertBulk) UpdateCredentials() *AccountUpsertBulk {
 	return u.Update(func(s *AccountUpsert) {
 		s.UpdateCredentials()
+	})
+}
+
+// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
+func (u *AccountUpsertBulk) SetOpenaiWarmupIdentityGeneration(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetOpenaiWarmupIdentityGeneration(v)
+	})
+}
+
+// AddOpenaiWarmupIdentityGeneration adds v to the "openai_warmup_identity_generation" field.
+func (u *AccountUpsertBulk) AddOpenaiWarmupIdentityGeneration(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddOpenaiWarmupIdentityGeneration(v)
+	})
+}
+
+// UpdateOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateOpenaiWarmupIdentityGeneration() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateOpenaiWarmupIdentityGeneration()
 	})
 }
 

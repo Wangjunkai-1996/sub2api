@@ -39,6 +39,7 @@ var (
 	ErrOpenAIWindowWarmupBlocked            = errors.New("blocked")
 	ErrOpenAIWindowWarmupBlockedConfig      = errors.New("blocked_config")
 	ErrOpenAIWindowWarmupCredentialsChanged = errors.New("credentials_changed")
+	ErrOpenAIWindowWarmupSendGuardClosed    = errors.New("send_guard_closed")
 )
 
 // OpenAICodexWindowProbe creates the one-shot request used to advance a
@@ -152,12 +153,14 @@ func (p *OpenAICodexWindowProbe) Probe(ctx context.Context, account *Account, ex
 	}
 	headers := buildOpenAIWindowWarmupHeaders(account)
 	request := OpenAIOutboundRequest{
-		Account:  account,
-		Model:    p.Model(),
-		Payload:  payload,
-		Headers:  headers,
-		Timeout:  p.RequestTimeout(),
-		Endpoint: p.Endpoint(),
+		Account:            account,
+		IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
+		SendGuard:          openAIWindowWarmupSendGuardFromContext(ctx),
+		Model:              p.Model(),
+		Payload:            payload,
+		Headers:            headers,
+		Timeout:            p.RequestTimeout(),
+		Endpoint:           p.Endpoint(),
 	}
 	result, executeErr := p.executor.Execute(ctx, request)
 	parsed := parseOpenAIWindowWarmupResult(result, expectedResetAt)
@@ -295,6 +298,7 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 		TerminalType:            terminalType,
 		ResetAt:                 cloneWarmupTime(resetAt),
 		ObservedResetAt:         cloneWarmupTime(resetAt),
+		Started:                 result.Started,
 		EOF:                     result.EOF,
 		Outcome:                 outcome,
 		AuthFailure:             cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure),

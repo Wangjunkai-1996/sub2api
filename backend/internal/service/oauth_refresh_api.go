@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,19 @@ type OAuthRefreshExecutor interface {
 // atomically publish scheduler invalidation with a successful update.
 type GrokOAuthRefreshSuccessRepository interface {
 	UpdateGrokOAuthCredentialsIfUnchanged(
+		ctx context.Context,
+		id int64,
+		expectedCredentials map[string]any,
+		expectedProxyID *int64,
+		credentials map[string]any,
+	) (bool, error)
+}
+
+// OpenAICredentialCASRepository prevents provider-side token rotation or Agent
+// Identity task registration from overwriting an administrator's concurrent
+// reauthorization. The full credential document and proxy form the compare key.
+type OpenAICredentialCASRepository interface {
+	UpdateOpenAIOAuthCredentialsIfUnchanged(
 		ctx context.Context,
 		id int64,
 		expectedCredentials map[string]any,
@@ -368,7 +382,7 @@ func (api *OAuthRefreshAPI) refresh(
 				)
 				return &OAuthRefreshResult{Account: currentAccount}, nil
 			}
-			durableAccount, readErr := api.loadGrokDurableAccountAfterPersist(ctx, cacheKey, freshAccount.ID)
+			durableAccount, readErr := api.loadDurableAccountAfterOAuthPersist(ctx, cacheKey, freshAccount.ID)
 			if readErr != nil || durableAccount == nil {
 				if readErr == nil {
 					readErr = fmt.Errorf("account not found after Grok OAuth success CAS")
@@ -381,6 +395,40 @@ func (api *OAuthRefreshAPI) refresh(
 			// mutation may have changed status, schedulability, or cooldown fields
 			// while the provider call was in flight. Return the durable row so
 			// post-refresh cache publication cannot restore that stale snapshot.
+			freshAccount = durableAccount
+		} else if freshAccount.IsOpenAIOAuth() {
+			conditionalRepo, ok := api.accountRepo.(OpenAICredentialCASRepository)
+			if !ok {
+				return nil, &providerConfigurationRefreshError{
+					err: fmt.Errorf("OpenAI OAuth refresh success CAS repository is not configured"),
+				}
+			}
+			persistedCredentials, currentAccount, applied, updateErr := persistOpenAIOAuthRefreshCAS(
+				ctx, api.accountRepo, conditionalRepo, attemptedAccount, newCredentials,
+			)
+			if updateErr != nil {
+				slog.Error("oauth_refresh_update_failed",
+					"account_id", freshAccount.ID,
+					"platform", freshAccount.Platform,
+					"error", updateErr,
+				)
+				return nil, fmt.Errorf("%w: %v", errOAuthRefreshCredentialPersist, updateErr)
+			}
+			if !applied {
+				slog.Info("oauth_refresh_success_cas_skipped_stale_credentials",
+					"account_id", freshAccount.ID,
+					"platform", freshAccount.Platform,
+				)
+				return &OAuthRefreshResult{Account: currentAccount}, nil
+			}
+			newCredentials = persistedCredentials
+			durableAccount, readErr := api.loadDurableAccountAfterOAuthPersist(ctx, cacheKey, freshAccount.ID)
+			if readErr != nil || durableAccount == nil {
+				if readErr == nil {
+					readErr = fmt.Errorf("account not found after OpenAI OAuth success CAS")
+				}
+				return nil, fmt.Errorf("%w: OpenAI OAuth credentials persisted but durable state is unavailable: %v", errOAuthRefreshCredentialPersist, readErr)
+			}
 			freshAccount = durableAccount
 		} else if updateErr := persistAccountCredentials(ctx, api.accountRepo, freshAccount, newCredentials); updateErr != nil {
 			slog.Error("oauth_refresh_update_failed",
@@ -404,6 +452,94 @@ func (api *OAuthRefreshAPI) refresh(
 	}, nil
 }
 
+var openAIOAuthRefreshCASCoreKeys = []string{
+	"access_token",
+	"refresh_token",
+	"id_token",
+	"expires_at",
+	"_token_version",
+	"token_type",
+	"client_id",
+	"auth_mode",
+	"openai_auth_mode",
+	"chatgpt_account_id",
+	"chatgpt_user_id",
+	"organization_id",
+	"agent_runtime_id",
+	"task_id",
+}
+
+func persistOpenAIOAuthRefreshCAS(
+	ctx context.Context,
+	accountRepo AccountRepository,
+	casRepo OpenAICredentialCASRepository,
+	attempted *Account,
+	providerCredentials map[string]any,
+) (map[string]any, *Account, bool, error) {
+	if accountRepo == nil || casRepo == nil || attempted == nil {
+		return nil, nil, false, errors.New("OpenAI OAuth refresh CAS dependencies are unavailable")
+	}
+	applied, err := casRepo.UpdateOpenAIOAuthCredentialsIfUnchanged(
+		ctx, attempted.ID, attempted.Credentials, attempted.ProxyID, providerCredentials,
+	)
+	if err != nil || applied {
+		return providerCredentials, nil, applied, err
+	}
+
+	current, err := accountRepo.GetByID(ctx, attempted.ID)
+	if err != nil || current == nil {
+		if err == nil {
+			err = errors.New("account not found after OpenAI OAuth success CAS miss")
+		}
+		return nil, nil, false, err
+	}
+	merged, safe := mergeOpenAIOAuthRefreshAfterConcurrentConfig(
+		attempted.Credentials, current.Credentials, providerCredentials,
+	)
+	if !safe || !current.IsOpenAIOAuth() {
+		return nil, current, false, nil
+	}
+	applied, err = casRepo.UpdateOpenAIOAuthCredentialsIfUnchanged(
+		ctx, attempted.ID, current.Credentials, current.ProxyID, merged,
+	)
+	if err != nil || applied {
+		return merged, nil, applied, err
+	}
+	current, err = accountRepo.GetByID(ctx, attempted.ID)
+	if err != nil || current == nil {
+		if err == nil {
+			err = errors.New("account not found after OpenAI OAuth retry CAS miss")
+		}
+		return nil, nil, false, err
+	}
+	return nil, current, false, nil
+}
+
+func mergeOpenAIOAuthRefreshAfterConcurrentConfig(
+	attempted map[string]any,
+	current map[string]any,
+	provider map[string]any,
+) (map[string]any, bool) {
+	for _, key := range openAIOAuthRefreshCASCoreKeys {
+		if !oauthCredentialEntryEqual(attempted, current, key) {
+			return nil, false
+		}
+	}
+	merged := shallowCopyMap(current)
+	for key, value := range provider {
+		if oauthCredentialEntryEqual(attempted, current, key) {
+			merged[key] = value
+		}
+	}
+	return merged, true
+}
+
+func oauthCredentialEntryEqual(left, right map[string]any, key string) bool {
+	leftValue, leftOK := left[key]
+	rightValue, rightOK := right[key]
+	return leftOK == rightOK && reflect.DeepEqual(leftValue, rightValue)
+}
+
 func (api *OAuthRefreshAPI) releaseRefreshLock(parent context.Context, cacheKey string) {
 	cleanupParent := context.Background()
 	if parent != nil {
@@ -416,7 +552,7 @@ func (api *OAuthRefreshAPI) releaseRefreshLock(parent context.Context, cacheKey 
 	}
 }
 
-func (api *OAuthRefreshAPI) loadGrokDurableAccountAfterPersist(parent context.Context, cacheKey string, accountID int64) (*Account, error) {
+func (api *OAuthRefreshAPI) loadDurableAccountAfterOAuthPersist(parent context.Context, cacheKey string, accountID int64) (*Account, error) {
 	cleanupParent := context.Background()
 	if parent != nil {
 		cleanupParent = context.WithoutCancel(parent)

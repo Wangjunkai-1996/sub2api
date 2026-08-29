@@ -34,7 +34,13 @@ type warmupRepositorySpy struct {
 	startEvidence     OpenAIWindowWarmupStartEvidence
 	uncertainEvidence OpenAIWindowWarmupUncertainEvidence
 	started           int
+	cancelStarted     int
 	successCalls      int
+	projectionCalls   int
+	projectedAccount  int64
+	projectedIdentity int64
+	projectedAt       time.Time
+	projectedReset    time.Time
 	suppressedCalls   int
 	reserve           bool
 	rejectSuccess     bool
@@ -63,8 +69,9 @@ func (r *warmupRepositorySpy) Enqueue(_ context.Context, in OpenAIWindowWarmupEn
 	job := &OpenAIWindowWarmupJob{
 		ID: int64(len(r.cycles) + 1), AccountID: in.AccountID, QuotaScope: in.QuotaScope,
 		State: OpenAIWindowWarmupStatePending, Trigger: in.Trigger, CycleKey: in.CycleKey,
-		CycleGeneration: in.CycleGeneration, ObservedResetAt: cloneWarmupTestTime(in.ObservedResetAt),
-		NextAttemptAt: in.NextAttemptAt,
+		CycleGeneration: in.CycleGeneration, IdentityGeneration: in.IdentityGeneration,
+		ObservedResetAt: cloneWarmupTestTime(in.ObservedResetAt),
+		NextAttemptAt:   in.NextAttemptAt,
 	}
 	r.cycles[key] = job
 	r.enqueues = append(r.enqueues, in)
@@ -131,6 +138,14 @@ func (r *warmupRepositorySpy) MarkStarted(_ context.Context, _ int64, _, _ strin
 	return !rejectStarted, nil
 }
 
+func (r *warmupRepositorySpy) CancelStartedBeforeSend(_ context.Context, _ int64, _, _ string, _ time.Time, _ string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cancelStarted++
+	r.action = "cancel_started"
+	return true, nil
+}
+
 func (r *warmupRepositorySpy) MarkSuccess(_ context.Context, _ int64, _, _ string, _ time.Time, reset *time.Time, status int, code string) (bool, error) {
 	if r.rejectSuccess {
 		return false, nil
@@ -139,6 +154,17 @@ func (r *warmupRepositorySpy) MarkSuccess(_ context.Context, _ int64, _, _ strin
 	r.successCalls++
 	r.mu.Unlock()
 	r.capture("success", OpenAIWindowWarmupStateCompleted, status, code, time.Time{}, reset)
+	return true, nil
+}
+
+func (r *warmupRepositorySpy) ProjectSuccessReset(_ context.Context, accountID, identityGeneration int64, at, resetAt time.Time) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.projectionCalls++
+	r.projectedAccount = accountID
+	r.projectedIdentity = identityGeneration
+	r.projectedAt = at
+	r.projectedReset = resetAt
 	return true, nil
 }
 
@@ -381,6 +407,12 @@ type warmupProbeStub struct {
 	expectedResets []*time.Time
 }
 
+type warmupProbeFunc func(context.Context, *Account, *time.Time) (*OpenAIWindowProbeResult, error)
+
+func (f warmupProbeFunc) Probe(ctx context.Context, account *Account, expectedReset *time.Time) (*OpenAIWindowProbeResult, error) {
+	return f(ctx, account, expectedReset)
+}
+
 func (p *warmupProbeStub) Probe(_ context.Context, _ *Account, expectedReset *time.Time) (*OpenAIWindowProbeResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -477,7 +509,7 @@ func TestOpenAIWindowWarmupScheduleUsesStableInitialCycle(t *testing.T) {
 	first, inserted, err := service.ScheduleAccountWarmup(context.Background(), account, OpenAIWindowWarmupTriggerImport)
 	require.NoError(t, err)
 	require.True(t, inserted)
-	require.Equal(t, fmt.Sprintf("initial:%d", account.CreatedAt.UnixNano()), first.CycleKey)
+	require.Equal(t, "initial:1", first.CycleKey)
 	require.Equal(t, reset.Add(openAIWindowWarmupDefaultGrace), first.NextAttemptAt)
 	require.Equal(t, reset, *first.ObservedResetAt)
 
@@ -963,10 +995,10 @@ func TestOpenAIWindowWarmupUsagePreflightSendsForIdleRollingReset(t *testing.T) 
 	require.Equal(t, "completed", repo.code)
 	require.Len(t, repo.enqueues, 1)
 	require.Equal(t, warmupResetCycleKey(confirmedReset), repo.enqueues[0].CycleKey)
-	accountRepo := service.accounts.(*warmupAccountRepositoryStub)
-	require.Len(t, accountRepo.updates, 1)
-	require.Equal(t, float64(0), accountRepo.updates[0]["codex_5h_used_percent"])
-	require.Equal(t, confirmedReset.Format(time.RFC3339Nano), accountRepo.updates[0]["codex_5h_reset_at"])
+	require.Equal(t, 1, repo.projectionCalls)
+	require.Equal(t, account.ID, repo.projectedAccount)
+	require.Equal(t, account.OpenAIWarmupIdentityGeneration, repo.projectedIdentity)
+	require.Equal(t, confirmedReset, repo.projectedReset)
 }
 
 func TestOpenAIWindowWarmupIdleRelativeResetRequiresPassiveConfirmation(t *testing.T) {
@@ -1929,6 +1961,35 @@ func TestOpenAIWindowWarmupStopsBeforeSendWhenLeaseRenewalIsRejected(t *testing.
 	require.Zero(t, probe.calls)
 }
 
+func TestOpenAIWindowWarmupCancelsStartedAttemptWhenSendGuardClosesBeforeProbe(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	guardOpen := true
+	service.options.KillSwitch = OpenAIWindowWarmupKillSwitchFunc(func(context.Context) (bool, error) {
+		return guardOpen, nil
+	})
+	repo.onMarkStarted = func() { guardOpen = false }
+	probeCalls := 0
+	service.probe = warmupProbeFunc(func(ctx context.Context, probeAccount *Account, _ *time.Time) (*OpenAIWindowProbeResult, error) {
+		probeCalls++
+		guard := openAIWindowWarmupSendGuardFromContext(ctx)
+		require.NotNil(t, guard)
+		return &OpenAIWindowProbeResult{}, guard.Check(ctx, probeAccount.ID)
+	})
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, 1, repo.started)
+	require.Equal(t, 1, probeCalls)
+	require.Equal(t, 1, repo.cancelStarted)
+	require.Equal(t, "cancel_started", repo.action)
+	require.Zero(t, claim.Job.AttemptCount)
+	require.Nil(t, claim.Job.SentAt)
+}
+
 func TestOpenAIWindowWarmupOncePolicyPausesContinuousResetCycle(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyInitialOnce)
@@ -2340,7 +2401,9 @@ func warmupEligibleAccount(now time.Time, policy string) *Account {
 	return &Account{
 		ID: 42, Name: "warmup-test", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
 		Status: StatusActive, Schedulable: true, Concurrency: 1, CreatedAt: now.Add(-24 * time.Hour),
-		Extra: map[string]any{OpenAICodexWarmupPolicyExtraKey: policy},
+		OpenAIWarmupIdentityGeneration: 1,
+		Credentials:                    map[string]any{"chatgpt_account_id": "warmup-account-42"},
+		Extra:                          map[string]any{OpenAICodexWarmupPolicyExtraKey: policy},
 	}
 }
 
@@ -2349,7 +2412,8 @@ func warmupTestClaim(accountID int64, observed time.Time) OpenAIWindowWarmupClai
 		Job: &OpenAIWindowWarmupJob{
 			ID: 7, AccountID: accountID, State: OpenAIWindowWarmupStateRunning,
 			QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal, CycleKey: warmupResetCycleKey(observed),
-			CycleGeneration: 1, ObservedResetAt: &observed, CreatedAt: observed.Add(-time.Hour),
+			CycleGeneration: 1, IdentityGeneration: 1,
+			ObservedResetAt: &observed, CreatedAt: observed.Add(-time.Hour),
 		},
 		Owner: "worker-a", LeaseToken: "1:test", LeaseUntil: observed.Add(2 * time.Minute),
 		PreviousState: OpenAIWindowWarmupStatePending,

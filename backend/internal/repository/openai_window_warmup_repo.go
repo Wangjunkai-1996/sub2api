@@ -32,6 +32,7 @@ func NewOpenAIWindowWarmupRepository(db *sql.DB) service.OpenAIWindowWarmupRepos
 
 const warmupJobSelectColumns = `
     id, account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
+    identity_generation,
     observed_reset_at, preflight_reset_at, preflight_observed_at,
     uncertain_observed_reset_at, uncertain_observed_at,
     uncertain_terminal_observed,
@@ -45,6 +46,15 @@ func (r *openAIWindowWarmupRepository) Enqueue(ctx context.Context, in service.O
 	}
 	if in.AccountID <= 0 || strings.TrimSpace(in.CycleKey) == "" {
 		return nil, false, errors.New("account_id and cycle_key are required")
+	}
+	identityGeneration := in.IdentityGeneration
+	if identityGeneration <= 0 {
+		if err := r.db.QueryRowContext(ctx,
+			`SELECT openai_warmup_identity_generation FROM accounts WHERE id = $1 AND deleted_at IS NULL`,
+			in.AccountID,
+		).Scan(&identityGeneration); err != nil {
+			return nil, false, err
+		}
 	}
 	scope := strings.TrimSpace(in.QuotaScope)
 	if scope == "" {
@@ -61,17 +71,20 @@ func (r *openAIWindowWarmupRepository) Enqueue(ctx context.Context, in service.O
 	// The state is selected with the database clock, not the application clock.
 	// This matters when an import request and a worker run on hosts with skew.
 	insertSQL := `
-INSERT INTO openai_window_warmup_jobs
-    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
-     observed_reset_at, next_attempt_at, attempt_count, created_at, updated_at)
-VALUES ($1, $2,
-			CASE WHEN $6::timestamptz IS NOT NULL AND $6::timestamptz > NOW() THEN 'armed' ELSE 'pending' END,
-	        $3, $4, $5, $6::timestamptz, $7, 0, NOW(), NOW())
+	INSERT INTO openai_window_warmup_jobs
+    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation, identity_generation,
+	     observed_reset_at, next_attempt_at, attempt_count, created_at, updated_at)
+	SELECT $1, $2,
+				CASE WHEN $6::timestamptz IS NOT NULL AND $6::timestamptz > NOW() THEN 'armed' ELSE 'pending' END,
+		        $3, $4, $5, $8, $6::timestamptz, $7, 0, NOW(), NOW()
+	FROM accounts AS a
+	WHERE a.id = $1 AND a.deleted_at IS NULL
+	  AND a.openai_warmup_identity_generation = $8
 ON CONFLICT DO NOTHING
 RETURNING ` + warmupJobSelectColumns
 	job, err := scanWarmupJob(r.db.QueryRowContext(ctx, insertSQL,
 		in.AccountID, scope, trigger, in.CycleKey, in.CycleGeneration,
-		nullWarmupTime(in.ObservedResetAt), next.UTC()))
+		nullWarmupTime(in.ObservedResetAt), next.UTC(), identityGeneration))
 	if err == nil {
 		return job, true, nil
 	}
@@ -81,11 +94,16 @@ RETURNING ` + warmupJobSelectColumns
 	// A duplicate is a successful idempotent enqueue. Return the existing row so
 	// callers can expose its current state without an additional race-prone API.
 	selectSQL := `SELECT ` + warmupJobSelectColumns + `
-	FROM openai_window_warmup_jobs
-	WHERE account_id = $1 AND quota_scope = $2
-	  AND (cycle_key = $3 OR state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent'))
-	ORDER BY (cycle_key = $3) DESC, id DESC
-	LIMIT 1`
+		FROM openai_window_warmup_jobs AS j
+		WHERE j.account_id = $1 AND j.quota_scope = $2
+		  AND EXISTS (
+		      SELECT 1 FROM accounts a
+		      WHERE a.id = j.account_id
+		        AND a.openai_warmup_identity_generation = j.identity_generation
+		  )
+		  AND (j.cycle_key = $3 OR j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent'))
+		ORDER BY (j.cycle_key = $3) DESC, j.id DESC
+		LIMIT 1`
 	job, err = scanWarmupJob(r.db.QueryRowContext(ctx, selectSQL, in.AccountID, scope, in.CycleKey))
 	if err != nil {
 		return nil, false, err
@@ -115,14 +133,18 @@ func (r *openAIWindowWarmupRepository) ClaimDue(ctx context.Context, owner strin
 	}
 	query := `
 	WITH candidates AS MATERIALIZED (
-	    SELECT id, state AS previous_state
-	    FROM openai_window_warmup_jobs
-	    WHERE account_id = ANY($4) AND ((
+		    SELECT j.id, j.state AS previous_state
+		    FROM openai_window_warmup_jobs AS j
+		    WHERE account_id = ANY($4) AND ((
 	        state IN ('pending', 'armed', 'due', 'retrying', 'uncertain', 'possibly_sent')
 	        AND next_attempt_at <= NOW()
 	    ) OR (
 	        state = 'running' AND lease_until IS NOT NULL AND lease_until <= NOW()
-	    ))
+		    )) AND EXISTS (
+		        SELECT 1 FROM accounts a
+		        WHERE a.id = j.account_id
+		          AND a.openai_warmup_identity_generation = j.identity_generation
+		    )
     ORDER BY next_attempt_at ASC, id ASC
     LIMIT $2
     FOR UPDATE SKIP LOCKED
@@ -161,7 +183,8 @@ ORDER BY next_attempt_at ASC, id ASC`
 		)
 		if err := rows.Scan(
 			&job.ID, &job.AccountID, &job.QuotaScope, &job.State, &job.Trigger,
-			&job.CycleKey, &job.CycleGeneration, &observed, &preflightReset, &preflightObserved,
+			&job.CycleKey, &job.CycleGeneration, &job.IdentityGeneration,
+			&observed, &preflightReset, &preflightObserved,
 			&uncertainReset, &uncertainAt,
 			&job.UncertainTerminalObserved, &job.NextAttemptAt,
 			&job.AttemptCount, &sent, &leaseOwner, &leaseToken, &until,
@@ -338,7 +361,7 @@ func (r *openAIWindowWarmupRepository) RenewLease(ctx context.Context, id int64,
 		lease = 2 * time.Minute
 	}
 	return r.fencedUpdate(ctx, `
-UPDATE openai_window_warmup_jobs
+			    UPDATE openai_window_warmup_jobs AS j
 SET lease_until = NOW() + ($4 * INTERVAL '1 microsecond'), updated_at = NOW()
 	WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
 	  AND split_part(lease_token, ':', 1) = cycle_generation::text
@@ -387,8 +410,9 @@ func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64
 	        AND a.deleted_at IS NULL
 	        AND (a.expires_at IS NULL OR a.expires_at > NOW())
 		        AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
-			        AND warmup.policy IN ('initial_once', 'continuous')
-			        AND (warmup.policy = 'continuous' OR j.cycle_key LIKE 'initial:%')
+				        AND warmup.policy IN ('initial_once', 'continuous')
+				        AND (warmup.policy = 'continuous' OR j.cycle_key LIKE 'initial:%')
+				        AND j.identity_generation = a.openai_warmup_identity_generation
 		        AND $5::boolean
 		        AND $6::double precision <= 0
 		        -- Only activity in the current durable window suppresses a send.
@@ -413,16 +437,21 @@ func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64
 func (r *openAIWindowWarmupRepository) MarkSuccess(ctx context.Context, id int64, owner, token string, at time.Time, resetAt *time.Time, status int, code string) (bool, error) {
 	return r.fencedQuery(ctx, `
 		WITH updated AS (
-		    UPDATE openai_window_warmup_jobs
+			    UPDATE openai_window_warmup_jobs AS j
 			    SET state = 'completed', sent_at = COALESCE(sent_at, $4),
 			        last_success_at = $4, observed_reset_at = COALESCE($5, observed_reset_at),
 			        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
 			        uncertain_terminal_observed = FALSE,
 			        status_code = NULLIF($6, 0), last_error_code = NULL, last_error = NULL,
 		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
-		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-		      AND split_part(lease_token, ':', 1) = cycle_generation::text
-		      AND lease_until IS NOT NULL AND lease_until > NOW()
+			    WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
+			      AND split_part(lease_token, ':', 1) = cycle_generation::text
+			      AND lease_until IS NOT NULL AND lease_until > NOW()
+			      AND EXISTS (
+			          SELECT 1 FROM accounts a
+			          WHERE a.id = j.account_id
+			            AND a.openai_warmup_identity_generation = j.identity_generation
+			      )
 		    RETURNING id, attempt_count, last_attempt_at
 		), attempt AS (
 		    INSERT INTO openai_window_warmup_attempts
@@ -446,15 +475,20 @@ func (r *openAIWindowWarmupRepository) MarkSuccess(ctx context.Context, id int64
 func (r *openAIWindowWarmupRepository) MarkSuppressed(ctx context.Context, id int64, owner, token string, at time.Time, resetAt *time.Time, code string) (bool, error) {
 	return r.fencedQuery(ctx, `
 		WITH updated AS (
-		    UPDATE openai_window_warmup_jobs
+			    UPDATE openai_window_warmup_jobs AS j
 			    SET state = 'completed', observed_reset_at = COALESCE($4, observed_reset_at),
 			        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
 			        uncertain_terminal_observed = FALSE,
 			        status_code = NULL, last_error_code = NULL, last_error = NULL,
 		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
-		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-		      AND split_part(lease_token, ':', 1) = cycle_generation::text
-		      AND lease_until IS NOT NULL AND lease_until > NOW()
+			    WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
+			      AND split_part(lease_token, ':', 1) = cycle_generation::text
+			      AND lease_until IS NOT NULL AND lease_until > NOW()
+			      AND EXISTS (
+			          SELECT 1 FROM accounts a
+			          WHERE a.id = j.account_id
+			            AND a.openai_warmup_identity_generation = j.identity_generation
+			      )
 		    RETURNING id, attempt_count, last_attempt_at
 		), attempt AS (
 		    INSERT INTO openai_window_warmup_attempts
@@ -559,20 +593,25 @@ func (r *openAIWindowWarmupRepository) RequeueAuthStateUpdateFailure(ctx context
 		return false, nil
 	}
 	return r.fencedUpdate(ctx, `
-		UPDATE openai_window_warmup_jobs
+		UPDATE openai_window_warmup_jobs AS j
 		SET state = 'retrying', next_attempt_at = $7,
 		    last_error_code = $8::varchar,
 		    last_error = CASE WHEN $8::varchar = 'credentials_changed'
 		        THEN 'credentials changed; retry scheduled'
 		        ELSE 'account state update failed; retry scheduled' END,
 		    updated_at = NOW()
-		WHERE id = $1
-		  AND cycle_generation = $2
-		  AND attempt_count = $3
-		  AND state = $4
-		  AND status_code IS NOT DISTINCT FROM NULLIF($5, 0)
-		  AND last_error_code IS NOT DISTINCT FROM NULLIF($6, '')
-		  AND lease_owner IS NULL AND lease_token IS NULL AND lease_until IS NULL`,
+		WHERE j.id = $1
+		  AND j.cycle_generation = $2
+		  AND j.attempt_count = $3
+		  AND j.state = $4
+		  AND j.status_code IS NOT DISTINCT FROM NULLIF($5, 0)
+		  AND j.last_error_code IS NOT DISTINCT FROM NULLIF($6, '')
+		  AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL
+		  AND EXISTS (
+		      SELECT 1 FROM accounts a
+		      WHERE a.id = j.account_id
+		        AND a.openai_warmup_identity_generation = j.identity_generation
+		  )`,
 		retry.JobID, retry.CycleGeneration, retry.AttemptCount, retry.BlockedState,
 		retry.StatusCode, retry.ErrorCode, retry.NextAttemptAt.UTC(), retry.RetryCode)
 }
@@ -616,7 +655,7 @@ SET state = $4::varchar, next_attempt_at = $5, observed_reset_at = COALESCE($6, 
 func (r *openAIWindowWarmupRepository) markNonterminal(ctx context.Context, id int64, owner, token, state string, at, next time.Time, status int, code, message string, resetAt *time.Time, uncertain service.OpenAIWindowWarmupUncertainEvidence) (bool, error) {
 	return r.fencedQuery(ctx, `
 			WITH updated AS (
-			    UPDATE openai_window_warmup_jobs
+			    UPDATE openai_window_warmup_jobs AS j
 				    SET state = $4::varchar, next_attempt_at = $5, status_code = NULLIF($6, 0),
 			        last_error_code = NULLIF($7, ''), last_error = NULLIF($8, ''),
 			        observed_reset_at = COALESCE($9, observed_reset_at),
@@ -635,9 +674,14 @@ func (r *openAIWindowWarmupRepository) markNonterminal(ctx context.Context, id i
 			            ELSE FALSE
 			        END,
 			        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
-		    WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-		      AND split_part(lease_token, ':', 1) = cycle_generation::text
-		      AND lease_until IS NOT NULL AND lease_until > NOW()
+			    WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
+			      AND split_part(lease_token, ':', 1) = cycle_generation::text
+			      AND lease_until IS NOT NULL AND lease_until > NOW()
+			      AND EXISTS (
+			          SELECT 1 FROM accounts a
+			          WHERE a.id = j.account_id
+			            AND a.openai_warmup_identity_generation = j.identity_generation
+			      )
 		    RETURNING id, attempt_count, last_attempt_at
 			), attempt AS (
 			    INSERT INTO openai_window_warmup_attempts
@@ -650,6 +694,44 @@ func (r *openAIWindowWarmupRepository) markNonterminal(ctx context.Context, id i
 			SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, state, next.UTC(), status, code, message,
 		nullWarmupTime(resetAt), uncertain.Authoritative, nullWarmupTime(uncertain.ResetAt),
 		uncertain.Terminal, nullableTimeValue(at), normalizeAttemptOutcome(state))
+}
+
+func (r *openAIWindowWarmupRepository) CancelStartedBeforeSend(ctx context.Context, id int64, owner, token string, next time.Time, reason string) (bool, error) {
+	return r.fencedUpdate(ctx, `
+			UPDATE openai_window_warmup_jobs AS j
+			SET state = 'pending', next_attempt_at = $4,
+			    attempt_count = attempt_count - 1,
+			    sent_at = CASE WHEN attempt_count = 1 THEN NULL ELSE (
+			        SELECT MAX(a.started_at) FROM openai_window_warmup_attempts a
+			        WHERE a.job_id = j.id AND a.attempt_no < j.attempt_count
+			    ) END,
+			    last_attempt_at = CASE WHEN attempt_count = 1 THEN NULL ELSE (
+			        SELECT MAX(a.started_at) FROM openai_window_warmup_attempts a
+			        WHERE a.job_id = j.id AND a.attempt_no < j.attempt_count
+			    ) END,
+			    preflight_reset_at = NULL, preflight_observed_at = NULL,
+			    last_error_code = NULLIF($5, ''), last_error = NULL,
+			    lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+			WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
+		  AND split_part(lease_token, ':', 1) = cycle_generation::text
+		  AND lease_until IS NOT NULL AND lease_until > NOW()
+		  AND attempt_count > 0`, id, owner, token, next.UTC(), reason)
+}
+
+func (r *openAIWindowWarmupRepository) ProjectSuccessReset(ctx context.Context, accountID, identityGeneration int64, at, resetAt time.Time) (bool, error) {
+	return r.fencedUpdate(ctx, `
+		UPDATE accounts
+		SET extra = jsonb_set(
+		        jsonb_set(
+		            jsonb_set(COALESCE(extra, '{}'::jsonb), '{codex_5h_used_percent}', '0'::jsonb, true),
+		            '{codex_5h_reset_at}', to_jsonb($4::text), true
+		        ),
+		        '{codex_usage_updated_at}', to_jsonb($3::text), true
+		    ),
+		    updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL
+		  AND openai_warmup_identity_generation = $2`,
+		accountID, identityGeneration, at.UTC().Format(time.RFC3339Nano), resetAt.UTC().Format(time.RFC3339Nano))
 }
 
 func (r *openAIWindowWarmupRepository) GetByID(ctx context.Context, id int64) (*service.OpenAIWindowWarmupJob, error) {
@@ -768,13 +850,15 @@ func (r *openAIWindowWarmupRepository) UnblockAccount(ctx context.Context, accou
 	}
 	query := `
 	WITH target AS MATERIALIZED (
-	    SELECT id
-	    FROM openai_window_warmup_jobs
-	    WHERE account_id = $1
+	    SELECT j.id
+	    FROM openai_window_warmup_jobs AS j
+	    JOIN accounts AS a ON a.id = j.account_id
+	        AND a.openai_warmup_identity_generation = j.identity_generation
+	    WHERE j.account_id = $1
 	    -- Prefer a live row. A newer quarantined duplicate must not hide or
 	    -- accidentally compete with the real active cycle.
-	    ORDER BY CASE WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
-	             id DESC
+	    ORDER BY CASE WHEN j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
+	             j.id DESC
 	    LIMIT 1
 	    FOR UPDATE
 	), updated AS (
@@ -844,7 +928,8 @@ func scanWarmupJob(row warmupRowScanner) (*service.OpenAIWindowWarmupJob, error)
 	var statusCode sql.NullInt64
 	err := row.Scan(
 		&job.ID, &job.AccountID, &job.QuotaScope, &job.State, &job.Trigger,
-		&job.CycleKey, &job.CycleGeneration, &observed, &preflightReset, &preflightObserved,
+		&job.CycleKey, &job.CycleGeneration, &job.IdentityGeneration,
+		&observed, &preflightReset, &preflightObserved,
 		&uncertainReset, &uncertainAt,
 		&job.UncertainTerminalObserved, &job.NextAttemptAt,
 		&job.AttemptCount, &sent, &owner, &token, &until, &lastAttempt,

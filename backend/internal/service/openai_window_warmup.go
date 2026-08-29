@@ -8,6 +8,7 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -131,12 +132,58 @@ func SetOpenAIWindowWarmupPolicy(account *Account, policy OpenAIWindowWarmupPoli
 // service and an OpenAI transport adapter.  Payload is a fixed minimal
 // Responses JSON body; callers must never put credentials or user content in it.
 type OpenAIOutboundRequest struct {
-	Account  *Account
-	Model    string
-	Payload  []byte
-	Headers  http.Header
-	Timeout  time.Duration
-	Endpoint string
+	Account            *Account
+	IdentityGeneration int64
+	SendGuard          OpenAIWindowWarmupSendGuard
+	Model              string
+	Payload            []byte
+	Headers            http.Header
+	Timeout            time.Duration
+	Endpoint           string
+}
+
+type OpenAIWindowWarmupSendGuard interface {
+	Check(context.Context, int64) error
+}
+
+type OpenAIWindowWarmupSendGuardFunc func(context.Context, int64) error
+
+func (f OpenAIWindowWarmupSendGuardFunc) Check(ctx context.Context, accountID int64) error {
+	if f == nil {
+		return nil
+	}
+	return f(ctx, accountID)
+}
+
+// OpenAIWindowWarmupIdentityLeaseRepository linearizes a guarded outbound POST
+// with account credential updates. The lease must hold a database row lock until
+// the transport returns so a concurrent reauthorization either completes first
+// and rejects the send, or waits until the already-authorized send finishes.
+type OpenAIWindowWarmupIdentityLeaseRepository interface {
+	AcquireOpenAIWindowWarmupIdentityLease(
+		context.Context,
+		int64,
+		int64,
+		map[string]any,
+		*int64,
+	) (release func(), acquired bool, err error)
+}
+
+type openAIWindowWarmupSendGuardContextKey struct{}
+
+func withOpenAIWindowWarmupSendGuard(ctx context.Context, guard OpenAIWindowWarmupSendGuard) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIWindowWarmupSendGuardContextKey{}, guard)
+}
+
+func openAIWindowWarmupSendGuardFromContext(ctx context.Context) OpenAIWindowWarmupSendGuard {
+	if ctx == nil {
+		return nil
+	}
+	guard, _ := ctx.Value(openAIWindowWarmupSendGuardContextKey{}).(OpenAIWindowWarmupSendGuard)
+	return guard
 }
 
 // OpenAIOutboundResult is intentionally bounded and metadata-only.  Body may
@@ -226,6 +273,7 @@ type OpenAIWindowProbeResult struct {
 	TerminalType    string
 	ResetAt         *time.Time
 	ObservedResetAt *time.Time
+	Started         bool
 	EOF             bool
 	Outcome         string
 	AuthFailure     *OpenAIWindowWarmupAuthFailure
@@ -295,14 +343,15 @@ func (f OpenAIWindowWarmupAllowlistFunc) AccountIDs(ctx context.Context) ([]int6
 // OpenAIWindowWarmupJob is the durable state projection returned to admin/UI.
 // Error fields are deliberately redacted codes/messages only.
 type OpenAIWindowWarmupJob struct {
-	ID              int64      `json:"id"`
-	AccountID       int64      `json:"account_id"`
-	QuotaScope      string     `json:"quota_scope"`
-	State           string     `json:"state"`
-	Trigger         string     `json:"trigger"`
-	CycleKey        string     `json:"cycle_key"`
-	CycleGeneration int64      `json:"cycle_generation"`
-	ObservedResetAt *time.Time `json:"observed_reset_at,omitempty"`
+	ID                 int64      `json:"id"`
+	AccountID          int64      `json:"account_id"`
+	QuotaScope         string     `json:"quota_scope"`
+	State              string     `json:"state"`
+	Trigger            string     `json:"trigger"`
+	CycleKey           string     `json:"cycle_key"`
+	CycleGeneration    int64      `json:"cycle_generation"`
+	IdentityGeneration int64      `json:"-"`
+	ObservedResetAt    *time.Time `json:"observed_reset_at,omitempty"`
 	// Preflight* records the authoritative five-hour observation immediately
 	// before the current/last synthetic send. It is attempt evidence rather than
 	// the cycle baseline exposed to operators.
@@ -330,13 +379,14 @@ type OpenAIWindowWarmupJob struct {
 
 // OpenAIWindowWarmupEnqueue describes one idempotent cycle insertion.
 type OpenAIWindowWarmupEnqueue struct {
-	AccountID       int64
-	QuotaScope      string
-	CycleKey        string
-	CycleGeneration int64
-	Trigger         string
-	ObservedResetAt *time.Time
-	NextAttemptAt   time.Time
+	AccountID          int64
+	QuotaScope         string
+	CycleKey           string
+	CycleGeneration    int64
+	IdentityGeneration int64
+	Trigger            string
+	ObservedResetAt    *time.Time
+	NextAttemptAt      time.Time
 }
 
 // OpenAIWindowWarmupClaim is returned by a repository after an atomic lease
@@ -398,7 +448,9 @@ type OpenAIWindowWarmupRepository interface {
 	ReleaseGlobalSend(context.Context, string) (bool, error)
 	RenewLease(context.Context, int64, string, string, time.Duration) (bool, error)
 	MarkStarted(context.Context, int64, string, string, time.Time, OpenAIWindowWarmupStartEvidence) (bool, error)
+	CancelStartedBeforeSend(context.Context, int64, string, string, time.Time, string) (bool, error)
 	MarkSuccess(context.Context, int64, string, string, time.Time, *time.Time, int, string) (bool, error)
+	ProjectSuccessReset(context.Context, int64, int64, time.Time, time.Time) (bool, error)
 	MarkSuppressed(context.Context, int64, string, string, time.Time, *time.Time, string) (bool, error)
 	MarkRetry(context.Context, int64, string, string, time.Time, time.Time, int, string, string) (bool, error)
 	MarkObservationFailure(context.Context, int64, string, string, time.Time, time.Time, string, int, string, string) (bool, error)
@@ -786,7 +838,8 @@ func (s *OpenAIWindowWarmupService) scheduleAccountWarmup(ctx context.Context, a
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
 		return nil, false, currentErr
 	}
-	if current != nil && current.State == OpenAIWindowWarmupStatePaused {
+	if current != nil && current.IdentityGeneration == account.OpenAIWarmupIdentityGeneration &&
+		current.State == OpenAIWindowWarmupStatePaused {
 		rearmed, changed, rearmErr := s.repo.UnblockAccount(ctx, account.ID, next, resetAt)
 		if rearmErr != nil {
 			return nil, false, rearmErr
@@ -798,7 +851,8 @@ func (s *OpenAIWindowWarmupService) scheduleAccountWarmup(ctx context.Context, a
 	}
 	job, inserted, err := s.repo.Enqueue(ctx, OpenAIWindowWarmupEnqueue{
 		AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
-		CycleKey: cycleKey, CycleGeneration: cycleGeneration, Trigger: trigger,
+		CycleKey: cycleKey, CycleGeneration: cycleGeneration,
+		IdentityGeneration: account.OpenAIWarmupIdentityGeneration, Trigger: trigger,
 		ObservedResetAt: resetAt, NextAttemptAt: next,
 	})
 	if err != nil {
@@ -884,7 +938,7 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
 		return nil, false, currentErr
 	}
-	if current != nil {
+	if current != nil && current.IdentityGeneration == account.OpenAIWarmupIdentityGeneration {
 		if warmupActiveState(current.State) {
 			return current, false, nil
 		}
@@ -907,11 +961,13 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 	if current != nil {
 		manualSeed = current.ID
 	}
+	cycleGeneration := warmupAccountGeneration(account)
 	return s.repo.Enqueue(ctx, OpenAIWindowWarmupEnqueue{
 		AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
-		CycleKey:        fmt.Sprintf("manual:%d", manualSeed),
-		CycleGeneration: warmupAccountGeneration(account),
-		Trigger:         OpenAIWindowWarmupTriggerManual, ObservedResetAt: resetAt,
+		CycleKey:           fmt.Sprintf("manual:%d:%d", account.OpenAIWarmupIdentityGeneration, manualSeed),
+		CycleGeneration:    cycleGeneration,
+		IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
+		Trigger:            OpenAIWindowWarmupTriggerManual, ObservedResetAt: resetAt,
 		NextAttemptAt: next,
 	})
 }
@@ -939,6 +995,13 @@ func (s *OpenAIWindowWarmupService) UnblockAccount(ctx context.Context, accountI
 	}
 	if !s.accountAllowed(ctx, accountID) {
 		return nil, false, errors.New("account is outside the configured OpenAI window warmup cohort")
+	}
+	current, currentErr := s.repo.GetCurrent(ctx, accountID, OpenAIWindowWarmupQuotaScopeGlobal)
+	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+		return nil, false, currentErr
+	}
+	if current == nil || current.IdentityGeneration != account.OpenAIWarmupIdentityGeneration {
+		return s.scheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerManual, false)
 	}
 	resetAt := accountCodexGlobalResetAt(account)
 	next := s.now()
@@ -1119,6 +1182,11 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 		return
 	}
 	account = latestAccount
+	if job.IdentityGeneration <= 0 || account.OpenAIWarmupIdentityGeneration != job.IdentityGeneration {
+		s.markPaused(ctx, claim, s.now(), "credential_identity_superseded")
+		_, _, _ = s.scheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerReconcile, false)
+		return
+	}
 	if !warmupAccountEligibleAt(account, s.now()) || !OpenAIWindowWarmupPolicyForAccount(account).Enabled() {
 		s.markPaused(ctx, claim, s.now(), "account_ineligible")
 		return
@@ -1151,7 +1219,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 		return
 	}
 	defer s.releaseGlobalSend(permitToken)
-	if !s.killSwitchEnabled(ctx) {
+	if guardErr := s.checkWarmupSendGuard(ctx, account.ID); guardErr != nil {
 		s.reschedule(ctx, claim, s.now().Add(s.options.ScanInterval), OpenAIWindowWarmupStatePending, job.ObservedResetAt)
 		return
 	}
@@ -1191,6 +1259,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 	sentAt := s.now()
 	job.SentAt = &sentAt
 	probeCtx, probeCancel := context.WithTimeout(ctx, s.options.RequestTimeout)
+	probeCtx = withOpenAIWindowWarmupSendGuard(probeCtx, OpenAIWindowWarmupSendGuardFunc(s.checkWarmupSendGuard))
 	result, probeErr := s.probe.Probe(probeCtx, account, job.PreflightResetAt)
 	probeCancel()
 	s.handleProbeResultWithPreflight(ctx, claim, account, result, probeErr, fiveHour.UsedPercent <= 0)
@@ -1206,6 +1275,24 @@ func (s *OpenAIWindowWarmupService) handleProbeResultWithPreflight(ctx context.C
 	statusCode := 0
 	if result != nil {
 		statusCode = result.StatusCode
+	}
+	if errors.Is(probeErr, ErrOpenAIWindowWarmupSendGuardClosed) {
+		if result == nil || !result.Started {
+			s.cancelStartedBeforeSend(ctx, claim, now, "send_guard_closed")
+		} else {
+			s.markRetry(ctx, claim, now, now.Add(s.options.ScanInterval), statusCode,
+				"send_guard_closed", "dynamic warmup guard closed before replay")
+		}
+		return
+	}
+	if errors.Is(probeErr, ErrOpenAIWindowWarmupCredentialsChanged) {
+		s.markPaused(ctx, claim, now, "credential_identity_superseded")
+		if s.accounts != nil && account != nil {
+			if latest, err := s.accounts.GetByID(ctx, account.ID); err == nil && latest != nil {
+				_, _, _ = s.scheduleAccountWarmup(ctx, latest, OpenAIWindowWarmupTriggerReconcile, false)
+			}
+		}
+		return
 	}
 	authFailure := openAIWindowWarmupProbeAuthFailure(result, probeErr)
 	if authFailure != nil && (authFailure.Disposition == OpenAIWindowWarmupAuthRefreshTransient ||
@@ -1401,18 +1488,27 @@ func (s *OpenAIWindowWarmupService) markSuccess(ctx context.Context, claim OpenA
 	if err != nil || !ok {
 		return false
 	}
-	if resetAt != nil && s.accounts != nil {
-		// The reset is upstream evidence from the completed probe. Persist only the
-		// bounded quota projection needed by the account card; durable worker state
-		// remains in the warmup tables.
-		_ = s.accounts.UpdateExtra(ctx, claim.Job.AccountID, map[string]any{
-			"codex_5h_used_percent":  float64(0),
-			"codex_5h_reset_at":      resetAt.UTC().Format(time.RFC3339Nano),
-			"codex_usage_updated_at": at.UTC().Format(time.RFC3339Nano),
-		})
+	if resetAt != nil {
+		_, _ = s.repo.ProjectSuccessReset(ctx, claim.Job.AccountID, claim.Job.IdentityGeneration, at, *resetAt)
 	}
 	s.metrics.success.Add(1)
 	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStateCompleted, status, code, resetAt)
+	return true
+}
+
+func (s *OpenAIWindowWarmupService) cancelStartedBeforeSend(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, reason string) bool {
+	if s == nil || s.repo == nil || claim.Job == nil {
+		return false
+	}
+	ok, err := s.repo.CancelStartedBeforeSend(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, at, reason)
+	if err != nil || !ok {
+		return false
+	}
+	if claim.Job.AttemptCount > 0 {
+		claim.Job.AttemptCount--
+	}
+	claim.Job.SentAt = nil
+	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStatePending, 0, reason, claim.Job.ObservedResetAt)
 	return true
 }
 
@@ -1749,11 +1845,13 @@ func (s *OpenAIWindowWarmupService) enqueueNextContinuousCycle(ctx context.Conte
 	if !s.accountAllowed(ctx, account.ID) {
 		return
 	}
-	cycleKey := warmupResetCycleKey(*reset)
+	cycleGeneration := warmupAccountGeneration(account)
+	cycleKey := warmupResetCycleKey(*reset, cycleGeneration)
 	job, inserted, err := s.repo.Enqueue(ctx, OpenAIWindowWarmupEnqueue{
 		AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
-		CycleKey: cycleKey, CycleGeneration: warmupAccountGeneration(account),
-		Trigger: OpenAIWindowWarmupTriggerReset, ObservedResetAt: reset,
+		CycleKey: cycleKey, CycleGeneration: cycleGeneration,
+		IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
+		Trigger:            OpenAIWindowWarmupTriggerReset, ObservedResetAt: reset,
 		NextAttemptAt: s.warmupDueAt(cycleKey, reset),
 	})
 	_ = job
@@ -1959,6 +2057,16 @@ func (s *OpenAIWindowWarmupService) killSwitchEnabled(ctx context.Context) bool 
 	return err == nil && ok
 }
 
+func (s *OpenAIWindowWarmupService) checkWarmupSendGuard(ctx context.Context, accountID int64) error {
+	if s == nil || !s.killSwitchEnabled(ctx) {
+		return ErrOpenAIWindowWarmupSendGuardClosed
+	}
+	if !s.accountAllowed(ctx, accountID) {
+		return ErrOpenAIWindowWarmupSendGuardClosed
+	}
+	return nil
+}
+
 func (s *OpenAIWindowWarmupService) refreshQueueStats(ctx context.Context, accountIDs []int64) {
 	if s == nil || s.repo == nil {
 		return
@@ -2085,9 +2193,40 @@ func warmupAccountEligible(a *Account) bool {
 
 func warmupAccountEligibleAt(a *Account, now time.Time) bool {
 	return a != nil && a.ID > 0 && a.Platform == PlatformOpenAI && a.Type == AccountTypeOAuth &&
+		a.OpenAIWarmupIdentityGeneration > 0 && openAIWindowWarmupIdentityKey(a) != "" &&
 		a.ParentAccountID == nil && a.QuotaDimensionOrDefault() == QuotaDimensionGlobal &&
 		a.IsActive() && a.Schedulable && !a.IsShadow() && !accountExpiredAt(a, now) &&
 		(a.TempUnschedulableUntil == nil || !now.Before(*a.TempUnschedulableUntil))
+}
+
+func openAIWindowWarmupIdentityKey(account *Account) string {
+	if account == nil || !account.IsOpenAIOAuthLike() {
+		return ""
+	}
+	if account.IsOpenAIAgentIdentity() {
+		runtimeID := strings.TrimSpace(account.GetCredential("agent_runtime_id"))
+		if runtimeID == "" {
+			return ""
+		}
+		return "agent:" + runtimeID
+	}
+	if account.IsOpenAIPersonalAccessToken() {
+		token := strings.TrimSpace(account.GetOpenAIAccessToken())
+		if token == "" {
+			return ""
+		}
+		digest := sha256.Sum256([]byte("openai-warmup-pat:" + token))
+		return "pat:" + hex.EncodeToString(digest[:])
+	}
+	accountID := strings.TrimSpace(account.GetChatGPTAccountID())
+	if accountID == "" {
+		return ""
+	}
+	identity := "chatgpt:" + accountID
+	if userID := strings.TrimSpace(account.GetCredential("chatgpt_user_id")); userID != "" {
+		identity += ":user:" + userID
+	}
+	return identity
 }
 
 func accountExpiredAt(a *Account, now time.Time) bool {
@@ -2097,6 +2236,9 @@ func accountExpiredAt(a *Account, now time.Time) bool {
 func warmupAccountGeneration(a *Account) int64 {
 	if a == nil {
 		return 0
+	}
+	if a.OpenAIWarmupIdentityGeneration > 0 {
+		return a.OpenAIWarmupIdentityGeneration
 	}
 	if !a.CreatedAt.IsZero() {
 		// PostgreSQL stores TIMESTAMPTZ at microsecond precision and rounds
@@ -2111,7 +2253,10 @@ func warmupInitialCycleKey(a *Account, generation int64) string {
 	return fmt.Sprintf("initial:%d", generation)
 }
 
-func warmupResetCycleKey(resetAt time.Time) string {
+func warmupResetCycleKey(resetAt time.Time, generation ...int64) string {
+	if len(generation) > 0 && generation[0] > 0 {
+		return fmt.Sprintf("reset:%d:%s", generation[0], resetAt.UTC().Format(time.RFC3339Nano))
+	}
 	return "reset:" + resetAt.UTC().Format(time.RFC3339Nano)
 }
 

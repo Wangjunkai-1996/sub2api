@@ -90,6 +90,11 @@ func Type(v string) predicate.Account {
 	return predicate.Account(sql.FieldEQ(FieldType, v))
 }
 
+// OpenaiWarmupIdentityGeneration applies equality check predicate on the "openai_warmup_identity_generation" field. It's identical to OpenaiWarmupIdentityGenerationEQ.
+func OpenaiWarmupIdentityGeneration(v int64) predicate.Account {
+	return predicate.Account(sql.FieldEQ(FieldOpenaiWarmupIdentityGeneration, v))
+}
+
 // ProxyID applies equality check predicate on the "proxy_id" field. It's identical to ProxyIDEQ.
 func ProxyID(v int64) predicate.Account {
 	return predicate.Account(sql.FieldEQ(FieldProxyID, v))
@@ -593,6 +598,46 @@ func TypeEqualFold(v string) predicate.Account {
 // TypeContainsFold applies the ContainsFold predicate on the "type" field.
 func TypeContainsFold(v string) predicate.Account {
 	return predicate.Account(sql.FieldContainsFold(FieldType, v))
+}
+
+// OpenaiWarmupIdentityGenerationEQ applies the EQ predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationEQ(v int64) predicate.Account {
+	return predicate.Account(sql.FieldEQ(FieldOpenaiWarmupIdentityGeneration, v))
+}
+
+// OpenaiWarmupIdentityGenerationNEQ applies the NEQ predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationNEQ(v int64) predicate.Account {
+	return predicate.Account(sql.FieldNEQ(FieldOpenaiWarmupIdentityGeneration, v))
+}
+
+// OpenaiWarmupIdentityGenerationIn applies the In predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationIn(vs ...int64) predicate.Account {
+	return predicate.Account(sql.FieldIn(FieldOpenaiWarmupIdentityGeneration, vs...))
+}
+
+// OpenaiWarmupIdentityGenerationNotIn applies the NotIn predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationNotIn(vs ...int64) predicate.Account {
+	return predicate.Account(sql.FieldNotIn(FieldOpenaiWarmupIdentityGeneration, vs...))
+}
+
+// OpenaiWarmupIdentityGenerationGT applies the GT predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationGT(v int64) predicate.Account {
+	return predicate.Account(sql.FieldGT(FieldOpenaiWarmupIdentityGeneration, v))
+}
+
+// OpenaiWarmupIdentityGenerationGTE applies the GTE predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationGTE(v int64) predicate.Account {
+	return predicate.Account(sql.FieldGTE(FieldOpenaiWarmupIdentityGeneration, v))
+}
+
+// OpenaiWarmupIdentityGenerationLT applies the LT predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationLT(v int64) predicate.Account {
+	return predicate.Account(sql.FieldLT(FieldOpenaiWarmupIdentityGeneration, v))
+}
+
+// OpenaiWarmupIdentityGenerationLTE applies the LTE predicate on the "openai_warmup_identity_generation" field.
+func OpenaiWarmupIdentityGenerationLTE(v int64) predicate.Account {
+	return predicate.Account(sql.FieldLTE(FieldOpenaiWarmupIdentityGeneration, v))
 }
 
 // ProxyIDEQ applies the EQ predicate on the "proxy_id" field.

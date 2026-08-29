@@ -32,6 +32,8 @@ const (
 	FieldType = "type"
 	// FieldCredentials holds the string denoting the credentials field in the database.
 	FieldCredentials = "credentials"
+	// FieldOpenaiWarmupIdentityGeneration holds the string denoting the openai_warmup_identity_generation field in the database.
+	FieldOpenaiWarmupIdentityGeneration = "openai_warmup_identity_generation"
 	// FieldExtra holds the string denoting the extra field in the database.
 	FieldExtra = "extra"
 	// FieldProxyID holds the string denoting the proxy_id field in the database.
@@ -139,6 +141,7 @@ var Columns = []string{
 	FieldPlatform,
 	FieldType,
 	FieldCredentials,
+	FieldOpenaiWarmupIdentityGeneration,
 	FieldExtra,
 	FieldProxyID,
 	FieldProxyFallbackOriginID,
@@ -202,6 +205,10 @@ var (
 	TypeValidator func(string) error
 	// DefaultCredentials holds the default value on creation for the "credentials" field.
 	DefaultCredentials func() map[string]interface{}
+	// DefaultOpenaiWarmupIdentityGeneration holds the default value on creation for the "openai_warmup_identity_generation" field.
+	DefaultOpenaiWarmupIdentityGeneration int64
+	// OpenaiWarmupIdentityGenerationValidator is a validator for the "openai_warmup_identity_generation" field. It is called by the builders before save.
+	OpenaiWarmupIdentityGenerationValidator func(int64) error
 	// DefaultExtra holds the default value on creation for the "extra" field.
 	DefaultExtra func() map[string]interface{}
 	// DefaultConcurrency holds the default value on creation for the "concurrency" field.
@@ -289,6 +296,11 @@ func ByPlatform(opts ...sql.OrderTermOption) OrderOption {
 // ByType orders the results by the type field.
 func ByType(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldType, opts...).ToFunc()
+}
+
+// ByOpenaiWarmupIdentityGeneration orders the results by the openai_warmup_identity_generation field.
+func ByOpenaiWarmupIdentityGeneration(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldOpenaiWarmupIdentityGeneration, opts...).ToFunc()
 }
 
 // ByProxyID orders the results by the proxy_id field.

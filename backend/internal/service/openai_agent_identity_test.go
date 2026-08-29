@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -137,13 +138,13 @@ func TestEnsureAgentIdentityTaskPersistsAndRedactsCredentials(t *testing.T) {
 	openAIAgentIdentityAuthAPIBaseURL = server.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
 
-	repo := &agentIdentityCredentialsRepo{}
 	account := &Account{ID: 7, Type: AccountTypeOAuth, Platform: PlatformOpenAI, Credentials: map[string]any{
 		"auth_mode":          OpenAIAuthModeAgentIdentity,
 		"agent_runtime_id":   key.runtimeID,
 		"agent_private_key":  privateKey,
 		"chatgpt_account_id": "account-test",
 	}}
+	repo := &agentIdentityCredentialsRepo{account: cloneAgentIdentityTestAccount(account)}
 	service := &OpenAIGatewayService{accountRepo: repo}
 	require.NoError(t, service.ensureAgentIdentityTask(context.Background(), account, ""))
 	require.Equal(t, "task-persisted", account.GetCredential("task_id"))
@@ -197,6 +198,73 @@ func TestEnsureAgentIdentityTaskSharesLockAcrossServicesForSameAccount(t *testin
 	require.Equal(t, "task-shared", repo.account.GetCredential("task_id"))
 }
 
+func TestEnsureAgentIdentityTaskDoesNotOverwriteConcurrentReauthorization(t *testing.T) {
+	key, privateKey := newTestAgentIdentityKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"task_id":"task-from-stale-registration"}`))
+	}))
+	defer server.Close()
+	oldBase := openAIAgentIdentityAuthAPIBaseURL
+	openAIAgentIdentityAuthAPIBaseURL = server.URL
+	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
+
+	account := &Account{ID: 9002, Type: AccountTypeOAuth, Platform: PlatformOpenAI, Credentials: map[string]any{
+		"auth_mode":         OpenAIAuthModeAgentIdentity,
+		"agent_runtime_id":  key.runtimeID,
+		"agent_private_key": privateKey,
+	}}
+	repo := &agentIdentityCredentialsRepo{account: cloneAgentIdentityTestAccount(account)}
+	repo.beforeCAS = func(r *agentIdentityCredentialsRepo) {
+		r.account.Credentials = map[string]any{
+			"auth_mode":         OpenAIAuthModeAgentIdentity,
+			"agent_runtime_id":  "runtime-reauthorized",
+			"agent_private_key": "reauthorized-private-key",
+		}
+	}
+
+	err := ensureAgentIdentityTaskForAccount(context.Background(), repo, nil, &sync.Mutex{}, account, "")
+
+	require.EqualError(t, err, "agent identity credentials changed during task registration")
+	require.Equal(t, "runtime-reauthorized", repo.account.GetCredential("agent_runtime_id"))
+	require.Empty(t, repo.account.GetCredential("task_id"))
+	require.Empty(t, account.GetCredential("task_id"))
+	require.Equal(t, "task-from-stale-registration", repo.lastCredentials["task_id"])
+	require.Equal(t, 1, repo.casCalls)
+	require.Zero(t, repo.casApplied)
+}
+
+func TestEnsureAgentIdentityTaskAcceptsConcurrentTaskForSameIdentity(t *testing.T) {
+	key, privateKey := newTestAgentIdentityKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"task_id":"task-from-stale-registration"}`))
+	}))
+	defer server.Close()
+	oldBase := openAIAgentIdentityAuthAPIBaseURL
+	openAIAgentIdentityAuthAPIBaseURL = server.URL
+	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
+
+	account := &Account{ID: 9003, Type: AccountTypeOAuth, Platform: PlatformOpenAI, Credentials: map[string]any{
+		"auth_mode":         OpenAIAuthModeAgentIdentity,
+		"agent_runtime_id":  key.runtimeID,
+		"agent_private_key": privateKey,
+	}}
+	repo := &agentIdentityCredentialsRepo{account: cloneAgentIdentityTestAccount(account)}
+	repo.beforeCAS = func(r *agentIdentityCredentialsRepo) {
+		credentials := shallowCopyMap(r.account.Credentials)
+		credentials["task_id"] = "task-from-concurrent-registration"
+		r.account.Credentials = credentials
+	}
+
+	err := ensureAgentIdentityTaskForAccount(context.Background(), repo, nil, &sync.Mutex{}, account, "")
+
+	require.NoError(t, err)
+	require.Equal(t, "task-from-concurrent-registration", repo.account.GetCredential("task_id"))
+	require.Equal(t, "task-from-concurrent-registration", account.GetCredential("task_id"))
+	require.Equal(t, "task-from-stale-registration", repo.lastCredentials["task_id"])
+	require.Equal(t, 1, repo.casCalls)
+	require.Zero(t, repo.casApplied)
+}
+
 func cloneAgentIdentityTestAccount(account *Account) *Account {
 	copy := *account
 	copy.Credentials = shallowCopyMap(account.Credentials)
@@ -205,13 +273,22 @@ func cloneAgentIdentityTestAccount(account *Account) *Account {
 
 type agentIdentityCredentialsRepo struct {
 	AccountRepository
-	credentials map[string]any
-	account     *Account
-	mu          sync.Mutex
+	credentials     map[string]any
+	lastCredentials map[string]any
+	account         *Account
+	beforeCAS       func(*agentIdentityCredentialsRepo)
+	casCalls        int
+	casApplied      int
+	mu              sync.Mutex
 }
 
 func (r *agentIdentityCredentialsRepo) GetByID(_ context.Context, _ int64) (*Account, error) {
-	return r.account, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.account == nil {
+		return nil, nil
+	}
+	return cloneAgentIdentityTestAccount(r.account), nil
 }
 
 func (r *agentIdentityCredentialsRepo) UpdateCredentials(_ context.Context, _ int64, credentials map[string]any) error {
@@ -219,6 +296,32 @@ func (r *agentIdentityCredentialsRepo) UpdateCredentials(_ context.Context, _ in
 	defer r.mu.Unlock()
 	r.credentials = credentials
 	return nil
+}
+
+func (r *agentIdentityCredentialsRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	_ context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.casCalls++
+	r.lastCredentials = shallowCopyMap(credentials)
+	if r.beforeCAS != nil {
+		r.beforeCAS(r)
+	}
+	if r.account == nil || r.account.ID != id || r.account.Platform != PlatformOpenAI ||
+		r.account.Type != AccountTypeOAuth ||
+		!reflect.DeepEqual(r.account.Credentials, expectedCredentials) ||
+		!reflect.DeepEqual(r.account.ProxyID, expectedProxyID) {
+		return false, nil
+	}
+	r.casApplied++
+	r.credentials = shallowCopyMap(credentials)
+	r.account.Credentials = shallowCopyMap(credentials)
+	return true, nil
 }
 
 func mustAgentIdentityJSON(t *testing.T, value any) []byte {

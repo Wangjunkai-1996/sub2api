@@ -475,6 +475,134 @@ func TestOpenAIWindowWarmupMigrationCurrentJobIndexMatchesLookupOrder(t *testing
 	require.NotContains(t, definition, "updated_at")
 }
 
+func TestOpenAIWindowWarmupIdentityMigrationReplayPreservesSupersededJobGeneration(t *testing.T) {
+	ctx := context.Background()
+	migrationSQL, err := appmigrations.FS.ReadFile("238_openai_window_warmup_identity_fence.sql")
+	require.NoError(t, err)
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "identity-migration-replay:" + uuid.NewString(), CycleGeneration: 238,
+		IdentityGeneration: identityGeneration,
+		Trigger:            service.OpenAIWindowWarmupTriggerImport,
+		NextAttemptAt:      time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.Equal(t, identityGeneration, job.IdentityGeneration)
+
+	currentGeneration := rotateWarmupIntegrationIdentity(t, accountID, identityGeneration)
+	require.Greater(t, currentGeneration, identityGeneration)
+
+	const replay = "990_test_openai_window_warmup_identity_fence_replay.sql"
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(),
+			`DELETE FROM schema_migrations WHERE filename = $1`, replay)
+	})
+	require.NoError(t, applyMigrationsFS(ctx, integrationDB, fstest.MapFS{
+		replay: &fstest.MapFile{Data: migrationSQL},
+	}))
+
+	replayed, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, identityGeneration, replayed.IdentityGeneration,
+		"replaying the migration must not authorize old work for the replacement identity")
+	require.NotEqual(t, currentGeneration, replayed.IdentityGeneration)
+}
+
+func TestOpenAIWindowWarmupIdentityLeaseBlocksCredentialUpdateUntilRelease(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	credentials := map[string]any{"chatgpt_account_id": "warmup-lease-old-" + uuid.NewString()}
+	account := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name: "warmup-identity-lease-" + uuid.NewString(), Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: credentials,
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
+	})
+	var identityGeneration int64
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT openai_warmup_identity_generation FROM accounts WHERE id = $1`, account.ID,
+	).Scan(&identityGeneration))
+
+	accountRepo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
+	release, acquired, err := accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
+		ctx, account.ID, identityGeneration, credentials, nil,
+	)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NotNil(t, release)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	updateConn, err := integrationDB.Conn(ctx)
+	require.NoError(t, err)
+	defer updateConn.Close()
+	var updatePID int
+	require.NoError(t, updateConn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&updatePID))
+	replacementID := "warmup-lease-new-" + uuid.NewString()
+	updateDone := make(chan error, 1)
+	go func() {
+		_, updateErr := updateConn.ExecContext(ctx, `
+			UPDATE accounts
+			SET credentials = jsonb_set(credentials, '{chatgpt_account_id}', to_jsonb($2::text), true)
+			WHERE id = $1`, account.ID, replacementID)
+		updateDone <- updateErr
+	}()
+
+	lockDeadline := time.Now().Add(2 * time.Second)
+	waitingOnLock := false
+	for !waitingOnLock && time.Now().Before(lockDeadline) {
+		select {
+		case updateErr := <-updateDone:
+			require.NoError(t, updateErr)
+			require.FailNow(t, "credential update completed while identity lease was held")
+		default:
+		}
+		require.NoError(t, integrationDB.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE pid = $1 AND wait_event_type = 'Lock'
+			)`, updatePID).Scan(&waitingOnLock))
+		if !waitingOnLock {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	require.True(t, waitingOnLock, "credential update did not wait on the account row lock")
+	select {
+	case updateErr := <-updateDone:
+		require.NoError(t, updateErr)
+		require.FailNow(t, "credential update completed before identity lease release")
+	default:
+	}
+
+	release()
+	released = true
+	select {
+	case updateErr := <-updateDone:
+		require.NoError(t, updateErr)
+	case <-ctx.Done():
+		require.FailNow(t, "credential update did not complete after identity lease release", ctx.Err())
+	}
+
+	var (
+		updatedAccountID  string
+		updatedGeneration int64
+	)
+	require.NoError(t, integrationDB.QueryRowContext(context.Background(), `
+		SELECT credentials ->> 'chatgpt_account_id', openai_warmup_identity_generation
+		FROM accounts WHERE id = $1`, account.ID).Scan(&updatedAccountID, &updatedGeneration))
+	require.Equal(t, replacementID, updatedAccountID)
+	require.Greater(t, updatedGeneration, identityGeneration)
+}
+
 func TestOpenAIWindowWarmupRepositoryCurrentPrefersActiveOverNewerBlocked(t *testing.T) {
 	ctx := context.Background()
 	accountID := createWarmupIntegrationAccount(t)
@@ -1599,6 +1727,73 @@ func TestOpenAIWindowWarmupRepositoryAuthStateRetryUsesExactTransitionCAS(t *tes
 	require.False(t, updated, "a delayed owner must not rearm a job that already left the blocked transition")
 }
 
+func TestOpenAIWindowWarmupRepositoryAuthStateRetryRejectsSupersededIdentityGeneration(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "auth-state-superseded:" + uuid.NewString(), CycleGeneration: 92,
+		IdentityGeneration: identityGeneration,
+		Trigger:            service.OpenAIWindowWarmupTriggerReset,
+		NextAttemptAt:      time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET state = 'blocked', attempt_count = 1, status_code = 401,
+		    last_error_code = 'needs_reauth', last_error = 'warmup blocked'
+		WHERE id = $1`, job.ID)
+	require.NoError(t, err)
+
+	currentGeneration := rotateWarmupIntegrationIdentity(t, accountID, identityGeneration)
+	require.Greater(t, currentGeneration, identityGeneration)
+	updated, err := repo.RequeueAuthStateUpdateFailure(ctx, service.OpenAIWindowWarmupAuthStateRetry{
+		JobID: job.ID, CycleGeneration: job.CycleGeneration, AttemptCount: 1,
+		BlockedState: service.OpenAIWindowWarmupStateBlocked,
+		StatusCode:   401, ErrorCode: "needs_reauth",
+		RetryCode: "account_state_update_failed", NextAttemptAt: time.Now().UTC().Add(time.Minute),
+	})
+	require.NoError(t, err)
+	require.False(t, updated)
+
+	stale, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateBlocked, stale.State)
+	require.Equal(t, identityGeneration, stale.IdentityGeneration)
+}
+
+func TestOpenAIWindowWarmupRepositoryUnblockRejectsSupersededIdentityGeneration(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "unblock-superseded:" + uuid.NewString(), CycleGeneration: 93,
+		IdentityGeneration: identityGeneration,
+		Trigger:            service.OpenAIWindowWarmupTriggerImport,
+		NextAttemptAt:      time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET state = 'blocked', last_error_code = 'needs_reauth', last_error = 'warmup blocked'
+		WHERE id = $1`, job.ID)
+	require.NoError(t, err)
+
+	currentGeneration := rotateWarmupIntegrationIdentity(t, accountID, identityGeneration)
+	require.Greater(t, currentGeneration, identityGeneration)
+	unblocked, changed, err := repo.UnblockAccount(ctx, accountID, time.Now().UTC(), nil)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.NotNil(t, unblocked)
+	require.Equal(t, job.ID, unblocked.ID)
+	require.Equal(t, service.OpenAIWindowWarmupStateBlocked, unblocked.State)
+	require.Equal(t, identityGeneration, unblocked.IdentityGeneration)
+}
+
 func TestOpenAIWindowWarmupRepositorySuppressionUsesRealAttemptNumber(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -2005,6 +2200,44 @@ func createWarmupIntegrationAccount(t *testing.T) int64 {
 		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
 	})
 	return account.ID
+}
+
+func createWarmupIntegrationIdentityAccount(t *testing.T) (int64, int64) {
+	t.Helper()
+	account := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name: "warmup-identity-" + uuid.NewString(), Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: map[string]any{"chatgpt_account_id": "warmup-old-" + uuid.NewString()},
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
+	})
+	var identityGeneration int64
+	require.NoError(t, integrationDB.QueryRowContext(context.Background(), `
+		SELECT openai_warmup_identity_generation FROM accounts WHERE id = $1`, account.ID,
+	).Scan(&identityGeneration))
+	require.Positive(t, identityGeneration)
+	return account.ID, identityGeneration
+}
+
+func rotateWarmupIntegrationIdentity(t *testing.T, accountID, previousGeneration int64) int64 {
+	t.Helper()
+	var identityGeneration int64
+	err := integrationDB.QueryRowContext(context.Background(), `
+		UPDATE accounts
+		SET credentials = jsonb_set(
+			COALESCE(credentials, '{}'::jsonb),
+			'{chatgpt_account_id}',
+			to_jsonb($2::text),
+			true
+		)
+		WHERE id = $1
+		RETURNING openai_warmup_identity_generation`,
+		accountID, "warmup-new-"+uuid.NewString(),
+	).Scan(&identityGeneration)
+	require.NoError(t, err)
+	require.Greater(t, identityGeneration, previousGeneration)
+	return identityGeneration
 }
 
 func mergeWarmupIntegrationAccountExtra(t *testing.T, accountID int64, extra map[string]any) {
