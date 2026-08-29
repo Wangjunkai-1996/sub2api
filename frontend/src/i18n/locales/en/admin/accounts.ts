@@ -1532,7 +1532,14 @@ export default {
         grokLastHeadersSeen: 'Headers {time}',
         passiveSampled: 'Passive',
         activeQuery: 'Query',
-        cachedQuery: 'Refresh cached usage'
+        cachedQuery: 'Refresh cached usage',
+        cachedQueryLoading: 'Refreshing',
+        cachedRefreshSuccess: 'Cached usage refreshed',
+        cachedRefreshUnchanged: 'Cached usage refreshed; no data changed',
+        cachedRefreshNoSnapshot: 'Cached usage refreshed; no valid snapshot yet',
+        cachedRefreshFailed: 'Failed to refresh cached usage',
+        snapshotPending: 'No valid snapshot yet; waiting for warmup',
+        snapshotPendingShort: 'Awaiting warmup'
       },
       openaiQuotaReset: {
         count: 'Credits',

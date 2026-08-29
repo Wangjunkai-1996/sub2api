@@ -466,7 +466,14 @@ export default {
         grokLastHeadersSeen: '响应头 {time}',
         passiveSampled: '被动采样',
         activeQuery: '查询',
-        cachedQuery: '刷新缓存'
+        cachedQuery: '刷新缓存',
+        cachedQueryLoading: '刷新中',
+        cachedRefreshSuccess: '缓存已刷新',
+        cachedRefreshUnchanged: '缓存已刷新，数据无变化',
+        cachedRefreshNoSnapshot: '缓存已刷新，仍无有效快照',
+        cachedRefreshFailed: '刷新缓存失败',
+        snapshotPending: '暂无有效快照，待暖机',
+        snapshotPendingShort: '待暖机'
       },
       openaiQuotaReset: {
         count: '次数',

@@ -87,6 +87,9 @@ func TestOpenAIWindowWarmupMigrationEnqueuesWithAccountTransaction(t *testing.T)
 	require.NoError(t, err)
 	warmupService := service.NewOpenAIWindowWarmupService(repo, nil, nil, nil, nil, service.OpenAIWindowWarmupOptions{
 		Now: func() time.Time { return now },
+		Allowlist: service.OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) {
+			return nil, nil
+		}),
 	})
 	runtimeJob, inserted, err := warmupService.ScheduleAccountWarmup(
 		context.Background(), account, service.OpenAIWindowWarmupTriggerImport,

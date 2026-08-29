@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -62,4 +63,43 @@ func TestProvideOpenAIWindowWarmupOptionsFailsClosedWithoutSettings(t *testing.T
 	allowlist, err := options.Allowlist.AccountIDs(context.Background())
 	require.Error(t, err)
 	require.Empty(t, allowlist)
+}
+
+func TestProvideOpenAIWindowWarmupOptionsDistinguishesEmptyFromInvalidAllowlist(t *testing.T) {
+	repo := &panelRateLimitSettingRepo{values: map[string]string{
+		SettingKeyOpenAIWindowWarmupAllowlist: `[]`,
+	}}
+	options := ProvideOpenAIWindowWarmupOptions(NewSettingService(repo, &config.Config{}))
+
+	allowlist, err := options.Allowlist.AccountIDs(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, allowlist, "a valid empty array selects the full eligible cohort")
+
+	for _, invalid := range []string{`{`, `null`, `{}`, `"[]"`, `[-1]`, `[0]`} {
+		require.NoError(t, repo.Set(context.Background(), SettingKeyOpenAIWindowWarmupAllowlist, invalid))
+		allowlist, err = options.Allowlist.AccountIDs(context.Background())
+		require.Error(t, err, invalid)
+		require.Empty(t, allowlist, invalid)
+	}
+
+	repo.getValueErr = errors.New("settings unavailable")
+	allowlist, err = options.Allowlist.AccountIDs(context.Background())
+	require.Error(t, err)
+	require.Empty(t, allowlist)
+}
+
+func TestValidateOpenAIWindowWarmupSettingsRejectsNonPositiveAllowlistIDs(t *testing.T) {
+	for _, allowlist := range [][]int64{{0}, {-1}, {42, 0}} {
+		settings := &SystemSettings{}
+		applyDefaultOpenAIWindowWarmupSettings(settings)
+		settings.OpenAIWindowWarmupAllowlist = allowlist
+
+		require.Error(t, validateOpenAIWindowWarmupSettings(settings), allowlist)
+	}
+
+	settings := &SystemSettings{}
+	applyDefaultOpenAIWindowWarmupSettings(settings)
+	settings.OpenAIWindowWarmupAllowlist = []int64{42, 7, 42}
+	require.NoError(t, validateOpenAIWindowWarmupSettings(settings))
+	require.Equal(t, []int64{42, 7}, settings.OpenAIWindowWarmupAllowlist)
 }

@@ -580,7 +580,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
-import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
+import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
 const appStore = useAppStore()
@@ -760,9 +760,36 @@ const usageBatchRequestTokenByAccountId = ref<Record<string, number>>({})
 const usageBatchCache = new Map<number, { data: AccountUsageInfo; ts: number }>()
 const USAGE_BATCH_CACHE_TTL = 5 * 60 * 1000
 const pendingUsageBatchIds = new Set<number>()
+const usageBatchWaiters = new Map<
+  number,
+  Array<{ token: number; resolve: (result: AccountUsageRequestResult) => void }>
+>()
 let usageBatchFlushTimer: ReturnType<typeof setTimeout> | null = null
 let queuedUsageBatchForce = false
 let usageBatchRequestToken = 0
+
+const settleUsageBatchWaiters = (
+  accountID: number,
+  requestToken: number,
+  result: AccountUsageRequestResult
+) => {
+  const waiters = usageBatchWaiters.get(accountID)
+  if (!waiters?.length) return
+
+  const pending = [] as typeof waiters
+  for (const waiter of waiters) {
+    if (waiter.token <= requestToken) {
+      waiter.resolve(result)
+    } else {
+      pending.push(waiter)
+    }
+  }
+  if (pending.length > 0) {
+    usageBatchWaiters.set(accountID, pending)
+  } else {
+    usageBatchWaiters.delete(accountID)
+  }
+}
 
 const buildDefaultTodayStats = (): WindowStats => ({
   requests: 0,
@@ -845,6 +872,10 @@ const flushQueuedUsageBatch = async () => {
       } else {
         usageBatchCache.delete(accountID)
       }
+      settleUsageBatchWaiters(accountID, requestTokensByAccount[key], {
+        usage,
+        error: nextErrors[key]
+      })
     }
 
     usageBatchByAccountId.value = nextUsage
@@ -860,6 +891,10 @@ const flushQueuedUsageBatch = async () => {
       }
       nextErrors[key] = 'Failed'
       nextLoading[key] = false
+      settleUsageBatchWaiters(accountID, requestTokensByAccount[key], {
+        usage: null,
+        error: 'Failed'
+      })
     }
     usageBatchErrorByAccountId.value = nextErrors
     usageBatchLoadingByAccountId.value = nextLoading
@@ -867,9 +902,13 @@ const flushQueuedUsageBatch = async () => {
   }
 }
 
-const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
-  if (!isDesktopViewport.value) return
-  if (!accountSupportsBatchUsage(account)) return
+const queueBatchedUsage = (
+  account: Account,
+  options?: { force?: boolean }
+): Promise<AccountUsageRequestResult> => {
+  if (!isDesktopViewport.value || !accountSupportsBatchUsage(account)) {
+    return Promise.resolve({ usage: null, error: null })
+  }
 
   const force = options?.force === true
   const cacheKey = account.id
@@ -882,7 +921,7 @@ const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
     if (cached && Date.now() - cached.ts < USAGE_BATCH_CACHE_TTL) {
       setUsageBatchState(cacheKey, cached.data, null)
       setUsageBatchLoading(cacheKey, false)
-      return
+      return Promise.resolve({ usage: cached.data, error: null })
     }
   }
 
@@ -890,18 +929,27 @@ const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
     ...usageBatchErrorByAccountId.value,
     [key]: null
   }
+  const requestToken = ++usageBatchRequestToken
   usageBatchRequestTokenByAccountId.value = {
     ...usageBatchRequestTokenByAccountId.value,
-    [key]: ++usageBatchRequestToken
+    [key]: requestToken
   }
   setUsageBatchLoading(cacheKey, true)
   pendingUsageBatchIds.add(cacheKey)
   queuedUsageBatchForce = queuedUsageBatchForce || force
 
-  if (usageBatchFlushTimer !== null) return
-  usageBatchFlushTimer = setTimeout(() => {
-    void flushQueuedUsageBatch()
-  }, 0)
+  const completion = new Promise<AccountUsageRequestResult>((resolve) => {
+    const waiters = usageBatchWaiters.get(cacheKey) ?? []
+    waiters.push({ token: requestToken, resolve })
+    usageBatchWaiters.set(cacheKey, waiters)
+  })
+
+  if (usageBatchFlushTimer === null) {
+    usageBatchFlushTimer = setTimeout(() => {
+      void flushQueuedUsageBatch()
+    }, 0)
+  }
+  return completion
 }
 
 const refreshTodayStatsBatch = async () => {

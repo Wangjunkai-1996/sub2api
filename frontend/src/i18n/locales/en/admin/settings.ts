@@ -459,7 +459,7 @@ export default {
         policyOff: 'Off',
         policyOnce: 'Once',
         policyContinuous: 'Continuous',
-        allowlist: 'Account allowlist',
+        allowlist: 'Account scope (empty = all eligible)',
         allowlistPlaceholder: 'e.g. 101, 205, 309',
         allowlistInvalid: 'The account allowlist must contain positive integer IDs separated by commas or spaces.',
         probeModel: 'Probe model',

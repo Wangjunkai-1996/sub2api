@@ -207,13 +207,24 @@ func ProvideOpenAIWindowWarmupOptions(settingService *SettingService) OpenAIWind
 			return current.OpenAIWindowWarmupEnabled, nil
 		}),
 		Allowlist: OpenAIWindowWarmupAllowlistFunc(func(ctx context.Context) ([]int64, error) {
-			current, settingsErr := loadOpenAIWindowWarmupSettings(ctx, settingService)
-			if settingsErr != nil {
-				return nil, settingsErr
-			}
-			return append([]int64(nil), current.OpenAIWindowWarmupAllowlist...), nil
+			return loadOpenAIWindowWarmupAllowlist(ctx, settingService)
 		}),
 	}
+}
+
+func loadOpenAIWindowWarmupAllowlist(ctx context.Context, settingService *SettingService) ([]int64, error) {
+	if settingService == nil || settingService.settingRepo == nil {
+		return nil, fmt.Errorf("openai window warmup setting service is not configured")
+	}
+	raw, err := settingService.settingRepo.GetValue(ctx, SettingKeyOpenAIWindowWarmupAllowlist)
+	if err != nil {
+		return nil, fmt.Errorf("read OpenAI window warmup allowlist: %w", err)
+	}
+	accountIDs, err := parseOpenAIWindowWarmupAllowlistStrict(raw)
+	if err != nil {
+		return nil, err
+	}
+	return append([]int64(nil), accountIDs...), nil
 }
 
 func loadOpenAIWindowWarmupSettings(ctx context.Context, settingService *SettingService) (*SystemSettings, error) {

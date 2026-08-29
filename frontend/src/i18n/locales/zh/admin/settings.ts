@@ -452,7 +452,7 @@ export default {
         policyOff: '关闭',
         policyOnce: '仅首次',
         policyContinuous: '持续',
-        allowlist: '账号 Allowlist',
+        allowlist: '账号范围（留空 = 全部符合资格）',
         allowlistPlaceholder: '例如 101, 205, 309',
         allowlistInvalid: '账号 Allowlist 只能包含逗号或空格分隔的正整数 ID。',
         probeModel: '探针模型',

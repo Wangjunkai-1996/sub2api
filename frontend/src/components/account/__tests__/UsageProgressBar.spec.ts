@@ -65,6 +65,22 @@ describe('UsageProgressBar', () => {
 		expect(wrapper.text()).toContain('usage.resetNow')
 	})
 
+  it('未知 reset 可显示调用方提供的待处理状态，不误报“现在”', () => {
+    const wrapper = mount(UsageProgressBar, {
+      props: {
+        label: '5h',
+        utilization: 0,
+        resetsAt: null,
+        showNowWhenIdle: true,
+        unknownResetLabel: '待暖机',
+        color: 'indigo'
+      }
+    })
+
+    expect(wrapper.text()).toContain('待暖机')
+    expect(wrapper.text()).not.toContain('usage.resetNow')
+  })
+
   it('showNowWhenIdle=true 但利用率大于 0 时显示倒计时', () => {
     const wrapper = mount(UsageProgressBar, {
       props: {

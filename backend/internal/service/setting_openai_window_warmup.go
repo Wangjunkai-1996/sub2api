@@ -82,11 +82,27 @@ func applyOpenAIWindowWarmupSettings(result *SystemSettings, values map[string]s
 }
 
 func parseOpenAIWindowWarmupAllowlist(raw string) []int64 {
-	var ids []int64
-	if json.Unmarshal([]byte(raw), &ids) != nil {
+	ids, err := parseOpenAIWindowWarmupAllowlistStrict(raw)
+	if err != nil {
 		return []int64{}
 	}
-	return normalizeWarmupAccountIDs(ids)
+	return ids
+}
+
+func parseOpenAIWindowWarmupAllowlistStrict(raw string) ([]int64, error) {
+	var ids []int64
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, fmt.Errorf("decode OpenAI window warmup allowlist: %w", err)
+	}
+	if ids == nil {
+		return nil, fmt.Errorf("OpenAI window warmup allowlist must be a JSON array")
+	}
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("OpenAI window warmup allowlist IDs must be positive")
+		}
+	}
+	return normalizeWarmupAccountIDs(ids), nil
 }
 
 func parseWarmupInt(raw string, fallback int) int {
@@ -137,6 +153,11 @@ func validateOpenAIWindowWarmupSettings(settings *SystemSettings) error {
 		return infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_POLICY_INVALID", "OpenAI window warmup default policy is invalid")
 	}
 	settings.OpenAIWindowWarmupDefaultPolicy = string(policy)
+	for _, accountID := range settings.OpenAIWindowWarmupAllowlist {
+		if accountID <= 0 {
+			return infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ALLOWLIST_INVALID", "OpenAI window warmup allowlist IDs must be positive")
+		}
+	}
 	settings.OpenAIWindowWarmupAllowlist = normalizeWarmupAccountIDs(settings.OpenAIWindowWarmupAllowlist)
 	model, err := NormalizeOpenAIWindowWarmupProbeModel(settings.OpenAIWindowWarmupProbeModel)
 	if err != nil {

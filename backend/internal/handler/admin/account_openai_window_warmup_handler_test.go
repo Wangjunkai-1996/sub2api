@@ -120,7 +120,11 @@ func setupWarmupHandlerRouter(t *testing.T, repo *warmupHandlerRepository) (*gin
 	account := warmupHandlerTestAccount()
 	adminService := &warmupHandlerAdminService{account: account}
 	accountRepo := &warmupHandlerAccountRepository{account: account}
-	warmup := service.NewOpenAIWindowWarmupService(repo, accountRepo, nil, nil, nil, service.OpenAIWindowWarmupOptions{})
+	warmup := service.NewOpenAIWindowWarmupService(repo, accountRepo, nil, nil, nil, service.OpenAIWindowWarmupOptions{
+		Allowlist: service.OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) {
+			return nil, nil
+		}),
+	})
 	handler := NewAccountHandler(adminService, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	handler.SetOpenAIWindowWarmupService(warmup, nil)
 

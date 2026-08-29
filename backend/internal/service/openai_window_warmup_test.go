@@ -21,8 +21,10 @@ type warmupRepositorySpy struct {
 
 	claims            []OpenAIWindowWarmupClaim
 	claimCalls        int
+	claimAccountIDs   []int64
 	enqueues          []OpenAIWindowWarmupEnqueue
 	cycles            map[string]*OpenAIWindowWarmupJob
+	currentBatchCalls int
 	action            string
 	state             string
 	code              string
@@ -68,10 +70,11 @@ func (r *warmupRepositorySpy) Enqueue(_ context.Context, in OpenAIWindowWarmupEn
 	return job, true, nil
 }
 
-func (r *warmupRepositorySpy) ClaimDue(_ context.Context, _ string, _ time.Duration, limit int, _ []int64) ([]OpenAIWindowWarmupClaim, error) {
+func (r *warmupRepositorySpy) ClaimDue(_ context.Context, _ string, _ time.Duration, limit int, accountIDs []int64) ([]OpenAIWindowWarmupClaim, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.claimCalls++
+	r.claimAccountIDs = append([]int64(nil), accountIDs...)
 	count := len(r.claims)
 	if limit < count {
 		count = limit
@@ -251,6 +254,30 @@ func (r *warmupRepositorySpy) GetCurrent(_ context.Context, accountID int64, _ s
 	return current, nil
 }
 
+func (r *warmupRepositorySpy) GetCurrentForAccounts(_ context.Context, accountIDs []int64, _ string) (map[int64]*OpenAIWindowWarmupJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.currentBatchCalls++
+	requested := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		requested[accountID] = struct{}{}
+	}
+	currentByAccount := make(map[int64]*OpenAIWindowWarmupJob, len(accountIDs))
+	for _, job := range r.cycles {
+		if job == nil {
+			continue
+		}
+		if _, ok := requested[job.AccountID]; !ok {
+			continue
+		}
+		current := currentByAccount[job.AccountID]
+		if current == nil || job.ID > current.ID {
+			currentByAccount[job.AccountID] = job
+		}
+	}
+	return currentByAccount, nil
+}
+
 func (r *warmupRepositorySpy) capture(action, state string, status int, code string, next time.Time, reset *time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -264,12 +291,13 @@ func (r *warmupRepositorySpy) capture(action, state string, status int, code str
 
 type warmupAccountRepositoryStub struct {
 	AccountRepository
-	mu       sync.Mutex
-	account  *Account
-	accounts map[int64]*Account
-	getCalls int
-	err      error
-	updates  []map[string]any
+	mu        sync.Mutex
+	account   *Account
+	accounts  map[int64]*Account
+	getCalls  int
+	listCalls int
+	err       error
+	updates   []map[string]any
 }
 
 func (r *warmupAccountRepositoryStub) GetByID(_ context.Context, id int64) (*Account, error) {
@@ -291,6 +319,7 @@ func (r *warmupAccountRepositoryStub) GetByID(_ context.Context, id int64) (*Acc
 func (r *warmupAccountRepositoryStub) ListSchedulableByPlatform(context.Context, string) ([]Account, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.listCalls++
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -573,15 +602,98 @@ func TestOpenAIWindowWarmupScanReportsDatabaseQueueStatsWhileDisabled(t *testing
 	require.Zero(t, repo.claimCalls)
 }
 
-func TestOpenAIWindowWarmupScanFailsClosedWithEmptyAllowlist(t *testing.T) {
+func TestOpenAIWindowWarmupScanEmptyAllowlistSelectsAllEligibleAccounts(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	repo := &warmupRepositorySpy{}
-	service := newWarmupTestService(repo, warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous), &warmupProbeStub{}, nil, now, true)
+	first := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	second := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyInitialOnce)
+	second.ID++
+	off := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyOff)
+	off.ID += 2
+	unschedulable := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	unschedulable.ID += 3
+	unschedulable.Schedulable = false
+	inactive := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	inactive.ID += 4
+	inactive.Status = StatusDisabled
+	shadow := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	shadow.ID += 5
+	shadow.ParentAccountID = &first.ID
+	apiKey := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	apiKey.ID += 6
+	apiKey.Type = AccountTypeAPIKey
+	spark := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	spark.ID += 7
+	spark.QuotaDimension = QuotaDimensionSpark
+	service := newWarmupTestService(repo, first, &warmupProbeStub{}, nil, now, true)
+	service.accounts = &warmupAccountRepositoryStub{accounts: map[int64]*Account{
+		first.ID: first, second.ID: second, off.ID: off, unschedulable.ID: unschedulable,
+		inactive.ID: inactive, shadow.ID: shadow, apiKey.ID: apiKey, spark.ID: spark,
+	}}
 	service.options.Allowlist = OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) { return nil, nil })
 
 	service.scanOnce(context.Background())
 
+	require.Equal(t, 1, repo.claimCalls)
+	require.ElementsMatch(t, []int64{first.ID, second.ID}, repo.claimAccountIDs)
+}
+
+func TestOpenAIWindowWarmupReconcileAndScanShareExplicitCohort(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	first := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	second := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	second.ID++
+	repo := &warmupRepositorySpy{}
+	service := newWarmupTestService(repo, first, &warmupProbeStub{}, nil, now, true)
+	service.accounts = &warmupAccountRepositoryStub{accounts: map[int64]*Account{first.ID: first, second.ID: second}}
+	service.options.Allowlist = OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) {
+		return []int64{second.ID}, nil
+	})
+
+	service.reconcileAccounts(context.Background())
+	service.scanOnce(context.Background())
+
+	require.Equal(t, 1, repo.currentBatchCalls)
+	require.Len(t, repo.enqueues, 1)
+	require.Equal(t, second.ID, repo.enqueues[0].AccountID)
+	require.Equal(t, []int64{second.ID}, repo.claimAccountIDs)
+}
+
+func TestOpenAIWindowWarmupScheduleSkipsAccountOutsideExplicitCohort(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.options.Allowlist = OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) {
+		return []int64{account.ID + 1}, nil
+	})
+
+	job, inserted, err := service.ScheduleAccountWarmup(context.Background(), account, OpenAIWindowWarmupTriggerImport)
+
+	require.NoError(t, err)
+	require.Nil(t, job)
+	require.False(t, inserted)
+	require.Empty(t, repo.enqueues)
+}
+
+func TestOpenAIWindowWarmupCohortReadErrorFailsClosed(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	accounts := &warmupAccountRepositoryStub{account: account}
+	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+	service.accounts = accounts
+	service.options.Allowlist = OpenAIWindowWarmupAllowlistFunc(func(context.Context) ([]int64, error) {
+		return nil, errors.New("settings unavailable")
+	})
+
+	service.reconcileAccounts(context.Background())
+	service.scanOnce(context.Background())
+
+	require.Zero(t, accounts.listCalls)
+	require.Zero(t, repo.currentBatchCalls)
 	require.Zero(t, repo.claimCalls)
+	require.Empty(t, repo.enqueues)
 }
 
 func TestOpenAIWindowWarmupSuppressesProbeWhenBusinessAdvancedReset(t *testing.T) {

@@ -271,8 +271,9 @@ func (f OpenAIWindowWarmupKillSwitchFunc) Enabled(ctx context.Context) (bool, er
 	return f(ctx)
 }
 
-// OpenAIWindowWarmupAllowlist is read on every scan. Returning an empty list
-// disables all accounts, and any read error fails closed.
+// OpenAIWindowWarmupAllowlist is read on every scan. An empty list selects all
+// otherwise eligible accounts; a non-empty list narrows that set. Read errors
+// still fail closed.
 type OpenAIWindowWarmupAllowlist interface {
 	AccountIDs(context.Context) ([]int64, error)
 }
@@ -615,26 +616,24 @@ func (s *OpenAIWindowWarmupService) reconcileAccounts(ctx context.Context) {
 		return
 	}
 	_, _ = s.repo.CleanupExpiredAttempts(ctx, 500)
-	accounts, err := s.accounts.ListSchedulableByPlatform(ctx, PlatformOpenAI)
+	accounts, accountIDs, ok := s.warmupCohort(ctx)
+	if !ok || len(accountIDs) == 0 {
+		return
+	}
+	currentByAccount, err := s.repo.GetCurrentForAccounts(ctx, accountIDs, OpenAIWindowWarmupQuotaScopeGlobal)
 	if err != nil {
 		return
 	}
 	for index := range accounts {
 		account := &accounts[index]
-		if !warmupAccountEligibleAt(account, s.now()) || !OpenAIWindowWarmupPolicyForAccount(account).Enabled() {
-			continue
-		}
-		current, currentErr := s.repo.GetCurrent(ctx, account.ID, OpenAIWindowWarmupQuotaScopeGlobal)
-		if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
-			continue
-		}
+		current := currentByAccount[account.ID]
 		if current == nil {
-			_, _, _ = s.ScheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerReconcile)
+			_, _, _ = s.scheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerReconcile, false)
 			continue
 		}
 		if current.State == OpenAIWindowWarmupStatePaused &&
 			(OpenAIWindowWarmupPolicyForAccount(account) == OpenAIWindowWarmupPolicyContinuous || strings.HasPrefix(current.CycleKey, "initial:")) {
-			_, _, _ = s.ScheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerReconcile)
+			_, _, _ = s.scheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerReconcile, false)
 			continue
 		}
 		if current.State == OpenAIWindowWarmupStateCompleted &&
@@ -646,30 +645,30 @@ func (s *OpenAIWindowWarmupService) reconcileAccounts(ctx context.Context) {
 }
 
 func (s *OpenAIWindowWarmupService) scanOnce(ctx context.Context) {
-	allowedAccountIDs, ok := s.allowedAccountIDs(ctx)
-	if !ok {
+	_, cohortAccountIDs, ok := s.warmupCohort(ctx)
+	if !ok || len(cohortAccountIDs) == 0 {
 		s.applyQueueStats(OpenAIWindowWarmupQueueStats{})
 		return
 	}
 	// A disabled worker may still report backlog, but must never claim a lease.
 	if !s.killSwitchEnabled(ctx) {
-		s.refreshQueueStats(ctx, allowedAccountIDs)
+		s.refreshQueueStats(ctx, cohortAccountIDs)
 		return
 	}
 	available := s.options.WorkerConcurrency - int(s.workerInflight.Load())
 	if available <= 0 {
-		s.refreshQueueStats(ctx, allowedAccountIDs)
+		s.refreshQueueStats(ctx, cohortAccountIDs)
 		return
 	}
 	limit := s.options.BatchSize
 	if available < limit {
 		limit = available
 	}
-	claims, err := s.repo.ClaimDue(ctx, s.owner, s.options.LeaseDuration, limit, allowedAccountIDs)
+	claims, err := s.repo.ClaimDue(ctx, s.owner, s.options.LeaseDuration, limit, cohortAccountIDs)
 	if err != nil {
 		return
 	}
-	s.refreshQueueStats(ctx, allowedAccountIDs)
+	s.refreshQueueStats(ctx, cohortAccountIDs)
 	for _, claim := range claims {
 		if claim.Job == nil {
 			continue
@@ -688,6 +687,10 @@ func (s *OpenAIWindowWarmupService) scanOnce(ctx context.Context) {
 // cycle. It is safe to call after every import/update; the unique cycle key
 // suppresses duplicate jobs.
 func (s *OpenAIWindowWarmupService) ScheduleAccountWarmup(ctx context.Context, account *Account, trigger string) (*OpenAIWindowWarmupJob, bool, error) {
+	return s.scheduleAccountWarmup(ctx, account, trigger, true)
+}
+
+func (s *OpenAIWindowWarmupService) scheduleAccountWarmup(ctx context.Context, account *Account, trigger string, enforceCohort bool) (*OpenAIWindowWarmupJob, bool, error) {
 	if s == nil || s.repo == nil || account == nil {
 		return nil, false, errors.New("warmup service is not configured")
 	}
@@ -696,6 +699,9 @@ func (s *OpenAIWindowWarmupService) ScheduleAccountWarmup(ctx context.Context, a
 	}
 	policy := OpenAIWindowWarmupPolicyForAccount(account)
 	if !policy.Enabled() {
+		return nil, false, nil
+	}
+	if enforceCohort && !s.accountAllowed(ctx, account.ID) {
 		return nil, false, nil
 	}
 	if trigger == "" {
@@ -808,6 +814,9 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 	if !warmupAccountEligibleAt(account, s.now()) {
 		return nil, false, errors.New("account is not eligible for OpenAI window warmup")
 	}
+	if !s.accountAllowed(ctx, accountID) {
+		return nil, false, errors.New("account is outside the configured OpenAI window warmup cohort")
+	}
 	current, currentErr := s.repo.GetCurrent(ctx, accountID, OpenAIWindowWarmupQuotaScopeGlobal)
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
 		return nil, false, currentErr
@@ -864,6 +873,9 @@ func (s *OpenAIWindowWarmupService) UnblockAccount(ctx context.Context, accountI
 	account, err := s.accounts.GetByID(ctx, accountID)
 	if err != nil || account == nil {
 		return nil, false, err
+	}
+	if !s.accountAllowed(ctx, accountID) {
+		return nil, false, errors.New("account is outside the configured OpenAI window warmup cohort")
 	}
 	resetAt := accountCodexGlobalResetAt(account)
 	next := s.now()
@@ -1656,6 +1668,9 @@ func (s *OpenAIWindowWarmupService) enqueueNextContinuousCycle(ctx context.Conte
 	if !warmupAccountEligibleAt(account, s.now()) || OpenAIWindowWarmupPolicyForAccount(account) != OpenAIWindowWarmupPolicyContinuous {
 		return
 	}
+	if !s.accountAllowed(ctx, account.ID) {
+		return
+	}
 	cycleKey := warmupResetCycleKey(*reset)
 	job, inserted, err := s.repo.Enqueue(ctx, OpenAIWindowWarmupEnqueue{
 		AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
@@ -1873,40 +1888,66 @@ func (s *OpenAIWindowWarmupService) applyQueueStats(stats OpenAIWindowWarmupQueu
 	s.metrics.inflight.Store(stats.Inflight)
 }
 
-func (s *OpenAIWindowWarmupService) allowedAccountIDs(ctx context.Context) ([]int64, bool) {
+func (s *OpenAIWindowWarmupService) configuredWarmupAllowlist(ctx context.Context) (map[int64]struct{}, bool, bool) {
 	if s == nil || s.options.Allowlist == nil {
-		return nil, false
+		return nil, false, false
 	}
 	accountIDs, err := s.options.Allowlist.AccountIDs(ctx)
-	if err != nil || len(accountIDs) == 0 {
-		return nil, false
+	if err != nil {
+		return nil, false, false
 	}
-	unique := make(map[int64]struct{}, len(accountIDs))
-	result := make([]int64, 0, len(accountIDs))
+	allowAll := len(accountIDs) == 0
+	configured := make(map[int64]struct{}, len(accountIDs))
 	for _, accountID := range accountIDs {
 		if accountID <= 0 {
 			continue
 		}
-		if _, exists := unique[accountID]; exists {
+		configured[accountID] = struct{}{}
+	}
+	return configured, allowAll, true
+}
+
+// warmupCohort is the single account-selection path used by reconciliation,
+// queue metrics, and claiming. This prevents reconciliation from creating jobs
+// that the scanner can never lease.
+func (s *OpenAIWindowWarmupService) warmupCohort(ctx context.Context) ([]Account, []int64, bool) {
+	configured, allowAll, ok := s.configuredWarmupAllowlist(ctx)
+	if !ok || s.accounts == nil {
+		return nil, nil, false
+	}
+	accounts, err := s.accounts.ListSchedulableByPlatform(ctx, PlatformOpenAI)
+	if err != nil {
+		return nil, nil, false
+	}
+	now := s.now()
+	cohort := make([]Account, 0, len(accounts))
+	accountIDs := make([]int64, 0, len(accounts))
+	for index := range accounts {
+		account := &accounts[index]
+		if !warmupAccountEligibleAt(account, now) || !OpenAIWindowWarmupPolicyForAccount(account).Enabled() {
 			continue
 		}
-		unique[accountID] = struct{}{}
-		result = append(result, accountID)
+		if !allowAll {
+			if _, allowed := configured[account.ID]; !allowed {
+				continue
+			}
+		}
+		cohort = append(cohort, *account)
+		accountIDs = append(accountIDs, account.ID)
 	}
-	return result, len(result) > 0
+	return cohort, accountIDs, true
 }
 
 func (s *OpenAIWindowWarmupService) accountAllowed(ctx context.Context, accountID int64) bool {
-	accountIDs, ok := s.allowedAccountIDs(ctx)
+	configured, allowAll, ok := s.configuredWarmupAllowlist(ctx)
 	if !ok {
 		return false
 	}
-	for _, allowedID := range accountIDs {
-		if allowedID == accountID {
-			return true
-		}
+	if allowAll {
+		return true
 	}
-	return false
+	_, allowed := configured[accountID]
+	return allowed
 }
 
 func (s *OpenAIWindowWarmupService) releaseGlobalSend(permitToken string) {

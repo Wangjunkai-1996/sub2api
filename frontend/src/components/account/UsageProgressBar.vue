@@ -69,6 +69,7 @@ const props = defineProps<{
   color: 'indigo' | 'emerald' | 'purple' | 'amber'
   windowStats?: WindowStats | null
   showNowWhenIdle?: boolean
+  unknownResetLabel?: string
   remainingCapacity?: boolean
 }>()
 
@@ -163,6 +164,7 @@ const displayPercent = computed(() => {
 
 const shouldShowResetTime = computed(() => {
   if (props.resetsAt) return true
+  if (props.unknownResetLabel) return true
   return Boolean(props.showNowWhenIdle && props.utilization <= 0)
 })
 
@@ -172,6 +174,7 @@ const formatResetTime = computed(() => {
   // future authoritative reset still represents an armed/active window even
   // when upstream rounds its tiny utilization to 0%, so show its countdown.
   if (!props.resetsAt) {
+    if (props.unknownResetLabel) return props.unknownResetLabel
     return props.showNowWhenIdle && props.utilization <= 0 ? t('usage.resetNow') : '-'
   }
 
@@ -181,6 +184,7 @@ const formatResetTime = computed(() => {
   // resetsAt 已过期：utilization>0 说明后端窗口数据还没刷新（active poll 没回写），
   // 显示「待刷新」以区别于真正可用的「现在」。
   if (diffMs <= 0) {
+    if (props.utilization <= 0 && props.unknownResetLabel) return props.unknownResetLabel
     return props.utilization > 0 ? t('usage.resetPending') : t('usage.resetNow')
   }
 
