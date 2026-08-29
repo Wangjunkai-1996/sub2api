@@ -1043,6 +1043,42 @@ func TestOpenAIWindowWarmupIdleRelativeResetRequiresPassiveConfirmation(t *testi
 	require.Empty(t, repo.enqueues)
 }
 
+func TestOpenAIWindowWarmupPositiveUsageConfirmsIdleRelativeReset(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	oldReset := now.Add(-time.Minute)
+	rollingReset := now.Add(5 * time.Hour)
+	parsedLater := rollingReset.Add(time.Second)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	account.Extra["codex_5h_used_percent"] = float64(0)
+	account.Extra["codex_5h_reset_at"] = rollingReset.Format(time.RFC3339)
+	parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+		StatusCode: http.StatusOK,
+		Body:       []byte(`data: {"type":"response.completed","response":{"id":"resp_usage","status":"completed","usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}}` + "\n\n"),
+		ResetAt:    &parsedLater,
+		RequestID:  "req_usage",
+		Headers: http.Header{
+			"X-Codex-Secondary-Window-Minutes":      {"300"},
+			"X-Codex-Secondary-Reset-After-Seconds": {"18000"},
+		},
+	}, &rollingReset)
+	require.True(t, parsed.resetFromRelativeHeader)
+	require.True(t, parsed.Usage.Positive())
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{result: parsed}
+	usage := &warmupUsageStub{usage: warmupUsage(rollingReset, 0, now.Add(24*time.Hour), 1)}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+
+	service.processClaim(context.Background(), warmupTestClaim(account.ID, oldReset))
+
+	require.Equal(t, 1, usage.calls, "positive terminal usage avoids a second passive observation")
+	require.Equal(t, 1, probe.calls)
+	require.Equal(t, 1, repo.started)
+	require.Equal(t, 1, repo.successCalls)
+	require.Equal(t, "completed", repo.code)
+	require.Len(t, repo.enqueues, 1)
+	require.Equal(t, warmupResetCycleKey(parsedLater, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
+}
+
 func TestOpenAIWindowWarmupInitialNilCycleBaselineRequiresPreflightAdvance(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	rollingReset := now.Add(5 * time.Hour)

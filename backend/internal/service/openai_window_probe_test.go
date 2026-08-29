@@ -176,6 +176,104 @@ func TestParseOpenAIWindowWarmupResultRequiresCompletedTerminalAndAdvancedReset(
 	require.ErrorContains(t, validateOpenAIWindowWarmupOutcome(&missingTerminal, &observed), "possibly_sent")
 }
 
+func TestParseOpenAIWindowWarmupResultAcceptsPositiveTerminalUsageWithFutureReset(t *testing.T) {
+	reset := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	expectedReset := reset.Add(time.Hour)
+	body := []byte("event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_warmup","status":"completed","usage":{"input_tokens":11,"output_tokens":2,"total_tokens":13}}}` + "\n\n")
+	parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		ResetAt:    &reset,
+		RequestID:  "req_warmup",
+	}, &expectedReset)
+
+	require.True(t, parsed.Terminal)
+	require.Equal(t, "response.completed", parsed.TerminalType)
+	require.Equal(t, &OpenAIWindowWarmupTokenUsage{InputTokens: 11, OutputTokens: 2, TotalTokens: 13}, parsed.Usage)
+	require.Equal(t, "resp_warmup", parsed.ResponseID)
+	require.Equal(t, "req_warmup", parsed.RequestID)
+	require.NoError(t, validateOpenAIWindowWarmupOutcome(parsed, &expectedReset),
+		"positive terminal usage may replace strict reset advancement, but not the future-reset requirement")
+}
+
+func TestParseOpenAIWindowWarmupResultSupportsTopLevelNonStreamUsage(t *testing.T) {
+	reset := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	body := []byte(`{"type":"response","id":"resp_json","status":"completed","usage":{"input_tokens":7,"output_tokens":0,"total_tokens":7},"codex_5h_reset_at":"` + reset.Format(time.RFC3339) + `"}`)
+	parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Headers:    http.Header{"X-Request-Id": {"req_json"}},
+	}, nil)
+
+	require.Equal(t, openAIWindowWarmupOutcomeCompleted, parsed.Outcome)
+	require.Equal(t, &OpenAIWindowWarmupTokenUsage{InputTokens: 7, OutputTokens: 0, TotalTokens: 7}, parsed.Usage)
+	require.Equal(t, "resp_json", parsed.ResponseID)
+	require.Equal(t, "req_json", parsed.RequestID)
+	require.Equal(t, reset.Unix(), parsed.ResetAt.Unix())
+}
+
+func TestParseOpenAIWindowWarmupResultRejectsInvalidTerminalUsage(t *testing.T) {
+	reset := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	expectedReset := reset.Add(time.Hour)
+	for _, test := range []struct {
+		name  string
+		usage string
+	}{
+		{name: "missing total", usage: `"input_tokens":7,"output_tokens":1`},
+		{name: "zero input", usage: `"input_tokens":0,"output_tokens":1,"total_tokens":1`},
+		{name: "zero total", usage: `"input_tokens":0,"output_tokens":0,"total_tokens":0`},
+		{name: "fractional", usage: `"input_tokens":7.5,"output_tokens":1,"total_tokens":8.5`},
+		{name: "inconsistent", usage: `"input_tokens":7,"output_tokens":1,"total_tokens":9`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`data: {"type":"response.completed","response":{"status":"completed","usage":{` + test.usage + `}}}` + "\n\n")
+			parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				ResetAt:    &reset,
+			}, &expectedReset)
+			require.Nil(t, parsed.Usage)
+			require.ErrorContains(t, validateOpenAIWindowWarmupOutcome(parsed, &expectedReset), "did not advance")
+		})
+	}
+}
+
+func TestParseOpenAIWindowWarmupResultUsesOnlyFinalTerminalUsage(t *testing.T) {
+	reset := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	body := []byte("data: " +
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}` +
+		"\n\ndata: " +
+		`{"type":"response.failed","response":{"status":"failed"}}` + "\n\n")
+	parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		ResetAt:    &reset,
+	}, nil)
+
+	require.Equal(t, "response.failed", parsed.TerminalType)
+	require.Nil(t, parsed.Usage)
+	require.Error(t, validateOpenAIWindowWarmupOutcome(parsed, nil))
+}
+
+func TestParseOpenAIWindowWarmupResultIgnoresNonTerminalUsage(t *testing.T) {
+	reset := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	expectedReset := reset.Add(time.Hour)
+	body := []byte("data: " +
+		`{"type":"response.in_progress","response":{"usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}` +
+		"\n\ndata: " +
+		`{"type":"response.completed","response":{"status":"completed"}}` + "\n\n")
+	parsed := ParseOpenAIWindowWarmupResult(&OpenAIOutboundResult{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		ResetAt:    &reset,
+	}, &expectedReset)
+
+	require.Equal(t, "response.completed", parsed.TerminalType)
+	require.Nil(t, parsed.Usage)
+	require.ErrorContains(t, validateOpenAIWindowWarmupOutcome(parsed, &expectedReset), "did not advance")
+}
+
 func TestParseOpenAIWindowWarmupResultRecognizesDoneAliasAndExplicitResetJSON(t *testing.T) {
 	reset := time.Now().UTC().Add(3 * time.Hour).Truncate(time.Second)
 	body := []byte(`data: {"type":"response.done","metadata":{"codex_5h_reset_at":"` + reset.Format(time.RFC3339) + `"}}` + "\n\n")

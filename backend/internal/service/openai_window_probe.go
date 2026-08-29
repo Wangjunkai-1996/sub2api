@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,14 +25,15 @@ const (
 	// Keep enough of an SSE response to identify terminal/reset evidence while
 	// making accidental retention of generated text unlikely.  The executor is
 	// expected to enforce the same bound before returning a result.
-	openAIWindowWarmupMaxBodyBytes      = 128 << 10
-	openAIWindowWarmupOutcomeCompleted  = "completed"
-	openAIWindowWarmupOutcomeIncomplete = "incomplete"
-	openAIWindowWarmupOutcomeFailed     = "failed"
-	openAIWindowWarmupOutcomeUncertain  = "uncertain"
-	openAIWindowWarmupOutcomeBlocked    = "blocked"
-	openAIWindowWarmupMaxModelBytes     = 128
-	openAIWindowWarmupInstructions      = "Reply with OK."
+	openAIWindowWarmupMaxBodyBytes       = 128 << 10
+	openAIWindowWarmupOutcomeCompleted   = "completed"
+	openAIWindowWarmupOutcomeIncomplete  = "incomplete"
+	openAIWindowWarmupOutcomeFailed      = "failed"
+	openAIWindowWarmupOutcomeUncertain   = "uncertain"
+	openAIWindowWarmupOutcomeBlocked     = "blocked"
+	openAIWindowWarmupMaxModelBytes      = 128
+	openAIWindowWarmupInstructions       = "Reply with OK."
+	openAIWindowWarmupMaxEvidenceIDBytes = 255
 )
 
 var (
@@ -265,15 +267,16 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 	}
 	terminal := result.Terminal
 	terminalType := strings.TrimSpace(result.TerminalType)
-	if bodyTerminal, bodyType, bodyReset := parseWarmupSSEEvidence(body); bodyTerminal {
+	bodyEvidence := parseWarmupSSEEvidence(body)
+	if bodyEvidence.Terminal {
 		terminal = true
 		// The response body is the raw upstream evidence.  An executor may set
 		// TerminalType before returning it, but a stale/contradictory success
 		// value must never override a failed or incomplete body status (and an
 		// explicit executor failure must not be promoted by a successful body).
-		terminalType = mergeWarmupTerminalTypes(terminalType, bodyType)
+		terminalType = mergeWarmupTerminalTypes(terminalType, bodyEvidence.TerminalType)
 		if resetAt == nil {
-			resetAt = bodyReset
+			resetAt = bodyEvidence.ResetAt
 		}
 	}
 	if terminalType == "" {
@@ -290,6 +293,10 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 	case result.StatusCode == http.StatusForbidden || result.StatusCode == http.StatusBadRequest || result.StatusCode == http.StatusNotFound:
 		outcome = openAIWindowWarmupOutcomeBlocked
 	}
+	requestID := normalizeWarmupEvidenceID(result.RequestID)
+	if requestID == "" {
+		requestID = normalizeWarmupEvidenceID(headers.Get("x-request-id"))
+	}
 	return &OpenAIWindowProbeResult{
 		StatusCode:              result.StatusCode,
 		Headers:                 headers,
@@ -302,6 +309,9 @@ func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt
 		EOF:                     result.EOF,
 		Outcome:                 outcome,
 		AuthFailure:             cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure),
+		Usage:                   cloneOpenAIWindowWarmupTokenUsage(bodyEvidence.Usage),
+		ResponseID:              normalizeWarmupEvidenceID(bodyEvidence.ResponseID),
+		RequestID:               requestID,
 		resetFromRelativeHeader: resetFromRelativeHeader,
 	}
 }
@@ -331,6 +341,9 @@ func validateOpenAIWindowWarmupOutcome(result *OpenAIWindowProbeResult, expected
 	}
 	if result.ResetAt == nil || !result.ResetAt.After(time.Now()) {
 		return errors.New("possibly_sent: warmup response has no future reset evidence")
+	}
+	if result.Usage.Positive() {
+		return nil
 	}
 	if expectedResetAt != nil && !result.ResetAt.After(*expectedResetAt) {
 		return errors.New("possibly_sent: warmup did not advance the observed reset")
@@ -395,6 +408,14 @@ func cloneWarmupTime(value *time.Time) *time.Time {
 	return &copy
 }
 
+func cloneOpenAIWindowWarmupTokenUsage(value *OpenAIWindowWarmupTokenUsage) *OpenAIWindowWarmupTokenUsage {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 // warmupResetFromHeaders converts the authoritative reset-after signal into
 // an absolute timestamp at observation time.  It never assumes a five-hour
 // duration.  The 5h/7d mapping follows ParseCodexRateLimitHeaders.Normalize.
@@ -415,18 +436,29 @@ func warmupResetFromHeaders(headers http.Header) *time.Time {
 	return &reset
 }
 
+type openAIWindowWarmupSSEEvidence struct {
+	Terminal     bool
+	TerminalType string
+	ResetAt      *time.Time
+	Usage        *OpenAIWindowWarmupTokenUsage
+	ResponseID   string
+}
+
 // parseWarmupSSEEvidence accepts both standard `data:` SSE frames and a
-// non-stream JSON response returned by a compatible proxy.  It intentionally
-// extracts only event type/status/reset metadata; response text is not parsed
-// or logged.
-func parseWarmupSSEEvidence(body []byte) (bool, string, *time.Time) {
+// non-stream JSON response returned by a compatible proxy. It extracts only
+// terminal/reset/metering identifiers; response text is not retained.
+func parseWarmupSSEEvidence(body []byte) openAIWindowWarmupSSEEvidence {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
-		return false, "", nil
+		return openAIWindowWarmupSSEEvidence{}
 	}
-	var terminal bool
-	terminalType := ""
-	var resetAt *time.Time
+	evidence := openAIWindowWarmupSSEEvidence{}
+	recordTerminal := func(payload []byte, eventType string) {
+		evidence.Terminal = true
+		evidence.TerminalType = warmupTerminalTypeWithStatus(payload, eventType)
+		evidence.Usage = parseOpenAIWindowWarmupTokenUsage(payload)
+		evidence.ResponseID = responseIDFromWarmupTerminal(payload)
+	}
 	forEachOpenAISSEDataPayload(string(trimmed), func(payload []byte) {
 		typeName := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 		if typeName == "" {
@@ -434,16 +466,15 @@ func parseWarmupSSEEvidence(body []byte) (bool, string, *time.Time) {
 		}
 		switch typeName {
 		case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
-			terminal = true
-			terminalType = warmupTerminalTypeWithStatus(payload, typeName)
+			recordTerminal(payload, typeName)
 		}
 		if candidate := resetAtFromJSON(payload); candidate != nil {
-			if resetAt == nil || candidate.After(*resetAt) {
-				resetAt = candidate
+			if evidence.ResetAt == nil || candidate.After(*evidence.ResetAt) {
+				evidence.ResetAt = candidate
 			}
 		}
 	})
-	if !terminal && gjson.Valid(string(trimmed)) {
+	if !evidence.Terminal && gjson.Valid(string(trimmed)) {
 		typeName := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())
 		if typeName == "response" {
 			typeName = warmupTerminalTypeWithStatus(trimmed, "response."+strings.TrimSpace(gjson.GetBytes(trimmed, "status").String()))
@@ -456,13 +487,60 @@ func parseWarmupSSEEvidence(body []byte) (bool, string, *time.Time) {
 		if typeName == "response.completed" || typeName == "response.done" ||
 			typeName == "response.incomplete" || typeName == "response.failed" ||
 			typeName == "response.cancelled" || typeName == "response.canceled" {
-			terminal, terminalType = true, typeName
+			recordTerminal(trimmed, typeName)
 		}
 		if candidate := resetAtFromJSON(trimmed); candidate != nil {
-			resetAt = candidate
+			evidence.ResetAt = candidate
 		}
 	}
-	return terminal, terminalType, resetAt
+	return evidence
+}
+
+func parseOpenAIWindowWarmupTokenUsage(payload []byte) *OpenAIWindowWarmupTokenUsage {
+	usage := gjson.GetBytes(payload, "response.usage")
+	if !usage.IsObject() {
+		usage = gjson.GetBytes(payload, "usage")
+	}
+	if !usage.IsObject() {
+		return nil
+	}
+	input, inputOK := parseWarmupTokenCount(usage.Get("input_tokens"))
+	output, outputOK := parseWarmupTokenCount(usage.Get("output_tokens"))
+	total, totalOK := parseWarmupTokenCount(usage.Get("total_tokens"))
+	parsed := &OpenAIWindowWarmupTokenUsage{InputTokens: input, OutputTokens: output, TotalTokens: total}
+	if !inputOK || !outputOK || !totalOK || !parsed.Positive() {
+		return nil
+	}
+	return parsed
+}
+
+func parseWarmupTokenCount(value gjson.Result) (int64, bool) {
+	if !value.Exists() || value.Type != gjson.Number {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value.Raw, 10, 64)
+	return parsed, err == nil
+}
+
+func responseIDFromWarmupTerminal(payload []byte) string {
+	responseID := normalizeWarmupEvidenceID(gjson.GetBytes(payload, "response.id").String())
+	if responseID == "" {
+		responseID = normalizeWarmupEvidenceID(gjson.GetBytes(payload, "id").String())
+	}
+	return responseID
+}
+
+func normalizeWarmupEvidenceID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > openAIWindowWarmupMaxEvidenceIDBytes {
+		return ""
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return ""
+		}
+	}
+	return value
 }
 
 // warmupTerminalTypeWithStatus treats a terminal event's nested response.status
@@ -519,8 +597,7 @@ func mergeWarmupTerminalTypes(existing, observed string) string {
 }
 
 func responseTerminalType(body []byte) string {
-	_, typeName, _ := parseWarmupSSEEvidence(body)
-	return typeName
+	return parseWarmupSSEEvidence(body).TerminalType
 }
 
 func resetAtFromJSON(payload []byte) *time.Time {

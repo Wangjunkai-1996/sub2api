@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -201,6 +202,27 @@ type OpenAIOutboundResult struct {
 	AuthFailure  *OpenAIWindowWarmupAuthFailure
 }
 
+// OpenAIWindowWarmupTokenUsage is the bounded metering evidence emitted by a
+// completed Responses request. It intentionally excludes token details and
+// response content.
+type OpenAIWindowWarmupTokenUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+	TotalTokens  int64
+}
+
+// Positive reports whether the complete token triplet is internally
+// consistent and proves that upstream accounted for this request.
+func (u *OpenAIWindowWarmupTokenUsage) Positive() bool {
+	if u == nil || u.InputTokens <= 0 || u.OutputTokens < 0 || u.TotalTokens <= 0 {
+		return false
+	}
+	if u.InputTokens > math.MaxInt64-u.OutputTokens {
+		return false
+	}
+	return u.InputTokens+u.OutputTokens == u.TotalTokens
+}
+
 // OpenAIWindowWarmupAuthDisposition is bounded metadata describing how an
 // authentication failure behaved. It never contains credential or response
 // content and lets the account-state adapter reuse existing 401/403 policy
@@ -277,6 +299,9 @@ type OpenAIWindowProbeResult struct {
 	EOF             bool
 	Outcome         string
 	AuthFailure     *OpenAIWindowWarmupAuthFailure
+	Usage           *OpenAIWindowWarmupTokenUsage
+	ResponseID      string
+	RequestID       string
 	// resetFromRelativeHeader distinguishes x-codex reset-after evidence from an
 	// explicit absolute reset carried by a response event. An idle now+5h
 	// projection naturally moves forward while the request is in flight.
@@ -419,6 +444,15 @@ type OpenAIWindowWarmupUncertainEvidence struct {
 	Authoritative bool
 	ResetAt       *time.Time
 	Terminal      bool
+}
+
+// openAIWindowWarmupSuccessEvidence is the only response-derived metadata
+// emitted in the structured success log. It never contains body text, prompt
+// content, headers, or credentials.
+type openAIWindowWarmupSuccessEvidence struct {
+	Usage      *OpenAIWindowWarmupTokenUsage
+	ResponseID string
+	RequestID  string
 }
 
 // OpenAIWindowWarmupAuthStateRetry identifies one completed blocked transition
@@ -1075,7 +1109,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 		}
 		if authoritative && active && reset != nil && reset.After(now) {
 			if job.UncertainTerminalObserved && warmupAttemptResetAdvanced(reset, job, now) {
-				if s.markSuccess(ctx, claim, now, reset, warmupJobStatus(job), "completed_reconciled") {
+				if s.markSuccess(ctx, claim, now, reset, warmupJobStatus(job), "completed_reconciled", openAIWindowWarmupSuccessEvidence{}) {
 					s.enqueueNextContinuousCycle(ctx, account, reset)
 				}
 			} else {
@@ -1102,7 +1136,7 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 			return
 		case warmupUncertainFixedReset:
 			if job.UncertainTerminalObserved && warmupAttemptResetAdvanced(reset, job, now) {
-				if s.markSuccess(ctx, claim, now, reset, warmupJobStatus(job), "completed_reconciled") {
+				if s.markSuccess(ctx, claim, now, reset, warmupJobStatus(job), "completed_reconciled", openAIWindowWarmupSuccessEvidence{}) {
 					s.enqueueNextContinuousCycle(ctx, account, reset)
 				}
 			} else {
@@ -1358,6 +1392,12 @@ func (s *OpenAIWindowWarmupService) handleProbeResultWithPreflight(ctx context.C
 		}
 		return
 	}
+	if reset, ok := warmupUsageConfirmedSuccess(result, now); ok {
+		if s.markSuccess(ctx, claim, now, reset, statusCode, "completed", warmupSuccessEvidence(result)) {
+			s.enqueueNextContinuousCycle(ctx, account, reset)
+		}
+		return
+	}
 	if probeErr != nil {
 		// A 5xx is an HTTP response, but it does not prove that the upstream
 		// failed before executing the POST.  OpenAI may have accepted the
@@ -1416,7 +1456,7 @@ func (s *OpenAIWindowWarmupService) handleProbeResultWithPreflight(ctx context.C
 			s.handleAmbiguousProbe(ctx, claim, account, result, statusCode, now)
 			return
 		}
-		ok := s.markSuccess(ctx, claim, now, reset, statusCode, "completed")
+		ok := s.markSuccess(ctx, claim, now, reset, statusCode, "completed", warmupSuccessEvidence(result))
 		if ok {
 			s.enqueueNextContinuousCycle(ctx, account, reset)
 		}
@@ -1439,7 +1479,7 @@ func (s *OpenAIWindowWarmupService) handleAmbiguousProbe(ctx context.Context, cl
 	reset, authoritative, active, reconcileErr := s.reconcileFiveHourObservation(ctx, account.ID, job)
 	if reconcileErr == nil && authoritative && active && reset != nil && reset.After(now) {
 		if terminal && warmupAttemptResetAdvanced(reset, job, now) {
-			if s.markSuccess(ctx, claim, now, reset, statusCode, "completed_reconciled") {
+			if s.markSuccess(ctx, claim, now, reset, statusCode, "completed_reconciled", warmupSuccessEvidence(result)) {
 				s.enqueueNextContinuousCycle(ctx, account, reset)
 			}
 		} else {
@@ -1483,10 +1523,21 @@ func (s *OpenAIWindowWarmupService) markStarted(ctx context.Context, claim OpenA
 	return true
 }
 
-func (s *OpenAIWindowWarmupService) markSuccess(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, resetAt *time.Time, status int, code string) bool {
+func (s *OpenAIWindowWarmupService) markSuccess(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, resetAt *time.Time, status int, code string, evidence openAIWindowWarmupSuccessEvidence) bool {
 	ok, err := s.repo.MarkSuccess(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, at, resetAt, status, code)
 	if err != nil || !ok {
 		return false
+	}
+	if evidence.Usage.Positive() {
+		slog.Info("openai_window_warmup_usage_confirmed",
+			"job_id", claim.Job.ID,
+			"account_id", claim.Job.AccountID,
+			"input_tokens", evidence.Usage.InputTokens,
+			"output_tokens", evidence.Usage.OutputTokens,
+			"total_tokens", evidence.Usage.TotalTokens,
+			"request_id", evidence.RequestID,
+			"response_id", evidence.ResponseID,
+		)
 	}
 	if resetAt != nil {
 		_, _ = s.repo.ProjectSuccessReset(ctx, claim.Job.AccountID, claim.Job.IdentityGeneration, at, *resetAt)
@@ -2010,6 +2061,32 @@ func warmupTerminalSucceeded(result *OpenAIWindowProbeResult) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func warmupUsageConfirmedSuccess(result *OpenAIWindowProbeResult, now time.Time) (*time.Time, bool) {
+	if result == nil || result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices ||
+		!warmupTerminalSucceeded(result) || !result.Usage.Positive() {
+		return nil, false
+	}
+	reset := result.ResetAt
+	if reset == nil {
+		reset = result.ObservedResetAt
+	}
+	if reset == nil || !reset.After(now) {
+		return nil, false
+	}
+	return reset, true
+}
+
+func warmupSuccessEvidence(result *OpenAIWindowProbeResult) openAIWindowWarmupSuccessEvidence {
+	if result == nil {
+		return openAIWindowWarmupSuccessEvidence{}
+	}
+	return openAIWindowWarmupSuccessEvidence{
+		Usage:      cloneOpenAIWindowWarmupTokenUsage(result.Usage),
+		ResponseID: result.ResponseID,
+		RequestID:  result.RequestID,
 	}
 }
 

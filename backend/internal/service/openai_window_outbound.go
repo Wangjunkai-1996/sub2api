@@ -510,27 +510,27 @@ func readOpenAIWindowOutboundResponse(resp *http.Response) (*OpenAIOutboundResul
 	if truncated {
 		body = body[:openAIWindowWarmupMaxBodyBytes]
 	}
-	terminal, terminalType, bodyReset := parseWarmupSSEEvidence(body)
+	bodyEvidence := parseWarmupSSEEvidence(body)
 	resetAt := warmupResetFromHeaders(resp.Header)
 	if resetAt == nil {
-		resetAt = bodyReset
+		resetAt = bodyEvidence.ResetAt
 	}
 	result := &OpenAIOutboundResult{
 		StatusCode:   resp.StatusCode,
 		Headers:      cloneWarmupHeaders(resp.Header),
 		Body:         append([]byte(nil), body...),
-		Terminal:     terminal,
-		TerminalType: terminalType,
+		Terminal:     bodyEvidence.Terminal,
+		TerminalType: bodyEvidence.TerminalType,
 		ResetAt:      cloneWarmupTime(resetAt),
 		Started:      true,
-		EOF:          readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !terminal,
+		EOF:          readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !bodyEvidence.Terminal,
 		RequestID:    strings.TrimSpace(resp.Header.Get("x-request-id")),
 	}
 	if truncated {
 		return result, errors.New("possibly_sent: openai warmup response exceeded evidence limit")
 	}
 	if readErr != nil {
-		result.EOF = errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) || !terminal
+		result.EOF = errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) || !bodyEvidence.Terminal
 		return result, fmt.Errorf("read openai warmup response: %w", readErr)
 	}
 	return result, nil
