@@ -37,6 +37,20 @@ describe('UsageProgressBar', () => {
 		expect(wrapper.text()).not.toContain('usage.resetNow')
 	})
 
+	it('刚开始的五小时窗口按剩余分钟向上显示', () => {
+		const wrapper = mount(UsageProgressBar, {
+			props: {
+				label: '5h',
+				utilization: 0,
+				resetsAt: '2026-03-17T04:59:59Z',
+				showNowWhenIdle: true,
+				color: 'indigo'
+			}
+		})
+
+		expect(wrapper.text()).toContain('5h 0m')
+	})
+
 	it('showNowWhenIdle=true、利用率为 0 且没有 reset 时显示“现在”', () => {
 		const wrapper = mount(UsageProgressBar, {
 			props: {

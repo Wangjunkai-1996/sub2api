@@ -465,7 +465,8 @@ export default {
         grokLastProbe: '探测 {time}',
         grokLastHeadersSeen: '响应头 {time}',
         passiveSampled: '被动采样',
-        activeQuery: '查询'
+        activeQuery: '查询',
+        cachedQuery: '刷新缓存'
       },
       openaiQuotaReset: {
         count: '次数',

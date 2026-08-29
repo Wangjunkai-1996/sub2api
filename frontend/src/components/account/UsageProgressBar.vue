@@ -184,8 +184,11 @@ const formatResetTime = computed(() => {
     return props.utilization > 0 ? t('usage.resetPending') : t('usage.resetNow')
   }
 
-  const diffHours = Math.floor(diffMs / (1000 * 60 * 60))
-  const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60))
+  // Round up the displayed minute so a freshly armed five-hour window does
+  // not immediately appear to have lost a minute to sub-minute precision.
+  const totalMinutes = Math.ceil(diffMs / (1000 * 60))
+  const diffHours = Math.floor(totalMinutes / 60)
+  const diffMins = totalMinutes % 60
 
   if (diffHours >= 24) {
     const days = Math.floor(diffHours / 24)

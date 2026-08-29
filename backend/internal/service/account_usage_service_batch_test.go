@@ -172,7 +172,9 @@ func TestAccountUsageService_GetUsageBatch_BestEffortByAccount(t *testing.T) {
 		cache:        NewUsageCache(),
 	}
 
-	usageByAccount, errorsByAccount, err := svc.GetUsageBatch(context.Background(), []int64{7001, 7002, 7003, 7002}, false)
+	// The batch endpoint may be force-refreshed by the table, but OpenAI OAuth
+	// rows must remain read-only and use their persisted snapshot.
+	usageByAccount, errorsByAccount, err := svc.GetUsageBatch(context.Background(), []int64{7001, 7002, 7003, 7002}, true)
 	if err != nil {
 		t.Fatalf("GetUsageBatch() error = %v", err)
 	}
@@ -181,7 +183,7 @@ func TestAccountUsageService_GetUsageBatch_BestEffortByAccount(t *testing.T) {
 		t.Fatalf("expected anthropic passive usage, got %#v", usageByAccount[7001])
 	}
 
-	if usageByAccount[7002] == nil || usageByAccount[7002].FiveHour == nil || usageByAccount[7002].FiveHour.Utilization != 18.0 {
+	if usageByAccount[7002] == nil || usageByAccount[7002].Source != "cached" || usageByAccount[7002].FiveHour == nil || usageByAccount[7002].FiveHour.Utilization != 18.0 {
 		t.Fatalf("expected openai snapshot usage, got %#v", usageByAccount[7002])
 	}
 

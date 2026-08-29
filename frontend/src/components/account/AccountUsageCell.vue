@@ -138,7 +138,7 @@
           color="emerald"
         />
         <!--
-          Upstream codex /wham/usage quota query + reset. The local active-sampling
+          Upstream codex /wham/usage quota query + reset. The local cached-snapshot
           refresh button is rendered via the pre-actions slot so the user sees a
           single row of related buttons instead of two stacked rows.
         -->
@@ -148,7 +148,7 @@
               type="button"
               class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/30 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               :disabled="activeQueryLoading"
-              @click="loadActiveUsage"
+              @click="loadOpenAIUsageSnapshot"
             >
               <svg
                 class="h-2.5 w-2.5"
@@ -164,7 +164,7 @@
                   d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
                 />
               </svg>
-              {{ t('admin.accounts.usageWindow.activeQuery') }}
+              {{ t('admin.accounts.usageWindow.cachedQuery') }}
             </button>
           </template>
         </OpenAIQuotaResetCell>
@@ -706,7 +706,8 @@ const isDesktopViewport = ref(
 )
 const hasEnteredViewport = ref(false)
 const pendingAutoLoad = ref(false)
-const pendingAutoLoadSource = ref<'passive' | 'active' | undefined>(undefined)
+type UsageSource = 'passive' | 'cached' | 'active'
+const pendingAutoLoadSource = ref<UsageSource | undefined>(undefined)
 
 let desktopViewportMediaQuery: MediaQueryList | null = null
 let desktopViewportListener: ((event: MediaQueryListEvent) => void) | null = null
@@ -1341,6 +1342,16 @@ const isAnthropicOAuthOrSetupToken = computed(() => {
   return props.account.platform === 'anthropic' && (props.account.type === 'oauth' || props.account.type === 'setup-token')
 })
 
+const isOpenAIOAuth = computed(() => {
+  return props.account.platform === 'openai' && props.account.type === 'oauth'
+})
+
+const defaultUsageSource = computed<UsageSource | undefined>(() => {
+  if (isAnthropicOAuthOrSetupToken.value) return 'passive'
+  if (isOpenAIOAuth.value) return 'cached'
+  return undefined
+})
+
 const requestParentBatchUsage = (options?: { force?: boolean }) => {
   if (!isBatchManaged.value || !shouldFetchUsage.value) return
   props.requestBatchedUsage?.(props.account, options)
@@ -1353,7 +1364,7 @@ const syncManagedUsageState = () => {
   loading.value = props.batchedUsageLoading === true
 }
 
-const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?: boolean }) => {
+const loadUsage = async (options?: { source?: UsageSource; bypassCache?: boolean }) => {
   if (!shouldFetchUsage.value) return
   if (isBatchManaged.value) {
     requestParentBatchUsage({ force: options?.bypassCache === true })
@@ -1374,9 +1385,12 @@ const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?
   error.value = null
 
   try {
-		const fetchFn = () => options?.source
-			? adminAPI.accounts.getUsage(props.account.id, options.source, options.bypassCache === true)
-			: adminAPI.accounts.getUsage(props.account.id)
+		const fetchFn = () => {
+			if (!options?.source) return adminAPI.accounts.getUsage(props.account.id)
+			return options.bypassCache === true
+				? adminAPI.accounts.getUsage(props.account.id, options.source, true)
+				: adminAPI.accounts.getUsage(props.account.id, options.source)
+		}
     const result = await enqueueUsageRequest(props.account, fetchFn)
     if (!unmounted.value) {
       usageInfo.value = result
@@ -1402,7 +1416,7 @@ const flushPendingAutoLoad = () => {
   })
 }
 
-const requestAutoLoad = (source?: 'passive' | 'active') => {
+const requestAutoLoad = (source?: UsageSource) => {
   if (!shouldFetchUsage.value) return
   if (shouldLazyLoadOnMobile.value && !hasEnteredViewport.value) {
     pendingAutoLoad.value = true
@@ -1448,6 +1462,15 @@ const loadActiveUsage = async () => {
     usageInfo.value = await adminAPI.accounts.getUsage(props.account.id, 'active', true)
   } catch (e: any) {
     console.error('Failed to load active usage:', e)
+  } finally {
+    activeQueryLoading.value = false
+  }
+}
+
+const loadOpenAIUsageSnapshot = async () => {
+  activeQueryLoading.value = true
+  try {
+    await loadUsage({ source: 'cached', bypassCache: true })
   } finally {
     activeQueryLoading.value = false
   }
@@ -1580,7 +1603,7 @@ onMounted(() => {
   }
 
   if (!shouldAutoLoadUsageOnMount.value) return
-  const source = isAnthropicOAuthOrSetupToken.value ? 'passive' : undefined
+  const source = defaultUsageSource.value
   requestAutoLoad(source)
 })
 
@@ -1629,8 +1652,8 @@ watch(openAIUsageRefreshKey, (nextKey, prevKey) => {
     return
   }
 
-  _usageCache.delete(props.account.id)
-  requestAutoLoad()
+	_usageCache.delete(props.account.id)
+	requestAutoLoad(defaultUsageSource.value)
 })
 
 watch(
@@ -1644,7 +1667,7 @@ watch(
       return
     }
 
-    const source = isAnthropicOAuthOrSetupToken.value ? 'passive' : undefined
+    const source = defaultUsageSource.value
     _usageCache.delete(props.account.id)
     loadUsage({ source, bypassCache: true }).catch((e) => {
       console.error('Failed to refresh usage after manual refresh:', e)
