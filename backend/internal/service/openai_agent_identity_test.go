@@ -271,6 +271,23 @@ func cloneAgentIdentityTestAccount(account *Account) *Account {
 	return &copy
 }
 
+func applyOpenAITestCredentialsCAS(
+	account *Account,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) bool {
+	if account == nil || account.ID != id || account.Platform != PlatformOpenAI ||
+		account.Type != AccountTypeOAuth ||
+		!reflect.DeepEqual(account.Credentials, expectedCredentials) ||
+		!reflect.DeepEqual(account.ProxyID, expectedProxyID) {
+		return false
+	}
+	account.Credentials = shallowCopyMap(credentials)
+	return true
+}
+
 type agentIdentityCredentialsRepo struct {
 	AccountRepository
 	credentials     map[string]any
@@ -312,15 +329,11 @@ func (r *agentIdentityCredentialsRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
 	if r.beforeCAS != nil {
 		r.beforeCAS(r)
 	}
-	if r.account == nil || r.account.ID != id || r.account.Platform != PlatformOpenAI ||
-		r.account.Type != AccountTypeOAuth ||
-		!reflect.DeepEqual(r.account.Credentials, expectedCredentials) ||
-		!reflect.DeepEqual(r.account.ProxyID, expectedProxyID) {
+	if !applyOpenAITestCredentialsCAS(r.account, id, expectedCredentials, expectedProxyID, credentials) {
 		return false, nil
 	}
 	r.casApplied++
 	r.credentials = shallowCopyMap(credentials)
-	r.account.Credentials = shallowCopyMap(credentials)
 	return true, nil
 }
 

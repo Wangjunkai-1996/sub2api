@@ -32,6 +32,8 @@ type stubQuotaAccountRepo struct {
 	extraUpdateErr error
 }
 
+var _ OpenAICredentialCASRepository = (*stubQuotaAccountRepo)(nil)
+
 func (r *stubQuotaAccountRepo) GetByID(_ context.Context, id int64) (*Account, error) {
 	acc, ok := r.accounts[id]
 	if !ok {
@@ -47,6 +49,16 @@ func (r *stubQuotaAccountRepo) UpdateCredentials(_ context.Context, id int64, cr
 	}
 	acc.Credentials = credentials
 	return nil
+}
+
+func (r *stubQuotaAccountRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	_ context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	return applyOpenAITestCredentialsCAS(r.accounts[id], id, expectedCredentials, expectedProxyID, credentials), nil
 }
 
 func (r *stubQuotaAccountRepo) UpdateExtra(_ context.Context, id int64, updates map[string]any) error {

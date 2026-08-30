@@ -546,6 +546,7 @@ func TestOpenAIWindowWarmupScheduleRearmsPausedPolicyCycle(t *testing.T) {
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + cycleKey: {
 			ID: 1, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: cycleKey, State: OpenAIWindowWarmupStatePaused,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
 		},
 	}}
 	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
@@ -571,7 +572,8 @@ func TestOpenAIWindowWarmupScheduleRearmsPausedSentCycleForPassiveObservation(t 
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + cycleKey: {
 			ID: 1, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: cycleKey, State: OpenAIWindowWarmupStatePaused,
-			ObservedResetAt: &oldReset, SentAt: &sentAt, AttemptCount: 1,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
+			ObservedResetAt:    &oldReset, SentAt: &sentAt, AttemptCount: 1,
 		},
 	}}
 	probe := &warmupProbeStub{}
@@ -607,10 +609,12 @@ func TestOpenAIWindowWarmupScheduleRearmsLatestPausedResetCycle(t *testing.T) {
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + initialKey: {
 			ID: 1, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: initialKey, State: OpenAIWindowWarmupStateCompleted,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
 		},
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + resetKey: {
 			ID: 2, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: resetKey, State: OpenAIWindowWarmupStatePaused,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
 		},
 	}}
 	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
@@ -631,6 +635,7 @@ func TestOpenAIWindowWarmupReconcilerRearmsPausedContinuousResetCycle(t *testing
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + resetKey: {
 			ID: 2, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: resetKey, State: OpenAIWindowWarmupStatePaused,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
 		},
 	}}
 	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
@@ -650,6 +655,7 @@ func TestOpenAIWindowWarmupReconcilerDoesNotRearmOnceResetCycle(t *testing.T) {
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + resetKey: {
 			ID: 2, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: resetKey, State: OpenAIWindowWarmupStatePaused,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
 		},
 	}}
 	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
@@ -848,7 +854,7 @@ func TestOpenAIWindowWarmupSuppressesProbeWhenBusinessAdvancedReset(t *testing.T
 	require.Equal(t, newReset, *repo.reset)
 	require.Zero(t, probe.calls)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(newReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(newReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 	require.Equal(t, int64(1), service.Metrics().RealTrafficSuppressed)
 }
 
@@ -874,7 +880,7 @@ func TestOpenAIWindowWarmupAmbiguousReconcileSuppressesWithoutSuccess(t *testing
 	require.Zero(t, service.Metrics().Success)
 	require.Zero(t, service.Metrics().RealTrafficSuppressed)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(newReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(newReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 }
 
 func TestOpenAIWindowWarmupAmbiguousIdleRollingResetRecordsEvidenceBeforeReplay(t *testing.T) {
@@ -921,7 +927,7 @@ func TestOpenAIWindowWarmupCompletedTerminalCanConfirmResetFromUsage(t *testing.
 	require.Zero(t, repo.suppressedCalls)
 	require.Equal(t, "completed_reconciled", repo.code)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(newReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(newReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 }
 
 func TestOpenAIWindowWarmupWaitsWhenClaimStillHasCurrentFutureReset(t *testing.T) {
@@ -994,7 +1000,7 @@ func TestOpenAIWindowWarmupUsagePreflightSendsForIdleRollingReset(t *testing.T) 
 	require.Equal(t, 1, repo.successCalls)
 	require.Equal(t, "completed", repo.code)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(confirmedReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(confirmedReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 	require.Equal(t, 1, repo.projectionCalls)
 	require.Equal(t, account.ID, repo.projectedAccount)
 	require.Equal(t, account.OpenAIWarmupIdentityGeneration, repo.projectedIdentity)
@@ -1291,7 +1297,7 @@ func TestOpenAIWindowWarmupUncertainRollingResetAllowsReplayAfterSecondObservati
 	require.Equal(t, 1, repo.successCalls)
 	require.Zero(t, repo.suppressedCalls)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(confirmedReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(confirmedReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 }
 
 func TestOpenAIWindowWarmupUncertainFixedResetSuppressesWithoutReplay(t *testing.T) {
@@ -1321,7 +1327,7 @@ func TestOpenAIWindowWarmupUncertainFixedResetSuppressesWithoutReplay(t *testing
 	require.Equal(t, 1, repo.suppressedCalls)
 	require.Equal(t, "possibly_sent_reconciled", repo.code)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(fixedReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(fixedReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 }
 
 func TestOpenAIWindowWarmupUncertainTerminalFixedResetCompletesSuccess(t *testing.T) {
@@ -1655,7 +1661,8 @@ func TestOpenAIWindowWarmupUsageAuthStateWriteFailureDurablyRetries(t *testing.T
 func TestOpenAIWindowWarmupScanContinuesAfterAuthStateWriteFailure(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	first := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
-	first.Credentials = map[string]any{"access_token": "rejected", "refresh_token": "refresh"}
+	first.Credentials["access_token"] = "rejected"
+	first.Credentials["refresh_token"] = "refresh"
 	second := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
 	second.ID = first.ID + 1
 	second.Name = "warmup-next-account"
@@ -2067,7 +2074,7 @@ func TestOpenAIWindowWarmupContinuousSuccessEnqueuesExactlyOneNextCycle(t *testi
 
 	require.Equal(t, "success", repo.action)
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(newReset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(newReset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 }
 
 func TestOpenAIWindowWarmupStaleSuccessOwnerCannotEnqueueNextCycle(t *testing.T) {
@@ -2095,6 +2102,7 @@ func TestOpenAIWindowWarmupReconcilerRepairsCompletedContinuousNextCycle(t *test
 		OpenAIWindowWarmupQuotaScopeGlobal + ":" + initialKey: {
 			ID: 1, AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 			CycleKey: initialKey, State: OpenAIWindowWarmupStateCompleted, ObservedResetAt: &reset,
+			IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
 		},
 	}}
 	service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
@@ -2102,7 +2110,7 @@ func TestOpenAIWindowWarmupReconcilerRepairsCompletedContinuousNextCycle(t *test
 	service.reconcileAccounts(context.Background())
 
 	require.Len(t, repo.enqueues, 1)
-	require.Equal(t, warmupResetCycleKey(reset), repo.enqueues[0].CycleKey)
+	require.Equal(t, warmupResetCycleKey(reset, account.OpenAIWarmupIdentityGeneration), repo.enqueues[0].CycleKey)
 }
 
 func TestOpenAIWindowWarmupOnceSuccessDoesNotEnqueueNextCycle(t *testing.T) {

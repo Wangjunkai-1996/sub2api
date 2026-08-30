@@ -88,14 +88,16 @@ func (r *warmupHandlerRepository) Enqueue(_ context.Context, in service.OpenAIWi
 		return &copyJob, false, nil
 	}
 	r.current = &service.OpenAIWindowWarmupJob{
-		ID:              91,
-		AccountID:       in.AccountID,
-		QuotaScope:      in.QuotaScope,
-		State:           service.OpenAIWindowWarmupStatePending,
-		Trigger:         in.Trigger,
-		CycleKey:        in.CycleKey,
-		ObservedResetAt: in.ObservedResetAt,
-		NextAttemptAt:   in.NextAttemptAt,
+		ID:                 91,
+		AccountID:          in.AccountID,
+		QuotaScope:         in.QuotaScope,
+		State:              service.OpenAIWindowWarmupStatePending,
+		Trigger:            in.Trigger,
+		CycleKey:           in.CycleKey,
+		CycleGeneration:    in.CycleGeneration,
+		IdentityGeneration: in.IdentityGeneration,
+		ObservedResetAt:    in.ObservedResetAt,
+		NextAttemptAt:      in.NextAttemptAt,
 	}
 	copyJob := *r.current
 	return &copyJob, true, nil
@@ -119,7 +121,9 @@ func warmupHandlerTestAccount() *service.Account {
 	return &service.Account{
 		ID: 42, Name: "warmup", Platform: service.PlatformOpenAI,
 		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
-		CreatedAt: time.Date(2026, 8, 28, 1, 2, 3, 0, time.UTC),
+		CreatedAt:                      time.Date(2026, 8, 28, 1, 2, 3, 0, time.UTC),
+		OpenAIWarmupIdentityGeneration: 1,
+		Credentials:                    map[string]any{"chatgpt_account_id": "warmup-handler-account-42"},
 		Extra: map[string]any{
 			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
 		},
@@ -272,7 +276,7 @@ func TestOpenAIWindowWarmupUnblockHandler(t *testing.T) {
 
 	repo := &warmupHandlerRepository{current: &service.OpenAIWindowWarmupJob{
 		ID: 92, AccountID: 42, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
-		State: service.OpenAIWindowWarmupStateBlocked,
+		State: service.OpenAIWindowWarmupStateBlocked, IdentityGeneration: 1,
 	}}
 	router, _, _, _ := setupWarmupHandlerRouter(t, repo)
 	recorder := httptest.NewRecorder()

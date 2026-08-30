@@ -59,7 +59,8 @@ func TestOpenAIWindowWarmupMigrationEnqueuesWithAccountTransaction(t *testing.T)
 	account := mustCreateAccount(t, integrationEntClient, &service.Account{
 		Name: "warmup-trigger-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
-		CreatedAt: createdAt,
+		CreatedAt:   createdAt,
+		Credentials: map[string]any{"chatgpt_account_id": "warmup-trigger-" + uuid.NewString()},
 		Extra: map[string]any{
 			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
 			"codex_5h_reset_at":                     reset.Format(time.RFC3339),
@@ -108,6 +109,7 @@ func TestOpenAIWindowWarmupMigrationDoesNotArmIdleRollingReset(t *testing.T) {
 	account := mustCreateAccount(t, integrationEntClient, &service.Account{
 		Name: "warmup-idle-trigger-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: map[string]any{"chatgpt_account_id": "warmup-idle-trigger-" + uuid.NewString()},
 		Extra: map[string]any{
 			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
 			"codex_5h_used_percent":                 float64(0),
@@ -144,6 +146,7 @@ func TestOpenAIWindowWarmupMigrationBackfillsOnlyUntouchedIdleArmedJobs(t *testi
 	ctx := context.Background()
 	migrationSQL, err := appmigrations.FS.ReadFile("232_openai_window_warmup_latest_reset.sql")
 	require.NoError(t, err)
+	restoreOpenAIWindowWarmupIdentityFenceAfterTest(t)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	reset := now.Add(5 * time.Hour)
@@ -221,7 +224,8 @@ func TestOpenAIWindowWarmupMigrationBackfillsOnlyUntouchedIdleArmedJobs(t *testi
 		account := mustCreateAccount(t, integrationEntClient, &service.Account{
 			Name: "warmup-backfill-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 			Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
-			Extra: jobs[i].extra,
+			Credentials: map[string]any{"chatgpt_account_id": "warmup-backfill-" + uuid.NewString()},
+			Extra:       jobs[i].extra,
 		})
 		jobs[i].accountID = account.ID
 		t.Cleanup(func() {
@@ -300,8 +304,7 @@ func TestOpenAIWindowWarmupMigrationPreservesIdleResetBaselineAcrossAccountRefre
 	require.NoError(t, err)
 	fixedSQL, err := appmigrations.FS.ReadFile("233_openai_window_warmup_idle_reset_baseline.sql")
 	require.NoError(t, err)
-	numericGuardSQL, err := appmigrations.FS.ReadFile("234_openai_window_warmup_numeric_guard.sql")
-	require.NoError(t, err)
+	restoreOpenAIWindowWarmupIdentityFenceAfterTest(t)
 
 	const (
 		previousReplay = "996_test_openai_window_warmup_previous_idle_trigger.sql"
@@ -309,10 +312,6 @@ func TestOpenAIWindowWarmupMigrationPreservesIdleResetBaselineAcrossAccountRefre
 		secondReplay   = "998_test_openai_window_warmup_idle_baseline_idempotent.sql"
 	)
 	t.Cleanup(func() {
-		// This test intentionally replays migration 233 to reproduce the old
-		// baseline behavior. Restore the current 234 trigger afterward so later
-		// tests observe the same schema that TestMain applied initially.
-		_, _ = integrationDB.ExecContext(context.Background(), string(numericGuardSQL))
 		_, _ = integrationDB.ExecContext(context.Background(),
 			`DELETE FROM schema_migrations WHERE filename IN ($1, $2, $3)`,
 			previousReplay, firstReplay, secondReplay)
@@ -794,6 +793,7 @@ func TestOpenAIWindowWarmupNumericGuardDoesNotRearmResetCycle(t *testing.T) {
 	ctx := context.Background()
 	numericGuardSQL, err := appmigrations.FS.ReadFile("234_openai_window_warmup_numeric_guard.sql")
 	require.NoError(t, err)
+	restoreOpenAIWindowWarmupIdentityFenceAfterTest(t)
 	const replay = "995_test_openai_window_warmup_numeric_guard_reset_cycle.sql"
 
 	accountID := createWarmupIntegrationAccount(t)
@@ -844,6 +844,7 @@ func TestOpenAIWindowWarmupMigrationReconcilesEarlyDuplicateActiveJobs(t *testin
 	require.NoError(t, err)
 	latestResetSQL, err := appmigrations.FS.ReadFile("232_openai_window_warmup_latest_reset.sql")
 	require.NoError(t, err)
+	restoreOpenAIWindowWarmupIdentityFenceAfterTest(t)
 
 	accountIDs := []int64{
 		createWarmupIntegrationAccount(t),
@@ -1014,6 +1015,7 @@ func TestOpenAIWindowWarmupMigrationFallsBackFromMalformedPrimaryReset(t *testin
 			account := mustCreateAccount(t, integrationEntClient, &service.Account{
 				Name: "warmup-reset-fallback-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 				Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+				Credentials: map[string]any{"chatgpt_account_id": "warmup-reset-fallback-" + uuid.NewString()},
 				Extra: map[string]any{
 					service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
 					"codex_5h_reset_at":                     tc.primary,
@@ -1042,6 +1044,7 @@ func TestOpenAIWindowWarmupMigrationSelectsLatestValidReset(t *testing.T) {
 	account := mustCreateAccount(t, integrationEntClient, &service.Account{
 		Name: "warmup-latest-reset-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: map[string]any{"chatgpt_account_id": "warmup-latest-reset-" + uuid.NewString()},
 		Extra: map[string]any{
 			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
 			"codex_5h_reset_at":                     primaryReset.Format(time.RFC3339Nano),
@@ -1073,6 +1076,7 @@ func TestOpenAIWindowWarmupMigrationFallsBackFromInvalidPrimaryPolicy(t *testing
 			account := mustCreateAccount(t, integrationEntClient, &service.Account{
 				Name: "warmup-policy-alias-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 				Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+				Credentials: map[string]any{"chatgpt_account_id": "warmup-policy-alias-" + uuid.NewString()},
 				Extra: map[string]any{
 					service.OpenAICodexWarmupPolicyExtraKey: tc.primary,
 					service.CodexWarmupPolicyExtraKey:       service.OpenAIWindowWarmupPolicyContinuous,
@@ -1108,6 +1112,7 @@ func TestOpenAIWindowWarmupPolicyTriggerPausesOrFencesActiveJob(t *testing.T) {
 			account := mustCreateAccount(t, integrationEntClient, &service.Account{
 				Name: "warmup-policy-pause-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 				Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+				Credentials: map[string]any{"chatgpt_account_id": "warmup-policy-pause-" + uuid.NewString()},
 				Extra: map[string]any{
 					service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
 				},
@@ -1173,23 +1178,10 @@ func TestOpenAIWindowWarmupRepositoryUnblockPausedSentJobAsUncertain(t *testing.
 	now := time.Now().UTC().Truncate(time.Second)
 	oldReset := now.Add(-time.Hour)
 	newReset := now.Add(5 * time.Hour)
-	account := mustCreateAccount(t, integrationEntClient, &service.Account{
-		Name: "warmup-paused-sent-" + uuid.NewString(), Platform: service.PlatformOpenAI,
-		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
-		Extra: map[string]any{
-			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
-		},
-	})
-	t.Cleanup(func() {
-		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
-	})
-	var identityGeneration int64
-	require.NoError(t, integrationDB.QueryRowContext(ctx, `
-		SELECT openai_warmup_identity_generation FROM accounts WHERE id = $1`, account.ID,
-	).Scan(&identityGeneration))
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
 	repo := NewOpenAIWindowWarmupRepository(integrationDB)
 	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
-		AccountID: account.ID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
 		CycleKey: "paused-sent:" + uuid.NewString(), CycleGeneration: 500,
 		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
 		NextAttemptAt: now,
@@ -1205,7 +1197,7 @@ func TestOpenAIWindowWarmupRepositoryUnblockPausedSentJobAsUncertain(t *testing.
 	require.NoError(t, err)
 
 	before := time.Now().UTC()
-	reenabled, changed, err := repo.UnblockAccount(ctx, account.ID, newReset, &newReset)
+	reenabled, changed, err := repo.UnblockAccount(ctx, accountID, newReset, &newReset)
 	after := time.Now().UTC()
 	require.NoError(t, err)
 	require.True(t, changed)
@@ -2714,6 +2706,7 @@ func createWarmupIntegrationAccount(t *testing.T) int64 {
 	account := mustCreateAccount(t, integrationEntClient, &service.Account{
 		Name: "warmup-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: map[string]any{"chatgpt_account_id": "warmup-" + uuid.NewString()},
 	})
 	t.Cleanup(func() {
 		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
@@ -2737,6 +2730,16 @@ func createWarmupIntegrationIdentityAccount(t *testing.T) (int64, int64) {
 	).Scan(&identityGeneration))
 	require.Positive(t, identityGeneration)
 	return account.ID, identityGeneration
+}
+
+func restoreOpenAIWindowWarmupIdentityFenceAfterTest(t *testing.T) {
+	t.Helper()
+	migrationSQL, err := appmigrations.FS.ReadFile("238_openai_window_warmup_identity_fence.sql")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := integrationDB.ExecContext(context.Background(), string(migrationSQL))
+		require.NoError(t, cleanupErr)
+	})
 }
 
 func rotateWarmupIntegrationIdentity(t *testing.T, accountID, previousGeneration int64) int64 {

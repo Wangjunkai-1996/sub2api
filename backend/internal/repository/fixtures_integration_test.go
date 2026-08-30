@@ -246,8 +246,11 @@ func mustCreateAccount(t *testing.T, client *dbent.Client, a *service.Account) *
 
 	created, err := create.Save(ctx)
 	require.NoError(t, err, "create account")
+	persisted, err := client.Account.Get(ctx, created.ID)
+	require.NoError(t, err, "reload created account")
 
 	a.ID = created.ID
+	a.OpenAIWarmupIdentityGeneration = persisted.OpenaiWarmupIdentityGeneration
 	a.CreatedAt = created.CreatedAt
 	a.UpdatedAt = created.UpdatedAt
 	return a

@@ -170,6 +170,8 @@ type openAIWindowForcedRefreshRepo struct {
 	onLease     func(int)
 }
 
+var _ OpenAICredentialCASRepository = (*openAIWindowForcedRefreshRepo)(nil)
+
 func (r *openAIWindowForcedRefreshRepo) GetByID(context.Context, int64) (*Account, error) {
 	return r.account, nil
 }
@@ -178,6 +180,20 @@ func (r *openAIWindowForcedRefreshRepo) UpdateCredentials(_ context.Context, _ i
 	r.updateCalls++
 	r.account.Credentials = shallowCopyMap(credentials)
 	return nil
+}
+
+func (r *openAIWindowForcedRefreshRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	_ context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	if !applyOpenAITestCredentialsCAS(r.account, id, expectedCredentials, expectedProxyID, credentials) {
+		return false, nil
+	}
+	r.updateCalls++
+	return true, nil
 }
 
 func (r *openAIWindowForcedRefreshRepo) AcquireOpenAIWindowWarmupIdentityLease(
@@ -839,7 +855,7 @@ func TestOpenAITokenProviderRefreshAfterUnauthorizedIgnoresFutureExpiry(t *testi
 	require.Equal(t, "forced-fresh-token", token)
 	require.Equal(t, 1, refreshExecutor.refreshCalls)
 	require.Equal(t, 1, repo.updateCalls)
-	require.Equal(t, 1, cache.deleteCalls)
+	require.Equal(t, 2, cache.deleteCalls, "the rejected token and the pre-commit cache are invalidated separately")
 	require.Equal(t, 1, cache.setCalls)
 	require.Equal(t, "forced-fresh-token", cache.token)
 	require.Equal(t, "forced-fresh-token", account.GetOpenAIAccessToken())
