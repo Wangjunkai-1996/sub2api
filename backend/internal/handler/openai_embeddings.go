@@ -80,7 +80,6 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 	setOpsRequestContext(c, reqModel, false)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeSync))
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
-	healthModel := openAITrafficDirectorHealthModel(reqModel, channelMapping)
 
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
@@ -115,8 +114,6 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 
 	// 分组利润控制：embeddings 文本入口请求级装门并固定 pricingAt。
 	embPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
-	embPricingCtx = service.WithOpenAITrafficDirectorHealthModel(embPricingCtx, healthModel)
-	embPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(embPricingCtx)
 	c.Request = c.Request.WithContext(embPricingCtx)
 
 	for {
@@ -142,13 +139,8 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
-			if cls, ok := classifyTrafficDirectorSelectionError(err); ok {
-				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
-				return
-			}
 			if len(failedAccountIDs) == 0 {
-				cls := classifyOpenAISelectionErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformOpenAI, err)
+				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformOpenAI)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
@@ -182,11 +174,6 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 			}
 			continue
 		}
-		if slotResult == openAISlotAcquireRetry {
-			failedAccountIDs[account.ID] = struct{}{}
-			reqLog.Info("openai.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
-			continue
-		}
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
@@ -206,10 +193,8 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 					accountReleaseFunc()
 				}
 			}()
-			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardEmbeddings(c.Request.Context(), c, account, forwardBody, "")
 		}()
-		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)

@@ -389,9 +389,8 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	inputTokens := gjson.GetBytes(respBody, "input_tokens")
 	if !inputTokens.Exists() {
 		// A successful HTTP status with an unusable provider payload is still an
-		// upstream stream/protocol anomaly. Mark it before translating the error
-		// so Traffic Director health reporting does not mistake it for a local
-		// request-conversion failure.
+		// upstream stream/protocol anomaly. Preserve that evidence before
+		// translating it into the client-facing error.
 		setOpsUpstreamError(c, resp.StatusCode, "stream error: upstream response missing input_tokens", "")
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream response missing input_tokens")
 		return fmt.Errorf("input_tokens response missing input_tokens field")

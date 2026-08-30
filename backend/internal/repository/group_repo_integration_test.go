@@ -87,15 +87,6 @@ func TestGroupRepositoryDeletesRollBackWhenSchedulerOutboxFails(t *testing.T) {
 		VALUES ($1, $2, NOW(), NOW() + INTERVAL '1 day', 'active')
 	`, user.ID, cascadeGroup.ID)
 	require.NoError(t, err)
-	for _, groupID := range []int64{plainGroup.ID, cascadeGroup.ID} {
-		_, err = integrationDB.ExecContext(ctx, `
-			INSERT INTO traffic_director_versions (
-				group_id, version, mode, spec, checksum,
-				operation_key, request_fingerprint
-			) VALUES ($1, 1, 'shadow', '{}'::jsonb, $2, 'delete-atomicity', $3)
-		`, groupID, strings.Repeat("a", 64), strings.Repeat("b", 64))
-		require.NoError(t, err)
-	}
 	_, err = integrationDB.ExecContext(ctx,
 		"DELETE FROM scheduler_outbox WHERE group_id IN ($1, $2)",
 		plainGroup.ID,
@@ -139,15 +130,10 @@ func TestGroupRepositoryDeletesRollBackWhenSchedulerOutboxFails(t *testing.T) {
 
 	for _, groupID := range []int64{plainGroup.ID, cascadeGroup.ID} {
 		var deletedAt sql.NullTime
-		var historyCount int
 		require.NoError(t, integrationDB.QueryRowContext(ctx,
 			"SELECT deleted_at FROM groups WHERE id = $1", groupID,
 		).Scan(&deletedAt))
 		require.False(t, deletedAt.Valid)
-		require.NoError(t, integrationDB.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM traffic_director_versions WHERE group_id = $1", groupID,
-		).Scan(&historyCount))
-		require.Equal(t, 1, historyCount)
 	}
 
 	var bindingCount int
@@ -361,45 +347,10 @@ func TestGroupRepositoryUpdateRejectsStaleOrdinarySnapshot(t *testing.T) {
 	require.InDelta(t, weightLoad, *got.AdvancedSchedulerOverrides.WeightLoad, 1e-12)
 }
 
-func TestGroupRepositoryUpdateRejectsStaleTrafficDirectorVersion(t *testing.T) {
-	ctx := context.Background()
-	group := mustCreateGroup(t, integrationEntClient, &service.Group{
-		Name:             uniqueTestValue(t, "traffic-director-stale-update"),
-		Platform:         service.PlatformOpenAI,
-		RateMultiplier:   1.0,
-		Status:           service.StatusActive,
-		SubscriptionType: service.SubscriptionTypeStandard,
-	})
-	t.Cleanup(func() {
-		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM groups WHERE id = $1", group.ID)
-	})
-	repo := newGroupRepositoryWithSQL(integrationEntClient, integrationDB)
-
-	// Simulate a publication committed after the caller loaded its Group
-	// snapshot. Ordinary updates must not overwrite the new head.
-	_, err := integrationDB.ExecContext(ctx, `
-		UPDATE groups
-		SET traffic_director_mode = 'shadow',
-		    traffic_director_version = 1,
-		    traffic_director_spec = '{}'::jsonb
-		WHERE id = $1
-	`, group.ID)
-	require.NoError(t, err)
-
-	group.Name = "must-not-overwrite-published-head"
-	err = repo.Update(ctx, group)
-	require.ErrorIs(t, err, service.ErrGroupTrafficDirectorVersionConflict)
-
-	got, err := repo.GetByID(ctx, group.ID)
-	require.NoError(t, err)
-	require.NotEqual(t, "must-not-overwrite-published-head", got.Name)
-	require.Equal(t, int64(1), got.TrafficDirectorVersion)
-}
-
 func TestGroupRepositoryUpdateUsesCallerTransaction(t *testing.T) {
 	ctx := context.Background()
 	group := mustCreateGroup(t, integrationEntClient, &service.Group{
-		Name:             uniqueTestValue(t, "traffic-director-transactional-update"),
+		Name:             uniqueTestValue(t, "transactional-update"),
 		Platform:         service.PlatformOpenAI,
 		RateMultiplier:   1.0,
 		Status:           service.StatusActive,

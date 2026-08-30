@@ -14,7 +14,9 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 22 // v22: Traffic Director group head mode/version (spec stays version-cached)
+// Keep v22 while the rollback binary is live. Its retired Traffic Director
+// fields remain in the JSON payload as explicit legacy/0 compatibility data.
+const apiKeyAuthSnapshotVersion = 22
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -432,8 +434,8 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			ProfitSafetyBuffer:              apiKey.Group.ProfitSafetyBuffer,
 			SchedulerType:                   apiKey.Group.SchedulerType,
 			AdvancedSchedulerOverrides:      apiKey.Group.AdvancedSchedulerOverrides.Clone(),
-			TrafficDirectorMode:             apiKey.Group.TrafficDirectorMode,
-			TrafficDirectorVersion:          apiKey.Group.TrafficDirectorVersion,
+			TrafficDirectorMode:             "legacy",
+			TrafficDirectorVersion:          0,
 		}
 	}
 	return snapshot
@@ -533,8 +535,6 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			ProfitSafetyBuffer:              snapshot.Group.ProfitSafetyBuffer,
 			SchedulerType:                   snapshot.Group.SchedulerType,
 			AdvancedSchedulerOverrides:      snapshot.Group.AdvancedSchedulerOverrides.Clone(),
-			TrafficDirectorMode:             snapshot.Group.TrafficDirectorMode,
-			TrafficDirectorVersion:          snapshot.Group.TrafficDirectorVersion,
 		}
 	}
 	s.compileAPIKeyIPRules(apiKey)

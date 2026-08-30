@@ -53,7 +53,7 @@ func TestAPIKeyAuthSnapshotProfitControlRoundtrip(t *testing.T) {
 	snapshot := svc.snapshotFromAPIKey(context.Background(), apiKey)
 	require.NotNil(t, snapshot)
 	require.Equal(t, apiKeyAuthSnapshotVersion, snapshot.Version)
-	require.Equal(t, 22, snapshot.Version, "v22 起认证快照携带 Traffic Director head mode/version")
+	require.Equal(t, 22, snapshot.Version)
 
 	// 模拟 L2 缓存的完整 JSON 往返（与 apiKeyCache.SetAuthCache/GetAuthCache 同构）。
 	payload, err := json.Marshal(&APIKeyAuthCacheEntry{Snapshot: snapshot})
@@ -90,4 +90,51 @@ func TestAPIKeyAuthSnapshotOldVersionEvicted(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, used, "版本不匹配的缓存条目必须淘汰并回源重建")
 	require.Nil(t, materialized)
+}
+
+func TestAPIKeyAuthV22PayloadRemainsReadableByLegacyBinary(t *testing.T) {
+	type legacyGroupSnapshot struct {
+		TrafficDirectorMode    string `json:"traffic_director_mode"`
+		TrafficDirectorVersion int64  `json:"traffic_director_version"`
+	}
+	type legacySnapshot struct {
+		Version int                  `json:"version"`
+		Group   *legacyGroupSnapshot `json:"group"`
+	}
+	type legacyCacheEntry struct {
+		Snapshot *legacySnapshot `json:"snapshot"`
+	}
+
+	svc := &APIKeyService{}
+	snapshot := svc.snapshotFromAPIKey(context.Background(), profitAuthTestAPIKey())
+	require.NotNil(t, snapshot)
+	payload, err := json.Marshal(&APIKeyAuthCacheEntry{Snapshot: snapshot})
+	require.NoError(t, err)
+	require.Contains(t, string(payload), `"traffic_director_mode":"legacy"`)
+	require.Contains(t, string(payload), `"traffic_director_version":0`)
+
+	var legacy legacyCacheEntry
+	require.NoError(t, json.Unmarshal(payload, &legacy))
+	require.NotNil(t, legacy.Snapshot)
+	require.Equal(t, 22, legacy.Snapshot.Version)
+	require.NotNil(t, legacy.Snapshot.Group)
+	require.Equal(t, "legacy", legacy.Snapshot.Group.TrafficDirectorMode)
+	require.Zero(t, legacy.Snapshot.Group.TrafficDirectorVersion)
+}
+
+func TestAPIKeyAuthV22LegacyPayloadReadableAfterTrafficDirectorRemoval(t *testing.T) {
+	groupID := int64(50)
+	payload := `{"snapshot":{"version":22,"api_key_id":82,"user_id":40,"group_id":50,"name":"legacy-v22","status":"active","user":{"id":40,"status":"active","concurrency":5},"group":{"id":50,"name":"VIP-roundtrip","platform":"openai","status":"active","rate_multiplier":0.06,"profit_control_enabled":true,"profit_min_margin":0.2,"profit_safety_buffer":0.05,"traffic_director_mode":"enforced","traffic_director_version":7}}}`
+
+	var entry APIKeyAuthCacheEntry
+	require.NoError(t, json.Unmarshal([]byte(payload), &entry))
+	materialized, used, err := (&APIKeyService{}).applyAuthCacheEntry("sk-legacy-v22", &entry)
+	require.NoError(t, err)
+	require.True(t, used)
+	require.NotNil(t, materialized)
+	require.Equal(t, &groupID, materialized.GroupID)
+	require.NotNil(t, materialized.Group)
+	require.Equal(t, groupID, materialized.Group.ID)
+	require.Equal(t, "VIP-roundtrip", materialized.Group.Name)
+	require.True(t, materialized.Group.ProfitControlEnabled)
 }

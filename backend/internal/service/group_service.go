@@ -17,14 +17,6 @@ var (
 		"GROUP_UPDATE_CONFLICT",
 		"group changed while it was being updated",
 	)
-	// ErrGroupTrafficDirectorVersionConflict is returned when an ordinary Group
-	// update was built from a stale Traffic Director head. The conditional
-	// repository update uses this optimistic-concurrency guard so a concurrent
-	// policy publication cannot be silently overwritten by an admin save.
-	ErrGroupTrafficDirectorVersionConflict = infraerrors.Conflict(
-		"GROUP_TRAFFIC_DIRECTOR_VERSION_CONFLICT",
-		"group changed while the Traffic Director policy was being updated",
-	)
 )
 
 type GroupRepository interface {

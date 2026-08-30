@@ -30,14 +30,6 @@ type groupRepository struct {
 	sql    sqlExecutor
 }
 
-// trafficDirectorHistoryCleanupSetting is a transaction-local PostgreSQL
-// marker used by the immutable-history trigger. It prevents an arbitrary
-// caller from deleting history merely because a group was soft-deleted, while
-// still allowing the group lifecycle transaction to clean up its own rows.
-const trafficDirectorHistoryCleanupSetting = "sub2api.traffic_director_history_cleanup"
-
-const trafficDirectorHistoryCleanupQuery = "SELECT set_config('" + trafficDirectorHistoryCleanupSetting + "', 'on', true)"
-
 func (r *groupRepository) beginGroupLifecycleTransaction(ctx context.Context) (context.Context, *dbent.Client, sqlExecutor, *dbent.Tx, bool, error) {
 	client := clientFromContext(ctx, r.client)
 	if client == nil {
@@ -306,12 +298,8 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	}
 	builder := client.Group.UpdateOneID(groupIn.ID).
 		// Keep the whole-row write conditional on the snapshot it was built from.
-		// The Traffic Director version preserves its dedicated conflict semantics;
-		// updated_at also rejects concurrent ordinary Group updates.
-		Where(
-			group.TrafficDirectorVersionEQ(groupIn.TrafficDirectorVersion),
-			group.UpdatedAtEQ(groupIn.UpdatedAt),
-		).
+		// updated_at rejects concurrent ordinary Group updates.
+		Where(group.UpdatedAtEQ(groupIn.UpdatedAt)).
 		SetUpdatedAt(updatedAt).
 		SetName(groupIn.Name).
 		SetDescription(groupIn.Description).
@@ -463,20 +451,14 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	if err != nil {
 		if dbent.IsNotFound(err) {
 			// Ent reports a conditional UPDATE with zero affected rows as
-			// NotFoundError. Distinguish deletion, a stale Traffic Director head,
-			// and a stale ordinary Group snapshot for callers and HTTP clients.
+			// NotFoundError. Distinguish deletion from a stale ordinary Group
+			// snapshot for callers and HTTP clients.
 			current, lookupErr := client.Group.Query().
 				Where(group.IDEQ(groupIn.ID)).
-				Select(group.FieldTrafficDirectorVersion, group.FieldUpdatedAt).
+				Select(group.FieldUpdatedAt).
 				Only(ctx)
 			if lookupErr != nil {
 				return translatePersistenceError(lookupErr, service.ErrGroupNotFound, service.ErrGroupExists)
-			}
-			if current.TrafficDirectorVersion != groupIn.TrafficDirectorVersion {
-				return service.ErrGroupTrafficDirectorVersionConflict.WithMetadata(map[string]string{
-					"expected_version": fmt.Sprintf("%d", groupIn.TrafficDirectorVersion),
-					"actual_version":   fmt.Sprintf("%d", current.TrafficDirectorVersion),
-				})
 			}
 			return service.ErrGroupUpdateConflict.WithMetadata(map[string]string{
 				"expected_updated_at": groupIn.UpdatedAt.UTC().Format(time.RFC3339Nano),
@@ -504,15 +486,6 @@ func (r *groupRepository) Delete(ctx context.Context, id int64) error {
 	_, err = txClient.Group.Delete().Where(group.IDEQ(id)).Exec(txCtx)
 	if err != nil {
 		return translatePersistenceError(err, service.ErrGroupNotFound, nil)
-	}
-	// Group.Delete is the legacy soft-delete path. Remove its private immutable
-	// Traffic Director history as part of the same lifecycle operation. The
-	// migration trigger requires this transaction-local cleanup marker.
-	if _, err := exec.ExecContext(txCtx, trafficDirectorHistoryCleanupQuery); err != nil {
-		return fmt.Errorf("mark traffic director history cleanup: %w", err)
-	}
-	if _, err := exec.ExecContext(txCtx, "DELETE FROM traffic_director_versions WHERE group_id = $1", id); err != nil {
-		return fmt.Errorf("delete traffic director history: %w", err)
 	}
 	if err := enqueueSchedulerOutbox(txCtx, exec, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {
 		return fmt.Errorf("enqueue group delete scheduler event: %w", err)
@@ -991,17 +964,6 @@ func (r *groupRepository) DeleteCascade(ctx context.Context, id int64) ([]int64,
 
 	// 5. Soft-delete group itself.
 	if _, err := txClient.Group.Delete().Where(group.IDEQ(id)).Exec(txCtx); err != nil {
-		return nil, err
-	}
-
-	// Traffic Director history is immutable while a group is active, but the
-	// existing group lifecycle is a soft delete. Remove its private policy
-	// history in the same transaction after deleted_at is set. The migration
-	// trigger requires this transaction-local cleanup marker.
-	if _, err := exec.ExecContext(txCtx, trafficDirectorHistoryCleanupQuery); err != nil {
-		return nil, err
-	}
-	if _, err := exec.ExecContext(txCtx, "DELETE FROM traffic_director_versions WHERE group_id = $1", id); err != nil {
 		return nil, err
 	}
 	if err := enqueueSchedulerOutbox(txCtx, exec, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {

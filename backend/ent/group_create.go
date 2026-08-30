@@ -878,40 +878,6 @@ func (_c *GroupCreate) SetNillableAdvancedSchedulerOverrides(v *domain.AdvancedS
 	return _c
 }
 
-// SetTrafficDirectorMode sets the "traffic_director_mode" field.
-func (_c *GroupCreate) SetTrafficDirectorMode(v string) *GroupCreate {
-	_c.mutation.SetTrafficDirectorMode(v)
-	return _c
-}
-
-// SetNillableTrafficDirectorMode sets the "traffic_director_mode" field if the given value is not nil.
-func (_c *GroupCreate) SetNillableTrafficDirectorMode(v *string) *GroupCreate {
-	if v != nil {
-		_c.SetTrafficDirectorMode(*v)
-	}
-	return _c
-}
-
-// SetTrafficDirectorVersion sets the "traffic_director_version" field.
-func (_c *GroupCreate) SetTrafficDirectorVersion(v int64) *GroupCreate {
-	_c.mutation.SetTrafficDirectorVersion(v)
-	return _c
-}
-
-// SetNillableTrafficDirectorVersion sets the "traffic_director_version" field if the given value is not nil.
-func (_c *GroupCreate) SetNillableTrafficDirectorVersion(v *int64) *GroupCreate {
-	if v != nil {
-		_c.SetTrafficDirectorVersion(*v)
-	}
-	return _c
-}
-
-// SetTrafficDirectorSpec sets the "traffic_director_spec" field.
-func (_c *GroupCreate) SetTrafficDirectorSpec(v *domain.TrafficDirectorSpec) *GroupCreate {
-	_c.mutation.SetTrafficDirectorSpec(v)
-	return _c
-}
-
 // AddAPIKeyIDs adds the "api_keys" edge to the APIKey entity by IDs.
 func (_c *GroupCreate) AddAPIKeyIDs(ids ...int64) *GroupCreate {
 	_c.mutation.AddAPIKeyIDs(ids...)
@@ -1209,14 +1175,6 @@ func (_c *GroupCreate) defaults() error {
 		v := group.DefaultAdvancedSchedulerOverrides
 		_c.mutation.SetAdvancedSchedulerOverrides(v)
 	}
-	if _, ok := _c.mutation.TrafficDirectorMode(); !ok {
-		v := group.DefaultTrafficDirectorMode
-		_c.mutation.SetTrafficDirectorMode(v)
-	}
-	if _, ok := _c.mutation.TrafficDirectorVersion(); !ok {
-		v := group.DefaultTrafficDirectorVersion
-		_c.mutation.SetTrafficDirectorVersion(v)
-	}
 	return nil
 }
 
@@ -1417,22 +1375,6 @@ func (_c *GroupCreate) check() error {
 	}
 	if _, ok := _c.mutation.AdvancedSchedulerOverrides(); !ok {
 		return &ValidationError{Name: "advanced_scheduler_overrides", err: errors.New(`ent: missing required field "Group.advanced_scheduler_overrides"`)}
-	}
-	if _, ok := _c.mutation.TrafficDirectorMode(); !ok {
-		return &ValidationError{Name: "traffic_director_mode", err: errors.New(`ent: missing required field "Group.traffic_director_mode"`)}
-	}
-	if v, ok := _c.mutation.TrafficDirectorMode(); ok {
-		if err := group.TrafficDirectorModeValidator(v); err != nil {
-			return &ValidationError{Name: "traffic_director_mode", err: fmt.Errorf(`ent: validator failed for field "Group.traffic_director_mode": %w`, err)}
-		}
-	}
-	if _, ok := _c.mutation.TrafficDirectorVersion(); !ok {
-		return &ValidationError{Name: "traffic_director_version", err: errors.New(`ent: missing required field "Group.traffic_director_version"`)}
-	}
-	if v, ok := _c.mutation.TrafficDirectorVersion(); ok {
-		if err := group.TrafficDirectorVersionValidator(v); err != nil {
-			return &ValidationError{Name: "traffic_director_version", err: fmt.Errorf(`ent: validator failed for field "Group.traffic_director_version": %w`, err)}
-		}
 	}
 	return nil
 }
@@ -1716,18 +1658,6 @@ func (_c *GroupCreate) createSpec() (*Group, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.AdvancedSchedulerOverrides(); ok {
 		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
 		_node.AdvancedSchedulerOverrides = value
-	}
-	if value, ok := _c.mutation.TrafficDirectorMode(); ok {
-		_spec.SetField(group.FieldTrafficDirectorMode, field.TypeString, value)
-		_node.TrafficDirectorMode = value
-	}
-	if value, ok := _c.mutation.TrafficDirectorVersion(); ok {
-		_spec.SetField(group.FieldTrafficDirectorVersion, field.TypeInt64, value)
-		_node.TrafficDirectorVersion = value
-	}
-	if value, ok := _c.mutation.TrafficDirectorSpec(); ok {
-		_spec.SetField(group.FieldTrafficDirectorSpec, field.TypeJSON, value)
-		_node.TrafficDirectorSpec = value
 	}
 	if nodes := _c.mutation.APIKeysIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -2933,15 +2863,6 @@ func (u *GroupUpsertOne) UpdateNewValues() *GroupUpsertOne {
 		}
 		if _, exists := u.create.mutation.DuplicateOperationID(); exists {
 			s.SetIgnore(group.FieldDuplicateOperationID)
-		}
-		if _, exists := u.create.mutation.TrafficDirectorMode(); exists {
-			s.SetIgnore(group.FieldTrafficDirectorMode)
-		}
-		if _, exists := u.create.mutation.TrafficDirectorVersion(); exists {
-			s.SetIgnore(group.FieldTrafficDirectorVersion)
-		}
-		if _, exists := u.create.mutation.TrafficDirectorSpec(); exists {
-			s.SetIgnore(group.FieldTrafficDirectorSpec)
 		}
 	}))
 	return u
@@ -4359,15 +4280,6 @@ func (u *GroupUpsertBulk) UpdateNewValues() *GroupUpsertBulk {
 			}
 			if _, exists := b.mutation.DuplicateOperationID(); exists {
 				s.SetIgnore(group.FieldDuplicateOperationID)
-			}
-			if _, exists := b.mutation.TrafficDirectorMode(); exists {
-				s.SetIgnore(group.FieldTrafficDirectorMode)
-			}
-			if _, exists := b.mutation.TrafficDirectorVersion(); exists {
-				s.SetIgnore(group.FieldTrafficDirectorVersion)
-			}
-			if _, exists := b.mutation.TrafficDirectorSpec(); exists {
-				s.SetIgnore(group.FieldTrafficDirectorSpec)
 			}
 		}
 	}))

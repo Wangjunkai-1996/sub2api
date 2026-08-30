@@ -3,7 +3,6 @@ package routes
 
 import (
 	"github.com/Wei-Shaw/sub2api/internal/handler"
-	adminhandler "github.com/Wei-Shaw/sub2api/internal/handler/admin"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -341,7 +340,6 @@ func registerGroupRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		groups.POST("/:id/composite-routes/preview", h.Admin.Group.PreviewCompositeRoute)
 		groups.PUT("/:id/composite-routes/:route_id", h.Admin.Group.UpdateCompositeRoute)
 		groups.DELETE("/:id/composite-routes/:route_id", h.Admin.Group.DeleteCompositeRoute)
-		registerTrafficDirectorRoutes(groups, h)
 		groups.GET("/:id", h.Admin.Group.GetByID)
 		groups.POST("", h.Admin.Group.Create)
 		groups.POST("/:id/duplicate", h.Admin.Group.Duplicate)
@@ -355,27 +353,6 @@ func registerGroupRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		groups.DELETE("/:id/rpm-overrides", h.Admin.Group.ClearGroupRPMOverrides)
 		groups.GET("/:id/api-keys", h.Admin.Group.GetGroupAPIKeys)
 	}
-}
-
-// registerTrafficDirectorRoutes keeps the policy API separate from the legacy
-// GroupHandler routes. The nil-safe lookup lets older test/bootstrap graphs
-// register the route tree before the dedicated service provider is enabled;
-// the handler then returns the documented 503 instead of panicking.
-func registerTrafficDirectorRoutes(groups *gin.RouterGroup, h *handler.Handlers) {
-	var trafficDirector *adminhandler.TrafficDirectorHandler
-	if h != nil && h.Admin != nil {
-		trafficDirector = h.Admin.TrafficDirector
-	}
-	if trafficDirector == nil {
-		trafficDirector = adminhandler.NewTrafficDirectorHandler(nil)
-	}
-	groups.GET("/:id/traffic-director", trafficDirector.Get)
-	groups.GET("/:id/traffic-director/versions", trafficDirector.ListVersions)
-	groups.GET("/:id/traffic-director/versions/:version", trafficDirector.GetVersion)
-	groups.POST("/:id/traffic-director/preview", trafficDirector.Preview)
-	groups.POST("/:id/traffic-director/publish", trafficDirector.Publish)
-	groups.POST("/:id/traffic-director/rollback/:version", trafficDirector.Rollback)
-	groups.GET("/:id/traffic-director/status", trafficDirector.Status)
 }
 
 func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth middleware.StepUpAuthMiddleware) {

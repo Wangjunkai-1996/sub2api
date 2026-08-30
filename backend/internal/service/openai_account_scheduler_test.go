@@ -3929,6 +3929,43 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CyberRedisReadFailureIs
 	require.Equal(t, []int64{account.ID}, releasedIDs, "Redis read failure must release the selected slot")
 }
 
+func TestOpenAIGatewayService_SelectAccountWithSchedulerForImages_CyberRedisReadFailureDoesNotFallbackToBasic(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	groupID := int64(101105)
+	account := Account{
+		ID: 38141, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1,
+		GroupIDs: []int64{groupID, 12}, Credentials: map[string]any{"plan_type": "pro"},
+	}
+	cache := &schedulerCyberGatewayCache{
+		schedulerTestGatewayCache: &schedulerTestGatewayCache{},
+		err:                       errors.New("redis unavailable"),
+	}
+	var acquiredIDs, releasedIDs []int64
+	settingService := NewSettingService(&openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+		SettingKeyOpenAICyberAccountCooldownEnabled: "true",
+	}}, &config.Config{})
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: []Account{account}},
+		cache:              cache,
+		cfg:                &config.Config{},
+		settingService:     settingService,
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{acquiredIDs: &acquiredIDs, releasedIDs: &releasedIDs}),
+	}
+
+	selection, _, err := svc.SelectAccountWithSchedulerForImages(
+		context.Background(), &groupID, "", "", nil, OpenAIImagesCapabilityNative,
+	)
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrOpenAICyberAccountCooldownStateUnavailable)
+	require.Equal(t, []int64{account.ID}, cache.reads, "Cyber state failure must not retry through basic Images fallback")
+	require.Equal(t, []int64{account.ID}, acquiredIDs)
+	require.Equal(t, []int64{account.ID}, releasedIDs)
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_CyberBlockedWaitPlanIsNotReturned(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 	defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
