@@ -1201,6 +1201,86 @@ func TestOpenAIResponsesWebSocket_PreviousResponseIDKindLoggedBeforeAcquireFailu
 	require.Contains(t, strings.ToLower(closeErr.Reason), "failed to acquire user concurrency slot")
 }
 
+func TestOpenAIResponsesWebSocket_BusyWaitPlanReturnsTryAgainWithoutQueueing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	groupID := int64(4202)
+	account := service.Account{
+		ID: 9902, Name: "openai-ws-busy", Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
+		Concurrency: 1, GroupIDs: []int64{groupID},
+		Credentials: map[string]any{"api_key": "sk-test"},
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+			"openai_apikey_responses_websockets_v2_mode":    service.OpenAIWSIngressModePassthrough,
+		},
+	}
+	var accountAcquireCalls atomic.Int32
+	cache := &concurrencyCacheMock{
+		acquireUserSlotFn: func(context.Context, int64, int, string) (bool, error) {
+			return true, nil
+		},
+		acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) {
+			accountAcquireCalls.Add(1)
+			return false, nil
+		},
+	}
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	concurrencySvc := service.NewConcurrencyService(cache)
+	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	defer billingCacheSvc.Stop()
+	gatewaySvc := service.NewOpenAIGatewayService(
+		&openAIWSUsageHandlerAccountRepoStub{account: account},
+		nil, nil, nil, nil, nil, nil, cfg, nil, concurrencySvc,
+		service.NewBillingService(cfg, nil), nil, billingCacheSvc, nil,
+		&service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil,
+	)
+	h := &OpenAIGatewayHandler{
+		gatewayService: gatewaySvc, billingCacheService: billingCacheSvc,
+		apiKeyService: &service.APIKeyService{},
+		concurrencyHelper: NewConcurrencyHelper(
+			concurrencySvc, SSEPingFormatNone, time.Second,
+		),
+	}
+	apiKey := &service.APIKey{
+		ID: 1802, GroupID: &groupID,
+		User: &service.User{ID: 1702, Status: service.StatusActive},
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware.ContextKeyAPIKey), apiKey)
+		c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.User.ID, Concurrency: 1})
+		c.Next()
+	})
+	router.GET("/openai/v1/responses", h.ResponsesWebSocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http")+"/openai/v1/responses", nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","stream":false,"input":"hello"}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = clientConn.Read(readCtx)
+	cancelRead()
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
+	require.Contains(t, strings.ToLower(closeErr.Reason), "account is busy")
+	require.Equal(t, int32(2), accountAcquireCalls.Load(), "scheduler and handler should each make one non-blocking slot attempt")
+}
+
 func TestOpenAIResponsesWebSocket_PassthroughUsageLogPersistsUserAgentAndReasoningEffort(t *testing.T) {
 	got := runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
 		firstPayload: `{"type":"response.create","model":"gpt-5.4","stream":false,"reasoning":{"effort":"HIGH"}}`,

@@ -227,8 +227,6 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldProfitSafetyBuffer,
 				group.FieldSchedulerType,
 				group.FieldAdvancedSchedulerOverrides,
-				group.FieldTrafficDirectorMode,
-				group.FieldTrafficDirectorVersion,
 			)
 		}).
 		Only(ctx)
@@ -1026,8 +1024,6 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		ProfitSafetyBuffer:              g.ProfitSafetyBuffer,
 		SchedulerType:                   g.SchedulerType,
 		AdvancedSchedulerOverrides:      g.AdvancedSchedulerOverrides.Clone(),
-		TrafficDirectorMode:             g.TrafficDirectorMode,
-		TrafficDirectorVersion:          g.TrafficDirectorVersion,
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}

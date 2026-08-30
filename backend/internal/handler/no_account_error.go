@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -158,58 +157,6 @@ func classifyOpenAICompatibleNoAccountErrorFromGin(
 		displayModel,
 		openAICompatibleRequestPlatform(ctx, apiKey),
 	)
-}
-
-// classifyOpenAISelectionErrorFromGin preserves the normal model-support
-// diagnosis for legacy no-account errors, but keeps an explicitly published
-// Traffic Director outage as 503. Re-running model diagnosis for that error
-// could incorrectly turn an exhausted fallback chain into a misleading 404.
-func classifyOpenAISelectionErrorFromGin(
-	c *gin.Context,
-	diag service.ModelAvailabilityDiagnoser,
-	apiKey *service.APIKey,
-	routingModel string,
-	displayModel string,
-	platform string,
-	err error,
-) noAccountErrorClassification {
-	if classification, ok := classifyTrafficDirectorSelectionError(err); ok {
-		return classification
-	}
-	return classifyNoAccountErrorFromGin(c, diag, apiKey, routingModel, displayModel, platform)
-}
-
-func classifyOpenAICompatibleSelectionErrorFromGin(
-	c *gin.Context,
-	diag service.ModelAvailabilityDiagnoser,
-	apiKey *service.APIKey,
-	routingModel string,
-	displayModel string,
-	err error,
-) noAccountErrorClassification {
-	if classification, ok := classifyTrafficDirectorSelectionError(err); ok {
-		return classification
-	}
-	return classifyOpenAICompatibleNoAccountErrorFromGin(c, diag, apiKey, routingModel, displayModel)
-}
-
-func classifyTrafficDirectorSelectionError(err error) (noAccountErrorClassification, bool) {
-	switch {
-	case errors.Is(err, service.ErrTrafficDirectorNoAvailablePool):
-		return noAccountErrorClassification{
-			Status:  http.StatusServiceUnavailable,
-			ErrType: "traffic_director_no_available_pool",
-			Message: "No account is available in the configured Traffic Director pool chain",
-		}, true
-	case errors.Is(err, service.ErrTrafficDirectorPolicyUnavailable):
-		return noAccountErrorClassification{
-			Status:  http.StatusServiceUnavailable,
-			ErrType: "traffic_director_policy_unavailable",
-			Message: "The current Traffic Director policy is temporarily unavailable",
-		}, true
-	default:
-		return noAccountErrorClassification{}, false
-	}
 }
 
 func openAICompatibleSelectionErrorForLog(err error, platform string) error {

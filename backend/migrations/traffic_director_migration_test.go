@@ -1,6 +1,8 @@
 package migrations
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -10,6 +12,8 @@ import (
 func TestTrafficDirectorMigration(t *testing.T) {
 	content, err := FS.ReadFile("228_traffic_director.sql")
 	require.NoError(t, err)
+	checksum := sha256.Sum256([]byte(strings.TrimSpace(string(content))))
+	require.Equal(t, "22a0e0d9c7f7ff18b1b557ebc6ab2ea4aba08f0b43a21a47308eeea3ad44c407", hex.EncodeToString(checksum[:]))
 
 	sql := strings.Join(strings.Fields(string(content)), " ")
 	require.Contains(t, sql, "traffic_director_mode VARCHAR(16) NOT NULL DEFAULT 'legacy'")

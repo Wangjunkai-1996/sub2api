@@ -136,6 +136,8 @@ type APIKeyAuthGroupSnapshot struct {
 	SchedulerType              string                     `json:"scheduler_type"`
 	AdvancedSchedulerOverrides AdvancedSchedulerOverrides `json:"advanced_scheduler_overrides"`
 
+	// Retained only for v22 wire compatibility with the rollback binary. New
+	// code always writes legacy/0 and never materializes these fields into Group.
 	TrafficDirectorMode    string `json:"traffic_director_mode"`
 	TrafficDirectorVersion int64  `json:"traffic_director_version"`
 }

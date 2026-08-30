@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,20 +35,4 @@ func TestOpenAIWSTurnPricingFreezePerTurn(t *testing.T) {
 
 	p.freeze(turn2)
 	require.Equal(t, turn2, p.currentOr(time.Time{}), "后续 turn 必须使用自己的定价时刻")
-}
-
-func TestOpenAIWSPendingHealthProbesLifecycle(t *testing.T) {
-	var probes openAIWSPendingHealthProbes
-	halfOpen := service.TrafficDirectorHealthDecision{HalfOpenProbe: true, ProbeToken: "probe"}
-
-	probes.track(1, "gpt-first", halfOpen)
-	probes.track(2, "gpt-healthy", service.TrafficDirectorHealthDecision{})
-	probes.track(2, "gpt-5", halfOpen)
-	probes.track(3, "gpt-5.1", halfOpen)
-
-	model, ok := probes.finish(2)
-	require.True(t, ok)
-	require.Equal(t, "gpt-5", model)
-	require.ElementsMatch(t, []string{"gpt-5.1"}, probes.drain())
-	require.Empty(t, probes.drain(), "drained probes must not be abandoned twice")
 }

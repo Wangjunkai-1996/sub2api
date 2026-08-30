@@ -442,29 +442,23 @@ type OpenAIGatewayService struct {
 	liveAttestation       liveattestation.Provider
 	liveAttestationCipher SecretEncryptor
 
-	openaiWSPoolOnce              sync.Once
-	openaiWSStateStoreOnce        sync.Once
-	openaiSchedulerOnce           sync.Once
-	openaiSchedulerMu             sync.RWMutex
-	openaiProxyStreamCircuitOnce  sync.Once
-	openaiWSPassthroughDialerOnce sync.Once
-	openaiModelTransientOnce      sync.Once
-	agentIdentityTaskMu           sync.Mutex
-	openaiWSPool                  *openAIWSConnPool
-	openaiWSStateStore            OpenAIWSStateStore
-	openaiScheduler               OpenAIAccountScheduler
-	// Traffic Director dependencies are installed by application wiring after
-	// construction. They remain optional so legacy deployments retain the
-	// existing scheduler path until a policy resolver is configured.
-	openaiTrafficDirectorMu             sync.RWMutex
-	openaiTrafficDirectorResolver       OpenAITrafficDirectorResolver
-	openaiTrafficDirectorHealthResolver OpenAITrafficDirectorHealthResolver
-	openaiWSPassthroughDialer           openAIWSClientDialer
-	openaiWSSessionPreemptions          openAIWSSessionPreemptRegistry
-	openaiAccountStats                  *openAIAccountRuntimeStats
-	openaiModelTransient                *openAIAccountModelTransientState
-	openaiProxyStreamCircuit            *openAIProxyStreamCircuit
-	openaiProxyStreamFailOpenLogAt      atomic.Int64
+	openaiWSPoolOnce               sync.Once
+	openaiWSStateStoreOnce         sync.Once
+	openaiSchedulerOnce            sync.Once
+	openaiSchedulerMu              sync.RWMutex
+	openaiProxyStreamCircuitOnce   sync.Once
+	openaiWSPassthroughDialerOnce  sync.Once
+	openaiModelTransientOnce       sync.Once
+	agentIdentityTaskMu            sync.Mutex
+	openaiWSPool                   *openAIWSConnPool
+	openaiWSStateStore             OpenAIWSStateStore
+	openaiScheduler                OpenAIAccountScheduler
+	openaiWSPassthroughDialer      openAIWSClientDialer
+	openaiWSSessionPreemptions     openAIWSSessionPreemptRegistry
+	openaiAccountStats             *openAIAccountRuntimeStats
+	openaiModelTransient           *openAIAccountModelTransientState
+	openaiProxyStreamCircuit       *openAIProxyStreamCircuit
+	openaiProxyStreamFailOpenLogAt atomic.Int64
 
 	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
@@ -487,31 +481,6 @@ type OpenAIGatewayService struct {
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
 	openaiCodexTurnStateWrites  atomic.Uint64
-}
-
-// SetOpenAITrafficDirectorResolver installs the group policy resolver used by
-// PlatformOpenAI scheduling. Passing nil disables Traffic Director routing for
-// legacy/shadow requests; an authenticated Group explicitly marked enforced
-// fails closed with policy-unavailable until a resolver is installed.
-func (s *OpenAIGatewayService) SetOpenAITrafficDirectorResolver(resolver OpenAITrafficDirectorResolver) {
-	if s == nil {
-		return
-	}
-	s.openaiTrafficDirectorMu.Lock()
-	s.openaiTrafficDirectorResolver = resolver
-	s.openaiTrafficDirectorMu.Unlock()
-}
-
-// SetOpenAITrafficDirectorHealthResolver installs the optional account health
-// resolver used by enforced policies. A nil resolver means health enforcement
-// is unavailable and therefore fails open per the policy contract.
-func (s *OpenAIGatewayService) SetOpenAITrafficDirectorHealthResolver(resolver OpenAITrafficDirectorHealthResolver) {
-	if s == nil {
-		return
-	}
-	s.openaiTrafficDirectorMu.Lock()
-	s.openaiTrafficDirectorHealthResolver = resolver
-	s.openaiTrafficDirectorMu.Unlock()
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

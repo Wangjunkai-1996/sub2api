@@ -114,36 +114,6 @@ func openAIAccountScheduleModel(c *gin.Context, account *service.Account, forwar
 	return service.ResolveOpenAIAccountUpstreamModelForRequest(account, forwardModel, requireCompact)
 }
 
-func openAITrafficDirectorHealthModel(requestedModel string, mapping service.ChannelMappingResult) string {
-	if mappedModel := strings.TrimSpace(mapping.MappedModel); mappedModel != "" {
-		return mappedModel
-	}
-	return strings.TrimSpace(requestedModel)
-}
-
-// reportOpenAITrafficDirectorOutcome is deliberately best-effort. Health
-// reporting must never change the client-visible result of an already
-// completed upstream attempt, and the service keeps legacy deployments as a
-// no-op when no richer health reporter is wired.
-func (h *OpenAIGatewayHandler) reportOpenAITrafficDirectorOutcome(
-	ctx context.Context,
-	account *service.Account,
-	model string,
-	result *service.OpenAIForwardResult,
-	err error,
-) {
-	if h == nil || h.gatewayService == nil || account == nil {
-		return
-	}
-	if _, reportErr := h.gatewayService.ReportOpenAITrafficDirectorHealthOutcome(ctx, account, model, result, err, 0, nil); reportErr != nil {
-		// Keep this at debug level: the health store is auxiliary and may be
-		// temporarily unavailable without making the upstream request fail.
-		if logger.L() != nil {
-			logger.L().Debug("openai.traffic_director.health_outcome_report_failed", zap.Int64("account_id", account.ID), zap.String("model", model), zap.Error(reportErr))
-		}
-	}
-}
-
 // resolveOpenAIMessagesDispatchMappedModel applies the group mapping while
 // preserving composite routes whose target platform is not OpenAI.
 func resolveOpenAIMessagesDispatchMappedModel(c *gin.Context, apiKey *service.APIKey, requestedModel string) string {
@@ -502,7 +472,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		forwardModel,
 		legacyCompact,
 	)
-	forwardCtx = service.WithOpenAIResponsesTrafficDirectorHealthModel(forwardCtx, forwardModel, legacyCompact)
 	c.Request = c.Request.WithContext(forwardCtx)
 
 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
@@ -572,7 +541,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 生图意图只影响能力路由与图片计费，不关门：混合 /v1/responses 请求的
 	// token 计费部分仍受利润门保护，独立图片/视频端点才在门外。
 	pricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
-	pricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(pricingCtx)
 	c.Request = c.Request.WithContext(pricingCtx)
 
 	for {
@@ -607,18 +575,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
-			if cls, ok := classifyTrafficDirectorSelectionError(err); ok {
-				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
-				return
-			}
 			if len(failedAccountIDs) == 0 {
 				if legacyCompact && errors.Is(err, service.ErrNoAvailableCompactAccounts) {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "compact_not_supported", "No available accounts support /responses/compact", streamStarted)
 					return
 				}
-				cls := classifyOpenAISelectionErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform, err)
+				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
@@ -691,11 +654,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 			continue
 		}
-		if slotResult == openAISlotAcquireRetry {
-			failedAccountIDs[account.ID] = struct{}{}
-			reqLog.Info("openai.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
-			continue
-		}
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
@@ -741,11 +699,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		attemptBody := h.deriveOpenAIForwardAttemptBody(reqLog, forwardBody, account, &passthroughFailoverState)
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
-			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
-		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, forwardModel, result, err)
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
 		responseLatencyMs := forwardDurationMs
@@ -1199,12 +1155,9 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	effectiveMappedModel := preferredMappedModel
-	healthModel := openAITrafficDirectorHealthModel(reqModel, channelMappingMsg)
 
 	// 分组利润控制：Messages 文本入口同样请求级装门并固定 pricingAt。
 	msgPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
-	msgPricingCtx = service.WithOpenAIMessagesTrafficDirectorHealthModel(msgPricingCtx, healthModel, effectiveMappedModel)
-	msgPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(msgPricingCtx)
 	c.Request = c.Request.WithContext(msgPricingCtx)
 
 	for {
@@ -1239,14 +1192,9 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
-			if cls, ok := classifyTrafficDirectorSelectionError(err); ok {
-				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.anthropicStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
-				return
-			}
 			if len(failedAccountIDs) == 0 {
 				if err != nil {
-					cls := classifyOpenAICompatibleSelectionErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel, err)
+					cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					}
@@ -1284,11 +1232,6 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 				h.handleOpenAIProfitVetoExhausted(c, streamStarted, reqLog, profitVetoCount)
 				return
 			}
-			continue
-		}
-		if slotResult == openAISlotAcquireRetry {
-			failedAccountIDs[account.ID] = struct{}{}
-			reqLog.Info("openai.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
 			continue
 		}
 		if slotResult != openAISlotAcquireOK {
@@ -1331,11 +1274,9 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		writerSizeBeforeForward := c.Writer.Size()
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
-			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
 		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, clientRequestedUsageFields(c, channelMappingMsg, reqModel, ""), service.HashUsageRequestPayload(body))
-		h.reportOpenAITrafficDirectorOutcome(c.Request.Context(), account, healthModel, result, err)
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
 		responseLatencyMs := forwardDurationMs
@@ -1636,9 +1577,6 @@ const (
 	// 未写任何响应；调用方应经 recordOpenAIProfitVeto 把该账号加入本请求排除集
 	// 后重新选号，全池耗尽由下一轮选号返回标准 no available accounts。
 	openAISlotAcquireProfitVetoed
-	// openAISlotAcquireRetry 表示 Traffic Director 当前池的等待失败；调用方
-	// 应排除该账号并重新选号，策略层决定是否推进到 fallback 池。
-	openAISlotAcquireRetry
 )
 
 // openAIWSTurnPricing 持有 WebSocket 连接内「当前 turn」的计费定价时刻。
@@ -1666,46 +1604,6 @@ func (p *openAIWSTurnPricing) currentOr(fallback time.Time) time.Time {
 		return p.at
 	}
 	return fallback
-}
-
-// openAIWSPendingHealthProbes tracks only half-open probes acquired for turns
-// after the initial request. Some WS transports can stop between BeforeTurn
-// and AfterTurn; draining the remaining entries lets the handler abandon those
-// probes instead of holding the distributed lease until expiry.
-type openAIWSPendingHealthProbes struct {
-	mu     sync.Mutex
-	models map[int]string
-}
-
-func (p *openAIWSPendingHealthProbes) track(turn int, model string, decision service.TrafficDirectorHealthDecision) {
-	if turn <= 1 || !decision.HalfOpenProbe || strings.TrimSpace(decision.ProbeToken) == "" {
-		return
-	}
-	p.mu.Lock()
-	if p.models == nil {
-		p.models = make(map[int]string, 2)
-	}
-	p.models[turn] = strings.TrimSpace(model)
-	p.mu.Unlock()
-}
-
-func (p *openAIWSPendingHealthProbes) finish(turn int) (string, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	model, ok := p.models[turn]
-	delete(p.models, turn)
-	return model, ok
-}
-
-func (p *openAIWSPendingHealthProbes) drain() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	models := make([]string, 0, len(p.models))
-	for turn, model := range p.models {
-		models = append(models, model)
-		delete(p.models, turn)
-	}
-	return models
 }
 
 // recordOpenAIProfitVeto 记录 OpenAI 侧选号循环的一次利润门终检否决：把账号
@@ -1800,21 +1698,6 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	// 门只存在于调度栈的局部 ctx，必须经选号结果重放到本函数的 ctx 上。
 	ctx := service.ContextWithSelectionProfitGate(c.Request.Context(), selection)
 	account := selection.Account
-	admitTrafficDirector := func(release func()) (func(), openAISlotAcquireResult) {
-		selection.ReleaseFunc = release
-		if selection.AdmitTrafficDirector(ctx, selection.ReleaseFunc) {
-			return selection.ReleaseFunc, openAISlotAcquireOK
-		}
-		if selection.ReleaseFunc != nil {
-			selection.ReleaseFunc()
-		}
-		if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) {
-			return nil, openAISlotAcquireRetry
-		}
-		markOpsRoutingCapacityLimited(c)
-		h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "No available accounts", *streamStarted)
-		return nil, openAISlotAcquireFailed
-	}
 	if selection.Acquired {
 		if err := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, selection.ReleaseFunc, reqLog); err != nil {
 			markOpsRoutingCapacityLimited(c)
@@ -1831,10 +1714,6 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 		}
 		account = latest
 		selection.Account = latest
-		accountReleaseFunc, admissionResult := admitTrafficDirector(selection.ReleaseFunc)
-		if admissionResult != openAISlotAcquireOK {
-			return nil, admissionResult
-		}
 		// 调度器已抢槽路径无门时由选号内部完成 eager 绑定；门下选号内部
 		// 推迟绑定，这里在终检通过后补准入后绑定。
 		if selection.ProfitGateActive() {
@@ -1842,7 +1721,7 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 				reqLog.Warn("openai.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 			}
 		}
-		return wrapReleaseOnDone(ctx, accountReleaseFunc), openAISlotAcquireOK
+		return wrapReleaseOnDone(ctx, selection.ReleaseFunc), openAISlotAcquireOK
 	}
 	if selection.WaitPlan == nil {
 		markOpsRoutingCapacityLimited(c)
@@ -1879,10 +1758,6 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 		}
 		account = latest
 		selection.Account = latest
-		fastReleaseFunc, admissionResult := admitTrafficDirector(fastReleaseFunc)
-		if admissionResult != openAISlotAcquireOK {
-			return nil, admissionResult
-		}
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
@@ -1897,9 +1772,6 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 			zap.Int64("account_id", account.ID),
 			zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
 		)
-		if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) {
-			return nil, openAISlotAcquireRetry
-		}
 		h.handleStreamingAwareError(c, http.StatusTooManyRequests, "rate_limit_error", "Too many pending requests, please retry later", *streamStarted)
 		return nil, openAISlotAcquireFailed
 	}
@@ -1923,10 +1795,6 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	)
 	if err != nil {
 		reqLog.Warn("openai.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-		var timeoutErr *ConcurrencyError
-		if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) && errors.As(err, &timeoutErr) && timeoutErr.IsTimeout {
-			return nil, openAISlotAcquireRetry
-		}
 		h.handleConcurrencyError(c, err, "account", *streamStarted)
 		return nil, openAISlotAcquireFailed
 	}
@@ -1950,10 +1818,6 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	}
 	account = latest
 	selection.Account = latest
-	accountReleaseFunc, admissionResult := admitTrafficDirector(accountReleaseFunc)
-	if admissionResult != openAISlotAcquireOK {
-		return nil, admissionResult
-	}
 	if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
 		reqLog.Warn("openai.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 	}
@@ -2115,8 +1979,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	if channelMappingWS.Mapped && strings.TrimSpace(channelMappingWS.MappedModel) != "" {
 		wsForwardModel = strings.TrimSpace(channelMappingWS.MappedModel)
 	}
-	healthModelWS := openAITrafficDirectorHealthModel(reqModel, channelMappingWS)
-
 	var currentUserRelease func()
 	var currentAccountRelease func()
 	releaseAccountSlot := func() {
@@ -2266,8 +2128,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// 继续按建连时刻的谷价计费。生图意图只影响能力路由与图片计费，不关门。
 	// 建连时刻只用于选号/准入，不作为任何 turn 的计费定价时刻。
 	wsPricingCtx, _ := h.gatewayService.WithOpenAIRequestPricingContext(ctx, apiKey.GroupID)
-	wsPricingCtx = service.WithOpenAITrafficDirectorHealthModel(wsPricingCtx, healthModelWS)
-	wsPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(wsPricingCtx)
 	ctx = wsPricingCtx
 
 	for {
@@ -2294,10 +2154,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
-			if cls, ok := classifyTrafficDirectorSelectionError(err); ok {
-				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, cls.ErrType)
-				return
-			}
 			if lastFailoverErr != nil {
 				closeOpenAIWSFailoverExhausted(c, wsConn, lastFailoverErr)
 			} else {
@@ -2344,16 +2200,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			}
 			account = latest
 			selection.Account = latest
-			selection.ReleaseFunc = accountReleaseFunc
-			if !selection.AdmitTrafficDirector(admissionCtx, selection.ReleaseFunc) {
-				if selection.ReleaseFunc != nil {
-					selection.ReleaseFunc()
-				}
-				failedAccountIDs[account.ID] = struct{}{}
-				reqLog.Info("openai.traffic_director_health_rejected", zap.Int64("account_id", account.ID))
-				continue
-			}
-			accountReleaseFunc = selection.ReleaseFunc
 		}
 		if !selection.Acquired {
 			if selection.WaitPlan == nil {
@@ -2369,34 +2215,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				reqLog.Warn("openai.websocket_account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to acquire account concurrency slot")
 				return
-			}
-			if !fastAcquired {
-				if h.gatewayService.OpenAITrafficDirectorRetryEnabledInContext(ctx) {
-					waitRelease, queueFull, waitErr := h.acquireOpenAIWebSocketWaitPlanSlot(
-						ctx, c, account.ID, selection.WaitPlan,
-					)
-					if queueFull {
-						failedAccountIDs[account.ID] = struct{}{}
-						reqLog.Info("openai.websocket_account_wait_queue_full",
-							zap.Int64("account_id", account.ID),
-							zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
-						)
-						continue
-					}
-					if waitErr == nil && waitRelease != nil {
-						fastReleaseFunc = waitRelease
-						fastAcquired = true
-					} else {
-						var timeoutErr *ConcurrencyError
-						if errors.As(waitErr, &timeoutErr) && timeoutErr.IsTimeout {
-							failedAccountIDs[account.ID] = struct{}{}
-							reqLog.Info("openai.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
-							continue
-						}
-						closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to acquire account concurrency slot")
-						return
-					}
-				}
 			}
 			if !fastAcquired {
 				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
@@ -2423,16 +2241,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			}
 			account = latest
 			selection.Account = latest
-			selection.ReleaseFunc = fastReleaseFunc
-			if !selection.AdmitTrafficDirector(admissionCtx, selection.ReleaseFunc) {
-				if selection.ReleaseFunc != nil {
-					selection.ReleaseFunc()
-				}
-				failedAccountIDs[account.ID] = struct{}{}
-				reqLog.Info("openai.traffic_director_health_rejected", zap.Int64("account_id", account.ID))
-				continue
-			}
-			fastReleaseFunc = selection.ReleaseFunc
 			accountReleaseFunc = fastReleaseFunc
 		}
 		// 准入完成：门并入连接 ctx，turn 级复核与 failover 重选共用。
@@ -2471,20 +2279,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 		maxReasoningEffort, reasoningEffortMappings, _ := openAIReasoningEffortPolicyForRequest(c, apiKey)
 		var requestPayloadHash string
-		var firstTurnHealthReported atomic.Bool
-		var pendingTurnHealthProbes openAIWSPendingHealthProbes
-		reportFirstTurnHealthOutcome := func(model string, result *service.OpenAIForwardResult, turnErr error) {
-			if !firstTurnHealthReported.CompareAndSwap(false, true) {
-				return
-			}
-			if result == nil && turnErr == nil {
-				// The proxy closed before producing a first-turn outcome. Consume a
-				// possible half-open probe without treating the empty session as an
-				// account failure or a successful recovery.
-				turnErr = context.Canceled
-			}
-			h.reportOpenAITrafficDirectorOutcome(ctx, account, model, result, turnErr)
-		}
 		var turnStartsMu sync.Mutex
 		turnStarts := make(map[int]time.Time, 4)
 		recordTurnStart := func(turn int, startedAt time.Time) {
@@ -2589,34 +2383,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					}
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", err)
 				}
-				// A long-lived WebSocket can outlive the account health decision made
-				// during initial selection. Re-check after obtaining the real turn
-				// slot so an Enforced half-open probe is owned by an actual request.
-				healthModel := reqModel
-				if snapshot := turnChannelMapping.Load(); snapshot != nil && strings.TrimSpace(snapshot.mapping.MappedModel) != "" {
-					healthModel = snapshot.mapping.MappedModel
-				}
-				healthDecision, healthErr := h.gatewayService.CheckOpenAITrafficDirectorHealth(turnCtx, account, healthModel, "")
-				if healthErr != nil {
-					reqLog.Debug("openai.websocket_turn_health_check_failed", zap.Int("turn", turn), zap.Int64("account_id", account.ID), zap.Error(healthErr))
-				}
-				if !healthDecision.Allowed {
-					if accountReleaseFunc != nil {
-						accountReleaseFunc()
-					}
-					if userReleaseFunc != nil {
-						userReleaseFunc()
-					}
-					reqLog.Info("openai.websocket_turn_health_rejected", zap.Int("turn", turn), zap.Int64("account_id", account.ID), zap.String("state", string(healthDecision.State)))
-					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer healthy, please reconnect", nil)
-				}
-				pendingTurnHealthProbes.track(turn, healthModel, healthDecision)
 				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
 				currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
 				return nil
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
-				pendingProbeModel, pendingProbe := pendingTurnHealthProbes.finish(turn)
 				turnStart := getTurnStart(turn)
 				// F1: cyber 标记按 turn 生命周期清理——defer 保证任意早返回路径都执行；
 				// CyberBlocked 必须在 submit 前同步预捕获（task 闭包由 worker 池异步执行，
@@ -2638,16 +2409,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					turnMapping = snapshot.mapping
 				} else {
 					turnMapping, _ = h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, turnRequestedModel)
-				}
-				turnHealthModel := openAITrafficDirectorHealthModel(turnRequestedModel, turnMapping)
-				if turn == 1 {
-					reportFirstTurnHealthOutcome(turnHealthModel, result, turnErr)
-				} else if result != nil || turnErr != nil {
-					h.reportOpenAITrafficDirectorOutcome(ctx, account, turnHealthModel, result, turnErr)
-				} else if pendingProbe {
-					// No upstream outcome was produced after the probe admission.
-					// Treat this as abandonment, not success or account failure.
-					h.reportOpenAITrafficDirectorOutcome(ctx, account, pendingProbeModel, nil, context.Canceled)
 				}
 				if turnUpstreamModel == "" {
 					turnUpstreamModel = turnRequestedModel
@@ -2744,18 +2505,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		for {
-			selection.CommitTrafficDirectorAttempt()
-			proxyErr := func() error {
-				defer func() {
-					for _, pendingProbeModel := range pendingTurnHealthProbes.drain() {
-						// The transport exited after BeforeTurn but before AfterTurn.
-						// Consume the half-open probe without manufacturing success.
-						h.reportOpenAITrafficDirectorOutcome(ctx, account, pendingProbeModel, nil, context.Canceled)
-					}
-				}()
-				return h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
-			}()
-			reportFirstTurnHealthOutcome(healthModelWS, nil, proxyErr)
+			proxyErr := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
 			err := proxyErr
 			if err == nil {
 				reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
@@ -2897,38 +2647,6 @@ func (h *OpenAIGatewayHandler) recoverAnthropicMessagesPanic(c *gin.Context, str
 	if !started {
 		h.anthropicErrorResponse(c, http.StatusInternalServerError, "api_error", "Internal server error")
 	}
-}
-
-// acquireOpenAIWebSocketWaitPlanSlot applies the same bounded account wait
-// queue used by HTTP OpenAI handlers before polling for a real slot. Queue
-// overflow is returned separately so the caller can exclude the account and
-// continue through the current Traffic Director pool/fallback chain.
-func (h *OpenAIGatewayHandler) acquireOpenAIWebSocketWaitPlanSlot(
-	ctx context.Context,
-	c *gin.Context,
-	accountID int64,
-	waitPlan *service.AccountWaitPlan,
-) (release func(), queueFull bool, err error) {
-	if h == nil || h.concurrencyHelper == nil || c == nil || waitPlan == nil {
-		return nil, false, errors.New("websocket account wait plan is unavailable")
-	}
-	canWait, waitCountErr := h.concurrencyHelper.IncrementAccountWaitCount(ctx, accountID, waitPlan.MaxWaiting)
-	if waitCountErr == nil && !canWait {
-		return nil, true, nil
-	}
-	accountWaitCounted := waitCountErr == nil && canWait
-	if accountWaitCounted {
-		defer h.concurrencyHelper.DecrementAccountWaitCount(ctx, accountID)
-	}
-	release, err = h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
-		c,
-		accountID,
-		waitPlan.MaxConcurrency,
-		waitPlan.Timeout,
-		false,
-		new(bool),
-	)
-	return release, false, err
 }
 
 func (h *OpenAIGatewayHandler) ensureResponsesDependencies(c *gin.Context, reqLog *zap.Logger) bool {

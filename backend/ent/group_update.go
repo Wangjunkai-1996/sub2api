@@ -1883,9 +1883,6 @@ func (_u *GroupUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.AdvancedSchedulerOverrides(); ok {
 		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
 	}
-	if _u.mutation.TrafficDirectorSpecCleared() {
-		_spec.ClearField(group.FieldTrafficDirectorSpec, field.TypeJSON)
-	}
 	if _u.mutation.APIKeysCleared() {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -4075,9 +4072,6 @@ func (_u *GroupUpdateOne) sqlSave(ctx context.Context) (_node *Group, err error)
 	}
 	if value, ok := _u.mutation.AdvancedSchedulerOverrides(); ok {
 		_spec.SetField(group.FieldAdvancedSchedulerOverrides, field.TypeJSON, value)
-	}
-	if _u.mutation.TrafficDirectorSpecCleared() {
-		_spec.ClearField(group.FieldTrafficDirectorSpec, field.TypeJSON)
 	}
 	if _u.mutation.APIKeysCleared() {
 		edge := &sqlgraph.EdgeSpec{

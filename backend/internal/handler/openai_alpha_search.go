@@ -83,7 +83,6 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 	setOpsRequestContext(c, requestedModel, false)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeSync))
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, requestedModel)
-	healthModel := openAITrafficDirectorHealthModel(requestedModel, channelMapping)
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
@@ -118,8 +117,6 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 	// 分组利润控制：alpha search 文本入口请求级装门并固定 pricingAt
 	//（记录路径经 service.OpenAIPricingAtFromContext 从请求 ctx 回读）。
 	asPricingCtx, _ := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
-	asPricingCtx = service.WithOpenAITrafficDirectorHealthModel(asPricingCtx, healthModel)
-	asPricingCtx = h.gatewayService.WithOpenAITrafficDirectorRetryLoopContext(asPricingCtx)
 	c.Request = c.Request.WithContext(asPricingCtx)
 
 	for {
@@ -142,13 +139,8 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 				reqLog.Info("openai_alpha_search.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
-			if cls, ok := classifyTrafficDirectorSelectionError(err); ok {
-				markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-				h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
-				return
-			}
 			if len(failedAccountIDs) == 0 {
-				cls := classifyOpenAISelectionErrorFromGin(c, h.gatewayService, apiKey, requestedModel, requestedModel, service.PlatformOpenAI, err)
+				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, requestedModel, requestedModel, service.PlatformOpenAI)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
@@ -174,11 +166,6 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 			}
 			continue
 		}
-		if slotResult == openAISlotAcquireRetry {
-			failedAccountIDs[account.ID] = struct{}{}
-			reqLog.Info("openai.traffic_director_wait_failed_reselect", zap.Int64("account_id", account.ID))
-			continue
-		}
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
@@ -191,10 +178,8 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 			if accountRelease != nil {
 				defer accountRelease()
 			}
-			selection.CommitTrafficDirectorAttempt()
 			return h.gatewayService.ForwardAlphaSearch(c.Request.Context(), c, account, forwardBody)
 		}()
-		h.reportAlphaSearchTrafficDirectorOutcome(c, account, healthModel, result, err, writerSizeBeforeForward)
 		service.SetOpsLatencyMs(c, service.OpsResponseLatencyMsKey, time.Since(forwardStart).Milliseconds())
 
 		if err == nil {
@@ -264,37 +249,6 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 			zap.Int("upstream_status", failoverErr.StatusCode),
 			zap.Int("switch_count", switchCount),
 		)
-	}
-}
-
-// reportAlphaSearchTrafficDirectorOutcome preserves the status of a
-// non-failover upstream response that ForwardAlphaSearch already wrote to the
-// client. Attempts that did not write keep statusCode=0 so failover and
-// transport errors continue to be classified from err.
-func (h *OpenAIGatewayHandler) reportAlphaSearchTrafficDirectorOutcome(
-	c *gin.Context,
-	account *service.Account,
-	model string,
-	result *service.OpenAIForwardResult,
-	err error,
-	writerSizeBeforeForward int,
-) {
-	if h == nil || h.gatewayService == nil || account == nil {
-		return
-	}
-	ctx := context.Background()
-	statusCode := 0
-	if c != nil {
-		if c.Request != nil {
-			ctx = c.Request.Context()
-		}
-		if c.Writer != nil && c.Writer.Size() != writerSizeBeforeForward {
-			statusCode = c.Writer.Status()
-		}
-	}
-	if _, reportErr := h.gatewayService.ReportOpenAITrafficDirectorHealthOutcome(ctx, account, model, result, err, statusCode, nil); reportErr != nil && logger.L() != nil {
-		logger.L().Debug("openai_alpha_search.traffic_director_health_report_failed",
-			zap.Int64("account_id", account.ID), zap.Error(reportErr))
 	}
 }
 
