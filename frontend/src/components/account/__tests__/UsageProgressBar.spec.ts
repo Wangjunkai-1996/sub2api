@@ -22,7 +22,7 @@ describe('UsageProgressBar', () => {
     vi.useRealTimers()
   })
 
-  it('showNowWhenIdle=true 且利用率为 0 时显示“现在”', () => {
+	it('showNowWhenIdle=true 且利用率为 0 但 reset 在未来时显示倒计时', () => {
     const wrapper = mount(UsageProgressBar, {
       props: {
         label: '5h',
@@ -33,8 +33,52 @@ describe('UsageProgressBar', () => {
       }
     })
 
-    expect(wrapper.text()).toContain('usage.resetNow')
-    expect(wrapper.text()).not.toContain('2h 30m')
+		expect(wrapper.text()).toContain('2h 30m')
+		expect(wrapper.text()).not.toContain('usage.resetNow')
+	})
+
+	it('刚开始的五小时窗口按剩余分钟向上显示', () => {
+		const wrapper = mount(UsageProgressBar, {
+			props: {
+				label: '5h',
+				utilization: 0,
+				resetsAt: '2026-03-17T04:59:59Z',
+				showNowWhenIdle: true,
+				color: 'indigo'
+			}
+		})
+
+		expect(wrapper.text()).toContain('5h 0m')
+	})
+
+	it('showNowWhenIdle=true、利用率为 0 且没有 reset 时显示“现在”', () => {
+		const wrapper = mount(UsageProgressBar, {
+			props: {
+				label: '5h',
+				utilization: 0,
+				resetsAt: null,
+				showNowWhenIdle: true,
+				color: 'indigo'
+			}
+		})
+
+		expect(wrapper.text()).toContain('usage.resetNow')
+	})
+
+  it('未知 reset 可显示调用方提供的待处理状态，不误报“现在”', () => {
+    const wrapper = mount(UsageProgressBar, {
+      props: {
+        label: '5h',
+        utilization: 0,
+        resetsAt: null,
+        showNowWhenIdle: true,
+        unknownResetLabel: '待暖机',
+        color: 'indigo'
+      }
+    })
+
+    expect(wrapper.text()).toContain('待暖机')
+    expect(wrapper.text()).not.toContain('usage.resetNow')
   })
 
   it('showNowWhenIdle=true 但利用率大于 0 时显示倒计时', () => {

@@ -2282,60 +2282,62 @@ func (m *APIKeyMutation) ResetEdge(name string) error {
 // AccountMutation represents an operation that mutates the Account nodes in the graph.
 type AccountMutation struct {
 	config
-	op                          Op
-	typ                         string
-	id                          *int64
-	created_at                  *time.Time
-	updated_at                  *time.Time
-	deleted_at                  *time.Time
-	name                        *string
-	notes                       *string
-	platform                    *string
-	_type                       *string
-	credentials                 *map[string]interface{}
-	extra                       *map[string]interface{}
-	proxy_fallback_origin_id    *int64
-	addproxy_fallback_origin_id *int64
-	concurrency                 *int
-	addconcurrency              *int
-	load_factor                 *int
-	addload_factor              *int
-	priority                    *int
-	addpriority                 *int
-	rate_multiplier             *float64
-	addrate_multiplier          *float64
-	status                      *string
-	error_message               *string
-	last_used_at                *time.Time
-	expires_at                  *time.Time
-	auto_pause_on_expired       *bool
-	schedulable                 *bool
-	rate_limited_at             *time.Time
-	rate_limit_reset_at         *time.Time
-	overload_until              *time.Time
-	temp_unschedulable_until    *time.Time
-	temp_unschedulable_reason   *string
-	session_window_start        *time.Time
-	session_window_end          *time.Time
-	session_window_status       *string
-	quota_dimension             *account.QuotaDimension
-	clearedFields               map[string]struct{}
-	groups                      map[int64]struct{}
-	removedgroups               map[int64]struct{}
-	clearedgroups               bool
-	proxy                       *int64
-	clearedproxy                bool
-	parent                      *int64
-	clearedparent               bool
-	children                    map[int64]struct{}
-	removedchildren             map[int64]struct{}
-	clearedchildren             bool
-	usage_logs                  map[int64]struct{}
-	removedusage_logs           map[int64]struct{}
-	clearedusage_logs           bool
-	done                        bool
-	oldValue                    func(context.Context) (*Account, error)
-	predicates                  []predicate.Account
+	op                                   Op
+	typ                                  string
+	id                                   *int64
+	created_at                           *time.Time
+	updated_at                           *time.Time
+	deleted_at                           *time.Time
+	name                                 *string
+	notes                                *string
+	platform                             *string
+	_type                                *string
+	credentials                          *map[string]interface{}
+	openai_warmup_identity_generation    *int64
+	addopenai_warmup_identity_generation *int64
+	extra                                *map[string]interface{}
+	proxy_fallback_origin_id             *int64
+	addproxy_fallback_origin_id          *int64
+	concurrency                          *int
+	addconcurrency                       *int
+	load_factor                          *int
+	addload_factor                       *int
+	priority                             *int
+	addpriority                          *int
+	rate_multiplier                      *float64
+	addrate_multiplier                   *float64
+	status                               *string
+	error_message                        *string
+	last_used_at                         *time.Time
+	expires_at                           *time.Time
+	auto_pause_on_expired                *bool
+	schedulable                          *bool
+	rate_limited_at                      *time.Time
+	rate_limit_reset_at                  *time.Time
+	overload_until                       *time.Time
+	temp_unschedulable_until             *time.Time
+	temp_unschedulable_reason            *string
+	session_window_start                 *time.Time
+	session_window_end                   *time.Time
+	session_window_status                *string
+	quota_dimension                      *account.QuotaDimension
+	clearedFields                        map[string]struct{}
+	groups                               map[int64]struct{}
+	removedgroups                        map[int64]struct{}
+	clearedgroups                        bool
+	proxy                                *int64
+	clearedproxy                         bool
+	parent                               *int64
+	clearedparent                        bool
+	children                             map[int64]struct{}
+	removedchildren                      map[int64]struct{}
+	clearedchildren                      bool
+	usage_logs                           map[int64]struct{}
+	removedusage_logs                    map[int64]struct{}
+	clearedusage_logs                    bool
+	done                                 bool
+	oldValue                             func(context.Context) (*Account, error)
+	predicates                           []predicate.Account
 }
 
 var _ ent.Mutation = (*AccountMutation)(nil)
@@ -2748,6 +2750,62 @@ func (m *AccountMutation) OldCredentials(ctx context.Context) (v map[string]inte
 // ResetCredentials resets all changes to the "credentials" field.
 func (m *AccountMutation) ResetCredentials() {
 	m.credentials = nil
+}
+
+// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
+func (m *AccountMutation) SetOpenaiWarmupIdentityGeneration(i int64) {
+	m.openai_warmup_identity_generation = &i
+	m.addopenai_warmup_identity_generation = nil
+}
+
+// OpenaiWarmupIdentityGeneration returns the value of the "openai_warmup_identity_generation" field in the mutation.
+func (m *AccountMutation) OpenaiWarmupIdentityGeneration() (r int64, exists bool) {
+	v := m.openai_warmup_identity_generation
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldOpenaiWarmupIdentityGeneration returns the old "openai_warmup_identity_generation" field's value of the Account entity.
+// If the Account object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *AccountMutation) OldOpenaiWarmupIdentityGeneration(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldOpenaiWarmupIdentityGeneration is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldOpenaiWarmupIdentityGeneration requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldOpenaiWarmupIdentityGeneration: %w", err)
+	}
+	return oldValue.OpenaiWarmupIdentityGeneration, nil
+}
+
+// AddOpenaiWarmupIdentityGeneration adds i to the "openai_warmup_identity_generation" field.
+func (m *AccountMutation) AddOpenaiWarmupIdentityGeneration(i int64) {
+	if m.addopenai_warmup_identity_generation != nil {
+		*m.addopenai_warmup_identity_generation += i
+	} else {
+		m.addopenai_warmup_identity_generation = &i
+	}
+}
+
+// AddedOpenaiWarmupIdentityGeneration returns the value that was added to the "openai_warmup_identity_generation" field in this mutation.
+func (m *AccountMutation) AddedOpenaiWarmupIdentityGeneration() (r int64, exists bool) {
+	v := m.addopenai_warmup_identity_generation
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetOpenaiWarmupIdentityGeneration resets all changes to the "openai_warmup_identity_generation" field.
+func (m *AccountMutation) ResetOpenaiWarmupIdentityGeneration() {
+	m.openai_warmup_identity_generation = nil
+	m.addopenai_warmup_identity_generation = nil
 }
 
 // SetExtra sets the "extra" field.
@@ -4138,7 +4196,7 @@ func (m *AccountMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *AccountMutation) Fields() []string {
-	fields := make([]string, 0, 31)
+	fields := make([]string, 0, 32)
 	if m.created_at != nil {
 		fields = append(fields, account.FieldCreatedAt)
 	}
@@ -4162,6 +4220,9 @@ func (m *AccountMutation) Fields() []string {
 	}
 	if m.credentials != nil {
 		fields = append(fields, account.FieldCredentials)
+	}
+	if m.openai_warmup_identity_generation != nil {
+		fields = append(fields, account.FieldOpenaiWarmupIdentityGeneration)
 	}
 	if m.extra != nil {
 		fields = append(fields, account.FieldExtra)
@@ -4256,6 +4317,8 @@ func (m *AccountMutation) Field(name string) (ent.Value, bool) {
 		return m.GetType()
 	case account.FieldCredentials:
 		return m.Credentials()
+	case account.FieldOpenaiWarmupIdentityGeneration:
+		return m.OpenaiWarmupIdentityGeneration()
 	case account.FieldExtra:
 		return m.Extra()
 	case account.FieldProxyID:
@@ -4327,6 +4390,8 @@ func (m *AccountMutation) OldField(ctx context.Context, name string) (ent.Value,
 		return m.OldType(ctx)
 	case account.FieldCredentials:
 		return m.OldCredentials(ctx)
+	case account.FieldOpenaiWarmupIdentityGeneration:
+		return m.OldOpenaiWarmupIdentityGeneration(ctx)
 	case account.FieldExtra:
 		return m.OldExtra(ctx)
 	case account.FieldProxyID:
@@ -4437,6 +4502,13 @@ func (m *AccountMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetCredentials(v)
+		return nil
+	case account.FieldOpenaiWarmupIdentityGeneration:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetOpenaiWarmupIdentityGeneration(v)
 		return nil
 	case account.FieldExtra:
 		v, ok := value.(map[string]interface{})
@@ -4607,6 +4679,9 @@ func (m *AccountMutation) SetField(name string, value ent.Value) error {
 // this mutation.
 func (m *AccountMutation) AddedFields() []string {
 	var fields []string
+	if m.addopenai_warmup_identity_generation != nil {
+		fields = append(fields, account.FieldOpenaiWarmupIdentityGeneration)
+	}
 	if m.addproxy_fallback_origin_id != nil {
 		fields = append(fields, account.FieldProxyFallbackOriginID)
 	}
@@ -4630,6 +4705,8 @@ func (m *AccountMutation) AddedFields() []string {
 // was not set, or was not defined in the schema.
 func (m *AccountMutation) AddedField(name string) (ent.Value, bool) {
 	switch name {
+	case account.FieldOpenaiWarmupIdentityGeneration:
+		return m.AddedOpenaiWarmupIdentityGeneration()
 	case account.FieldProxyFallbackOriginID:
 		return m.AddedProxyFallbackOriginID()
 	case account.FieldConcurrency:
@@ -4649,6 +4726,13 @@ func (m *AccountMutation) AddedField(name string) (ent.Value, bool) {
 // type.
 func (m *AccountMutation) AddField(name string, value ent.Value) error {
 	switch name {
+	case account.FieldOpenaiWarmupIdentityGeneration:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddOpenaiWarmupIdentityGeneration(v)
+		return nil
 	case account.FieldProxyFallbackOriginID:
 		v, ok := value.(int64)
 		if !ok {
@@ -4839,6 +4923,9 @@ func (m *AccountMutation) ResetField(name string) error {
 		return nil
 	case account.FieldCredentials:
 		m.ResetCredentials()
+		return nil
+	case account.FieldOpenaiWarmupIdentityGeneration:
+		m.ResetOpenaiWarmupIdentityGeneration()
 		return nil
 	case account.FieldExtra:
 		m.ResetExtra()

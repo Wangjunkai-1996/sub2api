@@ -254,7 +254,7 @@ describe('AccountUsageCell', () => {
 
     await flushPromises()
 
-    expect(getUsage).toHaveBeenCalledWith(2000)
+    expect(getUsage).toHaveBeenCalledWith(2000, 'cached')
     expect(wrapper.text()).toContain('5h|15|300')
     expect(wrapper.text()).toContain('7d|77|300')
   })
@@ -315,7 +315,7 @@ describe('AccountUsageCell', () => {
 
     await flushPromises()
 
-    expect(getUsage).toHaveBeenCalledWith(2001)
+    expect(getUsage).toHaveBeenCalledWith(2001, 'cached')
     // 单一数据源：始终使用 /usage API 返回值，忽略 codex 快照
     expect(wrapper.text()).toContain('5h|18|900')
     expect(wrapper.text()).toContain('7d|36|900')
@@ -386,9 +386,128 @@ describe('AccountUsageCell', () => {
 
     // 手动刷新再拉一次
     expect(getUsage).toHaveBeenCalledTimes(2)
-    expect(getUsage).toHaveBeenCalledWith(2010)
+    expect(getUsage).toHaveBeenCalledWith(2010, 'cached', true)
     // 单一数据源：始终使用 /usage API 值
     expect(wrapper.text()).toContain('5h|18|900')
+  })
+
+  it('OpenAI OAuth 的用量刷新只读取缓存，不触发 active 探测', async () => {
+    getUsage.mockResolvedValue({
+      source: 'cached',
+      five_hour: {
+        utilization: 18,
+        resets_at: '2099-03-07T12:00:00Z',
+        remaining_seconds: 3600,
+        window_stats: { requests: 1, tokens: 100, cost: 0, standard_cost: 0, user_cost: 0 }
+      },
+      seven_day: null
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 2099,
+          platform: 'openai',
+          type: 'oauth',
+          extra: {
+            codex_usage_updated_at: '2099-03-07T10:00:00Z',
+            codex_5h_used_percent: 18,
+            codex_5h_reset_at: '2099-03-07T12:00:00Z'
+          }
+        })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          OpenAIQuotaResetCell: {
+            template: '<div><slot name="pre-actions" /></div>'
+          }
+        }
+      }
+    })
+
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledWith(2099, 'cached')
+
+    await wrapper.get('button').trigger('click')
+    await flushPromises()
+
+    expect(getUsage).toHaveBeenLastCalledWith(2099, 'cached', true)
+    expect(getUsage.mock.calls.some((call: unknown[]) => call[1] === 'active')).toBe(false)
+  })
+
+  it('OpenAI 批量缓存刷新会保持加载态到请求完成，并反馈无变化、成功和失败', async () => {
+    const initialUsage = {
+      source: 'cached' as const,
+      updated_at: '2099-03-07T10:00:00Z',
+      five_hour: {
+        utilization: 18,
+        resets_at: '2099-03-07T12:00:00Z',
+        remaining_seconds: 3600,
+        window_stats: { requests: 1, tokens: 100, cost: 0, standard_cost: 0, user_cost: 0 }
+      },
+      seven_day: null,
+      seven_day_sonnet: null
+    }
+    const changedUsage = {
+      ...initialUsage,
+      five_hour: {
+        ...initialUsage.five_hour,
+        utilization: 24
+      }
+    }
+    const requestBatchedUsage = vi.fn().mockResolvedValue({ usage: initialUsage, error: null })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({ id: 2100, platform: 'openai', type: 'oauth' }),
+        batchedUsage: initialUsage,
+        requestBatchedUsage
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          OpenAIQuotaResetCell: {
+            template: '<div><slot name="pre-actions" /></div>'
+          }
+        }
+      }
+    })
+
+    await flushPromises()
+    requestBatchedUsage.mockClear()
+
+    let finishRefresh!: (result: { usage: typeof initialUsage; error: null }) => void
+    requestBatchedUsage.mockReturnValueOnce(new Promise((resolve) => {
+      finishRefresh = resolve
+    }))
+
+    await wrapper.get('[data-testid="openai-cached-usage-refresh"]').trigger('click')
+    expect(wrapper.get('[data-testid="openai-cached-usage-refresh"]').attributes('aria-busy')).toBe('true')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.cachedQueryLoading')
+    expect(wrapper.find('[data-testid="openai-cached-usage-feedback"]').exists()).toBe(false)
+
+    finishRefresh({ usage: initialUsage, error: null })
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="openai-cached-usage-refresh"]').attributes('aria-busy')).toBe('false')
+    expect(wrapper.get('[data-testid="openai-cached-usage-feedback"]').text())
+      .toBe('admin.accounts.usageWindow.cachedRefreshUnchanged')
+
+    requestBatchedUsage.mockResolvedValueOnce({ usage: changedUsage, error: null })
+    await wrapper.get('[data-testid="openai-cached-usage-refresh"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="openai-cached-usage-feedback"]').text())
+      .toBe('admin.accounts.usageWindow.cachedRefreshSuccess')
+
+    requestBatchedUsage.mockResolvedValueOnce({ usage: null, error: 'network failed' })
+    await wrapper.get('[data-testid="openai-cached-usage-refresh"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="openai-cached-usage-feedback"]').text())
+      .toBe('admin.accounts.usageWindow.cachedRefreshFailed')
+    expect(wrapper.text()).toContain('network failed')
   })
 
   it('OpenAI OAuth 在无 codex 快照时会回退显示 usage 接口窗口', async () => {
@@ -441,9 +560,11 @@ describe('AccountUsageCell', () => {
 
 	await flushPromises()
 
-	expect(getUsage).toHaveBeenCalledWith(2002)
+    expect(getUsage).toHaveBeenCalledWith(2002, 'cached')
 	expect(wrapper.text()).toContain('5h|0|27700')
 	expect(wrapper.text()).toContain('7d|0|27700')
+    expect(wrapper.get('[data-testid="openai-snapshot-pending"]').text())
+      .toBe('admin.accounts.usageWindow.snapshotPending')
   })
 
   it('OpenAI OAuth 在行数据刷新但仍无 codex 快照时会重新拉取 usage', async () => {
@@ -617,7 +738,7 @@ describe('AccountUsageCell', () => {
 
 	await flushPromises()
 
-  expect(getUsage).toHaveBeenCalledWith(2004)
+  expect(getUsage).toHaveBeenCalledWith(2004, 'cached')
   expect(wrapper.text()).toContain('5h|100|106540000')
   expect(wrapper.text()).toContain('7d|100|106540000')
   })

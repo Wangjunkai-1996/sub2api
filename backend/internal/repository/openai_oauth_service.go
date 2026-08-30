@@ -121,8 +121,9 @@ func (s *openaiOAuthService) refreshTokenWithClientID(ctx context.Context, refre
 
 func createOpenAIReqClient(proxyURL string) (*req.Client, error) {
 	return getSharedReqClient(reqClientOptions{
-		ProxyURL: proxyURL,
-		Timeout:  120 * time.Second,
+		ProxyURL:         proxyURL,
+		Timeout:          120 * time.Second,
+		DisableRedirects: true,
 	})
 }
 

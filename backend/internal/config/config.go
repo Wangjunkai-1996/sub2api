@@ -96,14 +96,19 @@ type Config struct {
 	UsageCleanup            UsageCleanupConfig            `mapstructure:"usage_cleanup"`
 	Concurrency             ConcurrencyConfig             `mapstructure:"concurrency"`
 	TokenRefresh            TokenRefreshConfig            `mapstructure:"token_refresh"`
-	RunMode                 string                        `mapstructure:"run_mode" yaml:"run_mode"`
-	Timezone                string                        `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
-	Gemini                  GeminiConfig                  `mapstructure:"gemini"`
-	Update                  UpdateConfig                  `mapstructure:"update"`
-	Idempotency             IdempotencyConfig             `mapstructure:"idempotency"`
-	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
-	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
-	Plugins                 PluginConfig                  `mapstructure:"plugins"`
+	// OpenAIWindowWarmupWorkerEnabled controls whether this process runs the
+	// durable Codex five-hour warmup worker. Text/API slots keep the default
+	// enabled; image-only slots must set OPENAI_WINDOW_WARMUP_WORKER_ENABLED=false
+	// so they cannot compete for shared warmup jobs.
+	OpenAIWindowWarmupWorkerEnabled bool               `mapstructure:"openai_window_warmup_worker_enabled"`
+	RunMode                         string             `mapstructure:"run_mode" yaml:"run_mode"`
+	Timezone                        string             `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
+	Gemini                          GeminiConfig       `mapstructure:"gemini"`
+	Update                          UpdateConfig       `mapstructure:"update"`
+	Idempotency                     IdempotencyConfig  `mapstructure:"idempotency"`
+	BatchImage                      BatchImageConfig   `mapstructure:"batch_image"`
+	ImageStorage                    ImageStorageConfig `mapstructure:"image_storage"`
+	Plugins                         PluginConfig       `mapstructure:"plugins"`
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -1794,6 +1799,9 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if err := viper.BindEnv("server.enable_server_timing", "ENABLE_SERVER_TIMING"); err != nil {
 		return nil, fmt.Errorf("bind ENABLE_SERVER_TIMING: %w", err)
 	}
+	if err := viper.BindEnv("openai_window_warmup_worker_enabled", "OPENAI_WINDOW_WARMUP_WORKER_ENABLED"); err != nil {
+		return nil, fmt.Errorf("bind OPENAI_WINDOW_WARMUP_WORKER_ENABLED: %w", err)
+	}
 
 	// 默认值
 	setDefaults()
@@ -2577,6 +2585,10 @@ func setDefaults() {
 // environment. Any subsystem that wants a richer default still applies it after
 // unmarshal, exactly as before.
 func setEnvReachableDefaults() {
+	// This is an effective true default: existing single-container and text
+	// deployments must continue to run the worker unless they opt into the
+	// image-only role explicitly.
+	viper.SetDefault("openai_window_warmup_worker_enabled", true)
 	viper.SetDefault("gateway.forced_codex_instructions_template_file", "")
 	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
 	viper.SetDefault("gateway.user_message_queue.mode", "")

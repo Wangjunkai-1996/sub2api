@@ -158,6 +158,14 @@ func runMainServer() {
 			log.Printf("Plugin manager started in degraded state: %v", err)
 		}
 	}
+	// Warmup starts after the plugin manager so the first scan can transparently
+	// reuse an enabled OpenAI OAuth transport plugin. Image-only slots construct
+	// the service for shared dependency wiring but must not run a second worker.
+	if app.OpenAIWindowWarmup != nil && cfg.OpenAIWindowWarmupWorkerEnabled {
+		app.OpenAIWindowWarmup.Start()
+	} else if app.OpenAIWindowWarmup != nil {
+		log.Printf("OpenAI window warmup worker disabled by OPENAI_WINDOW_WARMUP_WORKER_ENABLED")
+	}
 	if app.PromptAudit != nil {
 		if err := app.PromptAudit.Start(context.Background()); err != nil {
 			// Startup continues so unrelated APIs stay up. Fail-closed (unavailable)

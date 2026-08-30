@@ -451,6 +451,28 @@ export default {
         accountSchedulingThresholdsDisabledHint: '100 disables platform auto-pause. Values 1–99 pause scheduling once utilization reaches that percent.',
         accountSchedulingThresholdsRangeHint: 'Integer 1–100 (percent). OpenAI/Anthropic/Grok only.'
       },
+      openAIWindowWarmup: {
+        title: 'OpenAI Codex Five-Hour Window Warmup',
+        description: 'When the global switch is off, no new warmup jobs are claimed or sent.',
+        enabled: 'Enable automatic warmup',
+        defaultPolicy: 'Default import policy',
+        policyOff: 'Off',
+        policyOnce: 'Once',
+        policyContinuous: 'Continuous',
+        allowlist: 'Account scope (empty = all eligible)',
+        allowlistPlaceholder: 'e.g. 101, 205, 309',
+        allowlistInvalid: 'The account allowlist must contain positive integer IDs separated by commas or spaces.',
+        probeModel: 'Probe model',
+        workerConcurrency: 'Worker concurrency',
+        globalQPS: 'Global QPS',
+        batchSize: 'Scan batch',
+        scanSeconds: 'Scan interval (seconds)',
+        requestTimeoutSeconds: 'Request timeout (seconds)',
+        leaseSeconds: 'Lease (seconds)',
+        resetGraceSeconds: 'Reset grace (seconds)',
+        runtimeApplyHint: 'The global switch and account scope apply immediately. Restart the service after changing the probe model or worker parameters.',
+        leaseInvalid: 'The lease must be longer than the request timeout.'
+      },
       upstreamBillingProbe: {
         title: 'Upstream Rate Auto Detection',
         description: 'Periodically retrieve rates declared by upstream Sub2API sites. Account rates change only when the separate sync switch is enabled.',

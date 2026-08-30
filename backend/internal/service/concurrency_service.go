@@ -55,6 +55,21 @@ type ConcurrencyCache interface {
 	CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error
 }
 
+// AccountExclusiveSlotCache is an optional cache capability used by low-priority
+// maintenance traffic. Ordinary requests must fail fast while the exclusive
+// lease exists; they never wait on the lease itself.
+type AccountExclusiveSlotCache interface {
+	AcquireAccountExclusive(context.Context, int64, string, time.Duration) (bool, error)
+	RefreshAccountExclusive(context.Context, int64, string, time.Duration) (bool, error)
+	ReleaseAccountExclusive(context.Context, int64, string) (bool, error)
+}
+
+// AccountUnboundedSlotCache keeps an otherwise-unlimited account aware of the
+// warmup maintenance gate without imposing a numerical concurrency limit.
+type AccountUnboundedSlotCache interface {
+	AcquireUnboundedAccountSlot(context.Context, int64, string) (bool, error)
+}
+
 type APIKeyConcurrencyCache interface {
 	TrackAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) error
 	ReleaseAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) error
@@ -312,6 +327,62 @@ type AcquireResult struct {
 	ReleaseFunc func() // Must be called when done (typically via defer)
 }
 
+// AccountExclusiveLease reserves an idle account for a short maintenance
+// request. Release is idempotent and uses a fencing token in the cache.
+type AccountExclusiveLease struct {
+	cache     AccountExclusiveSlotCache
+	accountID int64
+	token     string
+	ttl       time.Duration
+	release   sync.Once
+}
+
+func (l *AccountExclusiveLease) Refresh(ctx context.Context) (bool, error) {
+	if l == nil || l.cache == nil || l.accountID <= 0 || l.token == "" {
+		return false, errors.New("account exclusive lease is unavailable")
+	}
+	// The cache also fences refresh against newly arrived business demand, so a
+	// maintenance owner cannot extend its lease ahead of a real request.
+	return l.cache.RefreshAccountExclusive(ctx, l.accountID, l.token, l.ttl)
+}
+
+func (l *AccountExclusiveLease) Release() {
+	if l == nil {
+		return
+	}
+	l.release.Do(func() {
+		if l.cache == nil || l.accountID <= 0 || l.token == "" {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := l.cache.ReleaseAccountExclusive(ctx, l.accountID, l.token); err != nil {
+			logger.LegacyPrintf("service.concurrency", "Warning: failed to release exclusive account lease for %d: %v", l.accountID, err)
+		}
+	})
+}
+
+// TryAcquireAccountExclusive atomically succeeds only when the account has no
+// ordinary/live request and no queued waiter. Unsupported caches fail closed.
+func (s *ConcurrencyService) TryAcquireAccountExclusive(ctx context.Context, accountID int64, ttl time.Duration) (*AccountExclusiveLease, bool, error) {
+	if s == nil || s.cache == nil || accountID <= 0 {
+		return nil, false, errors.New("account exclusive concurrency cache is unavailable")
+	}
+	cache, ok := s.cache.(AccountExclusiveSlotCache)
+	if !ok {
+		return nil, false, errors.New("account exclusive concurrency cache is unsupported")
+	}
+	if ttl <= 0 {
+		ttl = 2 * time.Minute
+	}
+	token := generateRequestID()
+	acquired, err := cache.AcquireAccountExclusive(ctx, accountID, token, ttl)
+	if err != nil || !acquired {
+		return nil, acquired, err
+	}
+	return &AccountExclusiveLease{cache: cache, accountID: accountID, token: token, ttl: ttl}, true, nil
+}
+
 type AccountWithConcurrency struct {
 	ID             int64
 	MaxConcurrency int
@@ -342,6 +413,32 @@ type UserLoadInfo struct {
 func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int) (*AcquireResult, error) {
 	// If maxConcurrency is 0 or negative, no limit
 	if maxConcurrency <= 0 {
+		if s != nil && s.cache != nil {
+			if cache, ok := s.cache.(AccountUnboundedSlotCache); ok {
+				requestID := generateRequestID()
+				acquired, err := cache.AcquireUnboundedAccountSlot(ctx, accountID, requestID)
+				if err != nil {
+					// Preserve the historical fail-open contract for unlimited
+					// accounts. A Redis outage also prevents a warmup worker from
+					// acquiring the exclusive lease in the first place.
+					logger.LegacyPrintf("service.concurrency", "Warning: failed to check warmup gate for unlimited account %d: %v", accountID, err)
+					return &AcquireResult{Acquired: true, ReleaseFunc: func() {}}, nil
+				}
+				if !acquired {
+					return &AcquireResult{Acquired: false}, nil
+				}
+				return &AcquireResult{
+					Acquired: true,
+					ReleaseFunc: func() {
+						bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						if err := s.cache.ReleaseAccountSlot(bgCtx, accountID, requestID); err != nil {
+							logger.LegacyPrintf("service.concurrency", "Warning: failed to release unlimited account slot for %d (req=%s): %v", accountID, requestID, err)
+						}
+					},
+				}, nil
+			}
+		}
 		return &AcquireResult{
 			Acquired:    true,
 			ReleaseFunc: func() {}, // no-op

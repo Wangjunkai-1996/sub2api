@@ -79,6 +79,10 @@ func (Account) Fields() []ent.Field {
 		field.JSON("credentials", map[string]any{}).
 			Default(func() map[string]any { return map[string]any{} }).
 			SchemaType(map[string]string{dialect.Postgres: "jsonb"}),
+		field.Int64("openai_warmup_identity_generation").
+			Default(1).
+			Min(1).
+			Comment("Monotonic OpenAI warmup identity generation; token refreshes do not advance it"),
 
 		// extra: 扩展数据，存储平台特定的额外信息
 		// 如 CRS 账户的 crs_account_id、组织信息等

@@ -1,0 +1,625 @@
+package service
+
+// The warmup probe is intentionally kept separate from the account test and
+// gateway paths.  It owns only the fixed, content-free Responses request and
+// interpretation of the upstream terminal/reset evidence.  Credential
+// material and the actual HTTP/TLS/plugin call belong to OpenAIOutboundExecutor.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	openaiPkg "github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/tidwall/gjson"
+)
+
+const (
+	openAIWindowWarmupEndpoint = chatgptCodexURL
+	// Keep enough of an SSE response to identify terminal/reset evidence while
+	// making accidental retention of generated text unlikely.  The executor is
+	// expected to enforce the same bound before returning a result.
+	openAIWindowWarmupMaxBodyBytes       = 128 << 10
+	openAIWindowWarmupOutcomeCompleted   = "completed"
+	openAIWindowWarmupOutcomeIncomplete  = "incomplete"
+	openAIWindowWarmupOutcomeFailed      = "failed"
+	openAIWindowWarmupOutcomeUncertain   = "uncertain"
+	openAIWindowWarmupOutcomeBlocked     = "blocked"
+	openAIWindowWarmupMaxModelBytes      = 128
+	openAIWindowWarmupInstructions       = "Reply with OK."
+	openAIWindowWarmupMaxEvidenceIDBytes = 255
+)
+
+var (
+	ErrOpenAIWindowWarmupNeedsReauth        = errors.New("needs_reauth")
+	ErrOpenAIWindowWarmupBlocked            = errors.New("blocked")
+	ErrOpenAIWindowWarmupBlockedConfig      = errors.New("blocked_config")
+	ErrOpenAIWindowWarmupCredentialsChanged = errors.New("credentials_changed")
+	ErrOpenAIWindowWarmupSendGuardClosed    = errors.New("send_guard_closed")
+)
+
+// OpenAICodexWindowProbe creates the one-shot request used to advance a
+// subscription's five-hour Codex window.  The executor is deliberately
+// injectable so production can select the built-in HTTP/TLS path or the
+// installed OAuth transport plugin without changing probe semantics.
+type OpenAICodexWindowProbe struct {
+	executor OpenAIOutboundExecutor
+	model    string
+	modelErr error
+	endpoint string
+	timeout  time.Duration
+}
+
+// NewOpenAICodexWindowProbe constructs a probe.  An omitted/blank model uses
+// the controlled CodexUsageProbeModel rather than a client-supplied model.
+func NewOpenAICodexWindowProbe(executor OpenAIOutboundExecutor, model ...string) *OpenAICodexWindowProbe {
+	selected := openaiPkg.CodexUsageProbeModel
+	if len(model) > 0 && strings.TrimSpace(model[0]) != "" {
+		selected = strings.TrimSpace(model[0])
+	}
+	normalized, modelErr := NormalizeOpenAIWindowWarmupProbeModel(selected)
+	if modelErr == nil {
+		selected = normalized
+	}
+	return &OpenAICodexWindowProbe{
+		executor: executor,
+		model:    selected,
+		modelErr: modelErr,
+		endpoint: openAIWindowWarmupEndpoint,
+		timeout:  openAIWindowWarmupDefaultTimeout,
+	}
+}
+
+func (p *OpenAICodexWindowProbe) SetRequestTimeout(timeout time.Duration) {
+	if p == nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = openAIWindowWarmupDefaultTimeout
+	}
+	p.timeout = timeout
+}
+
+// NormalizeOpenAIWindowWarmupProbeModel accepts only the repository's
+// controlled Codex subscription text-model catalog. Spark and image models
+// have independent quota semantics and therefore fail closed.
+func NormalizeOpenAIWindowWarmupProbeModel(raw string) (string, error) {
+	model := strings.TrimSpace(raw)
+	if model == "" {
+		return "", fmt.Errorf("%w: model is required", ErrOpenAIWindowWarmupBlockedConfig)
+	}
+	if len(model) > openAIWindowWarmupMaxModelBytes {
+		return "", fmt.Errorf("%w: model identifier is too long", ErrOpenAIWindowWarmupBlockedConfig)
+	}
+	if strings.Contains(strings.ToLower(model), "spark") {
+		return "", fmt.Errorf("%w: Spark quota is excluded", ErrOpenAIWindowWarmupBlockedConfig)
+	}
+	for _, candidate := range openaiPkg.DefaultModels {
+		if candidate.ID == model && (model == openaiPkg.CodexUsageProbeModel || strings.HasPrefix(model, "gpt-5")) {
+			return model, nil
+		}
+	}
+	return "", fmt.Errorf("%w: model is outside the controlled Codex catalog", ErrOpenAIWindowWarmupBlockedConfig)
+}
+
+// Model returns the controlled model used by the probe.
+func (p *OpenAICodexWindowProbe) Model() string {
+	if p == nil || strings.TrimSpace(p.model) == "" {
+		return openaiPkg.CodexUsageProbeModel
+	}
+	return p.model
+}
+
+// Endpoint returns the upstream Responses endpoint.  It is exposed for
+// diagnostics/tests, while callers should continue to use Probe.
+func (p *OpenAICodexWindowProbe) Endpoint() string {
+	if p == nil || strings.TrimSpace(p.endpoint) == "" {
+		return openAIWindowWarmupEndpoint
+	}
+	return p.endpoint
+}
+
+func (p *OpenAICodexWindowProbe) RequestTimeout() time.Duration {
+	if p == nil || p.timeout <= 0 {
+		return openAIWindowWarmupDefaultTimeout
+	}
+	return p.timeout
+}
+
+// Probe performs one fixed minimal Responses request and returns only bounded
+// metadata.  expectedResetAt is used as an evidence guard: a successful HTTP
+// response without a *future* reset is never reported as completed.
+func (p *OpenAICodexWindowProbe) Probe(ctx context.Context, account *Account, expectedResetAt *time.Time) (*OpenAIWindowProbeResult, error) {
+	if p == nil || p.executor == nil {
+		return nil, errors.New("warmup executor is not configured")
+	}
+	if p.modelErr != nil {
+		return nil, p.modelErr
+	}
+	if !warmupProbeAccountEligible(account) {
+		return nil, errors.New("warmup account is not an eligible OpenAI OAuth account")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	payload, err := buildOpenAIWindowWarmupPayload(p.Model())
+	if err != nil {
+		return nil, fmt.Errorf("build warmup payload: %w", err)
+	}
+	headers := buildOpenAIWindowWarmupHeaders(account)
+	request := OpenAIOutboundRequest{
+		Account:            account,
+		IdentityGeneration: account.OpenAIWarmupIdentityGeneration,
+		SendGuard:          openAIWindowWarmupSendGuardFromContext(ctx),
+		Model:              p.Model(),
+		Payload:            payload,
+		Headers:            headers,
+		Timeout:            p.RequestTimeout(),
+		Endpoint:           p.Endpoint(),
+	}
+	result, executeErr := p.executor.Execute(ctx, request)
+	parsed := parseOpenAIWindowWarmupResult(result, expectedResetAt)
+	if executeErr != nil {
+		// Preserve the executor's bounded result so the service can distinguish a
+		// request that may have reached upstream from one that failed pre-send.
+		if parsed == nil {
+			parsed = &OpenAIWindowProbeResult{Outcome: openAIWindowWarmupOutcomeUncertain}
+		}
+		if isWarmupProbePossiblySent(result, executeErr) {
+			return parsed, fmt.Errorf("possibly_sent: %w", executeErr)
+		}
+		return parsed, executeErr
+	}
+	if parsed == nil {
+		return nil, errors.New("warmup executor returned an empty result")
+	}
+	if err := validateOpenAIWindowWarmupOutcome(parsed, expectedResetAt); err != nil {
+		return parsed, err
+	}
+	return parsed, nil
+}
+
+func warmupProbeAccountEligible(account *Account) bool {
+	return account != nil && account.Platform == PlatformOpenAI &&
+		account.Type == AccountTypeOAuth && account.ParentAccountID == nil &&
+		!account.IsShadow() && account.IsActive() && account.Schedulable
+}
+
+// buildOpenAIWindowWarmupPayload is intentionally stable and tiny. It carries
+// only the short, non-empty instructions required by the Responses contract;
+// it has no tools, previous_response_id, or content from an inbound request.
+// `stream=true` is required by the Codex internal endpoint, and `store=false`
+// prevents server-side response storage.
+func buildOpenAIWindowWarmupPayload(model string) ([]byte, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = openaiPkg.CodexUsageProbeModel
+	}
+	payload := map[string]any{
+		"model":        model,
+		"instructions": openAIWindowWarmupInstructions,
+		"input": []map[string]any{
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "input_text", "text": "ping"},
+				},
+			},
+		},
+		"stream": true,
+		"store":  false,
+	}
+	return json.Marshal(payload)
+}
+
+// BuildOpenAIWindowWarmupPayload is an exported, read-only helper for adapter
+// and contract tests.  It returns a fresh byte slice on every invocation.
+func BuildOpenAIWindowWarmupPayload(model string) []byte {
+	payload, _ := buildOpenAIWindowWarmupPayload(model)
+	return payload
+}
+
+func buildOpenAIWindowWarmupHeaders(account *Account) http.Header {
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Accept", "text/event-stream")
+	headers.Set("OpenAI-Beta", "responses=experimental")
+	// Reuse the same identity normalization as ordinary Codex OAuth traffic.
+	// The executor is responsible for adding Authorization (Bearer or Agent
+	// Assertion) after refreshing/resolving credentials.
+	applyOpenAICodexProbeHeaders(headers)
+	if account != nil {
+		setOpenAIChatGPTAccountHeaders(headers, account)
+		if customUA := strings.TrimSpace(account.GetOpenAIUserAgent()); customUA != "" {
+			headers.Set("User-Agent", customUA)
+			enforceCodexIdentityHeadersWithUA(headers, customUA)
+		}
+		account.ApplyHeaderOverrides(headers)
+	}
+	return headers
+}
+
+// ParseOpenAIWindowWarmupResult interprets a bounded executor result.  It is
+// exported so repository/service tests can exercise terminal and reset guards
+// without making an upstream request.
+func ParseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt *time.Time) *OpenAIWindowProbeResult {
+	return parseOpenAIWindowWarmupResult(result, expectedResetAt)
+}
+
+func parseOpenAIWindowWarmupResult(result *OpenAIOutboundResult, expectedResetAt *time.Time) *OpenAIWindowProbeResult {
+	if result == nil {
+		return nil
+	}
+	headers := cloneWarmupHeaders(result.Headers)
+	body := boundedWarmupBody(result.Body)
+	resetAt := cloneWarmupTime(result.ResetAt)
+	headerReset := warmupResetFromHeaders(headers)
+	resetFromRelativeHeader := headerReset != nil
+	if resetAt == nil {
+		resetAt = headerReset
+	}
+	terminal := result.Terminal
+	terminalType := strings.TrimSpace(result.TerminalType)
+	bodyEvidence := parseWarmupSSEEvidence(body)
+	if bodyEvidence.Terminal {
+		terminal = true
+		// The response body is the raw upstream evidence.  An executor may set
+		// TerminalType before returning it, but a stale/contradictory success
+		// value must never override a failed or incomplete body status (and an
+		// explicit executor failure must not be promoted by a successful body).
+		terminalType = mergeWarmupTerminalTypes(terminalType, bodyEvidence.TerminalType)
+		if resetAt == nil {
+			resetAt = bodyEvidence.ResetAt
+		}
+	}
+	if terminalType == "" {
+		terminalType = responseTerminalType(body)
+	}
+	outcome := openAIWindowWarmupOutcomeUncertain
+	switch {
+	case terminalType == "response.completed" || terminalType == "response.done":
+		outcome = openAIWindowWarmupOutcomeCompleted
+	case terminalType == "response.incomplete":
+		outcome = openAIWindowWarmupOutcomeIncomplete
+	case terminalType == "response.failed" || terminalType == "response.cancelled" || terminalType == "response.canceled":
+		outcome = openAIWindowWarmupOutcomeFailed
+	case result.StatusCode == http.StatusForbidden || result.StatusCode == http.StatusBadRequest || result.StatusCode == http.StatusNotFound:
+		outcome = openAIWindowWarmupOutcomeBlocked
+	}
+	requestID := normalizeWarmupEvidenceID(result.RequestID)
+	if requestID == "" {
+		requestID = normalizeWarmupEvidenceID(headers.Get("x-request-id"))
+	}
+	return &OpenAIWindowProbeResult{
+		StatusCode:              result.StatusCode,
+		Headers:                 headers,
+		Body:                    body,
+		Terminal:                terminal,
+		TerminalType:            terminalType,
+		ResetAt:                 cloneWarmupTime(resetAt),
+		ObservedResetAt:         cloneWarmupTime(resetAt),
+		Started:                 result.Started,
+		EOF:                     result.EOF,
+		Outcome:                 outcome,
+		AuthFailure:             cloneOpenAIWindowWarmupAuthFailure(result.AuthFailure),
+		Usage:                   cloneOpenAIWindowWarmupTokenUsage(bodyEvidence.Usage),
+		ResponseID:              normalizeWarmupEvidenceID(bodyEvidence.ResponseID),
+		RequestID:               requestID,
+		resetFromRelativeHeader: resetFromRelativeHeader,
+	}
+}
+
+func validateOpenAIWindowWarmupOutcome(result *OpenAIWindowProbeResult, expectedResetAt *time.Time) error {
+	if result == nil {
+		return errors.New("warmup executor returned an empty result")
+	}
+	status := result.StatusCode
+	if status == http.StatusUnauthorized {
+		return fmt.Errorf("%w: upstream returned 401", ErrOpenAIWindowWarmupNeedsReauth)
+	}
+	if status == http.StatusForbidden {
+		return fmt.Errorf("%w: upstream returned 403", ErrOpenAIWindowWarmupBlocked)
+	}
+	if status == http.StatusBadRequest || status == http.StatusNotFound {
+		return fmt.Errorf("%w: upstream returned %d", ErrOpenAIWindowWarmupBlockedConfig, status)
+	}
+	if status == http.StatusTooManyRequests {
+		return errors.New("rate_limited: warmup upstream returned 429")
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("upstream_status_%d: warmup upstream returned %d", status, status)
+	}
+	if !result.Terminal || (result.TerminalType != "response.completed" && result.TerminalType != "response.done") {
+		return errors.New("possibly_sent: warmup response has no completed terminal event")
+	}
+	if result.ResetAt == nil || !result.ResetAt.After(time.Now()) {
+		return errors.New("possibly_sent: warmup response has no future reset evidence")
+	}
+	if result.Usage.Positive() {
+		return nil
+	}
+	if expectedResetAt != nil && !result.ResetAt.After(*expectedResetAt) {
+		return errors.New("possibly_sent: warmup did not advance the observed reset")
+	}
+	return nil
+}
+
+func isWarmupProbePossiblySent(result *OpenAIOutboundResult, err error) bool {
+	// A plugin can return an explicit negative acknowledgement only when it
+	// knows the upstream RoundTripper was never invoked.  That typed signal is
+	// stronger than the legacy error-text heuristic below (which intentionally
+	// treats timeout/EOF as ambiguous for transports without send evidence).
+	var pluginErr *PluginTransportError
+	if errors.As(err, &pluginErr) {
+		if pluginErr == nil {
+			// A typed-nil plugin error is malformed but may represent a request
+			// whose send state was lost. Treat it conservatively as possibly sent.
+			return true
+		}
+		if pluginErr.RequestSent {
+			return true
+		}
+		// A plugin's negative acknowledgement is valid only when no HTTP
+		// response evidence was delivered. Once headers/body bytes exist, the
+		// host has proof that the upstream was contacted even if the plugin's
+		// flag is stale or malformed.
+		return result != nil && (result.Started || result.EOF || result.StatusCode > 0)
+	}
+	if result != nil && (result.Started || result.EOF || result.StatusCode > 0) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "timeout") || strings.Contains(text, "eof") || strings.Contains(text, "possibly_sent")
+}
+
+func cloneWarmupHeaders(headers http.Header) http.Header {
+	if headers == nil {
+		return make(http.Header)
+	}
+	copy := make(http.Header, len(headers))
+	for key, values := range headers {
+		copy[key] = append([]string(nil), values...)
+	}
+	return copy
+}
+
+func boundedWarmupBody(body []byte) []byte {
+	if len(body) <= openAIWindowWarmupMaxBodyBytes {
+		return append([]byte(nil), body...)
+	}
+	return append([]byte(nil), body[:openAIWindowWarmupMaxBodyBytes]...)
+}
+
+func cloneWarmupTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := value.UTC()
+	return &copy
+}
+
+func cloneOpenAIWindowWarmupTokenUsage(value *OpenAIWindowWarmupTokenUsage) *OpenAIWindowWarmupTokenUsage {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+// warmupResetFromHeaders converts the authoritative reset-after signal into
+// an absolute timestamp at observation time.  It never assumes a five-hour
+// duration.  The 5h/7d mapping follows ParseCodexRateLimitHeaders.Normalize.
+func warmupResetFromHeaders(headers http.Header) *time.Time {
+	snapshot := ParseCodexRateLimitHeaders(headers)
+	if snapshot == nil {
+		return nil
+	}
+	normalized := snapshot.Normalize()
+	if normalized == nil || normalized.Reset5hSeconds == nil {
+		return nil
+	}
+	seconds := *normalized.Reset5hSeconds
+	if seconds <= 0 {
+		return nil
+	}
+	reset := time.Now().UTC().Add(time.Duration(seconds) * time.Second)
+	return &reset
+}
+
+type openAIWindowWarmupSSEEvidence struct {
+	Terminal     bool
+	TerminalType string
+	ResetAt      *time.Time
+	Usage        *OpenAIWindowWarmupTokenUsage
+	ResponseID   string
+}
+
+// parseWarmupSSEEvidence accepts both standard `data:` SSE frames and a
+// non-stream JSON response returned by a compatible proxy. It extracts only
+// terminal/reset/metering identifiers; response text is not retained.
+func parseWarmupSSEEvidence(body []byte) openAIWindowWarmupSSEEvidence {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return openAIWindowWarmupSSEEvidence{}
+	}
+	evidence := openAIWindowWarmupSSEEvidence{}
+	recordTerminal := func(payload []byte, eventType string) {
+		evidence.Terminal = true
+		evidence.TerminalType = warmupTerminalTypeWithStatus(payload, eventType)
+		evidence.Usage = parseOpenAIWindowWarmupTokenUsage(payload)
+		evidence.ResponseID = responseIDFromWarmupTerminal(payload)
+	}
+	forEachOpenAISSEDataPayload(string(trimmed), func(payload []byte) {
+		typeName := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+		if typeName == "" {
+			return
+		}
+		switch typeName {
+		case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+			recordTerminal(payload, typeName)
+		}
+		if candidate := resetAtFromJSON(payload); candidate != nil {
+			if evidence.ResetAt == nil || candidate.After(*evidence.ResetAt) {
+				evidence.ResetAt = candidate
+			}
+		}
+	})
+	if !evidence.Terminal && gjson.Valid(string(trimmed)) {
+		typeName := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())
+		if typeName == "response" {
+			typeName = warmupTerminalTypeWithStatus(trimmed, "response."+strings.TrimSpace(gjson.GetBytes(trimmed, "status").String()))
+		} else {
+			switch typeName {
+			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+				typeName = warmupTerminalTypeWithStatus(trimmed, typeName)
+			}
+		}
+		if typeName == "response.completed" || typeName == "response.done" ||
+			typeName == "response.incomplete" || typeName == "response.failed" ||
+			typeName == "response.cancelled" || typeName == "response.canceled" {
+			recordTerminal(trimmed, typeName)
+		}
+		if candidate := resetAtFromJSON(trimmed); candidate != nil {
+			evidence.ResetAt = candidate
+		}
+	}
+	return evidence
+}
+
+func parseOpenAIWindowWarmupTokenUsage(payload []byte) *OpenAIWindowWarmupTokenUsage {
+	usage := gjson.GetBytes(payload, "response.usage")
+	if !usage.IsObject() {
+		usage = gjson.GetBytes(payload, "usage")
+	}
+	if !usage.IsObject() {
+		return nil
+	}
+	input, inputOK := parseWarmupTokenCount(usage.Get("input_tokens"))
+	output, outputOK := parseWarmupTokenCount(usage.Get("output_tokens"))
+	total, totalOK := parseWarmupTokenCount(usage.Get("total_tokens"))
+	parsed := &OpenAIWindowWarmupTokenUsage{InputTokens: input, OutputTokens: output, TotalTokens: total}
+	if !inputOK || !outputOK || !totalOK || !parsed.Positive() {
+		return nil
+	}
+	return parsed
+}
+
+func parseWarmupTokenCount(value gjson.Result) (int64, bool) {
+	if !value.Exists() || value.Type != gjson.Number {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value.Raw, 10, 64)
+	return parsed, err == nil
+}
+
+func responseIDFromWarmupTerminal(payload []byte) string {
+	responseID := normalizeWarmupEvidenceID(gjson.GetBytes(payload, "response.id").String())
+	if responseID == "" {
+		responseID = normalizeWarmupEvidenceID(gjson.GetBytes(payload, "id").String())
+	}
+	return responseID
+}
+
+func normalizeWarmupEvidenceID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > openAIWindowWarmupMaxEvidenceIDBytes {
+		return ""
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return ""
+		}
+	}
+	return value
+}
+
+// warmupTerminalTypeWithStatus treats a terminal event's nested response.status
+// as authoritative when it contradicts the event name. Some proxies normalize
+// failed/incomplete responses to response.done; accepting those as completed
+// would advance the durable reset cycle without a successful request.
+func warmupTerminalTypeWithStatus(payload []byte, eventType string) string {
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
+	status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()))
+	if status == "" {
+		status = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "status").String()))
+	}
+	// An explicit failed/incomplete/cancelled event is stronger than a stale or
+	// contradictory nested status. Only completed/done aliases are normalized
+	// from nested status so a failed event cannot be promoted to success.
+	switch eventType {
+	case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		return eventType
+	}
+	switch status {
+	case "failed", "error":
+		return "response.failed"
+	case "incomplete", "cancelled", "canceled":
+		return "response." + status
+	case "completed", "complete":
+		return "response.completed"
+	default:
+		if status != "" && (eventType == "response.done" || eventType == "response.completed") {
+			// A terminal alias paired with an unknown non-empty status is not
+			// success evidence. Keep the cycle retryable/uncertain instead of
+			// allowing an in_progress or queued response to advance it.
+			return "response.incomplete"
+		}
+		return eventType
+	}
+}
+
+// mergeWarmupTerminalTypes combines executor metadata with independently
+// parsed body evidence.  Any non-success value wins over a success alias so a
+// conflicting producer cannot advance a durable warmup cycle.
+func mergeWarmupTerminalTypes(existing, observed string) string {
+	existing = strings.ToLower(strings.TrimSpace(existing))
+	observed = strings.ToLower(strings.TrimSpace(observed))
+	if existing == "" {
+		return observed
+	}
+	if observed == "" {
+		return existing
+	}
+	if existing != "response.completed" && existing != "response.done" {
+		return existing
+	}
+	return observed
+}
+
+func responseTerminalType(body []byte) string {
+	return parseWarmupSSEEvidence(body).TerminalType
+}
+
+func resetAtFromJSON(payload []byte) *time.Time {
+	// A successful warmup requires evidence for the Codex five-hour window,
+	// never a generic or weekly reset. Relative reset signals are handled only
+	// by the normalized Codex rate-limit header parser.
+	for _, path := range []string{
+		"codex_5h_reset_at",
+		"metadata.codex_5h_reset_at",
+		"response.codex_5h_reset_at",
+		"response.metadata.codex_5h_reset_at",
+		"response.rate_limit.codex_5h_reset_at",
+		"response.usage.codex_5h_reset_at",
+	} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		if t := parseWarmupTime(value.Value()); !t.IsZero() {
+			t = t.UTC()
+			return &t
+		}
+	}
+	return nil
+}

@@ -224,6 +224,18 @@ type SystemSettings struct {
 	CodexCLIOnlyAllowAppServerClients    bool   `json:"codex_cli_only_allow_app_server_clients"`
 	CodexCLIOnlyEngineFingerprintSignals string `json:"codex_cli_only_engine_fingerprint_signals"`
 
+	OpenAIWindowWarmupEnabled               bool    `json:"openai_window_warmup_enabled"`
+	OpenAIWindowWarmupDefaultPolicy         string  `json:"openai_window_warmup_default_policy"`
+	OpenAIWindowWarmupAllowlist             []int64 `json:"openai_window_warmup_allowlist"`
+	OpenAIWindowWarmupProbeModel            string  `json:"openai_window_warmup_probe_model"`
+	OpenAIWindowWarmupWorkerConcurrency     int     `json:"openai_window_warmup_worker_concurrency"`
+	OpenAIWindowWarmupGlobalQPS             float64 `json:"openai_window_warmup_global_qps"`
+	OpenAIWindowWarmupBatchSize             int     `json:"openai_window_warmup_batch_size"`
+	OpenAIWindowWarmupScanSeconds           int     `json:"openai_window_warmup_scan_seconds"`
+	OpenAIWindowWarmupRequestTimeoutSeconds int     `json:"openai_window_warmup_request_timeout_seconds"`
+	OpenAIWindowWarmupLeaseSeconds          int     `json:"openai_window_warmup_lease_seconds"`
+	OpenAIWindowWarmupResetGraceSeconds     int     `json:"openai_window_warmup_reset_grace_seconds"`
+
 	// Web Search Emulation
 	WebSearchEmulationEnabled bool `json:"web_search_emulation_enabled"`
 

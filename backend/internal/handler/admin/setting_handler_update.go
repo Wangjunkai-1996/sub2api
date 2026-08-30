@@ -265,6 +265,18 @@ type UpdateSettingsRequest struct {
 	CodexCLIOnlyAllowAppServerClients    *bool  `json:"codex_cli_only_allow_app_server_clients"`
 	CodexCLIOnlyEngineFingerprintSignals string `json:"codex_cli_only_engine_fingerprint_signals"`
 
+	OpenAIWindowWarmupEnabled               *bool    `json:"openai_window_warmup_enabled"`
+	OpenAIWindowWarmupDefaultPolicy         *string  `json:"openai_window_warmup_default_policy"`
+	OpenAIWindowWarmupAllowlist             *[]int64 `json:"openai_window_warmup_allowlist"`
+	OpenAIWindowWarmupProbeModel            *string  `json:"openai_window_warmup_probe_model"`
+	OpenAIWindowWarmupWorkerConcurrency     *int     `json:"openai_window_warmup_worker_concurrency"`
+	OpenAIWindowWarmupGlobalQPS             *float64 `json:"openai_window_warmup_global_qps"`
+	OpenAIWindowWarmupBatchSize             *int     `json:"openai_window_warmup_batch_size"`
+	OpenAIWindowWarmupScanSeconds           *int     `json:"openai_window_warmup_scan_seconds"`
+	OpenAIWindowWarmupRequestTimeoutSeconds *int     `json:"openai_window_warmup_request_timeout_seconds"`
+	OpenAIWindowWarmupLeaseSeconds          *int     `json:"openai_window_warmup_lease_seconds"`
+	OpenAIWindowWarmupResetGraceSeconds     *int     `json:"openai_window_warmup_reset_grace_seconds"`
+
 	// Payment visible method routing
 	PaymentVisibleMethodAlipaySource  *string `json:"payment_visible_method_alipay_source"`
 	PaymentVisibleMethodWxpaySource   *string `json:"payment_visible_method_wxpay_source"`
@@ -1764,6 +1776,54 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			return previousSettings.CodexCLIOnlyAllowAppServerClients
 		}(),
 		CodexCLIOnlyEngineFingerprintSignals: strings.TrimSpace(req.CodexCLIOnlyEngineFingerprintSignals),
+		OpenAIWindowWarmupEnabled: func() bool {
+			if req.OpenAIWindowWarmupEnabled != nil {
+				return *req.OpenAIWindowWarmupEnabled
+			}
+			return previousSettings.OpenAIWindowWarmupEnabled
+		}(),
+		OpenAIWindowWarmupDefaultPolicy: stringSetting(
+			req.OpenAIWindowWarmupDefaultPolicy,
+			previousSettings.OpenAIWindowWarmupDefaultPolicy,
+		),
+		OpenAIWindowWarmupAllowlist: func() []int64 {
+			if req.OpenAIWindowWarmupAllowlist != nil {
+				return append([]int64(nil), (*req.OpenAIWindowWarmupAllowlist)...)
+			}
+			return append([]int64(nil), previousSettings.OpenAIWindowWarmupAllowlist...)
+		}(),
+		OpenAIWindowWarmupProbeModel: stringSetting(
+			req.OpenAIWindowWarmupProbeModel,
+			previousSettings.OpenAIWindowWarmupProbeModel,
+		),
+		OpenAIWindowWarmupWorkerConcurrency: intValueOrDefault(
+			req.OpenAIWindowWarmupWorkerConcurrency,
+			previousSettings.OpenAIWindowWarmupWorkerConcurrency,
+		),
+		OpenAIWindowWarmupGlobalQPS: float64ValueOrDefault(
+			req.OpenAIWindowWarmupGlobalQPS,
+			previousSettings.OpenAIWindowWarmupGlobalQPS,
+		),
+		OpenAIWindowWarmupBatchSize: intValueOrDefault(
+			req.OpenAIWindowWarmupBatchSize,
+			previousSettings.OpenAIWindowWarmupBatchSize,
+		),
+		OpenAIWindowWarmupScanSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupScanSeconds,
+			previousSettings.OpenAIWindowWarmupScanSeconds,
+		),
+		OpenAIWindowWarmupRequestTimeoutSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupRequestTimeoutSeconds,
+			previousSettings.OpenAIWindowWarmupRequestTimeoutSeconds,
+		),
+		OpenAIWindowWarmupLeaseSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupLeaseSeconds,
+			previousSettings.OpenAIWindowWarmupLeaseSeconds,
+		),
+		OpenAIWindowWarmupResetGraceSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupResetGraceSeconds,
+			previousSettings.OpenAIWindowWarmupResetGraceSeconds,
+		),
 		PaymentVisibleMethodAlipaySource: func() string {
 			if req.PaymentVisibleMethodAlipaySource != nil {
 				return strings.TrimSpace(*req.PaymentVisibleMethodAlipaySource)
@@ -2301,6 +2361,17 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		CodexCLIOnlyWhitelist:                                  updatedSettings.CodexCLIOnlyWhitelist,
 		CodexCLIOnlyAllowAppServerClients:                      updatedSettings.CodexCLIOnlyAllowAppServerClients,
 		CodexCLIOnlyEngineFingerprintSignals:                   updatedSettings.CodexCLIOnlyEngineFingerprintSignals,
+		OpenAIWindowWarmupEnabled:                              updatedSettings.OpenAIWindowWarmupEnabled,
+		OpenAIWindowWarmupDefaultPolicy:                        updatedSettings.OpenAIWindowWarmupDefaultPolicy,
+		OpenAIWindowWarmupAllowlist:                            updatedSettings.OpenAIWindowWarmupAllowlist,
+		OpenAIWindowWarmupProbeModel:                           updatedSettings.OpenAIWindowWarmupProbeModel,
+		OpenAIWindowWarmupWorkerConcurrency:                    updatedSettings.OpenAIWindowWarmupWorkerConcurrency,
+		OpenAIWindowWarmupGlobalQPS:                            updatedSettings.OpenAIWindowWarmupGlobalQPS,
+		OpenAIWindowWarmupBatchSize:                            updatedSettings.OpenAIWindowWarmupBatchSize,
+		OpenAIWindowWarmupScanSeconds:                          updatedSettings.OpenAIWindowWarmupScanSeconds,
+		OpenAIWindowWarmupRequestTimeoutSeconds:                updatedSettings.OpenAIWindowWarmupRequestTimeoutSeconds,
+		OpenAIWindowWarmupLeaseSeconds:                         updatedSettings.OpenAIWindowWarmupLeaseSeconds,
+		OpenAIWindowWarmupResetGraceSeconds:                    updatedSettings.OpenAIWindowWarmupResetGraceSeconds,
 		PaymentVisibleMethodAlipaySource:                       updatedSettings.PaymentVisibleMethodAlipaySource,
 		PaymentVisibleMethodWxpaySource:                        updatedSettings.PaymentVisibleMethodWxpaySource,
 		PaymentVisibleMethodAlipayEnabled:                      updatedSettings.PaymentVisibleMethodAlipayEnabled,

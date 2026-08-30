@@ -133,6 +133,142 @@ func (s *ConcurrencyCacheSuite) TestLiveLease_CountsTowardRegularAccountAndUserL
 	require.True(s.T(), regularAccount)
 }
 
+func (s *ConcurrencyCacheSuite) TestWarmupExclusiveLeaseRequiresIdleAccount() {
+	exclusive, ok := s.cache.(service.AccountExclusiveSlotCache)
+	require.True(s.T(), ok)
+	accountID := int64(9151)
+
+	acquired, err := s.cache.AcquireAccountSlot(s.ctx, accountID, 2, "business")
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+	acquired, err = exclusive.AcquireAccountExclusive(s.ctx, accountID, "warmup-a", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.False(s.T(), acquired)
+	require.NoError(s.T(), s.cache.ReleaseAccountSlot(s.ctx, accountID, "business"))
+
+	queued, err := s.cache.IncrementAccountWaitCount(s.ctx, accountID, 2)
+	require.NoError(s.T(), err)
+	require.True(s.T(), queued)
+	acquired, err = exclusive.AcquireAccountExclusive(s.ctx, accountID, "warmup-a", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.False(s.T(), acquired)
+	require.NoError(s.T(), s.cache.DecrementAccountWaitCount(s.ctx, accountID))
+}
+
+func (s *ConcurrencyCacheSuite) TestWarmupExclusiveLeaseBlocksBusinessPathsAndReportsFullLoad() {
+	exclusive, ok := s.cache.(service.AccountExclusiveSlotCache)
+	require.True(s.T(), ok)
+	live, ok := s.cache.(service.LiveConcurrencyCache)
+	require.True(s.T(), ok)
+	accountID := int64(9152)
+
+	acquired, err := exclusive.AcquireAccountExclusive(s.ctx, accountID, "warmup-a", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+
+	regular, err := s.cache.AcquireAccountSlot(s.ctx, accountID, 7, "business")
+	require.NoError(s.T(), err)
+	require.False(s.T(), regular)
+	unbounded, ok := s.cache.(service.AccountUnboundedSlotCache)
+	require.True(s.T(), ok)
+	unlimited, err := unbounded.AcquireUnboundedAccountSlot(s.ctx, accountID, "unlimited-business")
+	require.NoError(s.T(), err)
+	require.False(s.T(), unlimited)
+	queued, err := s.cache.IncrementAccountWaitCount(s.ctx, accountID, 10)
+	require.NoError(s.T(), err)
+	require.True(s.T(), queued, "business must be able to register demand behind warmup")
+	refreshed, err := exclusive.RefreshAccountExclusive(s.ctx, accountID, "warmup-a", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.False(s.T(), refreshed, "warmup must not refresh ahead of a waiting business request")
+	liveAcquired, err := live.AcquireLiveLease(s.ctx, accountID, 7, 1001, 7, 1002, "live-business", false)
+	require.NoError(s.T(), err)
+	require.False(s.T(), liveAcquired)
+
+	loads, err := s.cache.GetAccountsLoadBatch(s.ctx, []service.AccountWithConcurrency{{ID: accountID, MaxConcurrency: 7}})
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 7, loads[accountID].CurrentConcurrency)
+	require.Equal(s.T(), 1, loads[accountID].WaitingCount)
+	require.Equal(s.T(), 114, loads[accountID].LoadRate)
+
+	// User concurrency uses its original two-key Lua contract and is not tied
+	// to the account-only maintenance gate.
+	userAcquired, err := s.cache.AcquireUserSlot(s.ctx, 1001, 1, "user-business")
+	require.NoError(s.T(), err)
+	require.True(s.T(), userAcquired)
+	require.NoError(s.T(), s.cache.DecrementAccountWaitCount(s.ctx, accountID))
+}
+
+func (s *ConcurrencyCacheSuite) TestWarmupExclusiveRefreshRejectsRegularAndLiveDemand() {
+	exclusive, ok := s.cache.(service.AccountExclusiveSlotCache)
+	require.True(s.T(), ok)
+	now, err := s.rawCache.redisUnixSeconds(s.ctx)
+	require.NoError(s.T(), err)
+
+	tests := []struct {
+		name      string
+		accountID int64
+		seed      func(int64) error
+	}{
+		{
+			name:      "regular slot",
+			accountID: 9154,
+			seed: func(accountID int64) error {
+				return s.rdb.ZAdd(s.ctx, accountSlotKey(accountID), redis.Z{Score: float64(now), Member: "business"}).Err()
+			},
+		},
+		{
+			name:      "live lease",
+			accountID: 9155,
+			seed: func(accountID int64) error {
+				return s.rdb.ZAdd(s.ctx, liveAccountSlotKey(accountID), redis.Z{Score: float64(now), Member: "live-business"}).Err()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			acquired, acquireErr := exclusive.AcquireAccountExclusive(s.ctx, tt.accountID, "warmup-owner", 2*time.Minute)
+			require.NoError(s.T(), acquireErr)
+			require.True(s.T(), acquired)
+			require.NoError(s.T(), tt.seed(tt.accountID))
+
+			refreshed, refreshErr := exclusive.RefreshAccountExclusive(s.ctx, tt.accountID, "warmup-owner", 2*time.Minute)
+			require.NoError(s.T(), refreshErr)
+			require.False(s.T(), refreshed)
+
+			released, releaseErr := exclusive.ReleaseAccountExclusive(s.ctx, tt.accountID, "warmup-owner")
+			require.NoError(s.T(), releaseErr)
+			require.True(s.T(), released)
+		})
+	}
+}
+
+func (s *ConcurrencyCacheSuite) TestWarmupExclusiveLeaseUsesTokenFencing() {
+	exclusive, ok := s.cache.(service.AccountExclusiveSlotCache)
+	require.True(s.T(), ok)
+	accountID := int64(9153)
+
+	acquired, err := exclusive.AcquireAccountExclusive(s.ctx, accountID, "owner-a", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+	refreshed, err := exclusive.RefreshAccountExclusive(s.ctx, accountID, "owner-b", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.False(s.T(), refreshed)
+	released, err := exclusive.ReleaseAccountExclusive(s.ctx, accountID, "owner-b")
+	require.NoError(s.T(), err)
+	require.False(s.T(), released)
+	refreshed, err = exclusive.RefreshAccountExclusive(s.ctx, accountID, "owner-a", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), refreshed)
+	released, err = exclusive.ReleaseAccountExclusive(s.ctx, accountID, "owner-a")
+	require.NoError(s.T(), err)
+	require.True(s.T(), released)
+
+	acquired, err = exclusive.AcquireAccountExclusive(s.ctx, accountID, "owner-b", 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+}
+
 func (s *ConcurrencyCacheSuite) TestAccountSlot_AcquireAndRelease() {
 	accountID := int64(10)
 	reqID1, reqID2, reqID3 := "req1", "req2", "req3"

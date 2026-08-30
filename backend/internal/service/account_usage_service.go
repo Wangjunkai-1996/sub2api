@@ -181,7 +181,7 @@ type AICredit struct {
 
 // UsageInfo 账号使用量信息
 type UsageInfo struct {
-	Source             string         `json:"source,omitempty"`               // "passive" or "active"
+	Source             string         `json:"source,omitempty"`               // "passive", "cached", or "active"
 	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`           // 更新时间
 	FiveHour           *UsageProgress `json:"five_hour"`                      // 5小时窗口
 	SevenDay           *UsageProgress `json:"seven_day,omitempty"`            // 7天窗口
@@ -336,6 +336,10 @@ func NewAccountUsageService(
 
 func supportsAnthropicPassiveUsage(account *Account) bool {
 	return account != nil && account.IsAnthropicOAuthOrSetupToken()
+}
+
+func supportsOpenAICachedUsage(account *Account) bool {
+	return account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth
 }
 
 func batchUsageErrorMessage(err error) string {
@@ -510,8 +514,27 @@ func (s *AccountUsageService) GetUsageForAccount(ctx context.Context, account *A
 	return s.getUsageForAccount(ctx, account, forceProbe)
 }
 
+// GetCachedUsage returns the locally persisted usage snapshot without making
+// any upstream request.  This is the read-only path used by the account table:
+// a refresh of the display must never submit a real Codex Responses request or
+// overwrite the reset baseline established by the warmup worker.
+func (s *AccountUsageService) GetCachedUsage(ctx context.Context, accountID int64) (*UsageInfo, error) {
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("get account failed: %w", err)
+	}
+	if account == nil {
+		return nil, ErrAccountNotFound
+	}
+	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return nil, fmt.Errorf("cached usage only supported for OpenAI OAuth accounts")
+	}
+	return s.getCachedOpenAIUsage(ctx, account), nil
+}
+
 // GetUsageBatch 批量获取账号使用量。
-// Anthropic OAuth/SetupToken 统一走 passive 链路，其他账号复用现有主动查询逻辑。
+// Anthropic OAuth/SetupToken 统一走 passive 链路，OpenAI OAuth 统一走本地
+// cached 快照；其他账号复用现有主动查询逻辑。
 // 单个账号失败不会中断整批请求，错误会按账号返回。
 func (s *AccountUsageService) GetUsageBatch(ctx context.Context, accountIDs []int64, force bool) (map[int64]*UsageInfo, map[int64]string, error) {
 	uniqueIDs := make([]int64, 0, len(accountIDs))
@@ -563,6 +586,10 @@ func (s *AccountUsageService) GetUsageBatch(ctx context.Context, accountIDs []in
 			var usageErr error
 			if supportsAnthropicPassiveUsage(account) {
 				usage, usageErr = s.getPassiveUsageForAccount(gctx, account)
+			} else if supportsOpenAICachedUsage(account) {
+				// Account-table refreshes must never submit a Codex Responses request.
+				// Explicit upstream quota actions use OpenAIQuotaService separately.
+				usage, usageErr = s.getCachedOpenAIUsage(gctx, account), nil
 			} else {
 				usage, usageErr = s.getUsageForAccount(gctx, account, force)
 			}
@@ -769,6 +796,39 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 	}
 
 	return usage, nil
+}
+
+func (s *AccountUsageService) getCachedOpenAIUsage(ctx context.Context, account *Account) *UsageInfo {
+	now := time.Now()
+	if account == nil {
+		return &UsageInfo{Source: "cached", UpdatedAt: &now}
+	}
+	updatedAt := now
+	if raw, ok := account.Extra["codex_usage_updated_at"]; ok {
+		if parsed, err := parseTime(fmt.Sprint(raw)); err == nil {
+			updatedAt = parsed
+		}
+	}
+	usage := &UsageInfo{Source: "cached", UpdatedAt: &updatedAt}
+
+	applyExtraToUsage(usage, account.Extra, now)
+	if s == nil || s.usageLogRepo == nil {
+		return usage
+	}
+
+	if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.FiveHour, 5*time.Hour, now)); err == nil {
+		if usage.FiveHour == nil {
+			usage.FiveHour = &UsageProgress{Utilization: 0}
+		}
+		usage.FiveHour.WindowStats = windowStatsFromAccountStats(stats)
+	}
+	if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.SevenDay, 7*24*time.Hour, now)); err == nil {
+		if usage.SevenDay == nil {
+			usage.SevenDay = &UsageProgress{Utilization: 0}
+		}
+		usage.SevenDay.WindowStats = windowStatsFromAccountStats(stats)
+	}
+	return usage
 }
 
 func shouldRefreshOpenAICodexSnapshot(account *Account, usage *UsageInfo, now time.Time) bool {
@@ -1513,7 +1573,7 @@ func buildCodexUsageProgressFromExtra(extra map[string]any, window string, now t
 	if resetAtRaw, ok := extra[resetAtKey]; ok {
 		if resetAt, err := parseTime(fmt.Sprint(resetAtRaw)); err == nil {
 			progress.ResetsAt = &resetAt
-			progress.RemainingSeconds = int(time.Until(resetAt).Seconds())
+			progress.RemainingSeconds = int(resetAt.Sub(now).Seconds())
 			if progress.RemainingSeconds < 0 {
 				progress.RemainingSeconds = 0
 			}
@@ -1529,7 +1589,7 @@ func buildCodexUsageProgressFromExtra(extra map[string]any, window string, now t
 			}
 			resetAt := base.Add(time.Duration(resetAfterSeconds) * time.Second)
 			progress.ResetsAt = &resetAt
-			progress.RemainingSeconds = int(time.Until(resetAt).Seconds())
+			progress.RemainingSeconds = int(resetAt.Sub(now).Seconds())
 			if progress.RemainingSeconds < 0 {
 				progress.RemainingSeconds = 0
 			}

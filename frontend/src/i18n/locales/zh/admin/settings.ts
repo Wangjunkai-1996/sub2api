@@ -444,6 +444,28 @@ export default {
         accountSchedulingThresholdsDisabledHint: '100 表示禁用该平台自动停调；1–99 表示达到该利用率后暂停调度。',
         accountSchedulingThresholdsRangeHint: '整数 1–100（百分比）。仅 OpenAI / Anthropic / Grok。'
       },
+      openAIWindowWarmup: {
+        title: 'OpenAI Codex 五小时窗口暖机',
+        description: '全局开关关闭时不会领取或发送新的暖机请求。',
+        enabled: '启用自动暖机',
+        defaultPolicy: '默认导入策略',
+        policyOff: '关闭',
+        policyOnce: '仅首次',
+        policyContinuous: '持续',
+        allowlist: '账号范围（留空 = 全部符合资格）',
+        allowlistPlaceholder: '例如 101, 205, 309',
+        allowlistInvalid: '账号 Allowlist 只能包含逗号或空格分隔的正整数 ID。',
+        probeModel: '探针模型',
+        workerConcurrency: 'Worker 并发',
+        globalQPS: '全局 QPS',
+        batchSize: '扫描批次',
+        scanSeconds: '扫描间隔（秒）',
+        requestTimeoutSeconds: '请求超时（秒）',
+        leaseSeconds: 'Lease（秒）',
+        resetGraceSeconds: 'Reset Grace（秒）',
+        runtimeApplyHint: '总开关和账号范围立即生效；探针模型及 Worker 参数保存后需重启服务生效。',
+        leaseInvalid: 'Lease 必须长于请求超时。'
+      },
       upstreamBillingProbe: {
         title: '上游倍率自动探测',
         description: '定期获取 API Key 账号所连接上游 Sub2API 站点声明的计费倍率；只有另行开启“同步上游声明倍率”的账号才会更新账号倍率。',

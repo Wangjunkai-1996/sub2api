@@ -131,8 +131,13 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 
 	// 插件已把请求交给上游时，自动切换账号可能造成重复扣费或重复执行。
 	var pluginErr *PluginTransportError
-	if errors.As(err, &pluginErr) && pluginErr.RequestSent {
-		return err
+	if errors.As(err, &pluginErr) {
+		if pluginErr == nil || pluginErr.RequestSent {
+			// A typed-nil plugin error is a malformed acknowledgement. It cannot
+			// prove that the POST was not sent, so fail closed and avoid account
+			// failover/replay.
+			return err
+		}
 	}
 
 	if classifyOpenAITransportError(err).Persistent {

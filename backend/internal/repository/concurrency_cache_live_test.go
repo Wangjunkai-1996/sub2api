@@ -71,3 +71,32 @@ func TestLiveLeaseExpiresWithoutRefresh(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, refreshed)
 }
+
+func TestWarmupExclusiveRefreshYieldsToRegisteredBusinessWaiter(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	cache := NewConcurrencyCache(client, 15, 900)
+	exclusive, ok := cache.(service.AccountExclusiveSlotCache)
+	require.True(t, ok)
+	ctx := context.Background()
+	const accountID int64 = 40
+
+	acquired, err := exclusive.AcquireAccountExclusive(ctx, accountID, "warmup-owner", 2*time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	queued, err := cache.IncrementAccountWaitCount(ctx, accountID, 10)
+	require.NoError(t, err)
+	require.True(t, queued, "real traffic must be able to register behind warmup")
+
+	refreshed, err := exclusive.RefreshAccountExclusive(ctx, accountID, "warmup-owner", 2*time.Minute)
+	require.NoError(t, err)
+	require.False(t, refreshed, "warmup must yield once real traffic is waiting")
+
+	released, err := exclusive.ReleaseAccountExclusive(ctx, accountID, "wrong-owner")
+	require.NoError(t, err)
+	require.False(t, released, "waiter detection must not weaken token fencing")
+	released, err = exclusive.ReleaseAccountExclusive(ctx, accountID, "warmup-owner")
+	require.NoError(t, err)
+	require.True(t, released)
+}

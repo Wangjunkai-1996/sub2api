@@ -723,6 +723,46 @@ func TestImportCodexSessionsAccessTokenOnlySameUserUpdatesExisting(t *testing.T)
 	}
 }
 
+func TestImportCodexSessionsExplicitOffPersistsCanonicalWarmupPolicy(t *testing.T) {
+	existingToken := buildCodexAccessToken(t, "workspace-1", "user-1", time.Now().Add(time.Hour))
+	svc := newCodexImportMemoryAdminService([]service.Account{{
+		ID:       10,
+		Name:     "existing",
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"chatgpt_account_id": "workspace-1",
+			"chatgpt_user_id":    "user-1",
+			"access_token":       existingToken,
+		},
+		Extra: map[string]any{
+			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			"preserved":                             true,
+		},
+	}})
+	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	off := service.OpenAIWindowWarmupPolicyOff
+
+	result, err := handler.importCodexSessions(context.Background(), CodexSessionImportRequest{
+		SkipDefaultGroupBind:    boolPtr(true),
+		OpenAICodexWarmupPolicy: &off,
+	}, []codexImportEntry{{Index: 1, Value: map[string]any{"access_token": existingToken}}})
+
+	if err != nil {
+		t.Fatalf("importCodexSessions error = %v", err)
+	}
+	if result.Updated != 1 || result.Created != 0 || result.Failed != 0 {
+		t.Fatalf("result = %+v, want one updated account", result)
+	}
+	updatedExtra := svc.updatedAccounts[0].input.Extra
+	if got := updatedExtra[service.OpenAICodexWarmupPolicyExtraKey]; got != service.OpenAIWindowWarmupPolicyOff {
+		t.Fatalf("canonical warmup policy = %v, want off", got)
+	}
+	if got := updatedExtra["preserved"]; got != true {
+		t.Fatalf("preserved extra = %v, want true", got)
+	}
+}
+
 func TestImportCodexSessionsUpgradesAccessTokenOnlyAccountWithRefreshToken(t *testing.T) {
 	oldToken := buildCodexAccessTokenWithJTI(t, "workspace-1", "user-1", "old-token", time.Now().Add(time.Hour))
 	newToken := buildCodexAccessTokenWithJTI(t, "workspace-1", "user-1", "new-token", time.Now().Add(time.Hour))

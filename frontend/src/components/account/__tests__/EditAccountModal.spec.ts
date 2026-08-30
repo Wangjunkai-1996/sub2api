@@ -800,6 +800,8 @@ describe('EditAccountModal', () => {
         'gpt-5.3-codex-spark': 'gpt-5.3-codex-spark-compact'
       }
     })
+    expect(payload).not.toHaveProperty('openai_codex_warmup_policy')
+    expect(payload?.extra).not.toHaveProperty('openai_codex_warmup_policy')
   })
 
   it('submits OpenAI APIKey Responses support override mode', async () => {
