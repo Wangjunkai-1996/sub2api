@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/setup"
 	"github.com/Wei-Shaw/sub2api/internal/web"
@@ -59,10 +61,22 @@ func main() {
 	// Parse command line flags
 	setupMode := flag.Bool("setup", false, "Run setup wizard in CLI mode")
 	showVersion := flag.Bool("version", false, "Show version information")
+	showMigrationContract := flag.Bool("migration-contract", false, "Print the embedded migration compatibility contract")
 	flag.Parse()
 
 	if *showVersion {
 		log.Printf("Sub2API %s (commit: %s, built: %s)\n", Version, Commit, Date)
+		return
+	}
+
+	if *showMigrationContract {
+		contract, err := repository.EmbeddedMigrationContract()
+		if err != nil {
+			log.Fatalf("Build migration contract: %v", err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(contract); err != nil {
+			log.Fatalf("Print migration contract: %v", err)
+		}
 		return
 	}
 
