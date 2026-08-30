@@ -167,6 +167,7 @@ type openAIWindowForcedRefreshRepo struct {
 	updateCalls int
 	leaseCalls  int
 	leaseHeld   bool
+	onLease     func(int)
 }
 
 func (r *openAIWindowForcedRefreshRepo) GetByID(context.Context, int64) (*Account, error) {
@@ -183,14 +184,23 @@ func (r *openAIWindowForcedRefreshRepo) AcquireOpenAIWindowWarmupIdentityLease(
 	_ context.Context,
 	accountID int64,
 	identityGeneration int64,
+	expectedPolicy OpenAIWindowWarmupPolicy,
+	expectedLastUsedAt *time.Time,
 	credentials map[string]any,
 	proxyID *int64,
+	proxy *Proxy,
 ) (func(), bool, error) {
 	r.leaseCalls++
+	if r.onLease != nil {
+		r.onLease(r.leaseCalls)
+	}
 	if r.account == nil || r.account.ID != accountID ||
 		r.account.OpenAIWarmupIdentityGeneration != identityGeneration ||
+		OpenAIWindowWarmupPolicyForAccount(r.account) != expectedPolicy ||
+		!sameOpenAIWindowWarmupTime(r.account.LastUsedAt, expectedLastUsedAt) ||
 		!reflect.DeepEqual(r.account.Credentials, credentials) ||
-		!reflect.DeepEqual(r.account.ProxyID, proxyID) {
+		!reflect.DeepEqual(r.account.ProxyID, proxyID) ||
+		!reflect.DeepEqual(r.account.Proxy, proxy) {
 		return nil, false, nil
 	}
 	r.leaseHeld = true
@@ -261,14 +271,19 @@ func openAIWindowOutboundAccount() *Account {
 		Concurrency: 3,
 		ProxyID:     &proxyID,
 		Proxy: &Proxy{
+			ID:       proxyID,
 			Protocol: "http",
 			Host:     "127.0.0.1",
 			Port:     7897,
+			Status:   StatusActive,
 		},
 		Credentials: map[string]any{
 			"access_token":       "stored-token-must-not-be-read-by-adapter",
 			"refresh_token":      "refresh-token",
 			"chatgpt_account_id": "chatgpt-warmup",
+		},
+		Extra: map[string]any{
+			OpenAICodexWarmupPolicyExtraKey: OpenAIWindowWarmupPolicyContinuous,
 		},
 	}
 }
@@ -441,6 +456,182 @@ func TestOpenAIWindowOutboundAdapterRefreshesOAuthOnceAfter401(t *testing.T) {
 	require.Equal(t, "Bearer rejected-token", upstream.requests[0].Header.Get("Authorization"))
 	require.Equal(t, "Bearer refreshed-token", upstream.requests[1].Header.Get("Authorization"))
 	require.Nil(t, result.AuthFailure)
+}
+
+func TestOpenAIWindowOutboundAdapterReplayUsesLockedDurableBearer(t *testing.T) {
+	account := openAIWindowOutboundAccount()
+	account.OpenAIWarmupIdentityGeneration = 1
+	account.Credentials["access_token"] = "rejected-token"
+	repo := &openAIWindowForcedRefreshRepo{account: account}
+	tokens := &openAIWindowOutboundTokenStub{
+		token:     "rejected-token",
+		refreshed: "refresh-result-token",
+		onRefresh: func() {
+			// Model a second refresher winning after this caller's refresh lock is
+			// released but before replay acquires its durable identity lease.
+			repo.account.Credentials = shallowCopyMap(repo.account.Credentials)
+			repo.account.Credentials["access_token"] = "durable-newer-token"
+		},
+	}
+	upstream := &openAIWindowOutboundHTTPStub{responses: []*http.Response{
+		{
+			StatusCode: http.StatusUnauthorized,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"token_expired"}}`)),
+		},
+		openAIWindowCompletedResponse(),
+	}}
+	request := openAIWindowOutboundRequest(account)
+	request.IdentityGeneration = account.OpenAIWarmupIdentityGeneration
+	request.SendGuard = OpenAIWindowWarmupSendGuardFunc(func(context.Context, int64) error { return nil })
+	adapter := &OpenAIWindowOutboundAdapter{accountRepo: repo, tokenProvider: tokens, httpUpstream: upstream}
+
+	result, err := adapter.Execute(context.Background(), request)
+
+	require.NoError(t, err)
+	require.True(t, result.Terminal)
+	require.Equal(t, 2, repo.leaseCalls)
+	require.Len(t, upstream.requests, 2)
+	require.Equal(t, "Bearer durable-newer-token", upstream.requests[1].Header.Get("Authorization"))
+	require.NotEqual(t, "Bearer refresh-result-token", upstream.requests[1].Header.Get("Authorization"))
+}
+
+func TestOpenAIWindowOutboundAdapterRejectsReplayWithoutDurableRefreshedBearer(t *testing.T) {
+	account := openAIWindowOutboundAccount()
+	account.OpenAIWarmupIdentityGeneration = 1
+	account.Credentials["access_token"] = "rejected-token"
+	repo := &openAIWindowForcedRefreshRepo{account: account}
+	tokens := &openAIWindowOutboundTokenStub{token: "rejected-token", refreshed: "cache-only-token"}
+	upstream := &openAIWindowOutboundHTTPStub{responses: []*http.Response{{
+		StatusCode: http.StatusUnauthorized,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"token_expired"}}`)),
+	}}}
+	request := openAIWindowOutboundRequest(account)
+	request.IdentityGeneration = account.OpenAIWarmupIdentityGeneration
+	request.SendGuard = OpenAIWindowWarmupSendGuardFunc(func(context.Context, int64) error { return nil })
+	adapter := &OpenAIWindowOutboundAdapter{accountRepo: repo, tokenProvider: tokens, httpUpstream: upstream}
+
+	result, err := adapter.Execute(context.Background(), request)
+
+	require.ErrorIs(t, err, ErrOpenAIWindowWarmupCredentialsChanged)
+	require.NotNil(t, result)
+	require.Equal(t, http.StatusUnauthorized, result.StatusCode)
+	require.Equal(t, 1, repo.leaseCalls)
+	require.Len(t, upstream.requests, 1, "an unbound cache token must never be replayed")
+}
+
+func TestOpenAIWindowOutboundAdapterRejectsGuardedSnapshotChangesBeforeAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Account)
+	}{
+		{
+			name: "warmup policy changed",
+			mutate: func(account *Account) {
+				account.Extra[OpenAICodexWarmupPolicyExtraKey] = OpenAIWindowWarmupPolicyInitialOnce
+			},
+		},
+		{
+			name: "real traffic observed",
+			mutate: func(account *Account) {
+				lastUsedAt := time.Now().UTC()
+				account.LastUsedAt = &lastUsedAt
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requestAccount := openAIWindowOutboundAccount()
+			requestAccount.OpenAIWarmupIdentityGeneration = 1
+			durableAccount := *requestAccount
+			durableAccount.Credentials = shallowCopyMap(requestAccount.Credentials)
+			durableAccount.Extra = shallowCopyMap(requestAccount.Extra)
+			tc.mutate(&durableAccount)
+			repo := &openAIWindowForcedRefreshRepo{account: &durableAccount}
+			tokens := &openAIWindowOutboundTokenStub{token: "unused-token"}
+			upstream := &openAIWindowOutboundHTTPStub{}
+			request := openAIWindowOutboundRequest(requestAccount)
+			request.IdentityGeneration = requestAccount.OpenAIWarmupIdentityGeneration
+			request.SendGuard = OpenAIWindowWarmupSendGuardFunc(func(context.Context, int64) error { return nil })
+
+			result, err := (&OpenAIWindowOutboundAdapter{
+				accountRepo: repo, tokenProvider: tokens, httpUpstream: upstream,
+			}).Execute(context.Background(), request)
+
+			require.ErrorIs(t, err, ErrOpenAIWindowWarmupCredentialsChanged)
+			require.Nil(t, result)
+			require.Zero(t, tokens.getCalls)
+			require.Zero(t, repo.leaseCalls)
+			require.Empty(t, upstream.requests)
+		})
+	}
+}
+
+func TestOpenAIWindowOutboundAdapterRejectsGuardedReplaySnapshotChangesAtLease(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Account)
+	}{
+		{
+			name: "warmup policy changed",
+			mutate: func(account *Account) {
+				account.Extra = shallowCopyMap(account.Extra)
+				account.Extra[OpenAICodexWarmupPolicyExtraKey] = OpenAIWindowWarmupPolicyInitialOnce
+			},
+		},
+		{
+			name: "real traffic observed",
+			mutate: func(account *Account) {
+				lastUsedAt := time.Now().UTC()
+				account.LastUsedAt = &lastUsedAt
+			},
+		},
+		{
+			name: "proxy route changed",
+			mutate: func(account *Account) {
+				proxy := *account.Proxy
+				proxy.Host = "127.0.0.2"
+				account.Proxy = &proxy
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := openAIWindowOutboundAccount()
+			account.OpenAIWarmupIdentityGeneration = 1
+			account.Credentials["access_token"] = "rejected-token"
+			repo := &openAIWindowForcedRefreshRepo{account: account}
+			repo.onLease = func(call int) {
+				if call == 2 {
+					tc.mutate(repo.account)
+				}
+			}
+			tokens := &openAIWindowOutboundTokenStub{
+				token:     "rejected-token",
+				refreshed: "refreshed-token",
+				onRefresh: func() {
+					repo.account.Credentials = shallowCopyMap(repo.account.Credentials)
+					repo.account.Credentials["access_token"] = "refreshed-token"
+				},
+			}
+			upstream := &openAIWindowOutboundHTTPStub{responses: []*http.Response{{
+				StatusCode: http.StatusUnauthorized,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"token_expired"}}`)),
+			}}}
+			request := openAIWindowOutboundRequest(account)
+			request.IdentityGeneration = account.OpenAIWarmupIdentityGeneration
+			request.SendGuard = OpenAIWindowWarmupSendGuardFunc(func(context.Context, int64) error { return nil })
+
+			result, err := (&OpenAIWindowOutboundAdapter{
+				accountRepo: repo, tokenProvider: tokens, httpUpstream: upstream,
+			}).Execute(context.Background(), request)
+
+			require.ErrorIs(t, err, ErrOpenAIWindowWarmupCredentialsChanged)
+			require.Nil(t, result)
+			require.Equal(t, 2, repo.leaseCalls)
+			require.Len(t, upstream.requests, 1, "snapshot changes must fence the replay POST")
+		})
+	}
 }
 
 func TestOpenAIWindowOutboundAdapterRejectsClosedGuardBeforeFirstTransport(t *testing.T) {

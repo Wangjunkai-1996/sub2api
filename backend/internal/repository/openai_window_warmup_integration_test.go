@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -519,6 +520,7 @@ func TestOpenAIWindowWarmupIdentityLeaseBlocksCredentialUpdateUntilRelease(t *te
 		Name: "warmup-identity-lease-" + uuid.NewString(), Platform: service.PlatformOpenAI,
 		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
 		Credentials: credentials,
+		Extra:       map[string]any{service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous},
 	})
 	t.Cleanup(func() {
 		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
@@ -529,8 +531,24 @@ func TestOpenAIWindowWarmupIdentityLeaseBlocksCredentialUpdateUntilRelease(t *te
 	).Scan(&identityGeneration))
 
 	accountRepo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
+	wrongLastUsedAt := time.Now().UTC().Add(time.Hour)
 	release, acquired, err := accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
-		ctx, account.ID, identityGeneration, credentials, nil,
+		ctx, account.ID, identityGeneration, service.OpenAIWindowWarmupPolicyInitialOnce,
+		account.LastUsedAt, credentials, nil, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, acquired, "a changed warmup policy must fence the send")
+	require.Nil(t, release)
+	release, acquired, err = accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
+		ctx, account.ID, identityGeneration, service.OpenAIWindowWarmupPolicyContinuous,
+		&wrongLastUsedAt, credentials, nil, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, acquired, "newer real traffic must fence the send")
+	require.Nil(t, release)
+	release, acquired, err = accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
+		ctx, account.ID, identityGeneration, service.OpenAIWindowWarmupPolicyContinuous,
+		account.LastUsedAt, credentials, nil, nil,
 	)
 	require.NoError(t, err)
 	require.True(t, acquired)
@@ -603,6 +621,85 @@ func TestOpenAIWindowWarmupIdentityLeaseBlocksCredentialUpdateUntilRelease(t *te
 	require.Greater(t, updatedGeneration, identityGeneration)
 }
 
+func TestOpenAIWindowWarmupIdentityLeaseLocksExactProxySnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	proxy := mustCreateProxy(t, integrationEntClient, &service.Proxy{
+		Name: "warmup-identity-proxy-" + uuid.NewString(), Protocol: "http",
+		Host: "127.0.0.1", Port: 7897, Username: "warmup-user", Password: "warmup-pass",
+		Status: service.StatusActive,
+	})
+	proxyID := proxy.ID
+	credentials := map[string]any{"chatgpt_account_id": "warmup-proxy-" + uuid.NewString()}
+	account := mustCreateAccount(t, integrationEntClient, &service.Account{
+		Name: "warmup-proxy-lease-" + uuid.NewString(), Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
+		Credentials: credentials, ProxyID: &proxyID,
+		Extra: map[string]any{service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous},
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
+		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM proxies WHERE id = $1`, proxy.ID)
+	})
+	var identityGeneration int64
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT openai_warmup_identity_generation FROM accounts WHERE id = $1`, account.ID,
+	).Scan(&identityGeneration))
+
+	accountRepo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
+	staleProxy := *proxy
+	staleProxy.Host = "127.0.0.2"
+	release, acquired, err := accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
+		ctx, account.ID, identityGeneration, service.OpenAIWindowWarmupPolicyContinuous,
+		account.LastUsedAt, credentials, &proxyID, &staleProxy,
+	)
+	require.NoError(t, err)
+	require.False(t, acquired, "a stale proxy route must fence the send")
+	require.Nil(t, release)
+
+	release, acquired, err = accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
+		ctx, account.ID, identityGeneration, service.OpenAIWindowWarmupPolicyContinuous,
+		account.LastUsedAt, credentials, &proxyID, proxy,
+	)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NotNil(t, release)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	replacementHost := "127.0.0.3"
+	blockedCtx, cancelBlocked := context.WithTimeout(ctx, 150*time.Millisecond)
+	_, updateErr := integrationDB.ExecContext(blockedCtx,
+		`UPDATE proxies SET host = $2, updated_at = NOW() WHERE id = $1`, proxy.ID, replacementHost)
+	cancelBlocked()
+	require.Error(t, updateErr, "proxy update must wait while the outbound lease is held")
+	require.ErrorIs(t, blockedCtx.Err(), context.DeadlineExceeded)
+	var currentHost string
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		`SELECT host FROM proxies WHERE id = $1`, proxy.ID).Scan(&currentHost))
+	require.Equal(t, proxy.Host, currentHost)
+
+	release()
+	released = true
+	_, updateErr = integrationDB.ExecContext(ctx,
+		`UPDATE proxies SET host = $2, updated_at = NOW() WHERE id = $1`, proxy.ID, replacementHost)
+	require.NoError(t, updateErr)
+	updatedProxy := *proxy
+	updatedProxy.Host = replacementHost
+	finalRelease, finalAcquired, err := accountRepo.AcquireOpenAIWindowWarmupIdentityLease(
+		ctx, account.ID, identityGeneration, service.OpenAIWindowWarmupPolicyContinuous,
+		account.LastUsedAt, credentials, &proxyID, &updatedProxy,
+	)
+	require.NoError(t, err)
+	require.True(t, finalAcquired)
+	require.NotNil(t, finalRelease)
+	finalRelease()
+}
+
 func TestOpenAIWindowWarmupRepositoryCurrentPrefersActiveOverNewerBlocked(t *testing.T) {
 	ctx := context.Background()
 	accountID := createWarmupIntegrationAccount(t)
@@ -637,9 +734,19 @@ func TestOpenAIWindowWarmupRepositoryCurrentPrefersActiveOverNewerBlocked(t *tes
 	require.Contains(t, byAccount, accountID)
 	require.Equal(t, active.ID, byAccount[accountID].ID)
 
-	// Unblock is a no-op while an active row exists; it must not try to mutate
-	// the newer blocked row (or collide with the partial unique index).
-	unblocked, changed, err := repo.UnblockAccount(ctx, accountID, time.Now().UTC(), nil)
+	// Unblock is a no-op while an active row exists. Holding the active row lock
+	// proves the no-op path neither waits on nor mutates that worker-owned row.
+	lockTx, err := integrationDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer lockTx.Rollback()
+	var lockedID int64
+	require.NoError(t, lockTx.QueryRowContext(ctx,
+		`SELECT id FROM openai_window_warmup_jobs WHERE id = $1 FOR UPDATE`, active.ID,
+	).Scan(&lockedID))
+	require.Equal(t, active.ID, lockedID)
+	unblockCtx, cancelUnblock := context.WithTimeout(ctx, time.Second)
+	defer cancelUnblock()
+	unblocked, changed, err := repo.UnblockAccount(unblockCtx, accountID, time.Now().UTC(), nil)
 	require.NoError(t, err)
 	require.False(t, changed)
 	require.Equal(t, active.ID, unblocked.ID)
@@ -1076,9 +1183,19 @@ func TestOpenAIWindowWarmupRepositoryUnblockPausedSentJobAsUncertain(t *testing.
 	t.Cleanup(func() {
 		_, _ = integrationDB.ExecContext(context.Background(), `DELETE FROM accounts WHERE id = $1`, account.ID)
 	})
+	var identityGeneration int64
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT openai_warmup_identity_generation FROM accounts WHERE id = $1`, account.ID,
+	).Scan(&identityGeneration))
 	repo := NewOpenAIWindowWarmupRepository(integrationDB)
-	job, err := repo.GetCurrent(ctx, account.ID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: account.ID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "paused-sent:" + uuid.NewString(), CycleGeneration: 500,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
+		NextAttemptAt: now,
+	})
 	require.NoError(t, err)
+	require.True(t, inserted)
 	_, err = integrationDB.ExecContext(ctx, `
 		UPDATE openai_window_warmup_jobs
 		SET state = 'paused', sent_at = $2, attempt_count = 1,
@@ -1101,6 +1218,204 @@ func TestOpenAIWindowWarmupRepositoryUnblockPausedSentJobAsUncertain(t *testing.
 	require.Empty(t, reenabled.LeaseOwner)
 	require.Empty(t, reenabled.LeaseToken)
 	require.Nil(t, reenabled.LeaseUntil)
+}
+
+func TestOpenAIWindowWarmupRepositoryMarkPausedPreservesStartedEvidence(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "paused-evidence:" + uuid.NewString(), CycleGeneration: 501,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
+		NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	claims, err := repo.ClaimDue(ctx, "paused-evidence-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	startedAt := time.Now().UTC().Truncate(time.Microsecond)
+	started, err := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, startedAt,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+	require.NoError(t, err)
+	require.True(t, started)
+
+	paused, err := repo.MarkPaused(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken,
+		startedAt.Add(time.Second), "account_ineligible")
+	require.NoError(t, err)
+	require.True(t, paused)
+
+	updated, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePaused, updated.State)
+	require.NotNil(t, updated.SentAt)
+	require.WithinDuration(t, startedAt, *updated.SentAt, time.Microsecond)
+	assertWarmupIntegrationAttempt(t, job.ID, 1, "started", 0, "")
+}
+
+func TestOpenAIWindowWarmupRepositoryBlockedEvidenceBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		status            int
+		code              string
+		wantOutcome       string
+		wantAttemptCode   string
+		wantAttemptStatus int
+		wantUnblockState  string
+		clearSentAt       bool
+		deleteAttempt     bool
+	}{
+		{
+			name:              "non-4xx-keeps-ambiguous-attempt-and-unblocks-uncertain",
+			status:            http.StatusServiceUnavailable,
+			code:              "attempt_limit",
+			wantOutcome:       "started",
+			wantAttemptCode:   "",
+			wantAttemptStatus: 0,
+			wantUnblockState:  service.OpenAIWindowWarmupStateUncertain,
+			clearSentAt:       true,
+		},
+		{
+			name:             "non-4xx-does-not-create-missing-attempt",
+			status:           http.StatusServiceUnavailable,
+			code:             "attempt_limit",
+			wantUnblockState: service.OpenAIWindowWarmupStateUncertain,
+			deleteAttempt:    true,
+		},
+		{
+			name:              "4xx-finalizes-started-attempt",
+			status:            http.StatusUnauthorized,
+			code:              "needs_reauth",
+			wantOutcome:       "failed",
+			wantAttemptCode:   "needs_reauth",
+			wantAttemptStatus: http.StatusUnauthorized,
+			wantUnblockState:  service.OpenAIWindowWarmupStateArmed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+			repo := NewOpenAIWindowWarmupRepository(integrationDB)
+			job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+				AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+				CycleKey: "blocked-evidence:" + uuid.NewString(), CycleGeneration: 502,
+				IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerReset,
+				NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+			})
+			require.NoError(t, err)
+			require.True(t, inserted)
+			mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+				service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			})
+
+			claims, err := repo.ClaimDue(ctx, "blocked-evidence-owner", 2*time.Minute, 1, []int64{accountID})
+			require.NoError(t, err)
+			require.Len(t, claims, 1)
+			startedAt := time.Now().UTC().Truncate(time.Microsecond)
+			started, err := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, startedAt,
+				service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+			require.NoError(t, err)
+			require.True(t, started)
+
+			if tc.deleteAttempt {
+				_, err = integrationDB.ExecContext(ctx,
+					`DELETE FROM openai_window_warmup_attempts WHERE job_id = $1 AND attempt_no = 1`, job.ID)
+				require.NoError(t, err)
+			}
+			if tc.clearSentAt {
+				// Exercise the legacy projection where the current attempt is the only
+				// durable indication that the request may have reached upstream.
+				_, err = integrationDB.ExecContext(ctx,
+					`UPDATE openai_window_warmup_jobs SET sent_at = NULL WHERE id = $1`, job.ID)
+				require.NoError(t, err)
+			}
+
+			blocked, err := repo.MarkBlocked(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken,
+				startedAt.Add(time.Second), tc.status, tc.code, "sanitized")
+			require.NoError(t, err)
+			require.True(t, blocked)
+			blockedJob, err := repo.GetByID(ctx, job.ID)
+			require.NoError(t, err)
+			require.Equal(t, service.OpenAIWindowWarmupStateBlocked, blockedJob.State)
+			if tc.clearSentAt {
+				require.Nil(t, blockedJob.SentAt)
+			}
+			if tc.deleteAttempt {
+				var attempts int
+				require.NoError(t, integrationDB.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM openai_window_warmup_attempts WHERE job_id = $1`, job.ID).Scan(&attempts))
+				require.Zero(t, attempts, "a non-4xx terminal transition must not invent failed send evidence")
+			} else {
+				assertWarmupIntegrationAttempt(t, job.ID, 1, tc.wantOutcome, tc.wantAttemptStatus, tc.wantAttemptCode)
+			}
+
+			unblockAt := time.Now().UTC().Add(time.Hour)
+			unblocked, changed, err := repo.UnblockAccount(ctx, accountID, unblockAt, nil)
+			require.NoError(t, err)
+			require.True(t, changed)
+			require.Equal(t, tc.wantUnblockState, unblocked.State)
+			if tc.wantUnblockState == service.OpenAIWindowWarmupStateUncertain {
+				require.WithinDuration(t, time.Now().UTC(), unblocked.NextAttemptAt, 2*time.Second)
+				require.NotNil(t, unblocked.SentAt, "uncertain replay state must retain a durable sent_at fence")
+				require.WithinDuration(t, startedAt, *unblocked.SentAt, time.Microsecond)
+			} else {
+				require.WithinDuration(t, unblockAt, unblocked.NextAttemptAt, time.Microsecond)
+				require.Nil(t, unblocked.SentAt, "a definitive current 4xx must clear the replay fence when rearmed")
+			}
+			if !tc.deleteAttempt {
+				assertWarmupIntegrationAttempt(t, job.ID, 1, tc.wantOutcome, tc.wantAttemptStatus, tc.wantAttemptCode)
+			}
+		})
+	}
+}
+
+func TestOpenAIWindowWarmupRepositoryUnblockPreservesEarlierSendFenceAfterObservationFailure(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "observation-after-send:" + uuid.NewString(), CycleGeneration: 503,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerReset,
+		NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	claims, err := repo.ClaimDue(ctx, "observation-after-send-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	startedAt := time.Now().UTC().Truncate(time.Microsecond)
+	started, err := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, startedAt,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+	require.NoError(t, err)
+	require.True(t, started)
+
+	observationAt := startedAt.Add(time.Second)
+	blocked, err := repo.MarkObservationFailure(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken,
+		observationAt, observationAt.Add(time.Minute), service.OpenAIWindowWarmupStateBlocked,
+		http.StatusUnauthorized, "needs_reauth", "sanitized")
+	require.NoError(t, err)
+	require.True(t, blocked)
+	assertWarmupIntegrationAttempt(t, job.ID, 1, "started", 0, "")
+	assertWarmupIntegrationAttempt(t, job.ID, 2, "failed", http.StatusUnauthorized, "needs_reauth")
+
+	unblockAt := observationAt.Add(time.Hour)
+	unblocked, changed, err := repo.UnblockAccount(ctx, accountID, unblockAt, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, service.OpenAIWindowWarmupStateUncertain, unblocked.State)
+	require.WithinDuration(t, time.Now().UTC(), unblocked.NextAttemptAt, 2*time.Second)
+	require.NotNil(t, unblocked.SentAt)
+	require.WithinDuration(t, startedAt, *unblocked.SentAt, time.Microsecond)
 }
 
 func TestOpenAIWindowWarmupMigrationSkipsTemporarilyUnschedulableAccount(t *testing.T) {
@@ -1624,6 +1939,153 @@ func TestOpenAIWindowWarmupRepositoryExpiredLeaseTakeoverFencesOldOwner(t *testi
 	require.Equal(t, 2, attemptCount)
 }
 
+func TestOpenAIWindowWarmupRepositoryCancelFirstStartedRestoresEmptyProjection(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "cancel-first:" + uuid.NewString(), CycleGeneration: 78,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerReset,
+		NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	claims, err := repo.ClaimDue(ctx, "cancel-first-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	require.Zero(t, claims[0].PreviousProjection.AttemptCount)
+	require.Nil(t, claims[0].PreviousProjection.SentAt)
+	require.Nil(t, claims[0].PreviousProjection.LastAttemptAt)
+	startedAt := time.Now().UTC().Truncate(time.Microsecond)
+	started, err := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, startedAt,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+	require.NoError(t, err)
+	require.True(t, started)
+
+	reservation := service.OpenAIWindowWarmupSendReservation{
+		PreviousProjection: claims[0].PreviousProjection,
+		StartedAt:          startedAt,
+	}
+	badReservation := reservation
+	badReservation.StartedAt = startedAt.Add(time.Second)
+	cancelled, err := repo.CancelStartedBeforeSend(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken,
+		badReservation, time.Now().UTC().Add(time.Minute), "send_guard_closed")
+	require.NoError(t, err)
+	require.False(t, cancelled, "a mismatched reservation must not erase send evidence")
+	assertWarmupIntegrationAttempt(t, job.ID, 1, "started", 0, "")
+	reserved, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, reserved.AttemptCount)
+	require.NotNil(t, reserved.SentAt)
+	require.WithinDuration(t, startedAt, *reserved.SentAt, time.Microsecond)
+
+	cancelled, err = repo.CancelStartedBeforeSend(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken,
+		reservation, time.Now().UTC().Add(time.Minute), "send_guard_closed")
+	require.NoError(t, err)
+	require.True(t, cancelled)
+	updated, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, updated.State)
+	require.Zero(t, updated.AttemptCount)
+	require.Nil(t, updated.SentAt)
+	require.Nil(t, updated.LastAttemptAt)
+	var attempts int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM openai_window_warmup_attempts WHERE job_id = $1`, job.ID).Scan(&attempts))
+	require.Zero(t, attempts)
+}
+
+func TestOpenAIWindowWarmupRepositoryCancelCurrentStartedPreservesEarlierEvidence(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "cancel-evidence:" + uuid.NewString(), CycleGeneration: 79,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerReset,
+		NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	first, err := repo.ClaimDue(ctx, "cancel-first", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	firstStartedAt := time.Now().UTC().Truncate(time.Microsecond)
+	firstPreflightReset := firstStartedAt.Add(5 * time.Hour)
+	started, err := repo.MarkStarted(ctx, job.ID, first[0].Owner, first[0].LeaseToken, firstStartedAt,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true, ResetAt: &firstPreflightReset})
+	require.NoError(t, err)
+	require.True(t, started)
+	uncertainReset := firstPreflightReset.Add(time.Minute)
+	uncertain, err := repo.MarkUncertain(ctx, job.ID, first[0].Owner, first[0].LeaseToken,
+		firstStartedAt.Add(time.Second), time.Now().UTC().Add(-time.Second), 200,
+		"possibly_sent", "sanitized", service.OpenAIWindowWarmupUncertainEvidence{
+			Authoritative: true, ResetAt: &uncertainReset, Terminal: true,
+		})
+	require.NoError(t, err)
+	require.True(t, uncertain)
+	assertWarmupIntegrationAttempt(t, job.ID, 1, "uncertain", 200, "possibly_sent")
+
+	second, err := repo.ClaimDue(ctx, "cancel-second", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	previous := second[0].PreviousProjection
+	require.Equal(t, 1, previous.AttemptCount)
+	require.NotNil(t, previous.SentAt)
+	require.NotNil(t, previous.LastAttemptAt)
+	require.NotNil(t, previous.PreflightResetAt)
+	require.NotNil(t, previous.PreflightObservedAt)
+	require.NotNil(t, previous.UncertainObservedResetAt)
+	require.NotNil(t, previous.UncertainObservedAt)
+	require.True(t, previous.UncertainTerminalObserved)
+	secondStartedAt := firstStartedAt.Add(2 * time.Second)
+	started, err = repo.MarkStarted(ctx, job.ID, second[0].Owner, second[0].LeaseToken, secondStartedAt,
+		service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+	require.NoError(t, err)
+	require.True(t, started)
+	assertWarmupIntegrationAttempt(t, job.ID, 2, "started", 0, "")
+
+	cancelled, err := repo.CancelStartedBeforeSend(ctx, job.ID, second[0].Owner, second[0].LeaseToken,
+		service.OpenAIWindowWarmupSendReservation{
+			PreviousProjection: second[0].PreviousProjection,
+			StartedAt:          secondStartedAt,
+		}, time.Now().UTC().Add(time.Minute), "send_guard_closed")
+	require.NoError(t, err)
+	require.True(t, cancelled)
+
+	updated, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, updated.State)
+	require.Equal(t, 1, updated.AttemptCount)
+	require.NotNil(t, updated.SentAt)
+	require.NotNil(t, updated.LastAttemptAt)
+	require.NotNil(t, updated.PreflightResetAt)
+	require.NotNil(t, updated.PreflightObservedAt)
+	require.NotNil(t, updated.UncertainObservedResetAt)
+	require.NotNil(t, updated.UncertainObservedAt)
+	require.WithinDuration(t, firstStartedAt, *updated.SentAt, time.Microsecond)
+	require.WithinDuration(t, *previous.LastAttemptAt, *updated.LastAttemptAt, time.Microsecond)
+	require.WithinDuration(t, *previous.PreflightResetAt, *updated.PreflightResetAt, time.Microsecond)
+	require.WithinDuration(t, *previous.PreflightObservedAt, *updated.PreflightObservedAt, time.Microsecond)
+	require.WithinDuration(t, *previous.UncertainObservedResetAt, *updated.UncertainObservedResetAt, time.Microsecond)
+	require.WithinDuration(t, *previous.UncertainObservedAt, *updated.UncertainObservedAt, time.Microsecond)
+	require.True(t, updated.UncertainTerminalObserved)
+	assertWarmupIntegrationAttempt(t, job.ID, 1, "uncertain", 200, "possibly_sent")
+	var remaining int
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM openai_window_warmup_attempts WHERE job_id = $1`, job.ID).Scan(&remaining))
+	require.Equal(t, 1, remaining)
+}
+
 func TestOpenAIWindowWarmupRepositoryObservationFailureIsCountedAndFenced(t *testing.T) {
 	ctx := context.Background()
 	accountID := createWarmupIntegrationAccount(t)
@@ -1656,6 +2118,63 @@ func TestOpenAIWindowWarmupRepositoryObservationFailureIsCountedAndFenced(t *tes
 	require.Equal(t, 1, updated.AttemptCount)
 	require.Nil(t, updated.SentAt)
 	assertWarmupIntegrationAttempt(t, job.ID, 1, "retry", 502, "usage_observation_failed")
+}
+
+func TestOpenAIWindowWarmupRepositoryCancelAfterObservationFailureDoesNotCreateSendEvidence(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "cancel-observation:" + uuid.NewString(), CycleGeneration: 72,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerReset,
+		NextAttemptAt: time.Now().UTC().Add(-time.Second),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	firstClaim, err := repo.ClaimDue(ctx, "observation-cancel-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, firstClaim, 1)
+	observationAt := time.Now().UTC().Truncate(time.Microsecond)
+	ok, err := repo.MarkObservationFailure(ctx, job.ID, firstClaim[0].Owner, firstClaim[0].LeaseToken,
+		observationAt, observationAt.Add(-time.Second), service.OpenAIWindowWarmupStateRetrying,
+		502, "usage_observation_failed", "sanitized")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	secondClaim, err := repo.ClaimDue(ctx, "send-cancel-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, secondClaim, 1)
+	sendReservationAt := observationAt.Add(time.Second)
+	ok, err = repo.MarkStarted(ctx, job.ID, secondClaim[0].Owner, secondClaim[0].LeaseToken,
+		sendReservationAt, service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	ok, err = repo.CancelStartedBeforeSend(ctx, job.ID, secondClaim[0].Owner, secondClaim[0].LeaseToken,
+		service.OpenAIWindowWarmupSendReservation{
+			PreviousProjection: secondClaim[0].PreviousProjection,
+			StartedAt:          sendReservationAt,
+		}, time.Now().UTC().Add(time.Minute), "credential_identity_superseded")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	updated, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePending, updated.State)
+	require.Equal(t, 1, updated.AttemptCount)
+	require.Nil(t, updated.SentAt, "an observation-only attempt must not become a replay fence")
+	require.NotNil(t, updated.LastAttemptAt)
+	require.WithinDuration(t, observationAt, *updated.LastAttemptAt, time.Microsecond)
+	assertWarmupIntegrationAttempt(t, job.ID, 1, "retry", 502, "usage_observation_failed")
+	var remaining int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM openai_window_warmup_attempts WHERE job_id = $1`, job.ID).Scan(&remaining))
+	require.Equal(t, 1, remaining)
 }
 
 func TestOpenAIWindowWarmupRepositoryAuthStateRetryUsesExactTransitionCAS(t *testing.T) {

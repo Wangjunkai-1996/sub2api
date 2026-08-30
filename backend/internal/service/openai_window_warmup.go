@@ -157,16 +157,19 @@ func (f OpenAIWindowWarmupSendGuardFunc) Check(ctx context.Context, accountID in
 }
 
 // OpenAIWindowWarmupIdentityLeaseRepository linearizes a guarded outbound POST
-// with account credential updates. The lease must hold a database row lock until
-// the transport returns so a concurrent reauthorization either completes first
-// and rejects the send, or waits until the already-authorized send finishes.
+// with durable identity, policy, and business-use updates. The lease must hold a
+// database row lock until the transport returns so a conflicting update either
+// completes first and rejects the send, or waits for the existing send to finish.
 type OpenAIWindowWarmupIdentityLeaseRepository interface {
 	AcquireOpenAIWindowWarmupIdentityLease(
 		context.Context,
 		int64,
 		int64,
+		OpenAIWindowWarmupPolicy,
+		*time.Time,
 		map[string]any,
 		*int64,
+		*Proxy,
 	) (release func(), acquired bool, err error)
 }
 
@@ -424,7 +427,31 @@ type OpenAIWindowWarmupClaim struct {
 	// PreviousState is the state atomically observed before ClaimDue changed it
 	// to running. It lets a lease takeover distinguish an interrupted send from
 	// a reconciled uncertain job without trusting process-local memory.
-	PreviousState string
+	PreviousState      string
+	PreviousProjection OpenAIWindowWarmupProjectionSnapshot
+}
+
+// OpenAIWindowWarmupProjectionSnapshot is the job evidence changed by
+// MarkStarted and restored if its local reservation is cancelled before the
+// outbound transport begins.
+type OpenAIWindowWarmupProjectionSnapshot struct {
+	AttemptCount              int
+	SentAt                    *time.Time
+	LastAttemptAt             *time.Time
+	PreflightResetAt          *time.Time
+	PreflightObservedAt       *time.Time
+	UncertainObservedResetAt  *time.Time
+	UncertainObservedAt       *time.Time
+	UncertainTerminalObserved bool
+}
+
+// OpenAIWindowWarmupSendReservation identifies the exact local send
+// reservation made by MarkStarted. The previous projection is captured by
+// ClaimDue under the job row lock and is restored only when the same attempt
+// is still the current fenced started row.
+type OpenAIWindowWarmupSendReservation struct {
+	PreviousProjection OpenAIWindowWarmupProjectionSnapshot
+	StartedAt          time.Time
 }
 
 // OpenAIWindowWarmupStartEvidence is the final passive usage observation that
@@ -482,7 +509,7 @@ type OpenAIWindowWarmupRepository interface {
 	ReleaseGlobalSend(context.Context, string) (bool, error)
 	RenewLease(context.Context, int64, string, string, time.Duration) (bool, error)
 	MarkStarted(context.Context, int64, string, string, time.Time, OpenAIWindowWarmupStartEvidence) (bool, error)
-	CancelStartedBeforeSend(context.Context, int64, string, string, time.Time, string) (bool, error)
+	CancelStartedBeforeSend(context.Context, int64, string, string, OpenAIWindowWarmupSendReservation, time.Time, string) (bool, error)
 	MarkSuccess(context.Context, int64, string, string, time.Time, *time.Time, int, string) (bool, error)
 	ProjectSuccessReset(context.Context, int64, int64, time.Time, time.Time) (bool, error)
 	MarkSuppressed(context.Context, int64, string, string, time.Time, *time.Time, string) (bool, error)
@@ -1098,9 +1125,11 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 	// separated passive observations fences replay; a reset that advances with
 	// the observation interval proves that /wham is still reporting an idle
 	// rolling projection and permits another bounded attempt.
-	if job.SentAt != nil && (claim.PreviousState == OpenAIWindowWarmupStateRunning ||
-		claim.PreviousState == OpenAIWindowWarmupStateUncertain ||
-		claim.PreviousState == OpenAIWindowWarmupStatePossiblySent) {
+	// sent_at is the durable send fence. It must take precedence over the
+	// previous state: a retrying/armed projection can still represent a request
+	// whose response was lost, so another POST is unsafe until passive usage
+	// reconciliation has completed.
+	if job.SentAt != nil {
 		now := s.now()
 		reset, authoritative, active, reconcileErr := s.reconcileFiveHourObservation(ctx, account.ID, job)
 		if reconcileErr != nil {
@@ -1271,7 +1300,8 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 		UsedPercent:   fiveHour.UsedPercent,
 		ResetAt:       cloneWarmupTime(fiveHour.ResetAt),
 	}
-	if !s.markStarted(ctx, claim, s.now(), startEvidence) {
+	startedAt := s.now()
+	if !s.markStarted(ctx, &claim, startedAt, startEvidence) {
 		if latest, latestErr := s.accounts.GetByID(ctx, job.AccountID); latestErr == nil && latest != nil {
 			if reset := accountCodexGlobalResetAt(latest); reset != nil && reset.After(s.now()) {
 				if warmupResetAdvanced(reset, job.ObservedResetAt, s.now()) {
@@ -1289,9 +1319,6 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 		s.reschedule(ctx, claim, s.now().Add(s.options.ScanInterval), OpenAIWindowWarmupStateRetrying, nil)
 		return
 	}
-	job.AttemptCount++
-	sentAt := s.now()
-	job.SentAt = &sentAt
 	probeCtx, probeCancel := context.WithTimeout(ctx, s.options.RequestTimeout)
 	probeCtx = withOpenAIWindowWarmupSendGuard(probeCtx, OpenAIWindowWarmupSendGuardFunc(s.checkWarmupSendGuard))
 	result, probeErr := s.probe.Probe(probeCtx, account, job.PreflightResetAt)
@@ -1320,7 +1347,17 @@ func (s *OpenAIWindowWarmupService) handleProbeResultWithPreflight(ctx context.C
 		return
 	}
 	if errors.Is(probeErr, ErrOpenAIWindowWarmupCredentialsChanged) {
-		s.markPaused(ctx, claim, now, "credential_identity_superseded")
+		// The identity fence can trip before the outbound transport is entered
+		// (for example, while refreshing the OAuth token). In that case the
+		// durable MarkStarted record is only a local send reservation and may be
+		// cancelled. Once the transport reports Started, the request may have
+		// reached upstream; retain the send evidence and force passive
+		// reconciliation instead of manufacturing a suppressed/failed outcome.
+		if result == nil || !result.Started {
+			s.cancelStartedBeforeSend(ctx, claim, now, "credential_identity_superseded")
+		} else {
+			s.markPaused(ctx, claim, now, "credential_identity_superseded")
+		}
 		if s.accounts != nil && account != nil {
 			if latest, err := s.accounts.GetByID(ctx, account.ID); err == nil && latest != nil {
 				_, _, _ = s.scheduleAccountWarmup(ctx, latest, OpenAIWindowWarmupTriggerReconcile, false)
@@ -1510,14 +1547,20 @@ func (s *OpenAIWindowWarmupService) handleAmbiguousProbe(ctx context.Context, cl
 		})
 }
 
-func (s *OpenAIWindowWarmupService) markStarted(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, evidence OpenAIWindowWarmupStartEvidence) bool {
+func (s *OpenAIWindowWarmupService) markStarted(ctx context.Context, claim *OpenAIWindowWarmupClaim, at time.Time, evidence OpenAIWindowWarmupStartEvidence) bool {
+	if claim == nil || claim.Job == nil {
+		return false
+	}
 	ok, err := s.repo.MarkStarted(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, at, evidence)
 	if err != nil || !ok {
 		return false
 	}
+	startedAt := at.UTC()
+	claim.Job.AttemptCount++
+	claim.Job.SentAt = &startedAt
+	claim.Job.LastAttemptAt = &startedAt
 	claim.Job.PreflightResetAt = cloneWarmupTime(evidence.ResetAt)
-	observedAt := at.UTC()
-	claim.Job.PreflightObservedAt = &observedAt
+	claim.Job.PreflightObservedAt = &startedAt
 	s.metrics.started.Add(1)
 	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStateRunning, 0, "started", claim.Job.ObservedResetAt)
 	return true
@@ -1551,16 +1594,39 @@ func (s *OpenAIWindowWarmupService) cancelStartedBeforeSend(ctx context.Context,
 	if s == nil || s.repo == nil || claim.Job == nil {
 		return false
 	}
-	ok, err := s.repo.CancelStartedBeforeSend(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, at, reason)
+	startedAt := time.Time{}
+	if claim.Job.LastAttemptAt != nil {
+		startedAt = claim.Job.LastAttemptAt.UTC()
+	}
+	reservation := OpenAIWindowWarmupSendReservation{
+		PreviousProjection: cloneWarmupProjectionSnapshot(claim.PreviousProjection),
+		StartedAt:          startedAt,
+	}
+	ok, err := s.repo.CancelStartedBeforeSend(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, reservation, at, reason)
 	if err != nil || !ok {
 		return false
 	}
-	if claim.Job.AttemptCount > 0 {
-		claim.Job.AttemptCount--
-	}
-	claim.Job.SentAt = nil
+	previous := reservation.PreviousProjection
+	claim.Job.AttemptCount = previous.AttemptCount
+	claim.Job.SentAt = cloneWarmupTime(previous.SentAt)
+	claim.Job.LastAttemptAt = cloneWarmupTime(previous.LastAttemptAt)
+	claim.Job.PreflightResetAt = cloneWarmupTime(previous.PreflightResetAt)
+	claim.Job.PreflightObservedAt = cloneWarmupTime(previous.PreflightObservedAt)
+	claim.Job.UncertainObservedResetAt = cloneWarmupTime(previous.UncertainObservedResetAt)
+	claim.Job.UncertainObservedAt = cloneWarmupTime(previous.UncertainObservedAt)
+	claim.Job.UncertainTerminalObserved = previous.UncertainTerminalObserved
 	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStatePending, 0, reason, claim.Job.ObservedResetAt)
 	return true
+}
+
+func cloneWarmupProjectionSnapshot(value OpenAIWindowWarmupProjectionSnapshot) OpenAIWindowWarmupProjectionSnapshot {
+	value.SentAt = cloneWarmupTime(value.SentAt)
+	value.LastAttemptAt = cloneWarmupTime(value.LastAttemptAt)
+	value.PreflightResetAt = cloneWarmupTime(value.PreflightResetAt)
+	value.PreflightObservedAt = cloneWarmupTime(value.PreflightObservedAt)
+	value.UncertainObservedResetAt = cloneWarmupTime(value.UncertainObservedResetAt)
+	value.UncertainObservedAt = cloneWarmupTime(value.UncertainObservedAt)
+	return value
 }
 
 func (s *OpenAIWindowWarmupService) markRetry(ctx context.Context, claim OpenAIWindowWarmupClaim, at, next time.Time, status int, code, message string) bool {

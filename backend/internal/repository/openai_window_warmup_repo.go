@@ -206,6 +206,16 @@ ORDER BY next_attempt_at ASC, id ASC`
 		claims = append(claims, service.OpenAIWindowWarmupClaim{
 			Job: &job, Owner: owner, LeaseToken: job.LeaseToken,
 			LeaseUntil: nullableTime(until), PreviousState: previousState,
+			PreviousProjection: service.OpenAIWindowWarmupProjectionSnapshot{
+				AttemptCount:              job.AttemptCount,
+				SentAt:                    nullableTimePointer(sent),
+				LastAttemptAt:             nullableTimePointer(lastAttempt),
+				PreflightResetAt:          nullableTimePointer(preflightReset),
+				PreflightObservedAt:       nullableTimePointer(preflightObserved),
+				UncertainObservedResetAt:  nullableTimePointer(uncertainReset),
+				UncertainObservedAt:       nullableTimePointer(uncertainAt),
+				UncertainTerminalObserved: job.UncertainTerminalObserved,
+			},
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -369,69 +379,86 @@ SET lease_until = NOW() + ($4 * INTERVAL '1 microsecond'), updated_at = NOW()
 }
 
 func (r *openAIWindowWarmupRepository) MarkStarted(ctx context.Context, id int64, owner, token string, at time.Time, evidence service.OpenAIWindowWarmupStartEvidence) (bool, error) {
-	return r.fencedUpdate(ctx, `
-	UPDATE openai_window_warmup_jobs AS j
-	SET last_attempt_at = COALESCE($4, NOW()), attempt_count = attempt_count + 1,
-	    sent_at = COALESCE($4, NOW()), preflight_reset_at = $7::timestamptz,
-	    preflight_observed_at = COALESCE($4, NOW()), uncertain_observed_reset_at = NULL,
-	    uncertain_observed_at = NULL, uncertain_terminal_observed = FALSE,
-	    updated_at = NOW()
-	WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
-	  AND split_part(lease_token, ':', 1) = cycle_generation::text
-	  AND lease_until IS NOT NULL AND lease_until > NOW()
-		  AND EXISTS (
-			      SELECT 1
-			      FROM accounts a
-			      CROSS JOIN LATERAL (
-				          SELECT MAX(candidate) AS reset_at
-				          FROM (VALUES
-				              (public.openai_window_warmup_parse_reset(a.extra ->> 'codex_5h_reset_at')),
-				              (public.openai_window_warmup_parse_reset(a.extra ->> 'codex_global_5h_reset_at'))
-				          ) AS resets(candidate)
-			      ) latest
-	      CROSS JOIN LATERAL (
-	          SELECT lower(trim(COALESCE(
-	              CASE WHEN jsonb_typeof(a.extra -> 'openai_codex_warmup_policy') = 'string'
-	                  THEN NULLIF(trim(a.extra ->> 'openai_codex_warmup_policy'), '') END,
-	              CASE WHEN jsonb_typeof(a.extra -> 'codex_warmup_policy') = 'string'
-	                  THEN NULLIF(trim(a.extra ->> 'codex_warmup_policy'), '') END,
-	              CASE WHEN jsonb_typeof(a.extra -> 'openai_window_warmup_policy') = 'string'
-	                  THEN NULLIF(trim(a.extra ->> 'openai_window_warmup_policy'), '') END,
-	              'off'
-	          ))) AS policy
-		      ) warmup
-		      WHERE a.id = j.account_id
-	        AND a.platform::text = 'openai'
-	        AND a.type::text = 'oauth'
-	        AND a.parent_account_id IS NULL
-	        AND COALESCE(a.quota_dimension::text, 'global') = 'global'
-	        AND a.status::text = 'active'
-	        AND a.schedulable
-	        AND a.deleted_at IS NULL
-	        AND (a.expires_at IS NULL OR a.expires_at > NOW())
-		        AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
-				        AND warmup.policy IN ('initial_once', 'continuous')
-				        AND (warmup.policy = 'continuous' OR j.cycle_key LIKE 'initial:%')
-				        AND j.identity_generation = a.openai_warmup_identity_generation
-		        AND $5::boolean
-		        AND $6::double precision <= 0
-		        -- Only activity in the current durable window suppresses a send.
-		        -- Usage before an observed reset belongs to the preceding window.
-		        AND (a.last_used_at IS NULL OR NOT (
-		            a.last_used_at > GREATEST(j.created_at, COALESCE(j.observed_reset_at, j.created_at))
-		        ))
-			        -- A still-current observed reset remains armed except for an initial
-			        -- cycle with authoritative 0% evidence. That equality is the normal
-			        -- first idle projection and the probe must advance it to succeed.
-			        AND ($7::timestamptz IS NULL OR $7 <= NOW() OR
-			             j.observed_reset_at IS NULL OR $7 > j.observed_reset_at OR
-			             (j.cycle_key LIKE 'initial:%' AND $7 = j.observed_reset_at AND
-			             public.openai_window_warmup_json_number_nonpositive(
-			                 a.extra -> 'codex_5h_used_percent'
-			             )))
-		        AND (latest.reset_at IS NULL OR latest.reset_at <= NOW() OR
-		             ($7::timestamptz IS NOT NULL AND latest.reset_at <= $7))
-			  )`, id, owner, token, nullableTimeValue(at), evidence.Authoritative, evidence.UsedPercent, nullWarmupTime(evidence.ResetAt))
+	return r.fencedQuery(ctx, `
+		WITH updated AS (
+			UPDATE openai_window_warmup_jobs AS j
+			SET last_attempt_at = COALESCE($4, NOW()), attempt_count = attempt_count + 1,
+				sent_at = COALESCE($4, NOW()), preflight_reset_at = $7::timestamptz,
+				preflight_observed_at = COALESCE($4, NOW()), uncertain_observed_reset_at = NULL,
+				uncertain_observed_at = NULL, uncertain_terminal_observed = FALSE,
+				updated_at = NOW()
+			WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
+			  AND split_part(lease_token, ':', 1) = cycle_generation::text
+			  AND lease_until IS NOT NULL AND lease_until > NOW()
+			  -- A pre-existing row for the next attempt means the durable counter and
+			  -- evidence diverged. Fail closed instead of overwriting that evidence.
+			  AND NOT EXISTS (
+				  SELECT 1 FROM openai_window_warmup_attempts AS prior
+				  WHERE prior.job_id = j.id AND prior.attempt_no = j.attempt_count + 1
+			  )
+			  AND EXISTS (
+				  SELECT 1
+				  FROM accounts a
+				  CROSS JOIN LATERAL (
+				      SELECT MAX(candidate) AS reset_at
+				      FROM (VALUES
+				          (public.openai_window_warmup_parse_reset(a.extra ->> 'codex_5h_reset_at')),
+				          (public.openai_window_warmup_parse_reset(a.extra ->> 'codex_global_5h_reset_at'))
+				      ) AS resets(candidate)
+				  ) latest
+				  CROSS JOIN LATERAL (
+				      SELECT lower(trim(COALESCE(
+				          CASE WHEN jsonb_typeof(a.extra -> 'openai_codex_warmup_policy') = 'string'
+				              THEN NULLIF(trim(a.extra ->> 'openai_codex_warmup_policy'), '') END,
+				          CASE WHEN jsonb_typeof(a.extra -> 'codex_warmup_policy') = 'string'
+				              THEN NULLIF(trim(a.extra ->> 'codex_warmup_policy'), '') END,
+				          CASE WHEN jsonb_typeof(a.extra -> 'openai_window_warmup_policy') = 'string'
+				              THEN NULLIF(trim(a.extra ->> 'openai_window_warmup_policy'), '') END,
+				          'off'
+				      ))) AS policy
+				  ) warmup
+				  WHERE a.id = j.account_id
+				    AND a.platform::text = 'openai'
+				    AND a.type::text = 'oauth'
+				    AND a.parent_account_id IS NULL
+				    AND COALESCE(a.quota_dimension::text, 'global') = 'global'
+				    AND a.status::text = 'active'
+				    AND a.schedulable
+				    AND a.deleted_at IS NULL
+				    AND (a.expires_at IS NULL OR a.expires_at > NOW())
+				    AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
+				    AND warmup.policy IN ('initial_once', 'continuous')
+				    AND (warmup.policy = 'continuous' OR j.cycle_key LIKE 'initial:%')
+				    AND j.identity_generation = a.openai_warmup_identity_generation
+				    AND $5::boolean
+				    AND $6::double precision <= 0
+				    -- Only activity in the current durable window suppresses a send.
+				    -- Usage before an observed reset belongs to the preceding window.
+				    AND (a.last_used_at IS NULL OR NOT (
+				        a.last_used_at > GREATEST(j.created_at, COALESCE(j.observed_reset_at, j.created_at))
+				    ))
+				    -- A still-current observed reset remains armed except for an initial
+				    -- cycle with authoritative 0% evidence. That equality is the normal
+				    -- first idle projection and the probe must advance it to succeed.
+				    AND ($7::timestamptz IS NULL OR $7 <= NOW() OR
+				         j.observed_reset_at IS NULL OR $7 > j.observed_reset_at OR
+				         (j.cycle_key LIKE 'initial:%' AND $7 = j.observed_reset_at AND
+				         public.openai_window_warmup_json_number_nonpositive(
+				             a.extra -> 'codex_5h_used_percent'
+				         )))
+				    AND (latest.reset_at IS NULL OR latest.reset_at <= NOW() OR
+				         ($7::timestamptz IS NOT NULL AND latest.reset_at <= $7))
+			  )
+			RETURNING id, attempt_count, last_attempt_at
+		), attempt AS (
+			INSERT INTO openai_window_warmup_attempts
+				(job_id, attempt_no, outcome, observed_reset_at, started_at, finished_at)
+			SELECT id, attempt_count, 'started', $7::timestamptz,
+			       COALESCE(last_attempt_at, NOW()), COALESCE(last_attempt_at, NOW())
+			FROM updated
+			RETURNING job_id
+		)
+		SELECT EXISTS(SELECT 1 FROM attempt)`, id, owner, token, nullableTimeValue(at), evidence.Authoritative, evidence.UsedPercent, nullWarmupTime(evidence.ResetAt))
 }
 
 func (r *openAIWindowWarmupRepository) MarkSuccess(ctx context.Context, id int64, owner, token string, at time.Time, resetAt *time.Time, status int, code string) (bool, error) {
@@ -569,10 +596,18 @@ func (r *openAIWindowWarmupRepository) MarkBlocked(ctx context.Context, id int64
 		), attempt AS (
 		    INSERT INTO openai_window_warmup_attempts
 		        (job_id, attempt_no, outcome, status_code, error_code, started_at, finished_at)
-		    SELECT id, attempt_count, 'failed', NULLIF($4, 0), NULLIF($5, ''),
-		           COALESCE(last_attempt_at, $7), $7
-		    FROM updated WHERE attempt_count > 0
-		    ON CONFLICT (job_id, attempt_no) DO NOTHING
+			SELECT id, attempt_count, 'failed', NULLIF($4, 0), NULLIF($5, ''),
+			       COALESCE(last_attempt_at, $7), $7
+			FROM updated
+			-- Only a real upstream 4xx definitively closes a started send.
+			WHERE attempt_count > 0 AND $4 BETWEEN 400 AND 499
+			ON CONFLICT (job_id, attempt_no) DO UPDATE
+		    SET outcome = EXCLUDED.outcome,
+		        status_code = EXCLUDED.status_code,
+		        error_code = EXCLUDED.error_code,
+		        finished_at = EXCLUDED.finished_at,
+		        expires_at = EXCLUDED.finished_at + INTERVAL '7 days'
+		    WHERE openai_window_warmup_attempts.outcome IN ('started', 'uncertain')
 		)
 		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, status, code, message, nullableTimeValue(at))
 }
@@ -689,33 +724,86 @@ func (r *openAIWindowWarmupRepository) markNonterminal(ctx context.Context, id i
 			    SELECT id, attempt_count, $14, NULLIF($6, 0), NULLIF($7, ''), COALESCE($9, $11),
 			           COALESCE(last_attempt_at, $13), $13
 			    FROM updated WHERE attempt_count > 0
-			    ON CONFLICT (job_id, attempt_no) DO NOTHING
+			    ON CONFLICT (job_id, attempt_no) DO UPDATE
+			    SET outcome = EXCLUDED.outcome,
+			        status_code = EXCLUDED.status_code,
+			        error_code = EXCLUDED.error_code,
+			        observed_reset_at = EXCLUDED.observed_reset_at,
+			        finished_at = EXCLUDED.finished_at,
+			        expires_at = EXCLUDED.finished_at + INTERVAL '7 days'
+			    WHERE openai_window_warmup_attempts.outcome IN ('started', 'uncertain')
 			)
 			SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, state, next.UTC(), status, code, message,
 		nullWarmupTime(resetAt), uncertain.Authoritative, nullWarmupTime(uncertain.ResetAt),
 		uncertain.Terminal, nullableTimeValue(at), normalizeAttemptOutcome(state))
 }
 
-func (r *openAIWindowWarmupRepository) CancelStartedBeforeSend(ctx context.Context, id int64, owner, token string, next time.Time, reason string) (bool, error) {
-	return r.fencedUpdate(ctx, `
-			UPDATE openai_window_warmup_jobs AS j
-			SET state = 'pending', next_attempt_at = $4,
-			    attempt_count = attempt_count - 1,
-			    sent_at = CASE WHEN attempt_count = 1 THEN NULL ELSE (
-			        SELECT MAX(a.started_at) FROM openai_window_warmup_attempts a
-			        WHERE a.job_id = j.id AND a.attempt_no < j.attempt_count
-			    ) END,
-			    last_attempt_at = CASE WHEN attempt_count = 1 THEN NULL ELSE (
-			        SELECT MAX(a.started_at) FROM openai_window_warmup_attempts a
-			        WHERE a.job_id = j.id AND a.attempt_no < j.attempt_count
-			    ) END,
-			    preflight_reset_at = NULL, preflight_observed_at = NULL,
-			    last_error_code = NULLIF($5, ''), last_error = NULL,
-			    lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+func (r *openAIWindowWarmupRepository) CancelStartedBeforeSend(ctx context.Context, id int64, owner, token string, reservation service.OpenAIWindowWarmupSendReservation, next time.Time, reason string) (bool, error) {
+	previous := reservation.PreviousProjection
+	if previous.AttemptCount < 0 || reservation.StartedAt.IsZero() {
+		return false, nil
+	}
+	return r.fencedQuery(ctx, `
+		WITH eligible AS MATERIALIZED (
+			SELECT j.id, j.attempt_count
+			FROM openai_window_warmup_jobs AS j
 			WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
-		  AND split_part(lease_token, ':', 1) = cycle_generation::text
-		  AND lease_until IS NOT NULL AND lease_until > NOW()
-		  AND attempt_count > 0`, id, owner, token, next.UTC(), reason)
+			  AND split_part(j.lease_token, ':', 1) = j.cycle_generation::text
+			  AND j.lease_until IS NOT NULL AND j.lease_until > NOW()
+			  -- The snapshot came from the same row lock acquired by ClaimDue. If
+			  -- another transition or duplicate MarkStarted changed the projection,
+			  -- leave the job fenced for passive reconciliation instead of guessing.
+			  AND j.attempt_count = $4::integer + 1
+			  AND j.sent_at IS NOT DISTINCT FROM $7::timestamptz
+			  AND j.last_attempt_at IS NOT DISTINCT FROM $7::timestamptz
+			  AND j.preflight_observed_at IS NOT DISTINCT FROM $7::timestamptz
+			  AND j.uncertain_observed_reset_at IS NULL
+			  AND j.uncertain_observed_at IS NULL
+			  AND NOT j.uncertain_terminal_observed
+			  AND EXISTS (
+				  SELECT 1 FROM openai_window_warmup_attempts AS a
+				  WHERE a.job_id = j.id
+				    AND a.attempt_no = j.attempt_count
+				    AND a.outcome = 'started'
+				    AND a.started_at IS NOT DISTINCT FROM $7::timestamptz
+			  )
+			FOR UPDATE
+		), deleted AS (
+			DELETE FROM openai_window_warmup_attempts AS a
+			USING eligible AS e
+			WHERE a.job_id = e.id
+			  AND a.attempt_no = e.attempt_count
+			  AND a.outcome = 'started'
+			  AND a.started_at IS NOT DISTINCT FROM $7::timestamptz
+			RETURNING a.job_id
+		), updated AS (
+			UPDATE openai_window_warmup_jobs AS j
+			SET state = 'pending', next_attempt_at = $13,
+			    attempt_count = $4::integer,
+			    -- Restore the exact projection captured before MarkStarted. An
+			    -- observation-only attempt may have a started_at timestamp, but its
+			    -- sent_at value is still NULL and must remain NULL after cancellation.
+			    sent_at = $5::timestamptz,
+			    last_attempt_at = $6::timestamptz,
+			    preflight_reset_at = $8::timestamptz,
+			    preflight_observed_at = $9::timestamptz,
+			    uncertain_observed_reset_at = $10::timestamptz,
+			    uncertain_observed_at = $11::timestamptz,
+			    uncertain_terminal_observed = $12::boolean,
+			    last_error_code = NULLIF($14, ''), last_error = NULL,
+			    lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+			FROM eligible AS e
+			JOIN deleted AS d ON d.job_id = e.id
+			WHERE j.id = e.id
+			  AND j.attempt_count = $4::integer + 1
+			RETURNING j.id
+		)
+		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token,
+		previous.AttemptCount, nullWarmupTime(previous.SentAt),
+		nullWarmupTime(previous.LastAttemptAt), nullableTimeValue(reservation.StartedAt),
+		nullWarmupTime(previous.PreflightResetAt), nullWarmupTime(previous.PreflightObservedAt),
+		nullWarmupTime(previous.UncertainObservedResetAt), nullWarmupTime(previous.UncertainObservedAt),
+		previous.UncertainTerminalObserved, next.UTC(), reason)
 }
 
 func (r *openAIWindowWarmupRepository) ProjectSuccessReset(ctx context.Context, accountID, identityGeneration int64, at, resetAt time.Time) (bool, error) {
@@ -849,32 +937,76 @@ func (r *openAIWindowWarmupRepository) UnblockAccount(ctx context.Context, accou
 		return nil, false, errors.New("nil openai warmup repository")
 	}
 	query := `
-	WITH target AS MATERIALIZED (
-	    SELECT j.id
-	    FROM openai_window_warmup_jobs AS j
-	    JOIN accounts AS a ON a.id = j.account_id
-	        AND a.openai_warmup_identity_generation = j.identity_generation
-	    WHERE j.account_id = $1
-	    -- Prefer a live row. A newer quarantined duplicate must not hide or
-	    -- accidentally compete with the real active cycle.
+	WITH locked_account AS MATERIALIZED (
+	    SELECT a.id, a.openai_warmup_identity_generation
+	    FROM accounts AS a
+	    WHERE a.id = $1
+	    FOR SHARE
+	), current_job AS MATERIALIZED (
+	    SELECT j.id, j.state
+	    FROM locked_account AS a
+	    JOIN openai_window_warmup_jobs AS j ON j.account_id = a.id
+	        AND j.identity_generation = a.openai_warmup_identity_generation
+	    -- Read the current projection without locking it. The target CTE below
+	    -- takes a row lock only when this exact job is eligible for unblocking.
 	    ORDER BY CASE WHEN j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
 	             j.id DESC
 	    LIMIT 1
-	    FOR UPDATE
+	), target AS MATERIALIZED (
+	    SELECT j.id,
+	           current_unresolved.started_at AS unresolved_started_at,
+	           -- sent_at is the durable send fence. It is cleared for rearming
+	           -- only when the current attempt is the same recorded send and a
+	           -- real upstream 4xx definitively rejected it. Observation-only
+	           -- failures use a later attempt timestamp and cannot clear the fence.
+	           (current_unresolved.started_at IS NOT NULL OR
+	            (j.sent_at IS NOT NULL AND NOT EXISTS (
+	               SELECT 1
+	               FROM openai_window_warmup_attempts AS a
+	               WHERE a.job_id = j.id
+	                 AND a.attempt_no = j.attempt_count
+	                 AND a.outcome = 'failed'
+	                 AND a.status_code BETWEEN 400 AND 499
+	                 AND a.started_at IS NOT DISTINCT FROM j.sent_at
+	                 AND j.last_attempt_at IS NOT DISTINCT FROM j.sent_at
+	                 AND NOT EXISTS (
+	                     SELECT 1
+	                     FROM openai_window_warmup_attempts AS unresolved
+	                     WHERE unresolved.job_id = j.id
+	                       AND unresolved.outcome IN ('started', 'uncertain')
+	                       AND unresolved.started_at IS NOT DISTINCT FROM j.sent_at
+	                 )
+	           ))) AS may_have_sent
+	    FROM current_job AS current
+	    JOIN openai_window_warmup_jobs AS j ON j.id = current.id
+	    LEFT JOIN LATERAL (
+	        SELECT attempt.started_at
+	        FROM openai_window_warmup_attempts AS attempt
+	        WHERE attempt.job_id = j.id
+	          AND attempt.attempt_no = j.attempt_count
+	          AND attempt.outcome IN ('started', 'uncertain')
+	    ) AS current_unresolved ON TRUE
+	    WHERE current.state IN ('paused', 'blocked', 'blocked_config')
+	      AND j.state IN ('paused', 'blocked', 'blocked_config')
+	    FOR UPDATE OF j
 	), updated AS (
 	    UPDATE openai_window_warmup_jobs AS j
 	    SET state = CASE
-	            WHEN j.state = 'paused' AND j.sent_at IS NOT NULL THEN 'uncertain'
+	            WHEN target.may_have_sent THEN 'uncertain'
 	            WHEN $2 > NOW() THEN 'armed'
 	            ELSE 'pending'
 	        END,
 	        next_attempt_at = CASE
-	            WHEN j.state = 'paused' AND j.sent_at IS NOT NULL THEN NOW()
+	            WHEN target.may_have_sent THEN NOW()
 	            ELSE $2
 	        END,
 	        observed_reset_at = CASE
-	            WHEN j.state = 'paused' AND j.sent_at IS NOT NULL THEN j.observed_reset_at
+	            WHEN target.may_have_sent THEN j.observed_reset_at
 	            ELSE COALESCE($3, j.observed_reset_at)
+	        END,
+	        sent_at = CASE
+	            WHEN target.may_have_sent THEN COALESCE(j.sent_at, target.unresolved_started_at)
+	            ELSE NULL
 	        END,
 	        lease_owner = NULL, lease_token = NULL, lease_until = NULL,
 	        last_error_code = NULL, last_error = NULL, updated_at = NOW()
@@ -1010,6 +1142,14 @@ func nullableTime(v sql.NullTime) time.Time {
 		return v.Time.UTC()
 	}
 	return time.Time{}
+}
+
+func nullableTimePointer(v sql.NullTime) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	value := v.Time.UTC()
+	return &value
 }
 
 func nullWarmupTime(v *time.Time) any {

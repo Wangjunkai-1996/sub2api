@@ -158,6 +158,19 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 
 		if isOpenAIWSTerminalEvent(eventType) {
 			prewarmTerminalCount++
+			// Only a completed/done response proves that generate=false was
+			// accepted and the connection is safe to reuse. Failed, incomplete,
+			// cancelled, and contradictory nested statuses must stay on the
+			// fallback path; treating them as prewarmed would bind an unusable
+			// response id and contaminate the next business request.
+			terminalType := warmupTerminalTypeWithStatus(message, eventType)
+			if terminalType != "response.completed" && terminalType != "response.done" {
+				lease.MarkBroken()
+				return wrapOpenAIWSFallback(
+					"prewarm_"+strings.TrimPrefix(terminalType, "response."),
+					errors.New("OpenAI websocket prewarm did not complete successfully: "+terminalType),
+				)
+			}
 			break
 		}
 	}

@@ -1657,21 +1657,36 @@ func (r *accountRepository) UpdateOpenAIOAuthCredentialsIfUnchanged(
 }
 
 // AcquireOpenAIWindowWarmupIdentityLease holds a PostgreSQL row-share lock for
-// the exact credentials used by a synthetic send. Account credential/proxy
-// updates conflict with this lock, closing the final read-to-POST race without
-// holding a lock during token refresh or task registration.
+// the exact durable snapshot used by a synthetic send. It locks the proxy row
+// before the account row, matching proxy update lock order, so route, credential,
+// policy, and business-use changes cannot cross the final read-to-POST boundary.
 func (r *accountRepository) AcquireOpenAIWindowWarmupIdentityLease(
 	ctx context.Context,
 	id int64,
 	identityGeneration int64,
+	expectedPolicy service.OpenAIWindowWarmupPolicy,
+	expectedLastUsedAt *time.Time,
 	expectedCredentials map[string]any,
 	expectedProxyID *int64,
+	expectedProxy *service.Proxy,
 ) (func(), bool, error) {
 	if r == nil || r.sql == nil {
 		return nil, false, errors.New("account repository SQL executor is not configured")
 	}
-	if id <= 0 || identityGeneration <= 0 {
+	expectedPolicy = service.NormalizeOpenAIWindowWarmupPolicy(string(expectedPolicy))
+	if id <= 0 || identityGeneration <= 0 || !expectedPolicy.Enabled() {
 		return nil, false, nil
+	}
+	var expectedProxyIdentity proxyProbeIdentity
+	if expectedProxyID == nil {
+		if expectedProxy != nil {
+			return nil, false, nil
+		}
+	} else {
+		if expectedProxy == nil || expectedProxy.ID != *expectedProxyID || !expectedProxy.IsActive() {
+			return nil, false, nil
+		}
+		expectedProxyIdentity = proxyProbeIdentityFromService(expectedProxy)
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -1700,6 +1715,44 @@ func (r *accountRepository) AcquireOpenAIWindowWarmupIdentityLease(
 		_ = tx.Rollback()
 		cancelLease()
 	}
+	if expectedProxyID != nil {
+		var (
+			currentProxyIdentity proxyProbeIdentity
+			currentExpiresAt     sql.NullTime
+		)
+		err = tx.QueryRowContext(ctx, `
+			SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''),
+			       status, expires_at
+			FROM proxies
+			WHERE id = $1 AND deleted_at IS NULL
+			  AND status = $2
+			  AND (expires_at IS NULL OR expires_at > NOW())
+			FOR SHARE`, *expectedProxyID, service.StatusActive).Scan(
+			&currentProxyIdentity.protocol,
+			&currentProxyIdentity.host,
+			&currentProxyIdentity.port,
+			&currentProxyIdentity.username,
+			&currentProxyIdentity.password,
+			&currentProxyIdentity.status,
+			&currentExpiresAt,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			release()
+			return nil, false, nil
+		}
+		if err != nil {
+			release()
+			return nil, false, err
+		}
+		expiresAtMatches := expectedProxy.ExpiresAt == nil && !currentExpiresAt.Valid
+		if expectedProxy.ExpiresAt != nil && currentExpiresAt.Valid {
+			expiresAtMatches = expectedProxy.ExpiresAt.Equal(currentExpiresAt.Time)
+		}
+		if currentProxyIdentity != expectedProxyIdentity || !expiresAtMatches {
+			release()
+			return nil, false, nil
+		}
+	}
 	var matchedID int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT a.id
@@ -1708,14 +1761,32 @@ func (r *accountRepository) AcquireOpenAIWindowWarmupIdentityLease(
 		  AND a.deleted_at IS NULL
 		  AND a.platform = $2
 		  AND a.type = $3
+		  AND a.parent_account_id IS NULL
+		  AND COALESCE(a.quota_dimension::text, 'global') = 'global'
+		  AND a.status::text = 'active'
+		  AND a.schedulable
+		  AND (a.expires_at IS NULL OR a.expires_at > NOW())
+		  AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
+		  AND lower(trim(COALESCE(
+		      CASE WHEN jsonb_typeof(a.extra -> 'openai_codex_warmup_policy') = 'string'
+		          THEN NULLIF(trim(a.extra ->> 'openai_codex_warmup_policy'), '') END,
+		      CASE WHEN jsonb_typeof(a.extra -> 'codex_warmup_policy') = 'string'
+		          THEN NULLIF(trim(a.extra ->> 'codex_warmup_policy'), '') END,
+		      CASE WHEN jsonb_typeof(a.extra -> 'openai_window_warmup_policy') = 'string'
+		          THEN NULLIF(trim(a.extra ->> 'openai_window_warmup_policy'), '') END,
+		      'off'
+		  ))) = $5
 		  AND a.openai_warmup_identity_generation = $4
-		  AND a.credentials = $5::jsonb
-		  AND a.proxy_id IS NOT DISTINCT FROM $6
+		  AND a.last_used_at IS NOT DISTINCT FROM $6::timestamptz
+		  AND a.credentials = $7::jsonb
+		  AND a.proxy_id IS NOT DISTINCT FROM $8
 		FOR SHARE`,
 		id,
 		service.PlatformOpenAI,
 		service.AccountTypeOAuth,
 		identityGeneration,
+		string(expectedPolicy),
+		nullWarmupTime(expectedLastUsedAt),
 		string(expectedJSON),
 		expectedProxyID,
 	).Scan(&matchedID)

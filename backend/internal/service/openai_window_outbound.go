@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 )
@@ -110,6 +111,7 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 	if err != nil {
 		return result, err
 	}
+	var refreshedToken, rejectedToken string
 	if request.Account.IsOpenAIAgentIdentity() {
 		if !isAgentIdentityTaskInvalidHTTPResponse(result.StatusCode, result.Body) {
 			return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthRefreshTerminal), nil
@@ -138,8 +140,14 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 			strings.TrimSpace(request.Account.GetOpenAIRefreshToken()) == "" {
 			return annotateOpenAIWindowAuthResult(result, request.Account, OpenAIWindowWarmupAuthNotRefreshable), nil
 		}
-		rejectedToken := strings.TrimSpace(strings.TrimPrefix(auth.Get("Authorization"), "Bearer "))
-		_, err = e.tokenProvider.RefreshAfterUnauthorized(execCtx, request.Account, rejectedToken)
+		rejectedToken = strings.TrimSpace(strings.TrimPrefix(auth.Get("Authorization"), "Bearer "))
+		refreshedToken, err = e.tokenProvider.RefreshAfterUnauthorized(execCtx, request.Account, rejectedToken)
+		if err == nil {
+			refreshedToken = strings.TrimSpace(refreshedToken)
+			if refreshedToken == "" {
+				err = fmt.Errorf("%w: token provider returned an empty refreshed token", ErrOpenAIWindowWarmupNeedsReauth)
+			}
+		}
 	}
 	if err != nil {
 		if errors.Is(err, errOpenAITokenRefreshInProgress) {
@@ -156,7 +164,38 @@ func (e *OpenAIWindowOutboundAdapter) Execute(ctx context.Context, request OpenA
 		}
 		return result, nil
 	}
-	replayRequest, replayAuth, prepareErr := e.prepareAuthorizedAttempt(execCtx, request)
+	var (
+		replayRequest OpenAIOutboundRequest
+		replayAuth    http.Header
+		prepareErr    error
+	)
+	if request.Account.IsOpenAIAgentIdentity() {
+		// Agent Identity assertions are generated from the current task and must
+		// continue through the normal authorization path after recovery.
+		replayRequest, replayAuth, prepareErr = e.prepareAuthorizedAttempt(execCtx, request)
+	} else {
+		// OAuth replay uses the refresh result captured above. prepareAttempt still
+		// reloads and fences the account before any second POST is attempted.
+		replayRequest, prepareErr = e.prepareAttempt(execCtx, request)
+		if prepareErr == nil {
+			replayToken := refreshedToken
+			if replayRequest.SendGuard != nil {
+				// The identity lease below locks replayRequest.Account.Credentials.
+				// Use the bearer from that same durable snapshot so a concurrent
+				// refresh cannot leave us locking T3 while replaying stale T2.
+				durableToken := strings.TrimSpace(replayRequest.Account.GetOpenAIAccessToken())
+				if durableToken == "" || durableToken == rejectedToken {
+					prepareErr = fmt.Errorf("%w: refreshed bearer is not durable", ErrOpenAIWindowWarmupCredentialsChanged)
+				} else {
+					replayToken = durableToken
+				}
+			}
+			// Unguarded callers do not acquire an identity lease and keep the exact
+			// refresh result, avoiding another read through a lagging token cache.
+			replayAuth = make(http.Header)
+			replayAuth.Set("Authorization", "Bearer "+replayToken)
+		}
+	}
 	if prepareErr != nil {
 		if errors.Is(prepareErr, ErrOpenAIWindowWarmupSendGuardClosed) ||
 			errors.Is(prepareErr, ErrOpenAIWindowWarmupCredentialsChanged) {
@@ -274,8 +313,20 @@ func (e *OpenAIWindowOutboundAdapter) prepareAttempt(ctx context.Context, reques
 		openAIWindowWarmupIdentityKey(latest) != openAIWindowWarmupIdentityKey(request.Account) {
 		return request, ErrOpenAIWindowWarmupCredentialsChanged
 	}
+	if request.SendGuard != nil &&
+		(OpenAIWindowWarmupPolicyForAccount(latest) != OpenAIWindowWarmupPolicyForAccount(request.Account) ||
+			!sameOpenAIWindowWarmupTime(latest.LastUsedAt, request.Account.LastUsedAt)) {
+		return request, ErrOpenAIWindowWarmupCredentialsChanged
+	}
 	request.Account = latest
 	return request, nil
+}
+
+func sameOpenAIWindowWarmupTime(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
 }
 
 func (e *OpenAIWindowOutboundAdapter) prepareAuthorizedAttempt(ctx context.Context, request OpenAIOutboundRequest) (OpenAIOutboundRequest, http.Header, error) {
@@ -370,8 +421,11 @@ func (e *OpenAIWindowOutboundAdapter) executePrepared(
 			ctx,
 			request.Account.ID,
 			request.IdentityGeneration,
+			OpenAIWindowWarmupPolicyForAccount(request.Account),
+			request.Account.LastUsedAt,
 			request.Account.Credentials,
 			request.Account.ProxyID,
+			request.Account.Proxy,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("acquire openai warmup identity lease: %w", err)

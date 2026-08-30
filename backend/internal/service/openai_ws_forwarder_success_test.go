@@ -1482,6 +1482,42 @@ func TestOpenAIGatewayService_PrewarmReadHonorsParentContext(t *testing.T) {
 	require.Less(t, elapsed, 180*time.Millisecond, "预热读取应受父 context 取消控制，不应阻塞到 read_timeout")
 }
 
+func TestOpenAIGatewayService_PrewarmFailureTerminalsAreNotReusable(t *testing.T) {
+	cases := []struct {
+		name  string
+		event string
+	}{
+		{name: "failed", event: `{"type":"response.failed","response":{"id":"resp_failed","status":"failed"}}`},
+		{name: "incomplete", event: `{"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete"}}`},
+		{name: "cancelled", event: `{"type":"response.cancelled","response":{"id":"resp_cancelled","status":"cancelled"}}`},
+		{name: "contradictory_done_status", event: `{"type":"response.done","response":{"id":"resp_done","status":"in_progress"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = true
+			svc := &OpenAIGatewayService{cfg: cfg, toolCorrector: NewCodexToolCorrector()}
+			account := &Account{ID: 602, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true}
+			conn := newOpenAIWSConn("prewarm_terminal_"+tc.name, account.ID, &openAIWSCaptureConn{events: [][]byte{[]byte(tc.event)}}, nil)
+			lease := &openAIWSConnLease{accountID: account.ID, conn: conn}
+
+			err := svc.performOpenAIWSGeneratePrewarm(
+				context.Background(),
+				lease,
+				OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+				map[string]any{"type": "response.create", "model": "gpt-5.1"},
+				"",
+				map[string]any{"model": "gpt-5.1"},
+				account,
+				nil,
+				0,
+			)
+			require.Error(t, err)
+			require.False(t, lease.IsPrewarmed(), "失败终态不能污染连接的预热标志")
+		})
+	}
+}
+
 func TestOpenAIGatewayService_Forward_WSv2_TurnMetadataInPayloadOnConnReuse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

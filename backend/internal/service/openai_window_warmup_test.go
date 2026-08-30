@@ -138,7 +138,7 @@ func (r *warmupRepositorySpy) MarkStarted(_ context.Context, _ int64, _, _ strin
 	return !rejectStarted, nil
 }
 
-func (r *warmupRepositorySpy) CancelStartedBeforeSend(_ context.Context, _ int64, _, _ string, _ time.Time, _ string) (bool, error) {
+func (r *warmupRepositorySpy) CancelStartedBeforeSend(_ context.Context, _ int64, _, _ string, _ OpenAIWindowWarmupSendReservation, _ time.Time, _ string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cancelStarted++
@@ -1100,6 +1100,9 @@ func TestOpenAIWindowWarmupInitialNilCycleBaselineRequiresPreflightAdvance(t *te
 	require.Equal(t, 1, repo.started)
 	require.Len(t, probe.expectedResets, 1)
 	require.Equal(t, rollingReset, *probe.expectedResets[0])
+	require.Equal(t, 1, claim.Job.AttemptCount)
+	require.Equal(t, now, *claim.Job.SentAt)
+	require.Equal(t, now, *claim.Job.LastAttemptAt)
 	require.Equal(t, rollingReset, *claim.Job.PreflightResetAt)
 	require.Equal(t, now, *claim.Job.PreflightObservedAt)
 	require.Zero(t, repo.successCalls, "a reset equal to the persisted preflight baseline is not advancement")
@@ -1161,7 +1164,8 @@ func TestOpenAIWindowWarmupMarkStartedCASRejectsNewerIdleRollingResetWithoutSupp
 	usage := &warmupUsageStub{usage: warmupUsage(preflightReset, 0, now.Add(24*time.Hour), 1)}
 	service := newWarmupTestService(repo, account, probe, usage, now, true)
 
-	service.processClaim(context.Background(), warmupTestClaim(account.ID, oldReset))
+	claim := warmupTestClaim(account.ID, oldReset)
+	service.processClaim(context.Background(), claim)
 
 	require.Equal(t, 1, usage.calls)
 	require.Equal(t, 1, repo.started, "the final repository CAS was attempted")
@@ -1172,6 +1176,11 @@ func TestOpenAIWindowWarmupMarkStartedCASRejectsNewerIdleRollingResetWithoutSupp
 	require.Zero(t, repo.suppressedCalls)
 	require.Zero(t, probe.calls)
 	require.Empty(t, repo.enqueues)
+	require.Zero(t, claim.Job.AttemptCount)
+	require.Nil(t, claim.Job.SentAt)
+	require.Nil(t, claim.Job.LastAttemptAt)
+	require.Nil(t, claim.Job.PreflightResetAt)
+	require.Nil(t, claim.Job.PreflightObservedAt)
 }
 
 func TestOpenAIWindowWarmupIdleRollingResetHonorsRecentBusinessUse(t *testing.T) {
@@ -2204,6 +2213,53 @@ func TestOpenAIWindowWarmupExpiredLeaseRequiresPassiveReconcileBeforeReplay(t *t
 	require.Equal(t, "uncertain", repo.action)
 	require.Zero(t, probe.calls)
 	require.Equal(t, 1, usage.calls)
+}
+
+func TestOpenAIWindowWarmupRetryingSendEvidenceRequiresPassiveReconcileBeforeReplay(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	repo := &warmupRepositorySpy{}
+	probe := &warmupProbeStub{}
+	usage := &warmupUsageStub{}
+	service := newWarmupTestService(repo, account, probe, usage, now, true)
+	claim := warmupTestClaim(account.ID, now.Add(-time.Hour))
+	sent := now.Add(-2 * time.Minute)
+	claim.Job.SentAt = &sent
+	claim.Job.AttemptCount = 1
+	claim.PreviousState = OpenAIWindowWarmupStateRetrying
+
+	service.processClaim(context.Background(), claim)
+
+	require.Equal(t, "uncertain", repo.action)
+	require.Zero(t, probe.calls)
+	require.Equal(t, 1, usage.calls)
+}
+
+func TestOpenAIWindowWarmupCredentialsChangedCancelsOnlyUnstartedAttempt(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+
+	for _, test := range []struct {
+		name       string
+		result     *OpenAIWindowProbeResult
+		wantCancel int
+		wantAction string
+	}{
+		{name: "identity fence before transport", wantCancel: 1, wantAction: "cancel_started"},
+		{name: "identity fence after transport began", result: &OpenAIWindowProbeResult{Started: true}, wantCancel: 0, wantAction: "paused"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &warmupRepositorySpy{}
+			service := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+			claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+			claim.Job.AttemptCount = 1
+
+			service.handleProbeResult(context.Background(), claim, account, test.result, ErrOpenAIWindowWarmupCredentialsChanged)
+
+			require.Equal(t, test.wantCancel, repo.cancelStarted)
+			require.Equal(t, test.wantAction, repo.action)
+		})
+	}
 }
 
 func TestOpenAIWindowWarmupUncertainReplayRequiresAuthoritativeUsage(t *testing.T) {
