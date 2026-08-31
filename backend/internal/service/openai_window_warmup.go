@@ -1227,27 +1227,30 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 			return
 		}
 	}
-	// Rows that exhausted the legacy preflight retry budget get one final
-	// passive capability classification. This fixes already-blocked weekly-only
-	// accounts without allowing another synthetic send or depending on the
-	// exclusive send gate.
+	// Exhausted legacy rows get one final passive capability classification.
+	// The retained attempt cap prevents another synthetic send.
 	if job.AttemptCount >= s.options.MaxAttempts {
-		if job.SentAt == nil {
-			usage, usageErr := s.queryWarmupUsage(ctx, account.ID)
-			if usageErr == nil && warmupFiveHourCapabilityForUsage(usage) == warmupFiveHourUnsupported {
-				s.markUnsupportedFiveHourWindow(ctx, claim, s.now())
-				return
-			}
+		if job.SentAt == nil && s.excludeUnsupportedFiveHourWindow(ctx, claim, account.ID) {
+			return
 		}
 		s.markBlocked(ctx, claim, s.now(), 0, "attempt_limit", "warmup attempt limit reached")
 		return
 	}
 	if s.options.Concurrency == nil {
+		if s.excludeUnsupportedFiveHourWindow(ctx, claim, account.ID) {
+			return
+		}
 		s.markRetry(ctx, claim, s.now(), s.now().Add(time.Minute), 0, "concurrency_gate_unavailable", "exclusive account gate unavailable")
 		return
 	}
 	exclusive, acquired, acquireErr := s.options.Concurrency.TryAcquireAccountExclusive(ctx, account.ID, s.options.LeaseDuration)
 	if acquireErr != nil || !acquired || exclusive == nil {
+		// Capability discovery is passive. A busy weekly-only account must not
+		// depend on eventually winning the exclusive send gate, while supported,
+		// unknown, and failed observations retain the existing reschedule path.
+		if s.excludeUnsupportedFiveHourWindow(ctx, claim, account.ID) {
+			return
+		}
 		next := s.now().Add(time.Minute)
 		s.reschedule(ctx, claim, next, OpenAIWindowWarmupStateRetrying, job.ObservedResetAt)
 		return
@@ -1890,6 +1893,17 @@ func (s *OpenAIWindowWarmupService) markUnsupportedFiveHourWindow(ctx context.Co
 		return false
 	}
 	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStateFailed, 0, OpenAIWindowWarmupErrorFiveHourWindowUnsupported, nil)
+	return true
+}
+
+func (s *OpenAIWindowWarmupService) excludeUnsupportedFiveHourWindow(ctx context.Context, claim OpenAIWindowWarmupClaim, accountID int64) bool {
+	usage, usageErr := s.queryWarmupUsage(ctx, accountID)
+	if usageErr != nil || warmupFiveHourCapabilityForUsage(usage) != warmupFiveHourUnsupported {
+		return false
+	}
+	// Return true for a definitive observation even if the lease CAS lost a
+	// race. The stale claimant must not attempt a second state transition.
+	s.markUnsupportedFiveHourWindow(ctx, claim, s.now())
 	return true
 }
 

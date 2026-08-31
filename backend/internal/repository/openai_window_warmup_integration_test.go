@@ -1386,6 +1386,39 @@ func TestOpenAIWindowWarmupRepositoryMarksUnsupportedFiveHourWindowTerminally(t 
 	}
 }
 
+func TestOpenAIWindowWarmupRepositoryUnsupportedObservationRejectsSupersededIdentity(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "unsupported-superseded-identity:" + uuid.NewString(), CycleGeneration: 509,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
+		NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	claims, err := repo.ClaimDue(ctx, "unsupported-superseded-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	currentGeneration := rotateWarmupIntegrationIdentity(t, accountID, identityGeneration)
+	require.Greater(t, currentGeneration, identityGeneration)
+
+	changed, err := repo.MarkUnsupportedFiveHourWindow(
+		ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, time.Now().UTC(),
+	)
+	require.NoError(t, err)
+	require.False(t, changed, "a passive observation from an old credential identity must be fenced")
+
+	stale, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStatePaused, stale.State,
+		"credential rotation pauses the stale job before the passive observation can commit")
+	require.NotEqual(t, service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported, stale.LastErrorCode)
+	require.Equal(t, identityGeneration, stale.IdentityGeneration)
+}
+
 func TestOpenAIWindowWarmupRepositoryUnsupportedTombstoneBlocksRevivedJobsUntilManualRecheck(t *testing.T) {
 	ctx := context.Background()
 	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)

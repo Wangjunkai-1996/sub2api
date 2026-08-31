@@ -1902,6 +1902,7 @@ func TestOpenAIWindowWarmupUsagePreflightAcceptsOptionalWeeklyWindow(t *testing.
 
 			service.processClaim(context.Background(), warmupTestClaim(account.ID, now.Add(-time.Minute)))
 
+			require.Equal(t, 1, usage.calls, "the acquired path must not duplicate passive usage queries")
 			require.Equal(t, 1, probe.calls)
 			require.Equal(t, 1, repo.started)
 			require.Equal(t, 1, repo.successCalls)
@@ -2082,23 +2083,75 @@ func TestOpenAIWindowWarmupFailsClosedWhenBlockedWeeklyResetIsMissing(t *testing
 	require.Zero(t, probe.calls)
 }
 
-func TestOpenAIWindowWarmupBusyAccountNeverQueriesUsageOrSends(t *testing.T) {
+func TestOpenAIWindowWarmupBusyWeeklyOnlyAccountIsExcludedAfterExclusiveGateContention(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	var usageValue OpenAIQuotaUsage
+	require.NoError(t, json.Unmarshal([]byte(fmt.Sprintf(
+		`{"plan_type":"pro","fetched_at":%d,"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":604800,"reset_at":%d},"secondary_window":null}}`,
+		now.Unix(), now.Add(24*time.Hour).Unix())), &usageValue))
 	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
 	repo := &warmupRepositorySpy{}
 	probe := &warmupProbeStub{}
-	usage := &warmupUsageStub{usage: &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
-		primaryWindowPresent: true, secondaryWindowPresent: true,
-	}}}
+	usage := &warmupUsageStub{usage: &usageValue}
 	service := newWarmupTestService(repo, account, probe, usage, now, true)
-	service.options.Concurrency = &warmupConcurrencyStub{acquired: false, lease: &warmupExclusiveCacheStub{refresh: true}}
+	concurrency := &warmupConcurrencyStub{acquired: false, lease: &warmupExclusiveCacheStub{refresh: true}}
+	service.options.Concurrency = concurrency
+	claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+	claim.Job.AttemptCount = 3
 
-	service.processClaim(context.Background(), warmupTestClaim(account.ID, now.Add(-time.Minute)))
+	service.processClaim(context.Background(), claim)
 
-	require.Equal(t, "reschedule", repo.action)
-	require.Equal(t, OpenAIWindowWarmupStateRetrying, repo.state)
-	require.Zero(t, usage.calls)
+	require.Equal(t, "unsupported", repo.action)
+	require.Equal(t, OpenAIWindowWarmupStateFailed, repo.state)
+	require.Equal(t, OpenAIWindowWarmupErrorFiveHourWindowUnsupported, repo.code)
+	require.Equal(t, 1, usage.calls)
+	require.Equal(t, 1, concurrency.calls, "classification runs only after the exclusive send gate is busy")
+	require.Equal(t, 3, claim.Job.AttemptCount, "passive capability exclusion is not a failed attempt")
+	require.Zero(t, repo.started)
 	require.Zero(t, probe.calls)
+}
+
+func TestOpenAIWindowWarmupBusyAccountCapabilityPrecheckDoesNotMisclassify(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		usage *warmupUsageStub
+	}{
+		{
+			name:  "five hour supported",
+			usage: &warmupUsageStub{usage: warmupUsage(now.Add(5*time.Hour), 0, now.Add(24*time.Hour), 1)},
+		},
+		{
+			name:  "capability unknown",
+			usage: &warmupUsageStub{usage: &OpenAIQuotaUsage{}},
+		},
+		{
+			name:  "usage query failed",
+			usage: &warmupUsageStub{err: errors.New("usage temporarily unavailable")},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+			repo := &warmupRepositorySpy{}
+			probe := &warmupProbeStub{}
+			service := newWarmupTestService(repo, account, probe, test.usage, now, true)
+			concurrency := &warmupConcurrencyStub{acquired: false, lease: &warmupExclusiveCacheStub{refresh: true}}
+			service.options.Concurrency = concurrency
+			claim := warmupTestClaim(account.ID, now.Add(-time.Minute))
+
+			service.processClaim(context.Background(), claim)
+
+			require.Equal(t, "reschedule", repo.action)
+			require.Equal(t, OpenAIWindowWarmupStateRetrying, repo.state)
+			require.NotEqual(t, OpenAIWindowWarmupErrorFiveHourWindowUnsupported, repo.code)
+			require.Equal(t, 1, test.usage.calls)
+			require.Equal(t, 1, concurrency.calls)
+			require.Zero(t, claim.Job.AttemptCount, "gate contention must not consume an attempt")
+			require.Zero(t, repo.started)
+			require.Zero(t, probe.calls)
+		})
+	}
 }
 
 func TestOpenAIWindowWarmupLostExclusiveLeaseStopsBeforeSend(t *testing.T) {
