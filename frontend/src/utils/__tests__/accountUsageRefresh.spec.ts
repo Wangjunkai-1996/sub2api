@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey } from '../accountUsageRefresh'
+import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey, buildOpenAIWarmupRefreshKey } from '../accountUsageRefresh'
 
 describe('buildOpenAIUsageRefreshKey', () => {
   it('会在 codex 快照变化时生成不同 key', () => {
@@ -59,6 +59,41 @@ describe('buildOpenAIUsageRefreshKey', () => {
       last_used_at: '2026-03-07T10:00:00Z',
       extra: {}
     } as any)).toBe('')
+  })
+})
+
+describe('buildOpenAIWarmupRefreshKey', () => {
+  it('changes when the persisted warmup state changes', () => {
+    const retrying = {
+      openai_window_warmup: {
+        policy: 'continuous',
+        state: 'retrying',
+        attempt_count: 3,
+        last_error_code: 'usage_preflight_failed',
+        next_attempt_at: '2026-08-31T12:30:00Z'
+      }
+    } as any
+    const skipped = {
+      openai_window_warmup: {
+        ...retrying.openai_window_warmup,
+        state: 'failed',
+        last_error_code: 'five_hour_window_unsupported',
+        next_attempt_at: null
+      }
+    } as any
+
+    expect(buildOpenAIWarmupRefreshKey(retrying)).not.toBe(buildOpenAIWarmupRefreshKey(skipped))
+  })
+
+  it('is stable when response object keys are reordered', () => {
+    const first = {
+      openai_window_warmup: { policy: 'continuous', state: 'retrying', attempt_count: 3 }
+    } as any
+    const reordered = {
+      openai_window_warmup: { attempt_count: 3, state: 'retrying', policy: 'continuous' }
+    } as any
+
+    expect(buildOpenAIWarmupRefreshKey(first)).toBe(buildOpenAIWarmupRefreshKey(reordered))
   })
 })
 
