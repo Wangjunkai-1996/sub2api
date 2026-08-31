@@ -130,6 +130,38 @@ func warmupHandlerTestAccount() *service.Account {
 	}
 }
 
+func TestOpenAIWindowWarmupStatusOnlyProjectsNextRunForActiveJobs(t *testing.T) {
+	next := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
+	account := warmupHandlerTestAccount()
+	for _, test := range []struct {
+		name        string
+		state       string
+		wantNextRun bool
+	}{
+		{name: "retrying", state: service.OpenAIWindowWarmupStateRetrying, wantNextRun: true},
+		{name: "failed capability", state: service.OpenAIWindowWarmupStateFailed, wantNextRun: false},
+		{name: "completed", state: service.OpenAIWindowWarmupStateCompleted, wantNextRun: false},
+		{name: "blocked", state: service.OpenAIWindowWarmupStateBlocked, wantNextRun: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := openAIWindowWarmupStatus(account, &service.OpenAIWindowWarmupJob{
+				ID: 7, AccountID: account.ID, State: test.state, NextAttemptAt: next,
+				LastErrorCode: service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported,
+			})
+			require.NotNil(t, status)
+			if test.wantNextRun {
+				require.Equal(t, &next, status.NextRunAt)
+				require.Equal(t, &next, status.NextAttemptAt)
+			} else {
+				require.Nil(t, status.NextRunAt)
+				require.Nil(t, status.NextAttemptAt)
+			}
+			require.NotNil(t, status.Job, "nested job retains durable history")
+			require.Equal(t, next, status.Job.NextAttemptAt)
+		})
+	}
+}
+
 func setupWarmupHandlerRouter(t *testing.T, repo *warmupHandlerRepository) (*gin.Engine, *warmupHandlerAdminService, *warmupHandlerAccountRepository, *service.OpenAIWindowWarmupService) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)

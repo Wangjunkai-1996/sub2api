@@ -49,7 +49,10 @@ const (
 	OpenAIWindowWarmupStatePaused        = "paused"
 	OpenAIWindowWarmupStateBlocked       = "blocked"
 	OpenAIWindowWarmupStateBlockedConfig = "blocked_config"
+	OpenAIWindowWarmupStateFailed        = "failed"
 	OpenAIWindowWarmupStateCompleted     = "completed"
+
+	OpenAIWindowWarmupErrorFiveHourWindowUnsupported = "five_hour_window_unsupported"
 
 	OpenAIWindowWarmupTriggerImport    = "import"
 	OpenAIWindowWarmupTriggerReset     = "reset"
@@ -518,6 +521,9 @@ type OpenAIWindowWarmupRepository interface {
 	MarkRateLimited(context.Context, int64, string, string, time.Time, time.Time, *time.Time, int, string) (bool, error)
 	MarkUncertain(context.Context, int64, string, string, time.Time, time.Time, int, string, string, OpenAIWindowWarmupUncertainEvidence) (bool, error)
 	MarkBlocked(context.Context, int64, string, string, time.Time, int, string, string) (bool, error)
+	MarkUnsupportedFiveHourWindow(context.Context, int64, string, string, time.Time) (bool, error)
+	ClearUnsupportedFiveHourWindow(context.Context, int64, int64) (bool, error)
+	RequeueLegacyPreflightLimit(context.Context, int64, int64, int, time.Time) (bool, error)
 	RequeueAuthStateUpdateFailure(context.Context, OpenAIWindowWarmupAuthStateRetry) (bool, error)
 	MarkPaused(context.Context, int64, string, string, time.Time, string) (bool, error)
 	Reschedule(context.Context, int64, string, string, time.Time, string, *time.Time) (bool, error)
@@ -773,6 +779,16 @@ func (s *OpenAIWindowWarmupService) reconcileAccounts(ctx context.Context) {
 			_, _, _ = s.scheduleAccountWarmup(ctx, account, OpenAIWindowWarmupTriggerReconcile, false)
 			continue
 		}
+		if current.State == OpenAIWindowWarmupStateBlocked && current.SentAt == nil &&
+			current.LastErrorCode == "attempt_limit_preflight" {
+			// Older workers exhausted weekly-only accounts before capability
+			// classification existed. Rearm exactly once for a passive check; the
+			// retained attempt cap still prevents any synthetic send.
+			_, _ = s.repo.RequeueLegacyPreflightLimit(
+				ctx, current.ID, current.IdentityGeneration, current.AttemptCount, s.now(),
+			)
+			continue
+		}
 		if current.State == OpenAIWindowWarmupStateCompleted &&
 			OpenAIWindowWarmupPolicyForAccount(account) == OpenAIWindowWarmupPolicyContinuous &&
 			current.ObservedResetAt != nil {
@@ -999,9 +1015,26 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
 		return nil, false, currentErr
 	}
+	capabilityRecheck := false
+	if current != nil && current.IdentityGeneration == account.OpenAIWarmupIdentityGeneration &&
+		openAIWindowWarmupFiveHourUnsupportedJob(current) {
+		cleared, clearErr := s.repo.ClearUnsupportedFiveHourWindow(
+			ctx, accountID, account.OpenAIWarmupIdentityGeneration,
+		)
+		if clearErr != nil {
+			return nil, false, clearErr
+		}
+		capabilityRecheck = cleared
+		if cleared {
+			current, currentErr = s.repo.GetCurrent(ctx, accountID, OpenAIWindowWarmupQuotaScopeGlobal)
+			if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+				return nil, false, currentErr
+			}
+		}
+	}
 	if current != nil && current.IdentityGeneration == account.OpenAIWarmupIdentityGeneration {
-		if warmupActiveState(current.State) {
-			return current, false, nil
+		if IsOpenAIWindowWarmupStateActive(current.State) {
+			return current, capabilityRecheck, nil
 		}
 		if current.State == OpenAIWindowWarmupStateBlocked || current.State == OpenAIWindowWarmupStateBlockedConfig || current.State == OpenAIWindowWarmupStatePaused {
 			resetAt := accountCodexGlobalResetAt(account)
@@ -1023,7 +1056,7 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 		manualSeed = current.ID
 	}
 	cycleGeneration := warmupAccountGeneration(account)
-	return s.repo.Enqueue(ctx, OpenAIWindowWarmupEnqueue{
+	job, inserted, enqueueErr := s.repo.Enqueue(ctx, OpenAIWindowWarmupEnqueue{
 		AccountID: account.ID, QuotaScope: OpenAIWindowWarmupQuotaScopeGlobal,
 		CycleKey:           fmt.Sprintf("manual:%d:%d", account.OpenAIWarmupIdentityGeneration, manualSeed),
 		CycleGeneration:    cycleGeneration,
@@ -1031,9 +1064,17 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 		Trigger:            OpenAIWindowWarmupTriggerManual, ObservedResetAt: resetAt,
 		NextAttemptAt: next,
 	})
+	return job, inserted || capabilityRecheck, enqueueErr
 }
 
-func warmupActiveState(state string) bool {
+func openAIWindowWarmupFiveHourUnsupportedJob(job *OpenAIWindowWarmupJob) bool {
+	return job != nil && job.State == OpenAIWindowWarmupStateFailed &&
+		job.LastErrorCode == OpenAIWindowWarmupErrorFiveHourWindowUnsupported
+}
+
+// IsOpenAIWindowWarmupStateActive reports whether a job can still be leased or
+// is currently held by a worker.
+func IsOpenAIWindowWarmupStateActive(state string) bool {
 	switch state {
 	case OpenAIWindowWarmupStatePending, OpenAIWindowWarmupStateArmed, OpenAIWindowWarmupStateDue,
 		OpenAIWindowWarmupStateRunning, OpenAIWindowWarmupStateRetrying,
@@ -1133,6 +1174,10 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 		now := s.now()
 		reset, authoritative, active, reconcileErr := s.reconcileFiveHourObservation(ctx, account.ID, job)
 		if reconcileErr != nil {
+			if errors.Is(reconcileErr, errWarmupFiveHourWindowUnsupported) {
+				s.markUnsupportedFiveHourWindow(ctx, claim, now)
+				return
+			}
 			s.handleUsageObservationFailure(ctx, claim, now, OpenAIWindowWarmupStateUncertain, "reconcile", reconcileErr)
 			return
 		}
@@ -1182,10 +1227,18 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 			return
 		}
 	}
-	// An uncertain sender gets its required passive observations above before
-	// the cap is enforced. No cycle may start another synthetic request once its
-	// durable attempt budget has been consumed.
+	// Rows that exhausted the legacy preflight retry budget get one final
+	// passive capability classification. This fixes already-blocked weekly-only
+	// accounts without allowing another synthetic send or depending on the
+	// exclusive send gate.
 	if job.AttemptCount >= s.options.MaxAttempts {
+		if job.SentAt == nil {
+			usage, usageErr := s.queryWarmupUsage(ctx, account.ID)
+			if usageErr == nil && warmupFiveHourCapabilityForUsage(usage) == warmupFiveHourUnsupported {
+				s.markUnsupportedFiveHourWindow(ctx, claim, s.now())
+				return
+			}
+		}
 		s.markBlocked(ctx, claim, s.now(), 0, "attempt_limit", "warmup attempt limit reached")
 		return
 	}
@@ -1210,6 +1263,10 @@ func (s *OpenAIWindowWarmupService) processClaim(parent context.Context, claim O
 			usageErr = errors.New("warmup usage reconciler returned an empty response")
 		}
 		s.handleUsageObservationFailure(ctx, claim, s.now(), OpenAIWindowWarmupStateRetrying, "preflight", usageErr)
+		return
+	}
+	if warmupFiveHourCapabilityForUsage(usage) == warmupFiveHourUnsupported {
+		s.markUnsupportedFiveHourWindow(ctx, claim, s.now())
 		return
 	}
 	fiveHour, authoritative := warmupFiveHourObservation(usage)
@@ -1403,16 +1460,21 @@ func (s *OpenAIWindowWarmupService) handleProbeResultWithPreflight(ctx context.C
 		return
 	}
 	if statusCode == http.StatusTooManyRequests {
-		if job.AttemptCount >= s.options.MaxAttempts {
-			s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached")
-			return
-		}
 		reset := result.ResetAt
 		if reset == nil {
 			reset = result.ObservedResetAt
 		}
-		if authoritative, _, _ := s.reconcileBlockedReset(ctx, account.ID); authoritative != nil && (reset == nil || authoritative.After(*reset)) {
-			reset = authoritative
+		authoritativeReset, _, reconcileErr := s.reconcileBlockedReset(ctx, account.ID)
+		if errors.Is(reconcileErr, errWarmupFiveHourWindowUnsupported) {
+			s.markUnsupportedFiveHourWindow(ctx, claim, now)
+			return
+		}
+		if authoritativeReset != nil && (reset == nil || authoritativeReset.After(*reset)) {
+			reset = authoritativeReset
+		}
+		if job.AttemptCount >= s.options.MaxAttempts {
+			s.markBlocked(ctx, claim, now, statusCode, "attempt_limit", "warmup attempt limit reached")
+			return
 		}
 		if reset != nil && reset.After(now) {
 			next := s.warmupDueAt(warmupResetCycleKey(*reset), reset)
@@ -1514,6 +1576,10 @@ func (s *OpenAIWindowWarmupService) handleAmbiguousProbe(ctx context.Context, cl
 	job := claim.Job
 	terminal := statusCode >= 200 && statusCode < 300 && warmupTerminalSucceeded(result)
 	reset, authoritative, active, reconcileErr := s.reconcileFiveHourObservation(ctx, account.ID, job)
+	if errors.Is(reconcileErr, errWarmupFiveHourWindowUnsupported) {
+		s.markUnsupportedFiveHourWindow(ctx, claim, now)
+		return
+	}
 	if reconcileErr == nil && authoritative && active && reset != nil && reset.After(now) {
 		if terminal && warmupAttemptResetAdvanced(reset, job, now) {
 			if s.markSuccess(ctx, claim, now, reset, statusCode, "completed_reconciled", warmupSuccessEvidence(result)) {
@@ -1818,6 +1884,15 @@ func (s *OpenAIWindowWarmupService) markBlocked(ctx context.Context, claim OpenA
 	return true
 }
 
+func (s *OpenAIWindowWarmupService) markUnsupportedFiveHourWindow(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time) bool {
+	ok, err := s.repo.MarkUnsupportedFiveHourWindow(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, at)
+	if err != nil || !ok {
+		return false
+	}
+	s.recordWarmupAudit(claim.Job, OpenAIWindowWarmupStateFailed, 0, OpenAIWindowWarmupErrorFiveHourWindowUnsupported, nil)
+	return true
+}
+
 func (s *OpenAIWindowWarmupService) markPaused(ctx context.Context, claim OpenAIWindowWarmupClaim, at time.Time, reason string) bool {
 	ok, err := s.repo.MarkPaused(ctx, claim.Job.ID, claim.Owner, claim.LeaseToken, at, reason)
 	if err != nil || !ok {
@@ -1874,6 +1949,9 @@ func (s *OpenAIWindowWarmupService) reconcileFiveHourObservation(ctx context.Con
 	if err != nil {
 		return nil, false, false, err
 	}
+	if warmupFiveHourCapabilityForUsage(usage) == warmupFiveHourUnsupported {
+		return nil, false, false, errWarmupFiveHourWindowUnsupported
+	}
 	observation, authoritative := warmupFiveHourObservation(usage)
 	if !authoritative {
 		return nil, false, false, errors.New("authoritative five-hour usage window unavailable")
@@ -1893,6 +1971,9 @@ func (s *OpenAIWindowWarmupService) reconcileBlockedReset(ctx context.Context, a
 	usage, err := s.queryWarmupUsage(ctx, accountID)
 	if err != nil {
 		return nil, false, err
+	}
+	if warmupFiveHourCapabilityForUsage(usage) == warmupFiveHourUnsupported {
+		return nil, false, errWarmupFiveHourWindowUnsupported
 	}
 	fiveHour, fiveHourAuthoritative := warmupFiveHourObservation(usage)
 	weekly, weeklyAuthoritative := warmupBlockedWeeklyObservation(usage)
@@ -1987,6 +2068,53 @@ func (s *OpenAIWindowWarmupService) enqueueNextContinuousCycle(ctx context.Conte
 type warmupWindowObservation struct {
 	ResetAt     *time.Time
 	UsedPercent float64
+}
+
+type warmupFiveHourCapability uint8
+
+const (
+	warmupFiveHourUnknown warmupFiveHourCapability = iota
+	warmupFiveHourAvailable
+	warmupFiveHourUnsupported
+)
+
+var errWarmupFiveHourWindowUnsupported = errors.New(OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
+
+// warmupFiveHourCapabilityForUsage only excludes the established weekly-only
+// response shape. Missing or ambiguous fields remain unknown and continue
+// through the existing fail-closed observation path.
+func warmupFiveHourCapabilityForUsage(usage *OpenAIQuotaUsage) warmupFiveHourCapability {
+	if usage == nil || usage.RateLimit == nil {
+		return warmupFiveHourUnknown
+	}
+	rateLimit := usage.RateLimit
+	if rateLimit.primaryWindowPresent && rateLimit.PrimaryWindow == nil {
+		return warmupFiveHourAvailable
+	}
+	windows := []*OpenAIRateLimitWindow{rateLimit.PrimaryWindow, rateLimit.SecondaryWindow}
+	for _, window := range windows {
+		if window != nil && window.LimitWindowSeconds > 0 && window.LimitWindowSeconds <= 6*60*60 {
+			return warmupFiveHourAvailable
+		}
+	}
+	if !rateLimit.primaryWindowPresent || rateLimit.PrimaryWindow == nil || rateLimit.PrimaryWindow.LimitWindowSeconds <= 6*60*60 {
+		return warmupFiveHourUnknown
+	}
+	for _, window := range windows {
+		if window == nil {
+			continue
+		}
+		if window.LimitWindowSeconds <= 6*60*60 || !warmupUsagePercentAuthoritative(window) {
+			return warmupFiveHourUnknown
+		}
+		if window.UsedPercent >= 100 {
+			reset, valid := warmupUsageWindowResetAt(usage, window)
+			if !valid || reset == nil {
+				return warmupFiveHourUnknown
+			}
+		}
+	}
+	return warmupFiveHourUnsupported
 }
 
 // warmupFiveHourObservation distinguishes an authoritative empty 5h slot from

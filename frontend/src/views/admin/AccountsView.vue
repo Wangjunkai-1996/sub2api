@@ -1783,8 +1783,16 @@ const openAIWindowWarmupState = (row: Account): string => {
   return row.openai_window_warmup?.state || 'pending'
 }
 
-const openAIWindowWarmupStateLabel = (row: Account): string =>
-  t(`admin.accounts.openai.windowWarmup.states.${openAIWindowWarmupState(row)}`)
+const isOpenAIWindowWarmupFiveHourUnsupported = (row: Account): boolean =>
+  openAIWindowWarmupState(row) === 'failed' &&
+  row.openai_window_warmup?.last_error_code === 'five_hour_window_unsupported'
+
+const openAIWindowWarmupStateLabel = (row: Account): string => {
+  const state = isOpenAIWindowWarmupFiveHourUnsupported(row)
+    ? 'five_hour_window_unsupported'
+    : openAIWindowWarmupState(row)
+  return t(`admin.accounts.openai.windowWarmup.states.${state}`)
+}
 
 const openAIWindowWarmupStateClass = (row: Account): string => {
   switch (openAIWindowWarmupState(row)) {
@@ -1792,6 +1800,10 @@ const openAIWindowWarmupStateClass = (row: Account): string => {
     case 'running': return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
     case 'blocked':
     case 'blocked_config': return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+    case 'failed':
+      return isOpenAIWindowWarmupFiveHourUnsupported(row)
+        ? 'bg-gray-100 text-gray-600 dark:bg-dark-700 dark:text-dark-300'
+        : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
     case 'uncertain':
     case 'possibly_sent': return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
     case 'paused':
@@ -1803,8 +1815,14 @@ const openAIWindowWarmupStateClass = (row: Account): string => {
 const isOpenAIWindowWarmupBlocked = (row: Account): boolean =>
   ['paused', 'blocked', 'blocked_config'].includes(openAIWindowWarmupState(row))
 
-const openAIWindowWarmupNextRun = (row: Account): string | null | undefined =>
-  row.openai_window_warmup?.next_run_at ?? row.openai_window_warmup?.next_attempt_at
+const openAIWindowWarmupActiveStates = new Set([
+  'pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent'
+])
+
+const openAIWindowWarmupNextRun = (row: Account): string | null | undefined => {
+  if (!openAIWindowWarmupActiveStates.has(openAIWindowWarmupState(row))) return null
+  return row.openai_window_warmup?.next_run_at ?? row.openai_window_warmup?.next_attempt_at
+}
 
 function getAntigravityTierClass(row: any): string {
   const tier = getAntigravityTierFromRow(row)

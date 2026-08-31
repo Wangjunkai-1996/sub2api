@@ -71,20 +71,35 @@ func (r *openAIWindowWarmupRepository) Enqueue(ctx context.Context, in service.O
 	// The state is selected with the database clock, not the application clock.
 	// This matters when an import request and a worker run on hosts with skew.
 	insertSQL := `
-	INSERT INTO openai_window_warmup_jobs
-    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation, identity_generation,
-	     observed_reset_at, next_attempt_at, attempt_count, created_at, updated_at)
-	SELECT $1, $2,
+		WITH locked_account AS MATERIALIZED (
+		    SELECT a.id
+		    FROM accounts AS a
+		    WHERE a.id = $1 AND a.deleted_at IS NULL
+		      AND a.openai_warmup_identity_generation = $8
+		    FOR SHARE
+		)
+		INSERT INTO openai_window_warmup_jobs
+	    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation, identity_generation,
+		     observed_reset_at, next_attempt_at, attempt_count, created_at, updated_at)
+		SELECT a.id, $2,
 				CASE WHEN $6::timestamptz IS NOT NULL AND $6::timestamptz > NOW() THEN 'armed' ELSE 'pending' END,
-		        $3, $4, $5, $8, $6::timestamptz, $7, 0, NOW(), NOW()
-	FROM accounts AS a
-	WHERE a.id = $1 AND a.deleted_at IS NULL
-	  AND a.openai_warmup_identity_generation = $8
-ON CONFLICT DO NOTHING
-RETURNING ` + warmupJobSelectColumns
+			        $3, $4, $5, $8, $6::timestamptz, $7, 0, NOW(), NOW()
+		FROM locked_account AS a
+		WHERE NOT EXISTS (
+		      SELECT 1
+		      FROM openai_window_warmup_jobs AS tombstone
+		      WHERE tombstone.account_id = a.id
+		        AND tombstone.quota_scope = $2::varchar
+		        AND tombstone.identity_generation = $8
+		        AND tombstone.state = 'failed'
+		        AND tombstone.last_error_code = $9
+		  )
+	ON CONFLICT DO NOTHING
+	RETURNING ` + warmupJobSelectColumns
 	job, err := scanWarmupJob(r.db.QueryRowContext(ctx, insertSQL,
 		in.AccountID, scope, trigger, in.CycleKey, in.CycleGeneration,
-		nullWarmupTime(in.ObservedResetAt), next.UTC(), identityGeneration))
+		nullWarmupTime(in.ObservedResetAt), next.UTC(), identityGeneration,
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported))
 	if err == nil {
 		return job, true, nil
 	}
@@ -101,10 +116,14 @@ RETURNING ` + warmupJobSelectColumns
 		      WHERE a.id = j.account_id
 		        AND a.openai_warmup_identity_generation = j.identity_generation
 		  )
-		  AND (j.cycle_key = $3 OR j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent'))
-		ORDER BY (j.cycle_key = $3) DESC, j.id DESC
+		  AND (j.cycle_key = $3
+		       OR j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent')
+		       OR (j.state = 'failed' AND j.last_error_code = $4))
+		ORDER BY (j.state = 'failed' AND j.last_error_code = $4) DESC,
+		         (j.cycle_key = $3) DESC, j.id DESC
 		LIMIT 1`
-	job, err = scanWarmupJob(r.db.QueryRowContext(ctx, selectSQL, in.AccountID, scope, in.CycleKey))
+	job, err = scanWarmupJob(r.db.QueryRowContext(ctx, selectSQL, in.AccountID, scope, in.CycleKey,
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported))
 	if err != nil {
 		return nil, false, err
 	}
@@ -140,11 +159,19 @@ func (r *openAIWindowWarmupRepository) ClaimDue(ctx context.Context, owner strin
 	        AND next_attempt_at <= NOW()
 	    ) OR (
 	        state = 'running' AND lease_until IS NOT NULL AND lease_until <= NOW()
-		    )) AND EXISTS (
-		        SELECT 1 FROM accounts a
-		        WHERE a.id = j.account_id
-		          AND a.openai_warmup_identity_generation = j.identity_generation
-		    )
+			    )) AND EXISTS (
+			        SELECT 1 FROM accounts a
+			        WHERE a.id = j.account_id
+			          AND a.openai_warmup_identity_generation = j.identity_generation
+			    ) AND NOT EXISTS (
+			        SELECT 1
+			        FROM openai_window_warmup_jobs AS tombstone
+			        WHERE tombstone.account_id = j.account_id
+			          AND tombstone.quota_scope = j.quota_scope
+			          AND tombstone.identity_generation = j.identity_generation
+			          AND tombstone.state = 'failed'
+			          AND tombstone.last_error_code = $5
+			    )
     ORDER BY next_attempt_at ASC, id ASC
     LIMIT $2
     FOR UPDATE SKIP LOCKED
@@ -165,7 +192,8 @@ func (r *openAIWindowWarmupRepository) ClaimDue(ctx context.Context, owner strin
 ORDER BY next_attempt_at ASC, id ASC`
 	// PostgreSQL interval multiplication accepts microseconds as a numeric
 	// value and avoids converting a Go duration to a wall-clock timestamp.
-	rows, err := r.db.QueryContext(ctx, query, owner, limit, lease.Microseconds(), pq.Array(allowedAccountIDs))
+	rows, err := r.db.QueryContext(ctx, query, owner, limit, lease.Microseconds(), pq.Array(allowedAccountIDs),
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
 	if err != nil {
 		return nil, err
 	}
@@ -238,10 +266,24 @@ func (r *openAIWindowWarmupRepository) QueueStats(ctx context.Context, allowedAc
 		           ((state IN ('pending', 'armed', 'due', 'retrying', 'uncertain', 'possibly_sent')
 		             AND next_attempt_at <= NOW())
 		            OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= NOW())) AS is_due
-		    FROM openai_window_warmup_jobs
-		    WHERE account_id = ANY($1)
-		      AND state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent')
-		)
+			    FROM openai_window_warmup_jobs AS j
+			    WHERE j.account_id = ANY($1)
+			      AND j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent')
+			      AND EXISTS (
+			          SELECT 1 FROM accounts AS a
+			          WHERE a.id = j.account_id
+			            AND a.openai_warmup_identity_generation = j.identity_generation
+			      )
+			      AND NOT EXISTS (
+			          SELECT 1
+			          FROM openai_window_warmup_jobs AS tombstone
+			          WHERE tombstone.account_id = j.account_id
+			            AND tombstone.quota_scope = j.quota_scope
+			            AND tombstone.identity_generation = j.identity_generation
+			            AND tombstone.state = 'failed'
+			            AND tombstone.last_error_code = $2
+			      )
+			)
 		SELECT
 		    COUNT(*),
 		    COUNT(*) FILTER (WHERE is_due),
@@ -251,7 +293,8 @@ func (r *openAIWindowWarmupRepository) QueueStats(ctx context.Context, allowedAc
 		    COALESCE(GREATEST(0, FLOOR(MAX(EXTRACT(EPOCH FROM NOW() - observed_reset_at))
 		        FILTER (WHERE is_due AND observed_reset_at IS NOT NULL AND observed_reset_at <= NOW()))), 0)::BIGINT
 		FROM relevant`
-	err := r.db.QueryRowContext(ctx, query, pq.Array(allowedAccountIDs)).Scan(
+	err := r.db.QueryRowContext(ctx, query, pq.Array(allowedAccountIDs),
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported).Scan(
 		&stats.Enqueued, &stats.Due, &stats.OldestDueAgeSeconds, &stats.Inflight, &stats.ResetLagSeconds,
 	)
 	return stats, err
@@ -290,9 +333,18 @@ func (r *openAIWindowWarmupRepository) CleanupSupersededTerminalJobs(ctx context
 		WHERE id IN (
 		    SELECT stale.id
 		    FROM openai_window_warmup_jobs AS stale
-		    WHERE stale.state IN ('completed', 'failed')
-		      AND stale.updated_at <= NOW() - INTERVAL '7 days'
-		      AND EXISTS (
+			    WHERE stale.state IN ('completed', 'failed')
+			      AND stale.updated_at <= NOW() - INTERVAL '7 days'
+			      AND NOT (
+			          stale.state = 'failed'
+			          AND stale.last_error_code = $2
+			          AND EXISTS (
+			              SELECT 1 FROM accounts AS current_account
+			              WHERE current_account.id = stale.account_id
+			                AND current_account.openai_warmup_identity_generation = stale.identity_generation
+			          )
+			      )
+			      AND EXISTS (
 		          SELECT 1
 		          FROM openai_window_warmup_jobs AS newer
 		          WHERE newer.account_id = stale.account_id
@@ -301,7 +353,7 @@ func (r *openAIWindowWarmupRepository) CleanupSupersededTerminalJobs(ctx context
 		      )
 		    ORDER BY stale.updated_at, stale.id
 		    LIMIT $1
-		)`, limit)
+			)`, limit, service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
 	if err != nil {
 		return 0, err
 	}
@@ -612,6 +664,134 @@ func (r *openAIWindowWarmupRepository) MarkBlocked(ctx context.Context, id int64
 		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, status, code, message, nullableTimeValue(at))
 }
 
+// MarkUnsupportedFiveHourWindow retires a weekly-only account without
+// recording another failed attempt. The current identity and lease fences
+// prevent a stale observation from terminating a newer credential cycle.
+func (r *openAIWindowWarmupRepository) MarkUnsupportedFiveHourWindow(ctx context.Context, id int64, owner, token string, at time.Time) (bool, error) {
+	return r.fencedQuery(ctx, `
+		WITH updated AS (
+		    UPDATE openai_window_warmup_jobs AS j
+		    SET state = 'failed', status_code = NULL,
+		        last_error_code = $5, last_error = NULL,
+		        uncertain_observed_reset_at = NULL, uncertain_observed_at = NULL,
+		        uncertain_terminal_observed = FALSE,
+		        lease_owner = NULL, lease_token = NULL, lease_until = NULL, updated_at = NOW()
+		    WHERE j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.lease_token = $3
+		      AND split_part(j.lease_token, ':', 1) = j.cycle_generation::text
+		      AND j.lease_until IS NOT NULL AND j.lease_until > NOW()
+		      AND EXISTS (
+		          SELECT 1 FROM accounts a
+		          WHERE a.id = j.account_id
+		            AND a.openai_warmup_identity_generation = j.identity_generation
+		      )
+		    RETURNING j.id, j.attempt_count
+		), closed_attempt AS (
+		    UPDATE openai_window_warmup_attempts AS a
+		    SET outcome = 'suppressed', status_code = NULL, error_code = $5,
+		        finished_at = $4::timestamptz,
+		        expires_at = $4::timestamptz + INTERVAL '7 days'
+		    FROM updated
+		    WHERE a.job_id = updated.id
+		      AND a.attempt_no = updated.attempt_count
+		      AND updated.attempt_count > 0
+		      AND a.outcome IN ('started', 'uncertain')
+		    RETURNING a.id
+		)
+		SELECT EXISTS(SELECT 1 FROM updated)`, id, owner, token, nullableTimeValue(at),
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
+}
+
+// ClearUnsupportedFiveHourWindow removes the durable capability exclusion only
+// for the account's current credential identity. The caller then reuses any
+// already-active row or enqueues one manual capability check.
+func (r *openAIWindowWarmupRepository) ClearUnsupportedFiveHourWindow(ctx context.Context, accountID, identityGeneration int64) (bool, error) {
+	if accountID <= 0 || identityGeneration <= 0 {
+		return false, nil
+	}
+	return r.fencedQuery(ctx, `
+		WITH locked_account AS MATERIALIZED (
+		    SELECT a.id
+		    FROM accounts AS a
+		    WHERE a.id = $1
+		      AND a.openai_warmup_identity_generation = $2
+		    FOR SHARE
+		), cleared AS (
+		    UPDATE openai_window_warmup_jobs AS j
+		    SET status_code = NULL, last_error_code = NULL, last_error = NULL,
+		        lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+		        updated_at = NOW()
+		    FROM locked_account AS a
+		    WHERE j.account_id = a.id
+		      AND j.quota_scope = 'global'
+		      AND j.identity_generation = $2
+		      AND j.state = 'failed'
+		      AND j.last_error_code = $3
+		      AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL
+		    RETURNING j.id
+		)
+		SELECT EXISTS(SELECT 1 FROM cleared)`, accountID, identityGeneration,
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
+}
+
+// RequeueLegacyPreflightLimit gives an exact legacy terminal row one passive
+// capability recheck. It preserves the exhausted attempt count, so the worker
+// cannot send another synthetic request before classifying the usage shape.
+func (r *openAIWindowWarmupRepository) RequeueLegacyPreflightLimit(
+	ctx context.Context,
+	jobID, identityGeneration int64,
+	attemptCount int,
+	next time.Time,
+) (bool, error) {
+	if jobID <= 0 || identityGeneration <= 0 || attemptCount <= 0 || next.IsZero() {
+		return false, nil
+	}
+	return r.fencedQuery(ctx, `
+		WITH locked_account AS MATERIALIZED (
+		    SELECT a.id
+		    FROM accounts AS a
+		    WHERE a.openai_warmup_identity_generation = $2
+		      AND EXISTS (
+		          SELECT 1 FROM openai_window_warmup_jobs AS target
+		          WHERE target.id = $1 AND target.account_id = a.id
+		      )
+		    FOR SHARE
+		), requeued AS (
+		    UPDATE openai_window_warmup_jobs AS j
+		    SET state = 'retrying', next_attempt_at = $4, status_code = NULL,
+		        last_error_code = NULL, last_error = NULL, updated_at = NOW()
+		    FROM locked_account AS a
+		    WHERE j.id = $1
+		      AND j.account_id = a.id
+		      AND j.quota_scope = 'global'
+		      AND j.identity_generation = $2
+		      AND j.attempt_count = $3
+		      AND j.state = 'blocked'
+		      AND j.last_error_code = 'attempt_limit_preflight'
+		      AND j.sent_at IS NULL
+		      AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL
+		      AND NOT EXISTS (
+		          SELECT 1
+		          FROM openai_window_warmup_jobs AS active
+		          WHERE active.account_id = j.account_id
+		            AND active.quota_scope = j.quota_scope
+		            AND active.id <> j.id
+		            AND active.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent')
+		      )
+		      AND NOT EXISTS (
+		          SELECT 1
+		          FROM openai_window_warmup_jobs AS tombstone
+		          WHERE tombstone.account_id = j.account_id
+		            AND tombstone.quota_scope = j.quota_scope
+		            AND tombstone.identity_generation = j.identity_generation
+		            AND tombstone.state = 'failed'
+		            AND tombstone.last_error_code = $5
+		      )
+		    RETURNING j.id
+		)
+		SELECT EXISTS(SELECT 1 FROM requeued)`, jobID, identityGeneration, attemptCount, next.UTC(),
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
+}
+
 // RequeueAuthStateUpdateFailure rearms only the exact terminal transition whose
 // account-state side effect failed. MarkBlocked/MarkObservationFailure already
 // fenced the original owner; the remaining generation, attempt, state, status,
@@ -834,13 +1014,27 @@ func (r *openAIWindowWarmupRepository) GetCurrent(ctx context.Context, accountID
 		scope = service.OpenAIWindowWarmupQuotaScopeGlobal
 	}
 	return scanWarmupJob(r.db.QueryRowContext(ctx, `
-SELECT `+warmupJobSelectColumns+` FROM openai_window_warmup_jobs
-WHERE account_id = $1 AND quota_scope = $2
+WITH candidates AS (
+    SELECT j.*,
+           a.openai_warmup_identity_generation = j.identity_generation AS current_identity
+    FROM openai_window_warmup_jobs AS j
+    LEFT JOIN accounts AS a ON a.id = j.account_id
+    WHERE j.account_id = $1 AND j.quota_scope = $2
+)
+SELECT `+warmupJobSelectColumns+` FROM candidates
 -- Legacy migrations may have quarantined a newer duplicate row as blocked.
 -- Current means the live cycle first; id is only the tie-breaker within a
--- state so admin/reconciler callers never project the quarantined row.
-ORDER BY CASE WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
-         id DESC LIMIT 1`, accountID, scope))
+-- state so admin/reconciler callers never project the quarantined row. A
+-- current-identity capability tombstone takes precedence over trigger-created
+-- active rows until an administrator explicitly requests a recheck.
+ORDER BY CASE
+             WHEN current_identity AND state = 'failed' AND last_error_code = $3 THEN 0
+             WHEN current_identity AND state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 1
+             WHEN current_identity THEN 2
+             WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 3
+             ELSE 4
+         END,
+         id DESC LIMIT 1`, accountID, scope, service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported))
 }
 
 func (r *openAIWindowWarmupRepository) GetCurrentForAccounts(ctx context.Context, accountIDs []int64, scope string) (map[int64]*service.OpenAIWindowWarmupJob, error) {
@@ -855,12 +1049,24 @@ func (r *openAIWindowWarmupRepository) GetCurrentForAccounts(ctx context.Context
 		scope = service.OpenAIWindowWarmupQuotaScopeGlobal
 	}
 	rows, err := r.db.QueryContext(ctx, `
+	WITH candidates AS (
+	    SELECT j.*,
+	           a.openai_warmup_identity_generation = j.identity_generation AS current_identity
+	    FROM openai_window_warmup_jobs AS j
+	    LEFT JOIN accounts AS a ON a.id = j.account_id
+	    WHERE j.account_id = ANY($1) AND j.quota_scope = $2
+	)
 	SELECT DISTINCT ON (account_id) `+warmupJobSelectColumns+`
-	FROM openai_window_warmup_jobs
-	WHERE account_id = ANY($1) AND quota_scope = $2
-	ORDER BY account_id,
-	         CASE WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 0 ELSE 1 END,
-	         id DESC`, pq.Array(accountIDs), scope)
+	FROM candidates
+		ORDER BY account_id,
+		         CASE
+		             WHEN current_identity AND state = 'failed' AND last_error_code = $3 THEN 0
+		             WHEN current_identity AND state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 1
+		             WHEN current_identity THEN 2
+		             WHEN state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent') THEN 3
+		             ELSE 4
+		         END,
+		         id DESC`, pq.Array(accountIDs), scope, service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
 	if err != nil {
 		return nil, err
 	}

@@ -905,6 +905,7 @@ export type OpenAIWindowWarmupState =
   | 'paused'
   | 'blocked'
   | 'blocked_config'
+  | 'failed'
   | 'completed'
 
 export interface OpenAIWindowWarmupJob {

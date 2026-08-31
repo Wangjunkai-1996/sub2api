@@ -148,8 +148,10 @@ func openAIWindowWarmupStatus(account *service.Account, job *service.OpenAIWindo
 	copyJob := *job
 	copyJob.LastError = redactedWarmupError(copyJob.LastError)
 	status.State = copyJob.State
-	status.NextRunAt = &copyJob.NextAttemptAt
-	status.NextAttemptAt = &copyJob.NextAttemptAt
+	if service.IsOpenAIWindowWarmupStateActive(copyJob.State) {
+		status.NextRunAt = &copyJob.NextAttemptAt
+		status.NextAttemptAt = &copyJob.NextAttemptAt
+	}
 	status.LastSuccessAt = copyJob.LastSuccessAt
 	status.ObservedResetAt = copyJob.ObservedResetAt
 	status.AttemptCount = copyJob.AttemptCount

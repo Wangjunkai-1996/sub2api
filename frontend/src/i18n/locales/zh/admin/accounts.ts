@@ -731,6 +731,8 @@ export default {
             paused: '已暂停',
             blocked: '已阻塞',
             blocked_config: '配置阻塞',
+            failed: '已终止',
+            five_hour_window_unsupported: '已跳过（无 5 小时窗口）',
             completed: '已完成'
           }
         },

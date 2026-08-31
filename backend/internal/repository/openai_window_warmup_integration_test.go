@@ -620,6 +620,73 @@ func TestOpenAIWindowWarmupIdentityLeaseBlocksCredentialUpdateUntilRelease(t *te
 	require.Greater(t, updatedGeneration, identityGeneration)
 }
 
+func TestOpenAIWindowWarmupEnqueueLocksIdentityUntilInsertCommits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+
+	lockTx, err := integrationDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer lockTx.Rollback()
+	var lockedID int64
+	require.NoError(t, lockTx.QueryRowContext(ctx,
+		`SELECT id FROM accounts WHERE id = $1 FOR NO KEY UPDATE`, accountID,
+	).Scan(&lockedID))
+
+	enqueueConn, err := integrationDB.Conn(ctx)
+	require.NoError(t, err)
+	defer enqueueConn.Close()
+	var enqueuePID int
+	require.NoError(t, enqueueConn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&enqueuePID))
+	repo := &openAIWindowWarmupRepository{db: enqueueConn}
+	type enqueueResult struct {
+		job      *service.OpenAIWindowWarmupJob
+		inserted bool
+		err      error
+	}
+	done := make(chan enqueueResult, 1)
+	go func() {
+		job, inserted, enqueueErr := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+			AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+			CycleKey: "identity-locked-enqueue:" + uuid.NewString(), CycleGeneration: 509,
+			IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
+			NextAttemptAt: time.Now().UTC(),
+		})
+		done <- enqueueResult{job: job, inserted: inserted, err: enqueueErr}
+	}()
+
+	lockDeadline := time.Now().Add(2 * time.Second)
+	waitingOnLock := false
+	for !waitingOnLock && time.Now().Before(lockDeadline) {
+		select {
+		case result := <-done:
+			require.NoError(t, result.err)
+			require.FailNow(t, "warmup enqueue completed without locking the account identity")
+		default:
+		}
+		require.NoError(t, integrationDB.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE pid = $1 AND wait_event_type = 'Lock'
+			)`, enqueuePID).Scan(&waitingOnLock))
+		if !waitingOnLock {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	require.True(t, waitingOnLock, "warmup enqueue did not wait on the account identity lock")
+
+	require.NoError(t, lockTx.Commit())
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.True(t, result.inserted)
+		require.NotNil(t, result.job)
+		require.Equal(t, identityGeneration, result.job.IdentityGeneration)
+	case <-ctx.Done():
+		require.FailNow(t, "warmup enqueue did not complete after identity lock release", ctx.Err())
+	}
+}
+
 func TestOpenAIWindowWarmupIdentityLeaseLocksExactProxySnapshot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1248,6 +1315,240 @@ func TestOpenAIWindowWarmupRepositoryMarkPausedPreservesStartedEvidence(t *testi
 	require.NotNil(t, updated.SentAt)
 	require.WithinDuration(t, startedAt, *updated.SentAt, time.Microsecond)
 	assertWarmupIntegrationAttempt(t, job.ID, 1, "started", 0, "")
+}
+
+func TestOpenAIWindowWarmupRepositoryMarksUnsupportedFiveHourWindowTerminally(t *testing.T) {
+	for _, markStarted := range []bool{false, true} {
+		name := "before send"
+		if markStarted {
+			name = "after ambiguous send"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+			repo := NewOpenAIWindowWarmupRepository(integrationDB)
+			job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+				AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+				CycleKey: "unsupported-five-hour:" + uuid.NewString(), CycleGeneration: 504,
+				IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
+				NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+			})
+			require.NoError(t, err)
+			require.True(t, inserted)
+			mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+				service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			})
+			claims, err := repo.ClaimDue(ctx, "unsupported-five-hour-owner", 2*time.Minute, 1, []int64{accountID})
+			require.NoError(t, err)
+			require.Len(t, claims, 1)
+			at := time.Now().UTC().Truncate(time.Microsecond)
+			if markStarted {
+				started, startErr := repo.MarkStarted(ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, at,
+					service.OpenAIWindowWarmupStartEvidence{Authoritative: true})
+				require.NoError(t, startErr)
+				require.True(t, started)
+			}
+
+			updated, err := repo.MarkUnsupportedFiveHourWindow(
+				ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, at.Add(time.Second),
+			)
+			require.NoError(t, err)
+			require.True(t, updated)
+			terminal, err := repo.GetByID(ctx, job.ID)
+			require.NoError(t, err)
+			require.Equal(t, service.OpenAIWindowWarmupStateFailed, terminal.State)
+			require.Equal(t, service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported, terminal.LastErrorCode)
+			require.Empty(t, terminal.LastError)
+			require.Empty(t, terminal.LeaseOwner)
+			require.Empty(t, terminal.LeaseToken)
+			require.Nil(t, terminal.LeaseUntil)
+			if markStarted {
+				require.Equal(t, 1, terminal.AttemptCount)
+				assertWarmupIntegrationAttempt(t, job.ID, 1, "suppressed", 0,
+					service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported)
+			} else {
+				require.Zero(t, terminal.AttemptCount)
+				var attempts int
+				require.NoError(t, integrationDB.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM openai_window_warmup_attempts WHERE job_id = $1`, job.ID).Scan(&attempts))
+				require.Zero(t, attempts, "capability exclusion must not invent an attempt")
+			}
+
+			stale, err := repo.MarkUnsupportedFiveHourWindow(
+				ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, at.Add(2*time.Second),
+			)
+			require.NoError(t, err)
+			require.False(t, stale, "cleared lease fences a duplicate terminal write")
+			due, err := repo.ClaimDue(ctx, "unsupported-five-hour-second-owner", 2*time.Minute, 1, []int64{accountID})
+			require.NoError(t, err)
+			require.Empty(t, due, "failed capability rows are outside the active queue")
+		})
+	}
+}
+
+func TestOpenAIWindowWarmupRepositoryUnsupportedTombstoneBlocksRevivedJobsUntilManualRecheck(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "unsupported-tombstone:" + uuid.NewString(), CycleGeneration: 505,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerReset,
+		NextAttemptAt: time.Now().UTC().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{
+		service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+	})
+
+	claims, err := repo.ClaimDue(ctx, "unsupported-tombstone-owner", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	marked, err := repo.MarkUnsupportedFiveHourWindow(
+		ctx, job.ID, claims[0].Owner, claims[0].LeaseToken, time.Now().UTC(),
+	)
+	require.NoError(t, err)
+	require.True(t, marked)
+
+	// Updating account.extra runs the legacy initial-job trigger. It may create an
+	// active row, but the current-identity tombstone must keep that row dormant.
+	mergeWarmupIntegrationAccountExtra(t, accountID, map[string]any{"warmup_tombstone_probe": uuid.NewString()})
+	var revivedID int64
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		SELECT id
+		FROM openai_window_warmup_jobs
+		WHERE account_id = $1
+		  AND identity_generation = $2
+		  AND state IN ('pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent')`,
+		accountID, identityGeneration).Scan(&revivedID))
+	_, err = integrationDB.ExecContext(ctx,
+		`UPDATE openai_window_warmup_jobs SET next_attempt_at = NOW() - INTERVAL '1 minute' WHERE id = $1`, revivedID)
+	require.NoError(t, err)
+
+	blockedEnqueue, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "manual-blocked-by-tombstone:" + uuid.NewString(), CycleGeneration: 506,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerManual,
+		NextAttemptAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.False(t, inserted)
+	require.Equal(t, job.ID, blockedEnqueue.ID)
+
+	current, err := repo.GetCurrent(ctx, accountID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, current.ID)
+	byAccount, err := repo.GetCurrentForAccounts(ctx, []int64{accountID}, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, byAccount[accountID].ID)
+	due, err := repo.ClaimDue(ctx, "unsupported-tombstone-dormant", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Empty(t, due)
+	stats, err := repo.QueueStats(ctx, []int64{accountID})
+	require.NoError(t, err)
+	require.Zero(t, stats.Enqueued)
+
+	_, err = integrationDB.ExecContext(ctx,
+		`UPDATE openai_window_warmup_jobs SET updated_at = NOW() - INTERVAL '8 days' WHERE id = $1`, job.ID)
+	require.NoError(t, err)
+	_, err = repo.CleanupSupersededTerminalJobs(ctx, 500)
+	require.NoError(t, err)
+	preserved, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported, preserved.LastErrorCode)
+
+	cleared, err := repo.ClearUnsupportedFiveHourWindow(ctx, accountID, identityGeneration)
+	require.NoError(t, err)
+	require.True(t, cleared)
+	clearedTombstone, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateFailed, clearedTombstone.State)
+	require.Empty(t, clearedTombstone.LastErrorCode)
+	current, err = repo.GetCurrent(ctx, accountID, service.OpenAIWindowWarmupQuotaScopeGlobal)
+	require.NoError(t, err)
+	require.Equal(t, revivedID, current.ID)
+	due, err = repo.ClaimDue(ctx, "unsupported-tombstone-recheck", 2*time.Minute, 1, []int64{accountID})
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.Equal(t, revivedID, due[0].Job.ID)
+}
+
+func TestOpenAIWindowWarmupRepositoryRequeuesLegacyPreflightLimitWithExactCAS(t *testing.T) {
+	ctx := context.Background()
+	accountID, identityGeneration := createWarmupIntegrationIdentityAccount(t)
+	repo := NewOpenAIWindowWarmupRepository(integrationDB)
+	job, inserted, err := repo.Enqueue(ctx, service.OpenAIWindowWarmupEnqueue{
+		AccountID: accountID, QuotaScope: service.OpenAIWindowWarmupQuotaScopeGlobal,
+		CycleKey: "legacy-preflight-limit:" + uuid.NewString(), CycleGeneration: 507,
+		IdentityGeneration: identityGeneration, Trigger: service.OpenAIWindowWarmupTriggerImport,
+		NextAttemptAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	resetBlocked := func() {
+		_, resetErr := integrationDB.ExecContext(ctx, `
+			UPDATE openai_window_warmup_jobs
+			SET state = 'blocked', attempt_count = 8, sent_at = NULL,
+			    status_code = NULL, last_error_code = 'attempt_limit_preflight',
+			    last_error = 'legacy preflight limit',
+			    lease_owner = NULL, lease_token = NULL, lease_until = NULL
+			WHERE id = $1`, job.ID)
+		require.NoError(t, resetErr)
+	}
+	resetBlocked()
+	next := time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
+	requeued, err := repo.RequeueLegacyPreflightLimit(ctx, job.ID, identityGeneration, 8, next)
+	require.NoError(t, err)
+	require.True(t, requeued)
+	updated, err := repo.GetByID(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, service.OpenAIWindowWarmupStateRetrying, updated.State)
+	require.Equal(t, 8, updated.AttemptCount)
+	require.WithinDuration(t, next, updated.NextAttemptAt, time.Microsecond)
+	require.Empty(t, updated.LastErrorCode)
+
+	resetBlocked()
+	requeued, err = repo.RequeueLegacyPreflightLimit(ctx, job.ID, identityGeneration, 7, next)
+	require.NoError(t, err)
+	require.False(t, requeued, "stale attempt count must not rearm the row")
+	_, err = integrationDB.ExecContext(ctx, `UPDATE openai_window_warmup_jobs SET sent_at = NOW() WHERE id = $1`, job.ID)
+	require.NoError(t, err)
+	requeued, err = repo.RequeueLegacyPreflightLimit(ctx, job.ID, identityGeneration, 8, next)
+	require.NoError(t, err)
+	require.False(t, requeued, "a row with send evidence must not be rearmed")
+
+	resetBlocked()
+	_, err = integrationDB.ExecContext(ctx, `
+		UPDATE openai_window_warmup_jobs
+		SET lease_owner = 'stale-owner', lease_token = '507:stale', lease_until = NOW() + INTERVAL '1 minute'
+		WHERE id = $1`, job.ID)
+	require.NoError(t, err)
+	requeued, err = repo.RequeueLegacyPreflightLimit(ctx, job.ID, identityGeneration, 8, next)
+	require.NoError(t, err)
+	require.False(t, requeued, "leased rows must remain fenced")
+
+	resetBlocked()
+	var tombstoneID int64
+	require.NoError(t, integrationDB.QueryRowContext(ctx, `
+		INSERT INTO openai_window_warmup_jobs
+		    (account_id, quota_scope, state, trigger, cycle_key, cycle_generation,
+		     identity_generation, next_attempt_at, last_error_code)
+		VALUES ($1, 'global', 'failed', 'reconcile', $2, 508, $3, NOW(), $4)
+		RETURNING id`, accountID, "legacy-tombstone:"+uuid.NewString(), identityGeneration,
+		service.OpenAIWindowWarmupErrorFiveHourWindowUnsupported).Scan(&tombstoneID))
+	requeued, err = repo.RequeueLegacyPreflightLimit(ctx, job.ID, identityGeneration, 8, next)
+	require.NoError(t, err)
+	require.False(t, requeued, "a current capability tombstone must win")
+	_, err = integrationDB.ExecContext(ctx, `DELETE FROM openai_window_warmup_jobs WHERE id = $1`, tombstoneID)
+	require.NoError(t, err)
+
+	currentGeneration := rotateWarmupIntegrationIdentity(t, accountID, identityGeneration)
+	require.Greater(t, currentGeneration, identityGeneration)
+	requeued, err = repo.RequeueLegacyPreflightLimit(ctx, job.ID, identityGeneration, 8, next)
+	require.NoError(t, err)
+	require.False(t, requeued, "a superseded identity must not be rearmed")
 }
 
 func TestOpenAIWindowWarmupRepositoryBlockedEvidenceBoundaries(t *testing.T) {

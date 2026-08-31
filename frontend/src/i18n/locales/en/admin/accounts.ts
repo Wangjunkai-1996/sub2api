@@ -645,6 +645,8 @@ export default {
             paused: 'Paused',
             blocked: 'Blocked',
             blocked_config: 'Config blocked',
+            failed: 'Stopped',
+            five_hour_window_unsupported: 'Skipped (no five-hour window)',
             completed: 'Completed'
           }
         },
