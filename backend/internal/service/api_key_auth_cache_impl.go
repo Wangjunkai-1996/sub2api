@@ -14,9 +14,10 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-// Keep v22 while the rollback binary is live. Its retired Traffic Director
-// fields remain in the JSON payload as explicit legacy/0 compatibility data.
-const apiKeyAuthSnapshotVersion = 22
+const (
+	apiKeyAuthSnapshotVersion       = 23
+	apiKeyAuthSnapshotBridgeVersion = 22
+)
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -327,7 +328,11 @@ func (s *APIKeyService) applyAuthCacheEntry(key string, entry *APIKeyAuthCacheEn
 	if entry.Snapshot == nil {
 		return nil, false, nil
 	}
-	if entry.Snapshot.Version != apiKeyAuthSnapshotVersion {
+	// During blue-green rollout, v22 and v23 share the same Redis key. V22 is
+	// a strict wire superset of v23, so accepting it avoids version ping-pong
+	// while encoding/json discards the retired fields before materialization.
+	if entry.Snapshot.Version != apiKeyAuthSnapshotVersion &&
+		entry.Snapshot.Version != apiKeyAuthSnapshotBridgeVersion {
 		return nil, false, nil
 	}
 	return s.snapshotToAPIKey(key, entry.Snapshot), true, nil
@@ -434,8 +439,6 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			ProfitSafetyBuffer:              apiKey.Group.ProfitSafetyBuffer,
 			SchedulerType:                   apiKey.Group.SchedulerType,
 			AdvancedSchedulerOverrides:      apiKey.Group.AdvancedSchedulerOverrides.Clone(),
-			TrafficDirectorMode:             "legacy",
-			TrafficDirectorVersion:          0,
 		}
 	}
 	return snapshot

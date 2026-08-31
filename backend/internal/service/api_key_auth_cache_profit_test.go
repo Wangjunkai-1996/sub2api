@@ -8,6 +8,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
@@ -53,7 +54,7 @@ func TestAPIKeyAuthSnapshotProfitControlRoundtrip(t *testing.T) {
 	snapshot := svc.snapshotFromAPIKey(context.Background(), apiKey)
 	require.NotNil(t, snapshot)
 	require.Equal(t, apiKeyAuthSnapshotVersion, snapshot.Version)
-	require.Equal(t, 22, snapshot.Version)
+	require.Equal(t, 23, snapshot.Version)
 
 	// 模拟 L2 缓存的完整 JSON 往返（与 apiKeyCache.SetAuthCache/GetAuthCache 同构）。
 	payload, err := json.Marshal(&APIKeyAuthCacheEntry{Snapshot: snapshot})
@@ -79,62 +80,48 @@ func TestAPIKeyAuthSnapshotProfitControlRoundtrip(t *testing.T) {
 	require.InDelta(t, 0.06*(1-0.25), gate.threshold, 1e-12)
 }
 
-// 旧版本快照（v16 及更早，无利润字段保真保证）必须被淘汰回源，不得复用。
-func TestAPIKeyAuthSnapshotOldVersionEvicted(t *testing.T) {
-	svc := &APIKeyService{}
-	snapshot := svc.snapshotFromAPIKey(context.Background(), profitAuthTestAPIKey())
-	require.NotNil(t, snapshot)
-	snapshot.Version = 16
+// 除当前 v23 与蓝绿过渡期的 v22 外，其余版本必须淘汰回源。
+func TestAPIKeyAuthSnapshotUnsupportedVersionsEvicted(t *testing.T) {
+	for _, version := range []int{16, 21, 24} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			svc := &APIKeyService{}
+			snapshot := svc.snapshotFromAPIKey(context.Background(), profitAuthTestAPIKey())
+			require.NotNil(t, snapshot)
+			snapshot.Version = version
 
-	materialized, used, err := svc.applyAuthCacheEntry("sk-old", &APIKeyAuthCacheEntry{Snapshot: snapshot})
-	require.NoError(t, err)
-	require.False(t, used, "版本不匹配的缓存条目必须淘汰并回源重建")
-	require.Nil(t, materialized)
+			materialized, used, err := svc.applyAuthCacheEntry("sk-old", &APIKeyAuthCacheEntry{Snapshot: snapshot})
+			require.NoError(t, err)
+			require.False(t, used, "unsupported cache versions must be evicted and rebuilt")
+			require.Nil(t, materialized)
+		})
+	}
 }
 
-func TestAPIKeyAuthV22PayloadRemainsReadableByLegacyBinary(t *testing.T) {
-	type legacyGroupSnapshot struct {
-		TrafficDirectorMode    string `json:"traffic_director_mode"`
-		TrafficDirectorVersion int64  `json:"traffic_director_version"`
-	}
-	type legacySnapshot struct {
-		Version int                  `json:"version"`
-		Group   *legacyGroupSnapshot `json:"group"`
-	}
-	type legacyCacheEntry struct {
-		Snapshot *legacySnapshot `json:"snapshot"`
-	}
-
+func TestAPIKeyAuthV23PayloadOmitsTrafficDirectorFields(t *testing.T) {
 	svc := &APIKeyService{}
 	snapshot := svc.snapshotFromAPIKey(context.Background(), profitAuthTestAPIKey())
 	require.NotNil(t, snapshot)
 	payload, err := json.Marshal(&APIKeyAuthCacheEntry{Snapshot: snapshot})
 	require.NoError(t, err)
-	require.Contains(t, string(payload), `"traffic_director_mode":"legacy"`)
-	require.Contains(t, string(payload), `"traffic_director_version":0`)
-
-	var legacy legacyCacheEntry
-	require.NoError(t, json.Unmarshal(payload, &legacy))
-	require.NotNil(t, legacy.Snapshot)
-	require.Equal(t, 22, legacy.Snapshot.Version)
-	require.NotNil(t, legacy.Snapshot.Group)
-	require.Equal(t, "legacy", legacy.Snapshot.Group.TrafficDirectorMode)
-	require.Zero(t, legacy.Snapshot.Group.TrafficDirectorVersion)
+	require.NotContains(t, string(payload), "traffic_director_mode")
+	require.NotContains(t, string(payload), "traffic_director_version")
+	require.NotContains(t, string(payload), "traffic_director_spec")
 }
 
-func TestAPIKeyAuthV22LegacyPayloadReadableAfterTrafficDirectorRemoval(t *testing.T) {
-	groupID := int64(50)
+func TestAPIKeyAuthV22TrafficDirectorPayloadBridgesWithoutMaterializingRetiredFields(t *testing.T) {
 	payload := `{"snapshot":{"version":22,"api_key_id":82,"user_id":40,"group_id":50,"name":"legacy-v22","status":"active","user":{"id":40,"status":"active","concurrency":5},"group":{"id":50,"name":"VIP-roundtrip","platform":"openai","status":"active","rate_multiplier":0.06,"profit_control_enabled":true,"profit_min_margin":0.2,"profit_safety_buffer":0.05,"traffic_director_mode":"enforced","traffic_director_version":7}}}`
 
 	var entry APIKeyAuthCacheEntry
 	require.NoError(t, json.Unmarshal([]byte(payload), &entry))
+	canonical, err := json.Marshal(&entry)
+	require.NoError(t, err)
+	require.NotContains(t, string(canonical), "traffic_director_mode")
+	require.NotContains(t, string(canonical), "traffic_director_version")
+
 	materialized, used, err := (&APIKeyService{}).applyAuthCacheEntry("sk-legacy-v22", &entry)
 	require.NoError(t, err)
-	require.True(t, used)
+	require.True(t, used, "v22 remains a read-only bridge during blue-green rollout")
 	require.NotNil(t, materialized)
-	require.Equal(t, &groupID, materialized.GroupID)
 	require.NotNil(t, materialized.Group)
-	require.Equal(t, groupID, materialized.Group.ID)
-	require.Equal(t, "VIP-roundtrip", materialized.Group.Name)
 	require.True(t, materialized.Group.ProfitControlEnabled)
 }

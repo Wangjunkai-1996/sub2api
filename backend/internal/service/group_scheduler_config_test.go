@@ -54,11 +54,11 @@ func TestGroupSchedulerAuthSnapshotRoundTripPreservesSparseOverrides(t *testing.
 
 	snapshot := svc.snapshotFromAPIKey(context.Background(), apiKey)
 	require.NotNil(t, snapshot)
-	require.Equal(t, 22, snapshot.Version)
+	require.Equal(t, 23, snapshot.Version)
 	payload, err := json.Marshal(snapshot)
 	require.NoError(t, err)
-	require.Contains(t, string(payload), `"traffic_director_mode":"legacy"`)
-	require.Contains(t, string(payload), `"traffic_director_version":0`)
+	require.NotContains(t, string(payload), "traffic_director_mode")
+	require.NotContains(t, string(payload), "traffic_director_version")
 	require.NotContains(t, string(payload), "traffic_director_spec")
 	var cached APIKeyAuthSnapshot
 	require.NoError(t, json.Unmarshal(payload, &cached))

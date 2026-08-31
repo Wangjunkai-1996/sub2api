@@ -232,6 +232,51 @@ func TestAPIKeyService_GetByKey_UsesL2Cache(t *testing.T) {
 	require.Equal(t, map[string][]int64{"claude-opus-*": {1, 2}}, apiKey.Group.ModelRouting)
 }
 
+func TestAPIKeyService_GetByKey_UsesV22BridgeWithoutRepositoryOrRewrite(t *testing.T) {
+	cache := &authCacheStub{}
+	repo := &authRepoStub{
+		getByKeyForAuth: func(ctx context.Context, key string) (*APIKey, error) {
+			return nil, errors.New("unexpected repository lookup for bridged v22 entry")
+		},
+	}
+	svc := NewAPIKeyService(repo, nil, nil, nil, nil, cache, &config.Config{
+		APIKeyAuth: config.APIKeyAuthCacheConfig{L2TTLSeconds: 60},
+	})
+
+	groupID := int64(9)
+	cache.getAuthCache = func(ctx context.Context, key string) (*APIKeyAuthCacheEntry, error) {
+		return &APIKeyAuthCacheEntry{Snapshot: &APIKeyAuthSnapshot{
+			Version:  apiKeyAuthSnapshotBridgeVersion,
+			APIKeyID: 1,
+			UserID:   2,
+			GroupID:  &groupID,
+			Status:   StatusActive,
+			User: APIKeyAuthUserSnapshot{
+				ID:          2,
+				Status:      StatusActive,
+				Role:        RoleUser,
+				Balance:     10,
+				Concurrency: 3,
+			},
+			Group: &APIKeyAuthGroupSnapshot{
+				ID:               groupID,
+				Name:             "bridge-v22",
+				Platform:         PlatformOpenAI,
+				Status:           StatusActive,
+				SubscriptionType: SubscriptionTypeStandard,
+				RateMultiplier:   1,
+			},
+		}}, nil
+	}
+
+	apiKey, err := svc.GetByKey(context.Background(), "k-v22")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), apiKey.ID)
+	require.NotNil(t, apiKey.Group)
+	require.Equal(t, "bridge-v22", apiKey.Group.Name)
+	require.Empty(t, cache.setAuthKeys, "a bridged v22 hit must not be rewritten during mixed-version rollout")
+}
+
 func TestAPIKeyService_SnapshotRoundTrip_PreservesMessagesDispatchModelConfig(t *testing.T) {
 	svc := NewAPIKeyService(nil, nil, nil, nil, nil, nil, &config.Config{})
 	groupID := int64(9)
