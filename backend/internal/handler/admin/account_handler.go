@@ -283,7 +283,12 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 			item.CurrentConcurrency = counts[account.ID]
 		}
 	}
-	setAccountEgressCurrentConcurrency(item.Account, item.CurrentConcurrency)
+	egressLoads := h.getAccountEgressRuntimeLoads(ctx, []service.Account{*account})
+	if load, ok := egressLoads[account.ID]; ok {
+		item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, account, item.CurrentConcurrency, &load)
+	} else {
+		item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, account, item.CurrentConcurrency, nil)
+	}
 
 	if account.IsAnthropicOAuthOrSetupToken() {
 		if h.accountUsageService != nil && account.GetWindowCostLimit() > 0 {
@@ -605,6 +610,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	concurrencyCounts := make(map[int64]int)
+	egressLoads := make(map[int64]service.AccountEgressLoadInfo)
 	var windowCosts map[int64]float64
 	var activeSessions map[int64]int
 	var rpmCounts map[int64]int
@@ -628,6 +634,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 		if cc, ccErr := h.concurrencyService.GetAccountConcurrencyBatch(c.Request.Context(), accountIDs); ccErr == nil && cc != nil {
 			concurrencyCounts = cc
 		}
+		egressLoads = h.getAccountEgressRuntimeLoads(c.Request.Context(), accounts)
 	}
 
 	// 识别需要查询窗口费用、会话数和 RPM 的账号（Anthropic OAuth/SetupToken 且启用了相应功能）
@@ -705,7 +712,11 @@ func (h *AccountHandler) List(c *gin.Context) {
 			SchedulerScore:     schedulerScores[acc.ID],
 			SchedulerScores:    schedulerGroupScores[acc.ID],
 		}
-		setAccountEgressCurrentConcurrency(item.Account, item.CurrentConcurrency)
+		if load, ok := egressLoads[acc.ID]; ok {
+			item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, acc, item.CurrentConcurrency, &load)
+		} else {
+			item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, acc, item.CurrentConcurrency, nil)
+		}
 
 		// 添加窗口费用（仅当启用时）
 		if windowCosts != nil {
@@ -747,12 +758,43 @@ func (h *AccountHandler) List(c *gin.Context) {
 	response.Paginated(c, result, total, page, pageSize)
 }
 
-func setAccountEgressCurrentConcurrency(account *dto.Account, current int) {
+func (h *AccountHandler) getAccountEgressRuntimeLoads(ctx context.Context, accounts []service.Account) map[int64]service.AccountEgressLoadInfo {
+	result := make(map[int64]service.AccountEgressLoadInfo)
+	if h == nil || h.concurrencyService == nil || len(accounts) == 0 {
+		return result
+	}
+	configs := make([]service.AccountEgressPoolConfig, 0, len(accounts))
+	for i := range accounts {
+		config, err := service.AccountEgressPoolConfigForRuntime(&accounts[i], 0)
+		if err == nil {
+			configs = append(configs, config)
+		}
+	}
+	if len(configs) == 0 {
+		return result
+	}
+	loads, err := h.concurrencyService.GetAccountEgressLoads(ctx, configs)
+	if err != nil {
+		return result
+	}
+	return loads
+}
+
+func setAccountEgressRuntimeLoad(account *dto.Account, source *service.Account, legacyCurrent int, load *service.AccountEgressLoadInfo) int {
 	if account == nil || account.EgressSummary == nil {
-		return
+		return legacyCurrent
+	}
+
+	current := legacyCurrent
+	if load != nil && load.Status != service.AccountEgressStatusConfigStale && load.Status != service.AccountEgressStatusConfigUnavailable {
+		if load.Status != service.AccountEgressStatusLegacyDraining {
+			current = load.ActiveTotal
+			account.EgressSummary.Bindings = dto.AccountEgressCapacityBindingsFromService(source, load.IdentityLoads)
+		}
 	}
 	value := current
 	account.EgressSummary.CurrentConcurrency = &value
+	return current
 }
 
 func buildAccountsListETag(

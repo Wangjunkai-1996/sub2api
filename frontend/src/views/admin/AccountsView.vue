@@ -1413,6 +1413,10 @@ const inAutoRefreshSilentWindow = () => {
   return Date.now() < autoRefreshSilentUntil.value
 }
 
+const egressCapacityBreakdownKey = (account: Account) => (
+  JSON.stringify(account.egress_summary?.bindings ?? [])
+)
+
 const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
   return (
     current.updated_at !== next.updated_at ||
@@ -1420,6 +1424,7 @@ const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
     current.egress_summary?.current_concurrency !== next.egress_summary?.current_concurrency ||
     current.egress_summary?.effective_capacity !== next.egress_summary?.effective_capacity ||
     current.egress_summary?.eligible_route_count !== next.egress_summary?.eligible_route_count ||
+    egressCapacityBreakdownKey(current) !== egressCapacityBreakdownKey(next) ||
     current.egress_revision !== next.egress_revision ||
     current.current_window_cost !== next.current_window_cost ||
     current.active_sessions !== next.active_sessions ||

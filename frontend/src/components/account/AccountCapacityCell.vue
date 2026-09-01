@@ -20,15 +20,15 @@
       {{ egressCapacityFormula }}
     </span>
 
-    <div v-if="egressBreakdown.length > 1" class="flex flex-col gap-0.5" data-testid="egress-capacity-breakdown">
+    <div v-if="egressBreakdown.length > 0" class="flex min-w-[8.5rem] max-w-[10.5rem] flex-col gap-0.5" data-testid="egress-capacity-breakdown">
       <span
         v-for="binding in egressBreakdown"
         :key="binding.route_id"
-        class="inline-flex max-w-[8.5rem] items-center gap-1 whitespace-nowrap text-[10px] leading-tight text-gray-500 dark:text-gray-400"
-        :title="binding.name || binding.observed_ip || String(binding.route_id)"
+        class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 whitespace-nowrap text-[10px] leading-tight text-gray-500 dark:text-gray-400"
+        :title="[binding.name, binding.observed_ip].filter(Boolean).join(' · ') || String(binding.route_id)"
       >
-        <span class="max-w-[4.75rem] truncate">{{ binding.name || binding.observed_ip || `#${binding.route_id}` }}</span>
-        <span class="font-mono">{{ binding.current_concurrency ?? 0 }}/{{ concurrencyPerEgress }}</span>
+        <span class="truncate font-mono">{{ binding.observed_ip || binding.name || `#${binding.route_id}` }}</span>
+        <span class="font-mono font-medium">{{ binding.current_concurrency ?? '--' }}/{{ concurrencyPerEgress }}</span>
       </span>
     </div>
 

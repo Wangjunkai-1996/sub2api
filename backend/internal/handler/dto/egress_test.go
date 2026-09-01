@@ -157,3 +157,33 @@ func TestAccountEgressViewsCountOnlyIneligibleBindingsAsDegraded(t *testing.T) {
 	require.Equal(t, 2, summary.DegradedRouteCount)
 	require.Equal(t, 3, summary.EffectiveCapacity)
 }
+
+func TestAccountEgressCapacityBindingsUseUniqueIdentitiesAndPrimaryRoute(t *testing.T) {
+	directScope := service.DefaultDirectEgressRuntimeScope
+	firstIdentity := &service.EgressIdentity{ID: 7, PublicIP: "51.81.109.154", Status: service.EgressIdentityStatusActive}
+	secondIdentity := &service.EgressIdentity{ID: 8, PublicIP: "67.215.237.47", Status: service.EgressIdentityStatusActive}
+	account := &service.Account{
+		EgressBindings: []service.AccountEgressBinding{
+			{
+				RouteID: 11, Position: 0, Status: service.AccountEgressBindingStatusActive,
+				Route: &service.EgressRoute{ID: 11, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: firstIdentity},
+			},
+			{
+				RouteID: 12, Position: 1, IsPrimary: true, Status: service.AccountEgressBindingStatusActive,
+				Route: &service.EgressRoute{ID: 12, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: firstIdentity},
+			},
+			{
+				RouteID: 13, Position: 2, Status: service.AccountEgressBindingStatusActive,
+				Route: &service.EgressRoute{ID: 13, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: secondIdentity},
+			},
+		},
+	}
+
+	bindings := AccountEgressCapacityBindingsFromService(account, map[string]int{"7": 2, "8": 1})
+	require.Len(t, bindings, 2)
+	require.Equal(t, int64(12), bindings[0].RouteID, "the primary route represents a shared identity")
+	require.Equal(t, "51.81.109.154", *bindings[0].ObservedIP)
+	require.Equal(t, 2, bindings[0].CurrentConcurrency)
+	require.Equal(t, "67.215.237.47", *bindings[1].ObservedIP)
+	require.Equal(t, 1, bindings[1].CurrentConcurrency)
+}

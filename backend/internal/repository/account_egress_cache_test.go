@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,41 @@ func newAccountEgressCacheTest(t *testing.T) (*concurrencyCache, *miniredis.Mini
 	t.Cleanup(func() { _ = rdb.Close() })
 	cache := NewConcurrencyCache(rdb, 15, 120).(*concurrencyCache)
 	return cache, server
+}
+
+type accountEgressCommandHook struct {
+	mu       sync.Mutex
+	commands []string
+}
+
+func (h *accountEgressCommandHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *accountEgressCommandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.record(cmd)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *accountEgressCommandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, cmd := range cmds {
+			h.record(cmd)
+		}
+		return next(ctx, cmds)
+	}
+}
+
+func (h *accountEgressCommandHook) record(cmd redis.Cmder) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.commands = append(h.commands, cmd.Name())
+}
+
+func (h *accountEgressCommandHook) Commands() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.commands...)
 }
 
 func accountEgressTestConfig(accountID int64, limit, maxWaiting int, candidates ...service.AccountEgressCandidate) service.AccountEgressPoolConfig {
@@ -380,7 +416,80 @@ func TestAccountEgressBatchLoadAndConcurrentHardCap(t *testing.T) {
 	require.NoError(t, err)
 	load := loads[config.AccountID]
 	require.Equal(t, 3, load.ActiveTotal)
+	require.Equal(t, map[string]int{candidate.IdentityID: 3}, load.IdentityLoads)
 	require.Equal(t, 3, load.EffectiveCapacity)
 	require.Equal(t, 10, load.WaitingCount)
 	require.GreaterOrEqual(t, load.LoadRate, 100)
+}
+
+func TestAccountEgressBatchLoadUsesOneAtomicSnapshotPerAccount(t *testing.T) {
+	cache, server := newAccountEgressCacheTest(t)
+	now := time.Unix(1_700_000_000, 0)
+	server.SetTime(now)
+	first := accountEgressTestConfig(1013, 3, 10,
+		accountEgressTestCandidate(0, 111, "ip:a"),
+		accountEgressTestCandidate(1, 112, "ip:b"),
+	)
+	second := accountEgressTestConfig(1014, 3, 10, accountEgressTestCandidate(0, 113, "ip:c"))
+	syncAccountEgressTestConfig(t, cache, first)
+	syncAccountEgressTestConfig(t, cache, second)
+
+	leaseTTL := service.AccountEgressLeaseTTL
+	waiterTTL := 2 * time.Minute
+	freshLeaseScore := float64(now.UnixMilli())
+	staleLeaseScore := float64(now.UnixMilli() - leaseTTL.Milliseconds() - 1)
+	freshWaiterScore := float64(now.UnixMicro())
+	staleWaiterScore := float64(now.UnixMicro() - waiterTTL.Microseconds() - 1)
+	for _, key := range []string{
+		accountEgressIdentityKey(first.AccountID, "ip:a"),
+		accountEgressTotalKey(first.AccountID),
+	} {
+		require.NoError(t, cache.rdb.ZAdd(context.Background(), key,
+			redis.Z{Score: freshLeaseScore, Member: "fresh"},
+			redis.Z{Score: staleLeaseScore, Member: "stale"},
+		).Err())
+	}
+	require.NoError(t, cache.rdb.ZAdd(context.Background(), accountEgressWaitersKey(first.AccountID),
+		redis.Z{Score: freshWaiterScore, Member: "fresh"},
+		redis.Z{Score: staleWaiterScore, Member: "stale"},
+	).Err())
+
+	hook := &accountEgressCommandHook{}
+	cache.rdb.AddHook(hook)
+	loads, err := cache.GetAccountEgressLoadsBatch(context.Background(), []service.AccountEgressPoolConfig{first, second}, leaseTTL, waiterTTL)
+	require.NoError(t, err)
+	require.Equal(t, []string{"eval", "eval"}, hook.Commands(), "each account must be read by one Lua snapshot without separate TIME or ZCARD commands")
+	require.Equal(t, 1, loads[first.AccountID].ActiveTotal)
+	require.Equal(t, 1, loads[first.AccountID].WaitingCount)
+	require.Equal(t, map[string]int{"ip:a": 1, "ip:b": 0}, loads[first.AccountID].IdentityLoads)
+	require.Equal(t, map[string]int{"ip:c": 0}, loads[second.AccountID].IdentityLoads)
+	require.Equal(t, int64(1), cache.rdb.ZCard(context.Background(), accountEgressIdentityKey(first.AccountID, "ip:a")).Val())
+	require.Equal(t, int64(1), cache.rdb.ZCard(context.Background(), accountEgressTotalKey(first.AccountID)).Val())
+	require.Equal(t, int64(1), cache.rdb.ZCard(context.Background(), accountEgressWaitersKey(first.AccountID)).Val())
+}
+
+func TestAccountEgressThreeIdentitiesProvideNineIndependentSlots(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	first := accountEgressTestCandidate(0, 101, "ip:sys1")
+	second := accountEgressTestCandidate(1, 102, "ip:rn67")
+	third := accountEgressTestCandidate(2, 103, "ip:rn104")
+	config := accountEgressTestConfig(1012, 3, 0, first, second, third)
+	syncAccountEgressTestConfig(t, cache, config)
+
+	for index := 0; index < 9; index++ {
+		result := acquireAccountEgressTest(t, cache, config, fmt.Sprintf("nine-slots-%d", index), "", "")
+		require.Equal(t, service.AccountEgressStatusAcquired, result.Status)
+	}
+	require.Equal(t, service.AccountEgressStatusFull, acquireAccountEgressTest(t, cache, config, "tenth-slot", "", "").Status)
+
+	loads, err := cache.GetAccountEgressLoadsBatch(context.Background(), []service.AccountEgressPoolConfig{config}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(t, err)
+	load := loads[config.AccountID]
+	require.Equal(t, 9, load.ActiveTotal)
+	require.Equal(t, 9, load.EffectiveCapacity)
+	require.Equal(t, map[string]int{
+		first.IdentityID:  3,
+		second.IdentityID: 3,
+		third.IdentityID:  3,
+	}, load.IdentityLoads)
 }

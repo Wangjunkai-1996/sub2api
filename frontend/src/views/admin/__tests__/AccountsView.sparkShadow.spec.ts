@@ -6,6 +6,7 @@ import AccountActionMenu from '@/components/admin/account/AccountActionMenu.vue'
 import PlatformTypeBadge from '@/components/common/PlatformTypeBadge.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import AccountCapacityCell from '@/components/account/AccountCapacityCell.vue'
 
 // 外审 F2:AccountActionMenu emit 'create-spark-shadow',但 AccountsView 此前未监听,
 // 导致按钮点击无效。本测试通过真实组件引用 emit 该事件,断言父页面接线调用 API。
@@ -240,6 +241,7 @@ const mountViewWithRow = () =>
             <div v-for="(row, idx) in (data || [])" :key="idx">
               <slot name="cell-name" :row="row" :value="row.name" />
               <slot name="cell-platform_type" :row="row" />
+              <slot name="cell-capacity" :row="row" />
               <slot name="cell-proxy" :row="row" />
               <slot name="cell-actions" :row="row" />
             </div>
@@ -678,6 +680,133 @@ describe('admin AccountsView — 账号行展示', () => {
 
     expect(listWithEtag).toHaveBeenCalledTimes(1)
     expect(wrapper.findComponent(PlatformTypeBadge).props('planType')).toBe('SuperGrok')
+    wrapper.unmount()
+  })
+
+  it('replaces an OpenAI pool row when per-IP load moves but the total stays unchanged', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    localStorage.setItem('account-auto-refresh', JSON.stringify({ enabled: true, interval_seconds: 5 }))
+
+    const initialAccount = {
+      id: 214,
+      name: 'pool-load-refresh',
+      platform: 'openai',
+      type: 'oauth',
+      current_concurrency: 3,
+      egress_summary: {
+        configured_route_count: 3,
+        eligible_route_count: 3,
+        concurrency_per_egress: 3,
+        effective_capacity: 9,
+        current_concurrency: 3,
+        bindings: [
+          { route_id: 10, observed_ip: '51.81.109.154', eligible: true, current_concurrency: 1 },
+          { route_id: 11, observed_ip: '67.215.237.47', eligible: true, current_concurrency: 2 },
+          { route_id: 12, observed_ip: '104.223.77.152', eligible: true, current_concurrency: 0 },
+        ],
+      },
+    }
+    const refreshedAccount = {
+      ...initialAccount,
+      egress_summary: {
+        ...initialAccount.egress_summary,
+        bindings: [
+          { route_id: 10, observed_ip: '51.81.109.154', eligible: true, current_concurrency: 0 },
+          { route_id: 11, observed_ip: '67.215.237.47', eligible: true, current_concurrency: 3 },
+          { route_id: 12, observed_ip: '104.223.77.152', eligible: true, current_concurrency: 0 },
+        ],
+      },
+    }
+    listAccounts.mockResolvedValue({ items: [initialAccount], total: 1, page: 1, page_size: 20, pages: 1 })
+    listWithEtag.mockResolvedValueOnce({
+      notModified: false,
+      etag: 'pool-load-2',
+      data: { items: [refreshedAccount], total: 1, page: 1, page_size: 20, pages: 1 },
+    })
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+    expect(wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings[0].current_concurrency).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(6000)
+    await flushPromises()
+
+    expect(wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings[0].current_concurrency).toBe(0)
+    expect(wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings[1].current_concurrency).toBe(3)
+    wrapper.unmount()
+  })
+
+  it('replaces an OpenAI pool row when binding metadata changes but all loads stay unchanged', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    localStorage.setItem('account-auto-refresh', JSON.stringify({ enabled: true, interval_seconds: 5 }))
+
+    const initialAccount = {
+      id: 215,
+      name: 'pool-metadata-refresh',
+      platform: 'openai',
+      type: 'oauth',
+      current_concurrency: 3,
+      egress_summary: {
+        configured_route_count: 3,
+        eligible_route_count: 3,
+        concurrency_per_egress: 3,
+        effective_capacity: 9,
+        current_concurrency: 3,
+        bindings: [
+          { route_id: 10, name: 'Local', observed_ip: '51.81.109.154', eligible: true, current_concurrency: 1 },
+          { route_id: 11, name: 'RN-67', observed_ip: '67.215.237.47', eligible: true, current_concurrency: 2 },
+          { route_id: 12, name: 'RN-104', observed_ip: '104.223.77.152', eligible: true, current_concurrency: 0 },
+        ],
+      },
+    }
+    const renamedAccount = {
+      ...initialAccount,
+      egress_summary: {
+        ...initialAccount.egress_summary,
+        bindings: initialAccount.egress_summary.bindings.map(binding => (
+          binding.route_id === 11 ? { ...binding, name: 'RackNerd 67' } : binding
+        )),
+      },
+    }
+    const reidentifiedAccount = {
+      ...renamedAccount,
+      egress_summary: {
+        ...renamedAccount.egress_summary,
+        bindings: renamedAccount.egress_summary.bindings.map(binding => (
+          binding.route_id === 12 ? { ...binding, observed_ip: '104.223.77.153' } : binding
+        )),
+      },
+    }
+    listAccounts.mockResolvedValue({ items: [initialAccount], total: 1, page: 1, page_size: 20, pages: 1 })
+    listWithEtag
+      .mockResolvedValueOnce({
+        notModified: false,
+        etag: 'pool-metadata-2',
+        data: { items: [renamedAccount], total: 1, page: 1, page_size: 20, pages: 1 },
+      })
+      .mockResolvedValueOnce({
+        notModified: false,
+        etag: 'pool-metadata-3',
+        data: { items: [reidentifiedAccount], total: 1, page: 1, page_size: 20, pages: 1 },
+      })
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(6000)
+    await flushPromises()
+    let renderedBindings = wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings
+    expect(renderedBindings[1].name).toBe('RackNerd 67')
+    expect(renderedBindings.map((binding: { current_concurrency: number }) => binding.current_concurrency)).toEqual([1, 2, 0])
+
+    await vi.advanceTimersByTimeAsync(6000)
+    await flushPromises()
+    renderedBindings = wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings
+    expect(renderedBindings[2].observed_ip).toBe('104.223.77.153')
+    expect(renderedBindings.map((binding: { current_concurrency: number }) => binding.current_concurrency)).toEqual([1, 2, 0])
+    expect(listWithEtag).toHaveBeenCalledTimes(2)
     wrapper.unmount()
   })
 })

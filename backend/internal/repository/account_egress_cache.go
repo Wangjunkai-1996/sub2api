@@ -404,6 +404,48 @@ var (
 		redis.call('DEL', metadataKey)
 		return 1
 	`)
+
+	accountEgressLoadSnapshotScript = redis.NewScript(`
+		redis.replicate_commands()
+		local configKey = KEYS[1]
+		local poolTotalKey = KEYS[2]
+		local legacyRegularKey = KEYS[3]
+		local legacyLiveKey = KEYS[4]
+		local modeKey = KEYS[5]
+		local waitersKey = KEYS[6]
+		local exclusiveKey = KEYS[7]
+		local leaseTTL = tonumber(ARGV[1])
+		local waiterTTL = tonumber(ARGV[2])
+		local legacyRegularTTL = tonumber(ARGV[3])
+		local legacyLiveTTL = tonumber(ARGV[4])
+
+		local timeResult = redis.call('TIME')
+		local nowSeconds = tonumber(timeResult[1])
+		local nowMicros = nowSeconds * 1000000 + tonumber(timeResult[2])
+		local nowMillis = math.floor(nowMicros / 1000)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - leaseTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyRegularKey, '-inf', nowSeconds - legacyRegularTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
+		redis.call('ZREMRANGEBYSCORE', waitersKey, '-inf', nowMicros - waiterTTL * 1000)
+
+		local result = {
+			redis.call('HGET', configKey, 'version') or '',
+			redis.call('HGET', configKey, 'digest') or '',
+			redis.call('HGET', configKey, 'limit') or '',
+			redis.call('GET', modeKey) or '',
+			redis.call('ZCARD', poolTotalKey),
+			redis.call('ZCARD', legacyRegularKey),
+			redis.call('ZCARD', legacyLiveKey),
+			redis.call('ZCARD', waitersKey),
+			redis.call('EXISTS', exclusiveKey)
+		}
+		for identityIndex = 8, #KEYS do
+			local identityKey = KEYS[identityIndex]
+			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowMillis - leaseTTL)
+			table.insert(result, redis.call('ZCARD', identityKey))
+		end
+		return result
+	`)
 )
 
 func NewAccountEgressCache(rdb *redis.Client) service.AccountEgressCache {
@@ -757,24 +799,12 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 	if c == nil || c.rdb == nil {
 		return nil, errors.New("account egress redis cache is unavailable")
 	}
-	now, err := c.rdb.Time(ctx).Result()
-	if err != nil {
-		return nil, fmt.Errorf("account egress redis TIME: %w", err)
-	}
-	leaseCutoff := strconv.FormatInt(now.UnixMilli()-accountEgressDurationMilliseconds(leaseTTL), 10)
-	waiterCutoff := strconv.FormatInt(now.UnixMicro()-accountEgressDurationMilliseconds(waiterTTL)*1000, 10)
 
 	type loadCommands struct {
-		config           service.AccountEgressPoolConfig
-		digest           string
-		configCmd        *redis.SliceCmd
-		identityCmds     []*redis.IntCmd
-		totalCmd         *redis.IntCmd
-		legacyRegularCmd *redis.IntCmd
-		legacyLiveCmd    *redis.IntCmd
-		modeCmd          *redis.StringCmd
-		waiterCmd        *redis.IntCmd
-		exclusiveCmd     *redis.IntCmd
+		config      service.AccountEgressPoolConfig
+		digest      string
+		identityIDs []string
+		snapshotCmd *redis.Cmd
 	}
 	pipe := c.rdb.Pipeline()
 	commands := make([]loadCommands, 0, len(configs))
@@ -788,11 +818,6 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		if err != nil {
 			return nil, err
 		}
-		command := loadCommands{
-			config:    config,
-			digest:    digest,
-			configCmd: pipe.HMGet(ctx, accountEgressConfigKey(config.AccountID), "version", "digest", "limit"),
-		}
 		identityIDs := make(map[string]struct{}, len(config.Candidates))
 		for _, candidate := range config.Candidates {
 			identityIDs[candidate.IdentityID] = struct{}{}
@@ -802,30 +827,44 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			orderedIdentities = append(orderedIdentities, identityID)
 		}
 		sort.Strings(orderedIdentities)
-		for _, identityID := range orderedIdentities {
-			key := accountEgressIdentityKey(config.AccountID, identityID)
-			pipe.ZRemRangeByScore(ctx, key, "-inf", leaseCutoff)
-			command.identityCmds = append(command.identityCmds, pipe.ZCard(ctx, key))
+		keys := []string{
+			accountEgressConfigKey(config.AccountID),
+			accountEgressTotalKey(config.AccountID),
+			accountEgressLegacyRegularKey(config.AccountID),
+			accountEgressLegacyLiveKey(config.AccountID),
+			accountEgressModeKey(config.AccountID),
+			accountEgressWaitersKey(config.AccountID),
+			accountEgressExclusiveKey(config.AccountID),
 		}
-		pipe.ZRemRangeByScore(ctx, accountEgressTotalKey(config.AccountID), "-inf", leaseCutoff)
-		command.totalCmd = pipe.ZCard(ctx, accountEgressTotalKey(config.AccountID))
-		pipe.ZRemRangeByScore(ctx, accountEgressLegacyRegularKey(config.AccountID), "-inf", strconv.FormatInt(now.Unix()-int64(c.slotTTLSeconds), 10))
-		command.legacyRegularCmd = pipe.ZCard(ctx, accountEgressLegacyRegularKey(config.AccountID))
-		pipe.ZRemRangeByScore(ctx, accountEgressLegacyLiveKey(config.AccountID), "-inf", strconv.FormatInt(now.Unix()-liveLeaseTTLSeconds, 10))
-		command.legacyLiveCmd = pipe.ZCard(ctx, accountEgressLegacyLiveKey(config.AccountID))
-		command.modeCmd = pipe.Get(ctx, accountEgressModeKey(config.AccountID))
-		pipe.ZRemRangeByScore(ctx, accountEgressWaitersKey(config.AccountID), "-inf", waiterCutoff)
-		command.waiterCmd = pipe.ZCard(ctx, accountEgressWaitersKey(config.AccountID))
-		command.exclusiveCmd = pipe.Exists(ctx, accountEgressExclusiveKey(config.AccountID), warmupAccountExclusiveKey(config.AccountID))
-		commands = append(commands, command)
+		for _, identityID := range orderedIdentities {
+			keys = append(keys, accountEgressIdentityKey(config.AccountID, identityID))
+		}
+		commands = append(commands, loadCommands{
+			config:      config,
+			digest:      digest,
+			identityIDs: orderedIdentities,
+			// EVAL keeps cleanup and every count in one account-scoped atomic snapshot.
+			snapshotCmd: accountEgressLoadSnapshotScript.Eval(ctx, pipe, keys,
+				accountEgressDurationMilliseconds(leaseTTL),
+				accountEgressDurationMilliseconds(waiterTTL),
+				c.slotTTLSeconds,
+				liveLeaseTTLSeconds,
+			),
+		})
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("load account egress pipeline: %w", err)
 	}
 
 	for _, command := range commands {
-		configValues, err := command.configCmd.Result()
-		if err != nil || len(configValues) != 3 || configValues[0] == nil {
+		values, err := command.snapshotCmd.Slice()
+		if err != nil {
+			return nil, fmt.Errorf("read account %d egress load snapshot: %w", command.config.AccountID, err)
+		}
+		if len(values) != 9+len(command.identityIDs) {
+			return nil, fmt.Errorf("invalid account %d egress load snapshot length: got %d, want %d", command.config.AccountID, len(values), 9+len(command.identityIDs))
+		}
+		if fmt.Sprint(values[0]) == "" {
 			results[command.config.AccountID] = service.AccountEgressLoadInfo{
 				AccountID:     command.config.AccountID,
 				Status:        service.AccountEgressStatusConfigUnavailable,
@@ -833,9 +872,9 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			}
 			continue
 		}
-		storedVersion, versionErr := strconv.ParseInt(fmt.Sprint(configValues[0]), 10, 64)
-		storedLimit, limitErr := strconv.Atoi(fmt.Sprint(configValues[2]))
-		if versionErr != nil || limitErr != nil || storedVersion != command.config.Version || fmt.Sprint(configValues[1]) != command.digest || storedLimit != command.config.PerIdentityConcurrency {
+		storedVersion, versionErr := strconv.ParseInt(fmt.Sprint(values[0]), 10, 64)
+		storedLimit, limitErr := strconv.Atoi(fmt.Sprint(values[2]))
+		if versionErr != nil || limitErr != nil || storedVersion != command.config.Version || fmt.Sprint(values[1]) != command.digest || storedLimit != command.config.PerIdentityConcurrency {
 			results[command.config.AccountID] = service.AccountEgressLoadInfo{
 				AccountID:     command.config.AccountID,
 				Status:        service.AccountEgressStatusConfigStale,
@@ -843,20 +882,41 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			}
 			continue
 		}
-		activeTotal := 0
-		for _, identityCmd := range command.identityCmds {
-			activeTotal += int(identityCmd.Val())
+		intAt := func(index int, label string) (int, error) {
+			value, parseErr := strconv.Atoi(fmt.Sprint(values[index]))
+			if parseErr != nil {
+				return 0, fmt.Errorf("parse account %d egress %s: %w", command.config.AccountID, label, parseErr)
+			}
+			return value, nil
 		}
-		if int(command.totalCmd.Val()) != activeTotal {
+		activeTotal := 0
+		identityLoads := make(map[string]int, len(command.identityIDs))
+		for index, identityID := range command.identityIDs {
+			active, parseErr := intAt(9+index, "identity load")
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			identityLoads[identityID] = active
+			activeTotal += active
+		}
+		totalCount, err := intAt(4, "total count")
+		if err != nil {
+			return nil, err
+		}
+		if totalCount != activeTotal {
 			results[command.config.AccountID] = service.AccountEgressLoadInfo{
 				AccountID:     command.config.AccountID,
 				Status:        service.AccountEgressStatusConfigStale,
 				ActiveTotal:   activeTotal,
+				IdentityLoads: identityLoads,
 				ConfigVersion: command.config.Version,
 			}
 			continue
 		}
-		waitingCount := int(command.waiterCmd.Val())
+		waitingCount, err := intAt(7, "waiting count")
+		if err != nil {
+			return nil, err
+		}
 		effectiveCapacity := command.config.EffectiveCapacity()
 		status := service.AccountEgressStatusAcquired
 		loadRate := 0
@@ -865,14 +925,26 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		} else {
 			loadRate = (activeTotal + waitingCount) * 100 / effectiveCapacity
 		}
-		if command.exclusiveCmd.Val() > 0 {
+		exclusiveCount, err := intAt(8, "exclusive count")
+		if err != nil {
+			return nil, err
+		}
+		if exclusiveCount > 0 {
 			status = service.AccountEgressStatusExclusive
 			if loadRate < 100 {
 				loadRate = 100
 			}
 		}
-		legacyActive := command.legacyRegularCmd.Val() + command.legacyLiveCmd.Val()
-		mode := command.modeCmd.Val()
+		legacyRegular, err := intAt(5, "legacy regular count")
+		if err != nil {
+			return nil, err
+		}
+		legacyLive, err := intAt(6, "legacy live count")
+		if err != nil {
+			return nil, err
+		}
+		legacyActive := int64(legacyRegular + legacyLive)
+		mode := fmt.Sprint(values[3])
 		if mode != "" && mode != "legacy" && mode != "pool" {
 			status = service.AccountEgressStatusConfigStale
 		} else if (mode == "pool" && legacyActive > 0) || (mode == "legacy" && activeTotal > 0) {
@@ -887,6 +959,7 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			AccountID:         command.config.AccountID,
 			Status:            status,
 			ActiveTotal:       activeTotal,
+			IdentityLoads:     identityLoads,
 			WaitingCount:      waitingCount,
 			EffectiveCapacity: effectiveCapacity,
 			LoadRate:          loadRate,

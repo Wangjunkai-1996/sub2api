@@ -225,6 +225,7 @@ type AccountEgressLoadInfo struct {
 	AccountID         int64
 	Status            AccountEgressStatus
 	ActiveTotal       int
+	IdentityLoads     map[string]int
 	WaitingCount      int
 	EffectiveCapacity int
 	LoadRate          int

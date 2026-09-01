@@ -124,6 +124,20 @@ func TestSelectionAccountPrefersFreshLegacyAccountAndResolvedPoolAccount(t *test
 	}, fresh))
 }
 
+func TestAccountEgressLeaseLostRecognizesOnlyAllocatorLoss(t *testing.T) {
+	leaseCtx, cancel := context.WithCancelCause(context.Background())
+	account := &Account{SelectedEgress: &ResolvedAccountEgress{Lease: &AccountEgressLease{ctx: leaseCtx}}}
+
+	require.False(t, AccountEgressLeaseLost(account))
+	cancel(ErrAccountEgressLeaseLost)
+	require.True(t, AccountEgressLeaseLost(account))
+
+	canceledCtx, cancelCanceled := context.WithCancelCause(context.Background())
+	cancelCanceled(context.Canceled)
+	account.SelectedEgress.Lease = &AccountEgressLease{ctx: canceledCtx}
+	require.False(t, AccountEgressLeaseLost(account), "ordinary request cancellation is not allocator lease loss")
+}
+
 func timePointer(value time.Time) *time.Time {
 	return &value
 }

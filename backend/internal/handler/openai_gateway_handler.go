@@ -1607,6 +1607,10 @@ func (p *openAIWSTurnPricing) currentOr(fallback time.Time) time.Time {
 	return fallback
 }
 
+func shouldHoldOpenAIWSPoolLease(selection *service.AccountSelectionResult, release func()) bool {
+	return release != nil && selection != nil && selection.Egress != nil && selection.Egress.Lease != nil
+}
+
 // recordOpenAIProfitVeto 记录 OpenAI 侧选号循环的一次利润门终检否决：把账号
 // 加入本请求排除集并递增否决计数。返回 false 表示否决次数已达
 // maxProfitVetoAttempts，调用方必须停止重选并按「无可用账号」终止。
@@ -1982,21 +1986,31 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 	var currentUserRelease func()
 	var currentAccountRelease func()
+	holdPoolLeaseBetweenTurns := false
 	releaseAccountSlot := func() {
 		if currentAccountRelease != nil {
 			currentAccountRelease()
 			currentAccountRelease = nil
 		}
+		holdPoolLeaseBetweenTurns = false
 	}
 	releaseTurnSlots := func() {
-		releaseAccountSlot()
+		if !holdPoolLeaseBetweenTurns {
+			releaseAccountSlot()
+		}
 		if currentUserRelease != nil {
 			currentUserRelease()
 			currentUserRelease = nil
 		}
 	}
 	// 必须尽早注册，确保任何 early return 都能释放已获取的并发槽位。
-	defer releaseTurnSlots()
+	defer func() {
+		releaseAccountSlot()
+		if currentUserRelease != nil {
+			currentUserRelease()
+			currentUserRelease = nil
+		}
+	}()
 
 	userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
 	if err != nil {
@@ -2250,6 +2264,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// captured by the previous failover account before credential lookup.
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
+		// A pool lease also fences the upstream transport and owns the context
+		// that keeps a long-lived WS session alive. Keep it for the connection;
+		// legacy account slots retain the existing per-turn lifecycle.
+		holdPoolLeaseBetweenTurns = shouldHoldOpenAIWSPoolLease(selection, currentAccountRelease)
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.websocket_bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
@@ -2357,7 +2375,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				// 防御式清理：避免异常路径下旧槽位覆盖导致泄漏。
 				releaseTurnSlots()
-				// 非首轮 turn 需要重新抢占并发槽位，避免长连接空闲占槽。
+				// 用户槽和 legacy 账号槽按 turn 重抢；pool lease 则为保证
+				// 连接出口与 lease 失效信号稳定而持有到整个 WS 连接结束。
 				userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
 				if err != nil {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire user concurrency slot", err)
@@ -2365,27 +2384,35 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if !userAcquired {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "too many concurrent requests, please retry later", nil)
 				}
-				accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
-				if err != nil {
-					if userReleaseFunc != nil {
-						userReleaseFunc()
+				if currentAccountRelease == nil {
+					if holdPoolLeaseBetweenTurns {
+						if userReleaseFunc != nil {
+							userReleaseFunc()
+						}
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account egress lease was lost, please reconnect", service.ErrAccountEgressLeaseLost)
 					}
-					return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire account concurrency slot", err)
-				}
-				if !accountAcquired {
-					if userReleaseFunc != nil {
-						userReleaseFunc()
+					accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+					if err != nil {
+						if userReleaseFunc != nil {
+							userReleaseFunc()
+						}
+						return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire account concurrency slot", err)
 					}
-					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is busy, please retry later", nil)
+					if !accountAcquired {
+						if userReleaseFunc != nil {
+							userReleaseFunc()
+						}
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is busy, please retry later", nil)
+					}
+					currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
 				}
-				if err := h.recheckOpenAICyberCooldownAfterAcquire(turnCtx, account, accountReleaseFunc, reqLog); err != nil {
+				if err := h.recheckOpenAICyberCooldownAfterAcquire(turnCtx, account, currentAccountRelease, reqLog); err != nil {
 					if userReleaseFunc != nil {
 						userReleaseFunc()
 					}
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", err)
 				}
 				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
-				currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
 				return nil
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
@@ -2515,6 +2542,14 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			if service.IsOpenAIWSSessionPreemptedError(err) {
 				return
 			}
+			if service.AccountEgressLeaseLost(account) {
+				reqLog.Warn("openai.websocket_egress_lease_lost",
+					zap.Int64("account_id", account.ID),
+					zap.String("binding_id", account.SelectedEgress.BindingID),
+				)
+				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account egress lease lost; please reconnect")
+				return
+			}
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				retryPayload, retryCurrentTurn := service.OpenAIWSCurrentTurnRetryPayload(err)
@@ -2540,6 +2575,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						return
 					}
 					if currentAccountRelease == nil {
+						if holdPoolLeaseBetweenTurns {
+							closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account egress lease was lost, please reconnect")
+							return
+						}
 						accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
 						if acquireErr != nil || !acquired {
 							reqLog.Warn("openai.websocket_same_account_retry_slot_unavailable",

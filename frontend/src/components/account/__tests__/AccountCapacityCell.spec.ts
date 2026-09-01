@@ -39,9 +39,9 @@ describe('AccountCapacityCell egress capacity', () => {
             effective_capacity: 12,
             current_concurrency: 5,
             bindings: [
-              { route_id: 1, name: 'Local', current_concurrency: 1 },
-              { route_id: 2, name: 'RN-104', current_concurrency: 2 },
-              { route_id: 3, name: 'RN-67', current_concurrency: 2 }
+              { route_id: 1, name: 'Local', observed_ip: '51.81.109.154', current_concurrency: 1 },
+              { route_id: 2, name: 'RN-104', observed_ip: '104.223.77.152', current_concurrency: 2 },
+              { route_id: 3, name: 'RN-67', observed_ip: '67.215.237.47', current_concurrency: 2 }
             ]
           }
         } as any
@@ -51,9 +51,9 @@ describe('AccountCapacityCell egress capacity', () => {
     expect(wrapper.text()).toContain('5/12')
     expect(wrapper.get('[data-testid="egress-capacity-formula"]').text()).toBe('3 IP x 4 = 12')
     const breakdown = wrapper.get('[data-testid="egress-capacity-breakdown"]').text()
-    expect(breakdown).toContain('Local1/4')
-    expect(breakdown).toContain('RN-1042/4')
-    expect(breakdown).toContain('RN-672/4')
+    expect(breakdown).toContain('51.81.109.1541/4')
+    expect(breakdown).toContain('104.223.77.1522/4')
+    expect(breakdown).toContain('67.215.237.472/4')
   })
 
   it('falls back to legacy account concurrency when no egress summary is present', () => {

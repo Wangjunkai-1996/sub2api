@@ -3,6 +3,7 @@ package dto
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,16 +51,25 @@ type AccountEgressPool struct {
 }
 
 type AccountEgressSummary struct {
-	ConfiguredRouteCount int                     `json:"configured_route_count"`
-	EligibleRouteCount   int                     `json:"eligible_route_count"`
-	DegradedRouteCount   int                     `json:"degraded_route_count"`
-	ConcurrencyPerEgress int                     `json:"concurrency_per_egress"`
-	EffectiveCapacity    int                     `json:"effective_capacity"`
-	CurrentConcurrency   *int                    `json:"current_concurrency,omitempty"`
-	PrimaryRouteID       *int64                  `json:"primary_route_id"`
-	Routes               []AssignableEgressRoute `json:"routes"`
-	Inherited            bool                    `json:"inherited,omitempty"`
-	InheritedFromID      *int64                  `json:"inherited_from_account_id,omitempty"`
+	ConfiguredRouteCount int                            `json:"configured_route_count"`
+	EligibleRouteCount   int                            `json:"eligible_route_count"`
+	DegradedRouteCount   int                            `json:"degraded_route_count"`
+	ConcurrencyPerEgress int                            `json:"concurrency_per_egress"`
+	EffectiveCapacity    int                            `json:"effective_capacity"`
+	CurrentConcurrency   *int                           `json:"current_concurrency,omitempty"`
+	PrimaryRouteID       *int64                         `json:"primary_route_id"`
+	Routes               []AssignableEgressRoute        `json:"routes"`
+	Inherited            bool                           `json:"inherited,omitempty"`
+	InheritedFromID      *int64                         `json:"inherited_from_account_id,omitempty"`
+	Bindings             []AccountEgressCapacityBinding `json:"bindings,omitempty"`
+}
+
+type AccountEgressCapacityBinding struct {
+	RouteID            int64   `json:"route_id"`
+	Name               string  `json:"name"`
+	ObservedIP         *string `json:"observed_ip,omitempty"`
+	Eligible           bool    `json:"eligible"`
+	CurrentConcurrency int     `json:"current_concurrency"`
 }
 
 func AssignableEgressRouteFromService(route *service.EgressRoute) *AssignableEgressRoute {
@@ -203,6 +213,69 @@ func AccountEgressViewsFromService(account *service.Account) (string, *AccountEg
 		InheritedFromID:      cloneInt64Pointer(account.ParentAccountID),
 	}
 	return mode, pool, summary
+}
+
+// AccountEgressCapacityBindingsFromService projects one row per unique public
+// identity. Multiple routes sharing an IP must never appear as extra capacity.
+func AccountEgressCapacityBindingsFromService(account *service.Account, identityLoads map[string]int) []AccountEgressCapacityBinding {
+	if account == nil || len(identityLoads) == 0 {
+		return nil
+	}
+
+	bindings := append([]service.AccountEgressBinding(nil), account.EgressBindings...)
+	sort.SliceStable(bindings, func(i, j int) bool {
+		if bindings[i].Position != bindings[j].Position {
+			return bindings[i].Position < bindings[j].Position
+		}
+		return bindings[i].RouteID < bindings[j].RouteID
+	})
+
+	type projection struct {
+		binding AccountEgressCapacityBinding
+		primary bool
+	}
+	projections := make([]projection, 0, len(identityLoads))
+	identityIndexes := make(map[int64]int, len(identityLoads))
+	now := time.Now()
+	for i := range bindings {
+		binding := &bindings[i]
+		route := binding.Route
+		if route == nil || route.ExpectedIdentity == nil || route.ExpectedIdentity.ID <= 0 {
+			continue
+		}
+		identityID := route.ExpectedIdentity.ID
+		active, known := identityLoads[strconv.FormatInt(identityID, 10)]
+		if !known {
+			continue
+		}
+		eligible, _ := egressRouteEligibility(route, now)
+		eligible = eligible && binding.Status == service.AccountEgressBindingStatusActive
+		item := AccountEgressCapacityBinding{
+			RouteID:            binding.RouteID,
+			Name:               egressRouteDisplayName(route),
+			ObservedIP:         cloneStringPointer(egressRouteIdentityIP(route)),
+			Eligible:           eligible,
+			CurrentConcurrency: active,
+		}
+		if index, exists := identityIndexes[identityID]; exists {
+			identityEligible := projections[index].binding.Eligible || item.Eligible
+			if binding.IsPrimary && !projections[index].primary {
+				item.Eligible = identityEligible
+				projections[index] = projection{binding: item, primary: true}
+			} else {
+				projections[index].binding.Eligible = identityEligible
+			}
+			continue
+		}
+		identityIndexes[identityID] = len(projections)
+		projections = append(projections, projection{binding: item, primary: binding.IsPrimary})
+	}
+
+	result := make([]AccountEgressCapacityBinding, len(projections))
+	for i := range projections {
+		result[i] = projections[i].binding
+	}
+	return result
 }
 
 func egressRouteDisplayName(route *service.EgressRoute) string {

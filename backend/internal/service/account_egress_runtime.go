@@ -33,6 +33,11 @@ func RequiredAccountEgressBindingFromContext(ctx context.Context) string {
 	return strings.TrimSpace(bindingID)
 }
 
+func AccountEgressLeaseLost(account *Account) bool {
+	return account != nil && account.SelectedEgress != nil && account.SelectedEgress.Lease != nil &&
+		errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseLost)
+}
+
 // CloneForRequest returns an account value that callers may safely decorate
 // with a selected egress without mutating a scheduler or repository snapshot.
 func (a *Account) CloneForRequest() *Account {
