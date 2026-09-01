@@ -657,7 +657,12 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
-	if input.EgressPool != nil && (account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth) {
+	effectiveType := account.Type
+	if input.Type != "" {
+		effectiveType = input.Type
+	}
+	if (input.EgressPool != nil || account.EgressMode == EgressModePool) &&
+		(account.Platform != PlatformOpenAI || effectiveType != AccountTypeOAuth) {
 		return nil, ErrEgressAccountUnsupported
 	}
 	if account.EgressMode == EgressModePool && input.EgressPool == nil && input.ProxyID != nil {
@@ -678,11 +683,11 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err != nil {
 			return nil, err
 		}
-		effectiveType := account.Type
+		effectiveTypeForExtra := account.Type
 		if input.Type != "" {
-			effectiveType = input.Type
+			effectiveTypeForExtra = input.Type
 		}
-		normalizedExtra, err = normalizeOpenAIAutoResetCreditExtra(account.Platform, effectiveType, account.IsShadow(), normalizedExtra)
+		normalizedExtra, err = normalizeOpenAIAutoResetCreditExtra(account.Platform, effectiveTypeForExtra, account.IsShadow(), normalizedExtra)
 		if err != nil {
 			return nil, err
 		}

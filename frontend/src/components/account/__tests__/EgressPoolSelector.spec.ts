@@ -94,7 +94,7 @@ describe('EgressPoolSelector', () => {
   })
 
   it('verifies one route through the redacted egress API and emits the refreshed route', async () => {
-    const refreshed = { ...routes[1], probe_latency_ms: 61 }
+    const refreshed = { ...routes[1], observed_ip: null, public_ip: '198.51.100.105', probe_success: true, probe_latency_ms: 61 }
     verifyMock.mockResolvedValue([refreshed])
     const wrapper = mountSelector([2], 2)
 
@@ -104,5 +104,46 @@ describe('EgressPoolSelector', () => {
     expect(verifyMock).toHaveBeenCalledWith([2])
     expect(wrapper.emitted('verified')?.[0]).toEqual([refreshed])
     expect(wrapper.text()).toContain('61ms')
+    expect(wrapper.text()).toContain('198.51.100.105')
+  })
+
+  it('shows the readable probe reason returned by a failed verification', async () => {
+    verifyMock.mockResolvedValue([{
+      ...routes[1],
+      name: 'Route #2',
+      proxy_name: 'RackNerd Los Angeles',
+      probe_success: false,
+      probe_reason_code: 'probe_failed'
+    }])
+    const wrapper = mountSelector([2], 2)
+
+    await wrapper.get('[data-testid="verify-egress-2"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('RackNerd Los Angeles')
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.reason.probe_failed')
+    expect(wrapper.text()).not.toContain('Route #2')
+  })
+
+  it('uses a meaningful proxy fallback when the DTO has no usable route name', () => {
+    const wrapper = mount(EgressPoolSelector, {
+      props: {
+        routes: [{
+          id: 77,
+          kind: 'proxy',
+          name: 'Route #77',
+          state: 'inactive',
+          eligible: false,
+          reason_code: 'proxy_unavailable'
+        }],
+        selectedRouteIds: [77],
+        primaryRouteId: 77
+      },
+      global: { stubs: { Icon: true } }
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.unnamedProxy')
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.reason.proxy_unavailable')
+    expect(wrapper.text()).not.toContain('Route #77')
   })
 })

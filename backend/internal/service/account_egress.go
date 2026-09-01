@@ -278,7 +278,12 @@ func (s *EgressService) ProbeRoutes(ctx context.Context, routeIDs []int64) ([]Eg
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				results[index] = EgressProbeResult{RouteID: routeID, ReasonCode: EgressProbeReasonRequestCanceled}
+				results[index] = EgressProbeResult{
+					RouteID:    routeID,
+					LatencyMs:  -1,
+					ObservedAt: time.Now(),
+					ReasonCode: EgressProbeReasonRequestCanceled,
+				}
 				return
 			}
 			results[index] = s.probeRoute(ctx, routeID)
@@ -289,7 +294,7 @@ func (s *EgressService) ProbeRoutes(ctx context.Context, routeIDs []int64) ([]Eg
 }
 
 func (s *EgressService) probeRoute(ctx context.Context, routeID int64) EgressProbeResult {
-	result := EgressProbeResult{RouteID: routeID, ObservedAt: time.Now()}
+	result := EgressProbeResult{RouteID: routeID, LatencyMs: -1, ObservedAt: time.Now()}
 	route, err := s.repo.GetRoute(ctx, routeID)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

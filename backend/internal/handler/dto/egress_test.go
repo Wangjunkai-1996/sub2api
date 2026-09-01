@@ -42,6 +42,14 @@ func TestAssignableEgressRouteFromServiceRedactsTransportSecrets(t *testing.T) {
 	require.NotNil(t, out)
 	require.True(t, out.Eligible)
 	require.Equal(t, "racknerd-a", out.Name)
+	require.Equal(t, "racknerd-a", out.DisplayName)
+	require.Equal(t, "racknerd-a", out.ProxyName)
+	require.Equal(t, "socks5", out.Protocol)
+	require.NotNil(t, out.PublicIP)
+	require.Equal(t, observedIP, *out.PublicIP)
+	require.NotNil(t, out.IPAddress)
+	require.Equal(t, observedIP, *out.IPAddress)
+	require.Equal(t, service.EgressIdentityStatusActive, out.IdentityStatus)
 
 	raw, err := json.Marshal(out)
 	require.NoError(t, err)
@@ -49,6 +57,46 @@ func TestAssignableEgressRouteFromServiceRedactsTransportSecrets(t *testing.T) {
 	for _, secret := range []string{"secret-host", "1080", "secret-user", "secret-pass", "socks5://"} {
 		require.NotContains(t, serialized, secret)
 	}
+}
+
+func TestAssignableEgressProbeResultIncludesSafePerRouteFailure(t *testing.T) {
+	observedAt := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	out := AssignableEgressProbeResultFromService(&service.EgressProbeResult{
+		RouteID:    91,
+		LatencyMs:  -1,
+		ObservedAt: observedAt,
+		ReasonCode: service.EgressProbeReasonProbeFailed,
+	})
+
+	require.NotNil(t, out)
+	require.Equal(t, int64(91), out.ID)
+	require.NotNil(t, out.ProbeSuccess)
+	require.False(t, *out.ProbeSuccess)
+	require.Nil(t, out.ProbeLatencyMs, "a probe that never produced latency must not be shown as 0ms")
+	require.Equal(t, service.EgressProbeReasonProbeFailed, out.ProbeReasonCode)
+	require.Equal(t, "Could not reach the public IP probe through this route.", out.ProbeMessage)
+	require.NotNil(t, out.ProbeObservedAt)
+	require.Equal(t, observedAt, *out.ProbeObservedAt)
+
+	raw, err := json.Marshal(out)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "proxy_url")
+	require.NotContains(t, string(raw), "credentials")
+}
+
+func TestAssignableEgressProbeResultIncludesObservedIPOnPersistenceFailure(t *testing.T) {
+	out := AssignableEgressProbeResultFromService(&service.EgressProbeResult{
+		RouteID:    92,
+		ObservedIP: "198.51.100.92",
+		LatencyMs:  43,
+		ReasonCode: service.EgressProbeReasonPersistenceFailed,
+	})
+
+	require.NotNil(t, out)
+	require.Equal(t, "198.51.100.92", out.ProbeObservedIP)
+	require.NotNil(t, out.ProbeLatencyMs)
+	require.Equal(t, int64(43), *out.ProbeLatencyMs)
+	require.Equal(t, "The verification result could not be saved.", out.ProbeMessage)
 }
 
 func TestAccountEgressViewsUseDistinctEligibleIdentitiesAndMarkInheritance(t *testing.T) {

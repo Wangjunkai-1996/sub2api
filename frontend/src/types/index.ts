@@ -998,15 +998,25 @@ export interface AssignableEgressRoute {
   id: number
   ref?: string
   kind: EgressKind
-  name: string
+  name?: string | null
+  display_name?: string | null
+  proxy_name?: string | null
+  protocol?: string | null
   proxy_id?: number | null
   revision?: number
   state: EgressRouteState
   eligible: boolean
   reason_code?: string | null
   observed_ip?: string | null
+  public_ip?: string | null
   ip_address?: string | null
+  identity_status?: string | null
   verified_at?: string | null
+  probe_success?: boolean | null
+  probe_reason_code?: string | null
+  probe_message?: string | null
+  probe_observed_ip?: string | null
+  probe_observed_at?: string | null
   probe_latency_ms?: number | null
   country?: string | null
   country_code?: string | null

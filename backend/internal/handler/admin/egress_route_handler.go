@@ -3,7 +3,6 @@ package admin
 import (
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
@@ -88,22 +87,10 @@ func (h *EgressRouteHandler) Verify(c *gin.Context) {
 	successCount := 0
 	for i := range results {
 		result := &results[i]
-		item := dto.AssignableEgressRouteFromService(result.Route)
+		item := dto.AssignableEgressProbeResultFromService(result)
 		if item == nil {
-			// Keep one safe result per requested route even when lookup failed.
-			item = &dto.AssignableEgressRoute{ID: result.RouteID, State: service.EgressRouteStateInactive, Eligible: false}
+			continue
 		}
-		success := result.Success
-		item.ProbeSuccess = &success
-		if result.LatencyMs >= 0 {
-			latency := result.LatencyMs
-			item.ProbeLatencyMs = &latency
-		}
-		item.ProbeReasonCode = strings.TrimSpace(result.ReasonCode)
-		if !result.Success && item.ProbeReasonCode == "" {
-			item.ProbeReasonCode = "probe_failed"
-		}
-		item.ProbeObservedAt = cloneTime(result.ObservedAt)
 		if result.Success {
 			successCount++
 		}
@@ -167,12 +154,4 @@ func probeBatchResult(success, total int) string {
 	default:
 		return "partial"
 	}
-}
-
-func cloneTime(value time.Time) *time.Time {
-	if value.IsZero() {
-		return nil
-	}
-	copy := value
-	return &copy
 }

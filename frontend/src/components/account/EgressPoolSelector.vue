@@ -52,7 +52,7 @@
               <span v-if="routeIp(route)" class="font-mono">{{ routeIp(route) }}</span>
               <span v-if="route.country_code || route.country">{{ route.country_code || route.country }}</span>
               <span v-if="route.probe_latency_ms != null">{{ route.probe_latency_ms }}ms</span>
-              <span v-if="route.reason_code" class="text-amber-700 dark:text-amber-300">{{ route.reason_code }}</span>
+              <span v-if="routeReason(route) && !verifyErrors[route.id]" class="text-amber-700 dark:text-amber-300">{{ routeReason(route) }}</span>
             </span>
           </label>
 
@@ -144,7 +144,7 @@ const visibleRoutes = computed(() => {
   for (const [id, route] of Object.entries(verifiedRoutes)) byID.set(Number(id), route)
   return Array.from(byID.values()).sort((left, right) => {
     if (left.kind !== right.kind) return left.kind === 'direct' ? -1 : 1
-    return left.name.localeCompare(right.name)
+    return routeLabel(left).localeCompare(routeLabel(right))
   })
 })
 
@@ -167,10 +167,49 @@ const setPrimary = (id: number) => {
   if (!props.disabled && isSelected(id)) emit('update:primaryRouteId', id)
 }
 
-const routeIp = (route: AssignableEgressRoute) => route.observed_ip || route.ip_address || ''
-const routeLabel = (route: AssignableEgressRoute) => route.name || (route.kind === 'direct'
-  ? t('admin.accounts.egressPool.direct')
-  : `#${route.id}`)
+const legacyRouteNumberPattern = /^route\s*#?\s*\d+$/i
+
+const routeIp = (route: AssignableEgressRoute) => route.observed_ip || route.public_ip || route.ip_address || ''
+const routeLabel = (route: AssignableEgressRoute) => {
+  if (route.kind === 'direct') return t('admin.accounts.egressPool.direct')
+  const names = [route.display_name, route.proxy_name, route.name]
+  const name = names.find((value) => {
+    const normalized = value?.trim() || ''
+    return normalized !== '' && !legacyRouteNumberPattern.test(normalized)
+  })?.trim()
+  if (name) return name
+  return t('admin.accounts.egressPool.unnamedProxy', { id: route.id })
+}
+
+const knownReasonCodes = new Set([
+  'route_not_found',
+  'route_unavailable',
+  'probe_failed',
+  'invalid_observation',
+  'revision_conflict',
+  'persistence_failed',
+  'request_canceled',
+  'pending_verification',
+  'route_inactive',
+  'route_expired',
+  'identity_mismatch',
+  'route_retired',
+  'identity_unavailable',
+  'direct_route_unavailable',
+  'proxy_unavailable',
+  'proxy_inactive',
+  'proxy_expired',
+  'route_kind_invalid'
+])
+
+const readableReason = (reasonCode?: string | null) => {
+  const code = reasonCode?.trim() || ''
+  if (!code) return ''
+  if (knownReasonCodes.has(code)) return t(`admin.accounts.egressPool.reason.${code}`)
+  return t('admin.accounts.egressPool.reason.unknown', { code })
+}
+
+const routeReason = (route: AssignableEgressRoute) => readableReason(route.probe_reason_code || route.reason_code)
 
 const stateLabel = (state: EgressRouteState) => t(`admin.accounts.egressPool.state.${state}`)
 const stateClass = (route: AssignableEgressRoute) => {
@@ -193,10 +232,22 @@ const verifyRoute = async (route: AssignableEgressRoute) => {
     if (verified) {
       verifiedRoutes[route.id] = verified
       emit('verified', verified)
+      const probeReason = readableReason(verified.probe_reason_code)
+      if (verified.probe_success === false || probeReason) {
+        verifyErrors[route.id] = probeReason || t('admin.accounts.egressPool.verifyFailed')
+      } else {
+        delete verifyErrors[route.id]
+      }
+    } else {
+      verifyErrors[route.id] = t('admin.accounts.egressPool.verifyFailed')
     }
   } catch (error: unknown) {
-    const apiError = error as { response?: { data?: { message?: string; detail?: string } }; message?: string }
-    verifyErrors[route.id] = apiError.response?.data?.message
+    const apiError = error as {
+      response?: { data?: { probe_reason_code?: string; message?: string; detail?: string } }
+      message?: string
+    }
+    verifyErrors[route.id] = readableReason(apiError.response?.data?.probe_reason_code)
+      || apiError.response?.data?.message
       || apiError.response?.data?.detail
       || apiError.message
       || t('admin.accounts.egressPool.verifyFailed')

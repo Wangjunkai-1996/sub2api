@@ -90,7 +90,16 @@ func (r *egressRepository) ListAssignableRoutes(ctx context.Context) ([]service.
 		return nil, service.ErrEgressRouteInvalid
 	}
 	routes, err := r.client.EgressRoute.Query().
-		Where(dbegressroute.StateNEQ(dbegressroute.State(service.EgressRouteStateRetired))).
+		Where(
+			dbegressroute.StateNEQ(dbegressroute.State(service.EgressRouteStateRetired)),
+			dbegressroute.Or(
+				dbegressroute.KindEQ(dbegressroute.Kind(service.EgressRouteKindDirect)),
+				dbegressroute.And(
+					dbegressroute.KindEQ(dbegressroute.Kind(service.EgressRouteKindProxy)),
+					dbegressroute.HasProxyWith(dbproxy.DeletedAtIsNil()),
+				),
+			),
+		).
 		Order(dbent.Asc(dbegressroute.FieldKind), dbent.Asc(dbegressroute.FieldID)).
 		WithExpectedIdentity().
 		WithProxy().

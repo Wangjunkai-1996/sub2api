@@ -12,22 +12,30 @@ import (
 // AssignableEgressRoute is the deliberately redacted admin projection. Keep
 // transport coordinates and credentials on the service model only.
 type AssignableEgressRoute struct {
-	ID         int64      `json:"id"`
-	Kind       string     `json:"kind"`
-	Name       string     `json:"name"`
-	ProxyID    *int64     `json:"proxy_id,omitempty"`
-	Revision   int64      `json:"revision"`
-	State      string     `json:"state"`
-	Eligible   bool       `json:"eligible"`
-	ReasonCode string     `json:"reason_code,omitempty"`
-	ObservedIP *string    `json:"observed_ip,omitempty"`
-	VerifiedAt *time.Time `json:"verified_at,omitempty"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	ID             int64      `json:"id"`
+	Kind           string     `json:"kind"`
+	Name           string     `json:"name"`
+	DisplayName    string     `json:"display_name"`
+	ProxyName      string     `json:"proxy_name,omitempty"`
+	Protocol       string     `json:"protocol,omitempty"`
+	ProxyID        *int64     `json:"proxy_id,omitempty"`
+	Revision       int64      `json:"revision"`
+	State          string     `json:"state"`
+	Eligible       bool       `json:"eligible"`
+	ReasonCode     string     `json:"reason_code,omitempty"`
+	PublicIP       *string    `json:"public_ip,omitempty"`
+	IPAddress      *string    `json:"ip_address,omitempty"`
+	IdentityStatus string     `json:"identity_status,omitempty"`
+	ObservedIP     *string    `json:"observed_ip,omitempty"`
+	VerifiedAt     *time.Time `json:"verified_at,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	// Probe fields are populated only by the verify endpoint. They stay
 	// optional so the assignable-list projection remains compact.
 	ProbeSuccess    *bool      `json:"probe_success,omitempty"`
 	ProbeLatencyMs  *int64     `json:"probe_latency_ms,omitempty"`
 	ProbeReasonCode string     `json:"probe_reason_code,omitempty"`
+	ProbeMessage    string     `json:"probe_message,omitempty"`
+	ProbeObservedIP string     `json:"probe_observed_ip,omitempty"`
 	ProbeObservedAt *time.Time `json:"probe_observed_at,omitempty"`
 }
 
@@ -59,19 +67,57 @@ func AssignableEgressRouteFromService(route *service.EgressRoute) *AssignableEgr
 		return nil
 	}
 	eligible, reason := egressRouteEligibility(route, time.Now())
+	displayName := egressRouteDisplayName(route)
+	identityIP := egressRouteIdentityIP(route)
 	return &AssignableEgressRoute{
-		ID:         route.ID,
-		Kind:       route.Kind,
-		Name:       egressRouteDisplayName(route),
-		ProxyID:    cloneInt64Pointer(route.ProxyID),
-		Revision:   route.Revision,
-		State:      route.State,
-		Eligible:   eligible,
-		ReasonCode: reason,
-		ObservedIP: cloneStringPointer(route.LastObservedIP),
-		VerifiedAt: cloneTimePointer(route.VerifiedAt),
-		ExpiresAt:  egressRouteExpiresAt(route),
+		ID:             route.ID,
+		Kind:           route.Kind,
+		Name:           displayName,
+		DisplayName:    displayName,
+		ProxyName:      egressRouteProxyName(route),
+		Protocol:       egressRouteProtocol(route),
+		ProxyID:        cloneInt64Pointer(route.ProxyID),
+		Revision:       route.Revision,
+		State:          route.State,
+		Eligible:       eligible,
+		ReasonCode:     reason,
+		PublicIP:       cloneStringPointer(identityIP),
+		IPAddress:      identityIP,
+		IdentityStatus: egressRouteIdentityStatus(route),
+		ObservedIP:     cloneStringPointer(route.LastObservedIP),
+		VerifiedAt:     cloneTimePointer(route.VerifiedAt),
+		ExpiresAt:      egressRouteExpiresAt(route),
 	}
+}
+
+// AssignableEgressProbeResultFromService preserves the batch verify contract:
+// every requested route gets a redacted item, including per-route failures.
+func AssignableEgressProbeResultFromService(result *service.EgressProbeResult) *AssignableEgressRoute {
+	if result == nil {
+		return nil
+	}
+	item := AssignableEgressRouteFromService(result.Route)
+	if item == nil {
+		item = &AssignableEgressRoute{
+			ID:       result.RouteID,
+			State:    service.EgressRouteStateInactive,
+			Eligible: false,
+		}
+	}
+	success := result.Success
+	item.ProbeSuccess = &success
+	if result.LatencyMs >= 0 {
+		latency := result.LatencyMs
+		item.ProbeLatencyMs = &latency
+	}
+	item.ProbeReasonCode = strings.TrimSpace(result.ReasonCode)
+	if !result.Success && item.ProbeReasonCode == "" {
+		item.ProbeReasonCode = service.EgressProbeReasonProbeFailed
+	}
+	item.ProbeMessage = egressProbeMessage(item.ProbeReasonCode)
+	item.ProbeObservedIP = strings.TrimSpace(result.ObservedIP)
+	item.ProbeObservedAt = nonZeroTimePointer(result.ObservedAt)
+	return item
 }
 
 func AccountEgressViewsFromService(account *service.Account) (string, *AccountEgressPool, *AccountEgressSummary) {
@@ -170,6 +216,68 @@ func egressRouteDisplayName(route *service.EgressRoute) string {
 		return strings.TrimSpace(route.Proxy.Name)
 	}
 	return fmt.Sprintf("Route #%d", route.ID)
+}
+
+func egressRouteProtocol(route *service.EgressRoute) string {
+	if route == nil || route.Proxy == nil {
+		return ""
+	}
+	return strings.TrimSpace(route.Proxy.Protocol)
+}
+
+func egressRouteProxyName(route *service.EgressRoute) string {
+	if route == nil || route.Proxy == nil {
+		return ""
+	}
+	return strings.TrimSpace(route.Proxy.Name)
+}
+
+func egressRouteIdentityIP(route *service.EgressRoute) *string {
+	if route == nil || route.ExpectedIdentity == nil {
+		return nil
+	}
+	ip := strings.TrimSpace(route.ExpectedIdentity.PublicIP)
+	if ip == "" {
+		return nil
+	}
+	return &ip
+}
+
+func egressRouteIdentityStatus(route *service.EgressRoute) string {
+	if route == nil || route.ExpectedIdentity == nil {
+		return ""
+	}
+	return strings.TrimSpace(route.ExpectedIdentity.Status)
+}
+
+func egressProbeMessage(reasonCode string) string {
+	switch strings.TrimSpace(reasonCode) {
+	case "":
+		return ""
+	case service.EgressProbeReasonRouteNotFound:
+		return "Route was not found."
+	case service.EgressProbeReasonRouteUnavailable:
+		return "Route is inactive, expired, retired, or missing its transport configuration."
+	case service.EgressProbeReasonProbeFailed:
+		return "Could not reach the public IP probe through this route."
+	case service.EgressProbeReasonInvalidObservation:
+		return "The probe did not return a valid public IP address."
+	case service.EgressProbeReasonRevisionConflict:
+		return "Route changed during verification; reload it and try again."
+	case service.EgressProbeReasonPersistenceFailed:
+		return "The verification result could not be saved."
+	case service.EgressProbeReasonRequestCanceled:
+		return "Verification was canceled or timed out."
+	default:
+		return "Route verification failed."
+	}
+}
+
+func nonZeroTimePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
 }
 
 func egressRouteEligibility(route *service.EgressRoute, now time.Time) (bool, string) {

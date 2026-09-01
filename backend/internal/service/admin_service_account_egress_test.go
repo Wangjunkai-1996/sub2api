@@ -113,3 +113,39 @@ func TestUpdateAccountPoolRejectsOpenAIAPIKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrEgressAccountUnsupported)
 	require.Zero(t, repo.updateCalls)
 }
+
+func TestUpdatePoolAccountRejectsChangingTypeToAPIKey(t *testing.T) {
+	account := poolAccountForAdminUpdate()
+	repo := &updateAccountCredsRepoStub{account: account}
+	svc := &adminServiceImpl{accountRepo: repo}
+
+	_, err := svc.UpdateAccount(context.Background(), account.ID, &UpdateAccountInput{
+		Type: AccountTypeAPIKey,
+	})
+
+	require.ErrorIs(t, err, ErrEgressAccountUnsupported)
+	require.Zero(t, repo.updateCalls)
+	require.Equal(t, AccountTypeOAuth, repo.account.Type)
+}
+
+func TestUpdateAccountRejectsPoolAndTypeChangeToAPIKeyTogether(t *testing.T) {
+	account := poolAccountForAdminUpdate()
+	account.EgressMode = EgressModeLegacy
+	repo := &updateAccountCredsRepoStub{account: account}
+	svc := &adminServiceImpl{accountRepo: repo}
+	revision := int64(7)
+
+	_, err := svc.UpdateAccount(context.Background(), account.ID, &UpdateAccountInput{
+		Type: AccountTypeAPIKey,
+		EgressPool: &ReplaceAccountPoolInput{
+			Mode:             EgressModePool,
+			RouteIDs:         []int64{11},
+			PrimaryRouteID:   11,
+			ExpectedRevision: &revision,
+		},
+	})
+
+	require.ErrorIs(t, err, ErrEgressAccountUnsupported)
+	require.Zero(t, repo.updateCalls)
+	require.Equal(t, AccountTypeOAuth, repo.account.Type)
+}
