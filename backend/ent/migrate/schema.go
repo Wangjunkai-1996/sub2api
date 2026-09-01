@@ -107,6 +107,8 @@ var (
 		{Name: "openai_warmup_identity_generation", Type: field.TypeInt64, Default: 1},
 		{Name: "extra", Type: field.TypeJSON, SchemaType: map[string]string{"postgres": "jsonb"}},
 		{Name: "proxy_fallback_origin_id", Type: field.TypeInt64, Nullable: true},
+		{Name: "egress_mode", Type: field.TypeEnum, Enums: []string{"legacy", "pool"}, Default: "legacy"},
+		{Name: "egress_revision", Type: field.TypeInt64, Default: 1},
 		{Name: "concurrency", Type: field.TypeInt, Default: 3},
 		{Name: "load_factor", Type: field.TypeInt, Nullable: true},
 		{Name: "priority", Type: field.TypeInt, Default: 50},
@@ -137,13 +139,13 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "accounts_proxies_proxy",
-				Columns:    []*schema.Column{AccountsColumns[31]},
+				Columns:    []*schema.Column{AccountsColumns[33]},
 				RefColumns: []*schema.Column{ProxiesColumns[0]},
 				OnDelete:   schema.SetNull,
 			},
 			{
 				Symbol:     "accounts_accounts_children",
-				Columns:    []*schema.Column{AccountsColumns[32]},
+				Columns:    []*schema.Column{AccountsColumns[34]},
 				RefColumns: []*schema.Column{AccountsColumns[0]},
 				OnDelete:   schema.Restrict,
 			},
@@ -162,52 +164,52 @@ var (
 			{
 				Name:    "account_status",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[16]},
+				Columns: []*schema.Column{AccountsColumns[18]},
 			},
 			{
 				Name:    "account_proxy_id",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[31]},
+				Columns: []*schema.Column{AccountsColumns[33]},
 			},
 			{
 				Name:    "account_priority",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[14]},
+				Columns: []*schema.Column{AccountsColumns[16]},
 			},
 			{
 				Name:    "account_last_used_at",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[18]},
+				Columns: []*schema.Column{AccountsColumns[20]},
 			},
 			{
 				Name:    "account_schedulable",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[21]},
+				Columns: []*schema.Column{AccountsColumns[23]},
 			},
 			{
 				Name:    "account_rate_limited_at",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[22]},
+				Columns: []*schema.Column{AccountsColumns[24]},
 			},
 			{
 				Name:    "account_rate_limit_reset_at",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[23]},
+				Columns: []*schema.Column{AccountsColumns[25]},
 			},
 			{
 				Name:    "account_overload_until",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[24]},
+				Columns: []*schema.Column{AccountsColumns[26]},
 			},
 			{
 				Name:    "account_platform_priority",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[6], AccountsColumns[14]},
+				Columns: []*schema.Column{AccountsColumns[6], AccountsColumns[16]},
 			},
 			{
 				Name:    "account_priority_status",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[14], AccountsColumns[16]},
+				Columns: []*schema.Column{AccountsColumns[16], AccountsColumns[18]},
 			},
 			{
 				Name:    "account_deleted_at",
@@ -217,7 +219,57 @@ var (
 			{
 				Name:    "account_parent_account_id",
 				Unique:  false,
-				Columns: []*schema.Column{AccountsColumns[32]},
+				Columns: []*schema.Column{AccountsColumns[34]},
+			},
+		},
+	}
+	// AccountEgressBindingsColumns holds the columns for the "account_egress_bindings" table.
+	AccountEgressBindingsColumns = []*schema.Column{
+		{Name: "position", Type: field.TypeInt, Default: 0},
+		{Name: "is_primary", Type: field.TypeBool, Default: false},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "draining"}, Default: "active"},
+		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "updated_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "account_id", Type: field.TypeInt64},
+		{Name: "route_id", Type: field.TypeInt64},
+	}
+	// AccountEgressBindingsTable holds the schema information for the "account_egress_bindings" table.
+	AccountEgressBindingsTable = &schema.Table{
+		Name:       "account_egress_bindings",
+		Columns:    AccountEgressBindingsColumns,
+		PrimaryKey: []*schema.Column{AccountEgressBindingsColumns[5], AccountEgressBindingsColumns[6]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "account_egress_bindings_accounts_account",
+				Columns:    []*schema.Column{AccountEgressBindingsColumns[5]},
+				RefColumns: []*schema.Column{AccountsColumns[0]},
+				OnDelete:   schema.Cascade,
+			},
+			{
+				Symbol:     "account_egress_bindings_egress_routes_route",
+				Columns:    []*schema.Column{AccountEgressBindingsColumns[6]},
+				RefColumns: []*schema.Column{EgressRoutesColumns[0]},
+				OnDelete:   schema.Restrict,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "accountegressbinding_route_id",
+				Unique:  false,
+				Columns: []*schema.Column{AccountEgressBindingsColumns[6]},
+			},
+			{
+				Name:    "accountegressbinding_account_id_position",
+				Unique:  true,
+				Columns: []*schema.Column{AccountEgressBindingsColumns[5], AccountEgressBindingsColumns[0]},
+			},
+			{
+				Name:    "accountegressbinding_account_id",
+				Unique:  true,
+				Columns: []*schema.Column{AccountEgressBindingsColumns[5]},
+				Annotation: &entsql.IndexAnnotation{
+					Where: "is_primary",
+				},
 			},
 		},
 	}
@@ -861,6 +913,90 @@ var (
 				Name:    "compositemodelroute_priority",
 				Unique:  false,
 				Columns: []*schema.Column{CompositeModelRoutesColumns[9]},
+			},
+		},
+	}
+	// EgressIdentitiesColumns holds the columns for the "egress_identities" table.
+	EgressIdentitiesColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt64, Increment: true},
+		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "updated_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "public_ip", Type: field.TypeString, SchemaType: map[string]string{"postgres": "inet"}},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "retired"}, Default: "active"},
+	}
+	// EgressIdentitiesTable holds the schema information for the "egress_identities" table.
+	EgressIdentitiesTable = &schema.Table{
+		Name:       "egress_identities",
+		Columns:    EgressIdentitiesColumns,
+		PrimaryKey: []*schema.Column{EgressIdentitiesColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "egressidentity_public_ip",
+				Unique:  true,
+				Columns: []*schema.Column{EgressIdentitiesColumns[3]},
+			},
+			{
+				Name:    "egressidentity_status",
+				Unique:  false,
+				Columns: []*schema.Column{EgressIdentitiesColumns[4]},
+			},
+		},
+	}
+	// EgressRoutesColumns holds the columns for the "egress_routes" table.
+	EgressRoutesColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt64, Increment: true},
+		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "updated_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "kind", Type: field.TypeEnum, Enums: []string{"proxy", "direct"}},
+		{Name: "runtime_scope", Type: field.TypeString, Nullable: true, Size: 128},
+		{Name: "state", Type: field.TypeEnum, Enums: []string{"pending_verification", "active", "inactive", "expired", "identity_mismatch", "retired"}, Default: "pending_verification"},
+		{Name: "last_observed_ip", Type: field.TypeString, Nullable: true, SchemaType: map[string]string{"postgres": "inet"}},
+		{Name: "last_probed_at", Type: field.TypeTime, Nullable: true, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "verified_at", Type: field.TypeTime, Nullable: true, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "revision", Type: field.TypeInt64, Default: 1},
+		{Name: "last_error", Type: field.TypeString, Nullable: true, SchemaType: map[string]string{"postgres": "text"}},
+		{Name: "proxy_id", Type: field.TypeInt64, Nullable: true},
+		{Name: "expected_identity_id", Type: field.TypeInt64, Nullable: true},
+	}
+	// EgressRoutesTable holds the schema information for the "egress_routes" table.
+	EgressRoutesTable = &schema.Table{
+		Name:       "egress_routes",
+		Columns:    EgressRoutesColumns,
+		PrimaryKey: []*schema.Column{EgressRoutesColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "egress_routes_proxies_proxy",
+				Columns:    []*schema.Column{EgressRoutesColumns[11]},
+				RefColumns: []*schema.Column{ProxiesColumns[0]},
+				OnDelete:   schema.Restrict,
+			},
+			{
+				Symbol:     "egress_routes_egress_identities_expected_identity",
+				Columns:    []*schema.Column{EgressRoutesColumns[12]},
+				RefColumns: []*schema.Column{EgressIdentitiesColumns[0]},
+				OnDelete:   schema.Restrict,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "egressroute_proxy_id",
+				Unique:  true,
+				Columns: []*schema.Column{EgressRoutesColumns[11]},
+			},
+			{
+				Name:    "egressroute_runtime_scope",
+				Unique:  true,
+				Columns: []*schema.Column{EgressRoutesColumns[4]},
+			},
+			{
+				Name:    "egressroute_expected_identity_id",
+				Unique:  false,
+				Columns: []*schema.Column{EgressRoutesColumns[12]},
+			},
+			{
+				Name:    "egressroute_state_expected_identity_id",
+				Unique:  false,
+				Columns: []*schema.Column{EgressRoutesColumns[5], EgressRoutesColumns[12]},
 			},
 		},
 	}
@@ -2088,6 +2224,7 @@ var (
 	Tables = []*schema.Table{
 		APIKeysTable,
 		AccountsTable,
+		AccountEgressBindingsTable,
 		AccountGroupsTable,
 		AnnouncementsTable,
 		AnnouncementReadsTable,
@@ -2101,6 +2238,8 @@ var (
 		ChannelMonitorHistoriesTable,
 		ChannelMonitorRequestTemplatesTable,
 		CompositeModelRoutesTable,
+		EgressIdentitiesTable,
+		EgressRoutesTable,
 		ErrorPassthroughRulesTable,
 		GroupsTable,
 		IdempotencyRecordsTable,
@@ -2138,6 +2277,11 @@ func init() {
 	AccountsTable.ForeignKeys[1].RefTable = AccountsTable
 	AccountsTable.Annotation = &entsql.Annotation{
 		Table: "accounts",
+	}
+	AccountEgressBindingsTable.ForeignKeys[0].RefTable = AccountsTable
+	AccountEgressBindingsTable.ForeignKeys[1].RefTable = EgressRoutesTable
+	AccountEgressBindingsTable.Annotation = &entsql.Annotation{
+		Table: "account_egress_bindings",
 	}
 	AccountGroupsTable.ForeignKeys[0].RefTable = AccountsTable
 	AccountGroupsTable.ForeignKeys[1].RefTable = GroupsTable
@@ -2187,6 +2331,14 @@ func init() {
 	CompositeModelRoutesTable.ForeignKeys[0].RefTable = GroupsTable
 	CompositeModelRoutesTable.Annotation = &entsql.Annotation{
 		Table: "composite_model_routes",
+	}
+	EgressIdentitiesTable.Annotation = &entsql.Annotation{
+		Table: "egress_identities",
+	}
+	EgressRoutesTable.ForeignKeys[0].RefTable = ProxiesTable
+	EgressRoutesTable.ForeignKeys[1].RefTable = EgressIdentitiesTable
+	EgressRoutesTable.Annotation = &entsql.Annotation{
+		Table: "egress_routes",
 	}
 	ErrorPassthroughRulesTable.Annotation = &entsql.Annotation{
 		Table: "error_passthrough_rules",

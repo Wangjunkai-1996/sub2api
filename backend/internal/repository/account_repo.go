@@ -21,6 +21,7 @@ import (
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	dbaccount "github.com/Wei-Shaw/sub2api/ent/account"
+	dbaccountegressbinding "github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	dbaccountgroup "github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	dbgroup "github.com/Wei-Shaw/sub2api/ent/group"
 	dbpredicate "github.com/Wei-Shaw/sub2api/ent/predicate"
@@ -70,6 +71,11 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 }
 
 const postgresParameterBatchSize = 50000
+
+// Eager-loading egress routes adds a second IN query for route IDs. Keep this
+// batch comfortably below the PostgreSQL parameter limit even when an account
+// uses the maximum configured route count.
+const accountEgressHydrationBatchSize = 1000
 
 const codexFingerprintSeedCanonicalPattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 const codexFingerprintNilSeed = "00000000-0000-0000-0000-000000000000"
@@ -150,6 +156,12 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 		SetErrorMessage(account.ErrorMessage).
 		SetSchedulable(account.Schedulable).
 		SetAutoPauseOnExpired(account.AutoPauseOnExpired)
+	if account.EgressMode != "" {
+		builder.SetEgressMode(dbaccount.EgressMode(account.EgressMode))
+	}
+	if account.EgressRevision > 0 {
+		builder.SetEgressRevision(account.EgressRevision)
+	}
 
 	if account.RateMultiplier != nil {
 		builder.SetRateMultiplier(*account.RateMultiplier)
@@ -200,6 +212,8 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	account.CreatedAt = created.CreatedAt
 	account.UpdatedAt = created.UpdatedAt
 	account.OpenAIWarmupIdentityGeneration = created.OpenaiWarmupIdentityGeneration
+	account.EgressMode = string(created.EgressMode)
+	account.EgressRevision = created.EgressRevision
 	return nil
 }
 
@@ -244,6 +258,9 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 	}
 	account.GroupIDs = groupIDs
 	account.AccountGroups = append([]service.AccountGroup(nil), groups...)
+	if err := applyAccountEgressWrite(ctx, txClient, account); err != nil {
+		return err
+	}
 	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(groupIDs)); err != nil {
 		return err
 	}
@@ -317,6 +334,10 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 	if err != nil {
 		return nil, err
 	}
+	egressBindingsByAccount, egressSourcesByAccount, err := r.loadAccountEgressHydration(ctx, entAccounts)
+	if err != nil {
+		return nil, err
+	}
 
 	outByID := make(map[int64]*service.Account, len(entAccounts))
 	for _, entAcc := range entAccounts {
@@ -329,6 +350,7 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		if entAcc.Edges.Proxy != nil {
 			out.Proxy = proxyEntityToService(entAcc.Edges.Proxy)
 		}
+		applyAccountEgressHydration(out, entAcc, egressBindingsByAccount, egressSourcesByAccount)
 
 		if groups, ok := groupsByAccount[entAcc.ID]; ok {
 			out.Groups = groups
@@ -488,6 +510,9 @@ func (r *accountRepository) updateAccount(
 		explicitRateMultiplier,
 	)
 	if err != nil {
+		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
+	}
+	if err := applyAccountEgressWrite(ctx, client, account); err != nil {
 		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
 	}
 	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(account.GroupIDs)); err != nil {
@@ -3400,6 +3425,10 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 	if err != nil {
 		return nil, err
 	}
+	egressBindingsByAccount, egressSourcesByAccount, err := r.loadAccountEgressHydration(ctx, accounts)
+	if err != nil {
+		return nil, err
+	}
 
 	outAccounts := make([]service.Account, 0, len(accounts))
 	for _, acc := range accounts {
@@ -3419,6 +3448,7 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 				out.ProxyFallbackOriginName = &n
 			}
 		}
+		applyAccountEgressHydration(out, acc, egressBindingsByAccount, egressSourcesByAccount)
 		if groups, ok := groupsByAccount[acc.ID]; ok {
 			out.Groups = groups
 		}
@@ -3620,6 +3650,131 @@ func buildSchedulerGroupPayload(groupIDs []int64) any {
 	return map[string]any{"group_ids": groupIDs}
 }
 
+// loadAccountEgressHydration loads every source account and binding set in two
+// batched queries. Linked shadows read their parent's routes, but the bindings
+// are rewritten to the shadow account ID so concurrency remains isolated.
+func (r *accountRepository) loadAccountEgressHydration(
+	ctx context.Context,
+	accounts []*dbent.Account,
+) (map[int64][]service.AccountEgressBinding, map[int64]*dbent.Account, error) {
+	bindingsByRuntimeAccount := make(map[int64][]service.AccountEgressBinding, len(accounts))
+	sourcesByRuntimeAccount := make(map[int64]*dbent.Account, len(accounts))
+	if len(accounts) == 0 {
+		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+	}
+
+	sourceIDs := make([]int64, 0, len(accounts))
+	seenSourceIDs := make(map[int64]struct{}, len(accounts))
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		sourceID := account.ID
+		if account.ParentAccountID != nil {
+			sourceID = *account.ParentAccountID
+		}
+		if _, exists := seenSourceIDs[sourceID]; exists {
+			continue
+		}
+		seenSourceIDs[sourceID] = struct{}{}
+		sourceIDs = append(sourceIDs, sourceID)
+	}
+	if len(sourceIDs) == 0 {
+		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+	}
+
+	sourceByID := make(map[int64]*dbent.Account, len(sourceIDs))
+	// Keep each IN list below PostgreSQL's bind-parameter limit. This path is
+	// used by scheduler pages as well as admin bulk reads, so a large page must
+	// not fail merely because parent/shadow source IDs were accumulated into a
+	// single query.
+	for start := 0; start < len(sourceIDs); start += accountEgressHydrationBatchSize {
+		end := start + accountEgressHydrationBatchSize
+		if end > len(sourceIDs) {
+			end = len(sourceIDs)
+		}
+		sources, err := r.client.Account.Query().
+			Where(dbaccount.IDIn(sourceIDs[start:end]...)).
+			WithProxy().
+			All(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, source := range sources {
+			sourceByID[source.ID] = source
+		}
+	}
+
+	bindingsBySource := make(map[int64][]*dbent.AccountEgressBinding, len(sourceIDs))
+	for start := 0; start < len(sourceIDs); start += accountEgressHydrationBatchSize {
+		end := start + accountEgressHydrationBatchSize
+		if end > len(sourceIDs) {
+			end = len(sourceIDs)
+		}
+		bindings, err := r.client.AccountEgressBinding.Query().
+			Where(dbaccountegressbinding.AccountIDIn(sourceIDs[start:end]...)).
+			Order(
+				dbent.Asc(dbaccountegressbinding.FieldAccountID),
+				dbent.Asc(dbaccountegressbinding.FieldPosition),
+				dbent.Asc(dbaccountegressbinding.FieldRouteID),
+			).
+			WithRoute(func(q *dbent.EgressRouteQuery) {
+				q.WithExpectedIdentity().WithProxy()
+			}).
+			All(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, binding := range bindings {
+			bindingsBySource[binding.AccountID] = append(bindingsBySource[binding.AccountID], binding)
+		}
+	}
+
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		sourceID := account.ID
+		if account.ParentAccountID != nil {
+			sourceID = *account.ParentAccountID
+		}
+		source := sourceByID[sourceID]
+		if source == nil {
+			continue
+		}
+		sourcesByRuntimeAccount[account.ID] = source
+		runtimeBindings := make([]service.AccountEgressBinding, 0, len(bindingsBySource[sourceID]))
+		for _, binding := range bindingsBySource[sourceID] {
+			runtimeBindings = append(runtimeBindings, accountEgressBindingEntityToService(binding, account.ID))
+		}
+		bindingsByRuntimeAccount[account.ID] = runtimeBindings
+	}
+	return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+}
+
+func applyAccountEgressHydration(
+	out *service.Account,
+	entity *dbent.Account,
+	bindingsByAccount map[int64][]service.AccountEgressBinding,
+	sourcesByAccount map[int64]*dbent.Account,
+) {
+	if out == nil || entity == nil {
+		return
+	}
+	if source := sourcesByAccount[entity.ID]; source != nil {
+		out.EgressMode = string(source.EgressMode)
+		out.ProxyID = source.ProxyID
+		if source.Edges.Proxy != nil {
+			out.Proxy = proxyEntityToService(source.Edges.Proxy)
+		} else if source.ProxyID == nil {
+			out.Proxy = nil
+		}
+	}
+	if bindings, exists := bindingsByAccount[entity.ID]; exists {
+		out.EgressBindings = bindings
+	}
+}
+
 func accountEntityToService(m *dbent.Account) *service.Account {
 	if m == nil {
 		return nil
@@ -3638,6 +3793,8 @@ func accountEntityToService(m *dbent.Account) *service.Account {
 		Extra:                          copyJSONMap(m.Extra),
 		ProxyID:                        m.ProxyID,
 		ProxyFallbackOriginID:          m.ProxyFallbackOriginID,
+		EgressMode:                     string(m.EgressMode),
+		EgressRevision:                 m.EgressRevision,
 		Concurrency:                    m.Concurrency,
 		Priority:                       m.Priority,
 		RateMultiplier:                 &rateMultiplier,

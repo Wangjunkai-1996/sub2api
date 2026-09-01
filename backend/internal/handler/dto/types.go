@@ -210,6 +210,10 @@ type Account struct {
 	ProxyID                 *int64                         `json:"proxy_id"`
 	ProxyFallbackOriginID   *int64                         `json:"proxy_fallback_origin_id"`
 	ProxyFallbackOriginName *string                        `json:"proxy_fallback_origin_name,omitempty"`
+	EgressMode              string                         `json:"egress_mode,omitempty"`
+	EgressRevision          int64                          `json:"egress_revision,omitempty"`
+	EgressPool              *AccountEgressPool             `json:"egress_pool,omitempty"`
+	EgressSummary           *AccountEgressSummary          `json:"egress_summary,omitempty"`
 	Concurrency             int                            `json:"concurrency"`
 	LoadFactor              *int                           `json:"load_factor,omitempty"`
 	Priority                int                            `json:"priority"`

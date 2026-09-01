@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -33,8 +34,38 @@ func newProxyRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *proxyRep
 	return &proxyRepository{client: client, sql: sqlq}
 }
 
+func (r *proxyRepository) beginProxyLifecycleTransaction(ctx context.Context) (context.Context, *dbent.Client, sqlExecutor, *dbent.Tx, bool, error) {
+	client := clientFromContext(ctx, r.client)
+	if client == nil {
+		return nil, nil, nil, nil, false, errors.New("proxy lifecycle client is unavailable")
+	}
+	if dbent.TxFromContext(ctx) != nil {
+		return ctx, client, client, nil, false, nil
+	}
+	tx, err := client.Tx(ctx)
+	if errors.Is(err, dbent.ErrTxStarted) {
+		return ctx, client, client, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, nil, nil, false, err
+	}
+	txCtx := dbent.NewTxContext(ctx, tx)
+	txClient := tx.Client()
+	return txCtx, txClient, txClient, tx, true, nil
+}
+
 func (r *proxyRepository) Create(ctx context.Context, proxyIn *service.Proxy) error {
-	builder := r.client.Proxy.Create().
+	if proxyIn == nil {
+		return service.ErrEgressRouteInvalid
+	}
+	txCtx, client, exec, tx, ownsTx, err := r.beginProxyLifecycleTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	if ownsTx {
+		defer func() { _ = tx.Rollback() }()
+	}
+	builder := client.Proxy.Create().
 		SetName(proxyIn.Name).
 		SetProtocol(proxyIn.Protocol).
 		SetHost(proxyIn.Host).
@@ -55,11 +86,20 @@ func (r *proxyRepository) Create(ctx context.Context, proxyIn *service.Proxy) er
 		builder.SetBackupProxyID(*proxyIn.BackupProxyID)
 	}
 
-	created, err := builder.Save(ctx)
-	if err == nil {
-		applyProxyEntityToService(proxyIn, created)
+	created, err := builder.Save(txCtx)
+	if err != nil {
+		return err
 	}
-	return err
+	if err := syncProxyEgressRouteTx(txCtx, exec, created.ID, proxyLifecycleRouteState(proxyIn, time.Now()), true); err != nil {
+		return err
+	}
+	if ownsTx {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	applyProxyEntityToService(proxyIn, created)
+	return nil
 }
 
 func (r *proxyRepository) GetByID(ctx context.Context, id int64) (*service.Proxy, error) {
@@ -93,28 +133,22 @@ func (r *proxyRepository) ListByIDs(ctx context.Context, ids []int64) ([]service
 }
 
 func (r *proxyRepository) Update(ctx context.Context, proxyIn *service.Proxy) error {
-	client := r.client
-	var tx *dbent.Tx
-	if contextTx := dbent.TxFromContext(ctx); contextTx != nil {
-		client = contextTx.Client()
-	} else {
-		var err error
-		tx, err = r.client.Tx(ctx)
-		if err != nil && err != dbent.ErrTxStarted {
-			return err
-		}
-		if tx != nil {
-			defer func() { _ = tx.Rollback() }()
-			ctx = dbent.NewTxContext(ctx, tx)
-			client = tx.Client()
-		}
+	if proxyIn == nil {
+		return service.ErrEgressRouteInvalid
 	}
-
-	updated, err := updateProxyAndInvalidateProbeSnapshots(ctx, client, proxyIn)
+	txCtx, client, _, tx, ownsTx, err := r.beginProxyLifecycleTransaction(ctx)
 	if err != nil {
 		return err
 	}
-	if tx != nil {
+	if ownsTx {
+		defer func() { _ = tx.Rollback() }()
+	}
+
+	updated, err := updateProxyAndInvalidateProbeSnapshots(txCtx, client, proxyIn)
+	if err != nil {
+		return err
+	}
+	if ownsTx {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -124,16 +158,18 @@ func (r *proxyRepository) Update(ctx context.Context, proxyIn *service.Proxy) er
 }
 
 type proxyProbeIdentity struct {
-	protocol string
-	host     string
-	port     int
-	username string
-	password string
-	status   string
+	protocol        string
+	host            string
+	port            int
+	username        string
+	password        string
+	status          string
+	hasExpiresAt    bool
+	expiresAtUnixNs int64
 }
 
 func proxyProbeIdentityFromService(proxyIn *service.Proxy) proxyProbeIdentity {
-	return proxyProbeIdentity{
+	identity := proxyProbeIdentity{
 		protocol: proxyIn.Protocol,
 		host:     proxyIn.Host,
 		port:     proxyIn.Port,
@@ -141,6 +177,11 @@ func proxyProbeIdentityFromService(proxyIn *service.Proxy) proxyProbeIdentity {
 		password: proxyIn.Password,
 		status:   proxyIn.Status,
 	}
+	if proxyIn.ExpiresAt != nil {
+		identity.hasExpiresAt = true
+		identity.expiresAtUnixNs = proxyIn.ExpiresAt.UnixNano()
+	}
+	return identity
 }
 
 func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.Client, proxyIn *service.Proxy) (*dbent.Proxy, error) {
@@ -194,12 +235,15 @@ func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.C
 	if err := enqueueProxyProbeAccountChanges(ctx, client, accountIDs); err != nil {
 		return nil, err
 	}
+	if err := syncProxyEgressRouteTx(ctx, client, proxyIn.ID, proxyLifecycleRouteState(proxyIn, time.Now()), true); err != nil {
+		return nil, err
+	}
 	return updated, nil
 }
 
 func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID int64) (proxyProbeIdentity, error) {
 	rows, err := client.QueryContext(ctx, `
-		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status
+		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status, expires_at
 		FROM proxies
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -214,11 +258,28 @@ func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID i
 		}
 		return proxyProbeIdentity{}, service.ErrProxyNotFound
 	}
-	var identity proxyProbeIdentity
-	if err := rows.Scan(&identity.protocol, &identity.host, &identity.port, &identity.username, &identity.password, &identity.status); err != nil {
+	var (
+		identity  proxyProbeIdentity
+		expiresAt sql.NullTime
+	)
+	if err := rows.Scan(&identity.protocol, &identity.host, &identity.port, &identity.username, &identity.password, &identity.status, &expiresAt); err != nil {
 		return proxyProbeIdentity{}, err
 	}
+	if expiresAt.Valid {
+		identity.hasExpiresAt = true
+		identity.expiresAtUnixNs = expiresAt.Time.UnixNano()
+	}
 	return identity, rows.Err()
+}
+
+func proxyLifecycleRouteState(proxyIn *service.Proxy, now time.Time) string {
+	if proxyIn == nil || proxyIn.Status != service.StatusActive {
+		return service.EgressRouteStateInactive
+	}
+	if proxyIn.IsExpired(now) {
+		return service.EgressRouteStateExpired
+	}
+	return service.EgressRouteStatePendingVerification
 }
 
 func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyID int64) ([]int64, error) {
@@ -274,8 +335,37 @@ func enqueueProxyProbeAccountChanges(ctx context.Context, exec sqlExecutor, acco
 }
 
 func (r *proxyRepository) Delete(ctx context.Context, id int64) error {
-	_, err := r.client.Proxy.Delete().Where(proxy.IDEQ(id)).Exec(ctx)
-	return err
+	if id <= 0 {
+		return service.ErrProxyNotFound
+	}
+	txCtx, client, exec, tx, ownsTx, err := r.beginProxyLifecycleTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	if ownsTx {
+		defer func() { _ = tx.Rollback() }()
+	}
+	count, err := countProxyAccountReferences(txCtx, exec, id)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return service.ErrProxyInUse
+	}
+	deleted, err := client.Proxy.Delete().Where(proxy.IDEQ(id)).Exec(txCtx)
+	if err != nil {
+		return err
+	}
+	if deleted == 0 {
+		return service.ErrProxyNotFound
+	}
+	if err := syncProxyEgressRouteTx(txCtx, exec, id, service.EgressRouteStateRetired, false); err != nil {
+		return err
+	}
+	if ownsTx {
+		return tx.Commit()
+	}
+	return nil
 }
 
 func (r *proxyRepository) List(ctx context.Context, params pagination.PaginationParams) ([]service.Proxy, *pagination.PaginationResult, error) {
@@ -471,8 +561,31 @@ func (r *proxyRepository) ExistsByHostPortAuth(ctx context.Context, host string,
 
 // CountAccountsByProxyID returns the number of accounts using a specific proxy
 func (r *proxyRepository) CountAccountsByProxyID(ctx context.Context, proxyID int64) (int64, error) {
+	return countProxyAccountReferences(ctx, r.sql, proxyID)
+}
+
+func countProxyAccountReferences(ctx context.Context, exec sqlExecutor, proxyID int64) (int64, error) {
+	if exec == nil || proxyID <= 0 {
+		return 0, nil
+	}
 	var count int64
-	if err := scanSingleRow(ctx, r.sql, "SELECT COUNT(*) FROM accounts WHERE proxy_id = $1 AND deleted_at IS NULL", []any{proxyID}, &count); err != nil {
+	err := scanSingleRow(ctx, exec, `
+		SELECT COUNT(*)
+		FROM (
+			SELECT a.id
+			FROM accounts a
+			WHERE a.proxy_id=$1 AND a.deleted_at IS NULL
+			UNION
+			SELECT a.id
+			FROM account_egress_bindings b
+			JOIN egress_routes er ON er.id=b.route_id
+			JOIN accounts a ON a.id=b.account_id
+			WHERE er.proxy_id=$1
+				AND a.deleted_at IS NULL
+				AND a.platform=$2
+				AND a.egress_mode=$3
+		) referenced_accounts`, []any{proxyID, service.PlatformOpenAI, service.EgressModePool}, &count)
+	if err != nil {
 		return 0, err
 	}
 	return count, nil
@@ -480,11 +593,24 @@ func (r *proxyRepository) CountAccountsByProxyID(ctx context.Context, proxyID in
 
 func (r *proxyRepository) ListAccountSummariesByProxyID(ctx context.Context, proxyID int64) ([]service.ProxyAccountSummary, error) {
 	rows, err := r.sql.QueryContext(ctx, `
-		SELECT id, name, platform, type, notes
-		FROM accounts
-		WHERE proxy_id = $1 AND deleted_at IS NULL
-		ORDER BY id DESC
-	`, proxyID)
+		SELECT a.id, a.name, a.platform, a.type, a.notes
+		FROM accounts a
+		JOIN (
+			SELECT id AS account_id
+			FROM accounts
+			WHERE proxy_id=$1 AND deleted_at IS NULL
+			UNION
+			SELECT a.id AS account_id
+			FROM account_egress_bindings b
+			JOIN egress_routes er ON er.id=b.route_id
+			JOIN accounts a ON a.id=b.account_id
+			WHERE er.proxy_id=$1
+				AND a.deleted_at IS NULL
+				AND a.platform=$2
+				AND a.egress_mode=$3
+		) refs ON refs.account_id=a.id
+		ORDER BY a.id DESC
+	`, proxyID, service.PlatformOpenAI, service.EgressModePool)
 	if err != nil {
 		return nil, err
 	}
@@ -522,7 +648,23 @@ func (r *proxyRepository) ListAccountSummariesByProxyID(ctx context.Context, pro
 
 // GetAccountCountsForProxies returns a map of proxy ID to account count for all proxies
 func (r *proxyRepository) GetAccountCountsForProxies(ctx context.Context) (counts map[int64]int64, err error) {
-	rows, err := r.sql.QueryContext(ctx, "SELECT proxy_id, COUNT(*) AS count FROM accounts WHERE proxy_id IS NOT NULL AND deleted_at IS NULL GROUP BY proxy_id")
+	rows, err := r.sql.QueryContext(ctx, `
+		SELECT proxy_id, COUNT(*) AS count
+		FROM (
+			SELECT a.id AS account_id, a.proxy_id
+			FROM accounts a
+			WHERE a.proxy_id IS NOT NULL AND a.deleted_at IS NULL
+			UNION
+			SELECT a.id AS account_id, er.proxy_id
+			FROM account_egress_bindings b
+			JOIN egress_routes er ON er.id=b.route_id
+			JOIN accounts a ON a.id=b.account_id
+			WHERE er.proxy_id IS NOT NULL
+				AND a.deleted_at IS NULL
+				AND a.platform=$1
+				AND a.egress_mode=$2
+		) referenced_accounts
+		GROUP BY proxy_id`, service.PlatformOpenAI, service.EgressModePool)
 	if err != nil {
 		return nil, err
 	}
@@ -728,6 +870,9 @@ func (r *proxyRepository) sweepOneExpiredProxyOnExec(ctx context.Context, exec s
 		service.StatusExpired, proxyID); err != nil {
 		return nil, err
 	}
+	if err := syncProxyEgressRouteTx(ctx, exec, proxyID, service.EgressRouteStateExpired, false); err != nil {
+		return nil, err
+	}
 	if !change {
 		accountIDs, err := invalidateProxyProbeSnapshots(ctx, exec, proxyID)
 		if err != nil {
@@ -752,7 +897,8 @@ func (r *proxyRepository) sweepOneExpiredProxyOnExec(ctx context.Context, exec s
 				END,
 				updated_at=NOW()
 			WHERE proxy_id=$1 AND proxy_fallback_origin_id IS NULL AND deleted_at IS NULL
-			RETURNING id`, proxyID)
+				AND NOT (platform=$2 AND egress_mode=$3)
+			RETURNING id`, proxyID, service.PlatformOpenAI, service.EgressModePool)
 	} else {
 		rows, err = exec.QueryContext(ctx, `
 			UPDATE accounts SET proxy_id=$2, proxy_fallback_origin_id=$1,
@@ -763,7 +909,8 @@ func (r *proxyRepository) sweepOneExpiredProxyOnExec(ctx context.Context, exec s
 				END,
 				updated_at=NOW()
 			WHERE proxy_id=$1 AND proxy_fallback_origin_id IS NULL AND deleted_at IS NULL
-			RETURNING id`, proxyID, *target)
+				AND NOT (platform=$3 AND egress_mode=$4)
+			RETURNING id`, proxyID, *target, service.PlatformOpenAI, service.EgressModePool)
 	}
 	if err != nil {
 		return nil, err

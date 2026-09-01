@@ -47,11 +47,14 @@ func ProvideAdminHandlers(
 	affiliateHandler *admin.AffiliateHandler,
 	complianceHandler *admin.ComplianceHandler,
 	auditLogHandler *admin.AuditLogHandler,
+	egressRouteHandler *admin.EgressRouteHandler,
+	egressService *service.EgressService,
 	upstreamBillingProbe *service.UpstreamBillingProbeService,
 	ollamaCloudUsage *service.OllamaCloudUsageService,
 	openAIWindowWarmup *service.OpenAIWindowWarmupService,
 	settingService *service.SettingService,
 ) *AdminHandlers {
+	accountHandler.SetEgressService(egressService)
 	accountHandler.SetUpstreamBillingProbeService(upstreamBillingProbe)
 	accountHandler.SetOllamaCloudUsageService(ollamaCloudUsage)
 	accountHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
@@ -61,6 +64,7 @@ func ProvideAdminHandlers(
 		User:                   userHandler,
 		Group:                  groupHandler,
 		Account:                accountHandler,
+		EgressRoute:            egressRouteHandler,
 		Announcement:           announcementHandler,
 		DataManagement:         dataManagementHandler,
 		Backup:                 backupHandler,
@@ -287,6 +291,7 @@ var ProviderSet = wire.NewSet(
 	admin.NewAffiliateHandler,
 	admin.NewComplianceHandler,
 	admin.NewAuditLogHandler,
+	admin.NewEgressRouteHandler,
 
 	// AdminHandlers and Handlers constructors
 	ProvideAdminHandlers,

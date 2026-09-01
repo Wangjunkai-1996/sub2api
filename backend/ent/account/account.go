@@ -40,6 +40,10 @@ const (
 	FieldProxyID = "proxy_id"
 	// FieldProxyFallbackOriginID holds the string denoting the proxy_fallback_origin_id field in the database.
 	FieldProxyFallbackOriginID = "proxy_fallback_origin_id"
+	// FieldEgressMode holds the string denoting the egress_mode field in the database.
+	FieldEgressMode = "egress_mode"
+	// FieldEgressRevision holds the string denoting the egress_revision field in the database.
+	FieldEgressRevision = "egress_revision"
 	// FieldConcurrency holds the string denoting the concurrency field in the database.
 	FieldConcurrency = "concurrency"
 	// FieldLoadFactor holds the string denoting the load_factor field in the database.
@@ -84,6 +88,8 @@ const (
 	EdgeGroups = "groups"
 	// EdgeProxy holds the string denoting the proxy edge name in mutations.
 	EdgeProxy = "proxy"
+	// EdgeEgressRoutes holds the string denoting the egress_routes edge name in mutations.
+	EdgeEgressRoutes = "egress_routes"
 	// EdgeParent holds the string denoting the parent edge name in mutations.
 	EdgeParent = "parent"
 	// EdgeChildren holds the string denoting the children edge name in mutations.
@@ -92,6 +98,8 @@ const (
 	EdgeUsageLogs = "usage_logs"
 	// EdgeAccountGroups holds the string denoting the account_groups edge name in mutations.
 	EdgeAccountGroups = "account_groups"
+	// EdgeEgressBindings holds the string denoting the egress_bindings edge name in mutations.
+	EdgeEgressBindings = "egress_bindings"
 	// Table holds the table name of the account in the database.
 	Table = "accounts"
 	// GroupsTable is the table that holds the groups relation/edge. The primary key declared below.
@@ -106,6 +114,11 @@ const (
 	ProxyInverseTable = "proxies"
 	// ProxyColumn is the table column denoting the proxy relation/edge.
 	ProxyColumn = "proxy_id"
+	// EgressRoutesTable is the table that holds the egress_routes relation/edge. The primary key declared below.
+	EgressRoutesTable = "account_egress_bindings"
+	// EgressRoutesInverseTable is the table name for the EgressRoute entity.
+	// It exists in this package in order to avoid circular dependency with the "egressroute" package.
+	EgressRoutesInverseTable = "egress_routes"
 	// ParentTable is the table that holds the parent relation/edge.
 	ParentTable = "accounts"
 	// ParentColumn is the table column denoting the parent relation/edge.
@@ -128,6 +141,13 @@ const (
 	AccountGroupsInverseTable = "account_groups"
 	// AccountGroupsColumn is the table column denoting the account_groups relation/edge.
 	AccountGroupsColumn = "account_id"
+	// EgressBindingsTable is the table that holds the egress_bindings relation/edge.
+	EgressBindingsTable = "account_egress_bindings"
+	// EgressBindingsInverseTable is the table name for the AccountEgressBinding entity.
+	// It exists in this package in order to avoid circular dependency with the "accountegressbinding" package.
+	EgressBindingsInverseTable = "account_egress_bindings"
+	// EgressBindingsColumn is the table column denoting the egress_bindings relation/edge.
+	EgressBindingsColumn = "account_id"
 )
 
 // Columns holds all SQL columns for account fields.
@@ -145,6 +165,8 @@ var Columns = []string{
 	FieldExtra,
 	FieldProxyID,
 	FieldProxyFallbackOriginID,
+	FieldEgressMode,
+	FieldEgressRevision,
 	FieldConcurrency,
 	FieldLoadFactor,
 	FieldPriority,
@@ -171,6 +193,9 @@ var (
 	// GroupsPrimaryKey and GroupsColumn2 are the table columns denoting the
 	// primary key for the groups relation (M2M).
 	GroupsPrimaryKey = []string{"account_id", "group_id"}
+	// EgressRoutesPrimaryKey and EgressRoutesColumn2 are the table columns denoting the
+	// primary key for the egress_routes relation (M2M).
+	EgressRoutesPrimaryKey = []string{"account_id", "route_id"}
 )
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -211,6 +236,10 @@ var (
 	OpenaiWarmupIdentityGenerationValidator func(int64) error
 	// DefaultExtra holds the default value on creation for the "extra" field.
 	DefaultExtra func() map[string]interface{}
+	// DefaultEgressRevision holds the default value on creation for the "egress_revision" field.
+	DefaultEgressRevision int64
+	// EgressRevisionValidator is a validator for the "egress_revision" field. It is called by the builders before save.
+	EgressRevisionValidator func(int64) error
 	// DefaultConcurrency holds the default value on creation for the "concurrency" field.
 	DefaultConcurrency int
 	// DefaultPriority holds the default value on creation for the "priority" field.
@@ -228,6 +257,32 @@ var (
 	// SessionWindowStatusValidator is a validator for the "session_window_status" field. It is called by the builders before save.
 	SessionWindowStatusValidator func(string) error
 )
+
+// EgressMode defines the type for the "egress_mode" enum field.
+type EgressMode string
+
+// EgressModeLegacy is the default value of the EgressMode enum.
+const DefaultEgressMode = EgressModeLegacy
+
+// EgressMode values.
+const (
+	EgressModeLegacy EgressMode = "legacy"
+	EgressModePool   EgressMode = "pool"
+)
+
+func (em EgressMode) String() string {
+	return string(em)
+}
+
+// EgressModeValidator is a validator for the "egress_mode" field enum values. It is called by the builders before save.
+func EgressModeValidator(em EgressMode) error {
+	switch em {
+	case EgressModeLegacy, EgressModePool:
+		return nil
+	default:
+		return fmt.Errorf("account: invalid enum value for egress_mode field: %q", em)
+	}
+}
 
 // QuotaDimension defines the type for the "quota_dimension" enum field.
 type QuotaDimension string
@@ -311,6 +366,16 @@ func ByProxyID(opts ...sql.OrderTermOption) OrderOption {
 // ByProxyFallbackOriginID orders the results by the proxy_fallback_origin_id field.
 func ByProxyFallbackOriginID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldProxyFallbackOriginID, opts...).ToFunc()
+}
+
+// ByEgressMode orders the results by the egress_mode field.
+func ByEgressMode(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldEgressMode, opts...).ToFunc()
+}
+
+// ByEgressRevision orders the results by the egress_revision field.
+func ByEgressRevision(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldEgressRevision, opts...).ToFunc()
 }
 
 // ByConcurrency orders the results by the concurrency field.
@@ -434,6 +499,20 @@ func ByProxyField(field string, opts ...sql.OrderTermOption) OrderOption {
 	}
 }
 
+// ByEgressRoutesCount orders the results by egress_routes count.
+func ByEgressRoutesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newEgressRoutesStep(), opts...)
+	}
+}
+
+// ByEgressRoutes orders the results by egress_routes terms.
+func ByEgressRoutes(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newEgressRoutesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // ByParentField orders the results by parent field.
 func ByParentField(field string, opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -482,6 +561,20 @@ func ByAccountGroups(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newAccountGroupsStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
+
+// ByEgressBindingsCount orders the results by egress_bindings count.
+func ByEgressBindingsCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newEgressBindingsStep(), opts...)
+	}
+}
+
+// ByEgressBindings orders the results by egress_bindings terms.
+func ByEgressBindings(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newEgressBindingsStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
 func newGroupsStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -494,6 +587,13 @@ func newProxyStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(ProxyInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.M2O, false, ProxyTable, ProxyColumn),
+	)
+}
+func newEgressRoutesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(EgressRoutesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.M2M, false, EgressRoutesTable, EgressRoutesPrimaryKey...),
 	)
 }
 func newParentStep() *sqlgraph.Step {
@@ -522,5 +622,12 @@ func newAccountGroupsStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(AccountGroupsInverseTable, AccountGroupsColumn),
 		sqlgraph.Edge(sqlgraph.O2M, true, AccountGroupsTable, AccountGroupsColumn),
+	)
+}
+func newEgressBindingsStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(EgressBindingsInverseTable, EgressBindingsColumn),
+		sqlgraph.Edge(sqlgraph.O2M, true, EgressBindingsTable, EgressBindingsColumn),
 	)
 }

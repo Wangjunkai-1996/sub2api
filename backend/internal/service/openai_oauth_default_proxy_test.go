@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -168,7 +169,10 @@ func TestOpenAIOAuthServiceDefaultProxy(t *testing.T) {
 		require.NoError(t, err)
 		session, ok := svc.sessionStore.Get(result.SessionID)
 		require.True(t, ok)
-		require.Equal(t, proxy.URL(), session.ProxyURL)
+		require.Equal(t, proxy.ID, *session.ProxyID)
+		encodedSession, marshalErr := json.Marshal(session)
+		require.NoError(t, marshalErr)
+		require.NotContains(t, string(encodedSession), "proxy_url")
 
 		_, err = svc.ExchangeCode(context.Background(), &OpenAIExchangeCodeInput{
 			SessionID: result.SessionID,
@@ -197,7 +201,10 @@ func TestOpenAIOAuthServiceDefaultProxy(t *testing.T) {
 		require.NoError(t, err)
 		session, ok := svc.sessionStore.Get(result.SessionID)
 		require.True(t, ok)
-		require.Equal(t, explicitProxy.URL(), session.ProxyURL)
+		require.Equal(t, explicitProxy.ID, *session.ProxyID)
+		encodedSession, marshalErr := json.Marshal(session)
+		require.NoError(t, marshalErr)
+		require.NotContains(t, string(encodedSession), "proxy_url")
 		require.Zero(t, settings.getValueCalls)
 	})
 

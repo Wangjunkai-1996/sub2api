@@ -237,6 +237,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	if state := service.OllamaCloudUsageStateFromAccount(a); state.Eligible {
 		ollamaCloudUsage = state
 	}
+	egressMode, egressPool, egressSummary := AccountEgressViewsFromService(a)
 	out := &Account{
 		ID:                      a.ID,
 		Name:                    a.Name,
@@ -250,6 +251,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		ProxyID:                 a.ProxyID,
 		ProxyFallbackOriginID:   a.ProxyFallbackOriginID,
 		ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		EgressMode:              egressMode,
+		EgressRevision:          a.EgressRevision,
+		EgressPool:              egressPool,
+		EgressSummary:           egressSummary,
 		Concurrency:             a.Concurrency,
 		LoadFactor:              a.LoadFactor,
 		Priority:                a.Priority,

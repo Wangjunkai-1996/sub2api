@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +19,13 @@ import (
 )
 
 const (
-	dataType       = "sub2api-data"
-	legacyDataType = "sub2api-bundle"
-	dataVersion    = 1
-	dataPageCap    = 1000
+	dataType           = "sub2api-data"
+	legacyDataType     = "sub2api-bundle"
+	dataVersion        = 1
+	accountDataVersion = 2
+	dataPageCap        = 1000
+
+	dataDirectDefaultRouteKey = "direct:default"
 )
 
 type DataPayload struct {
@@ -58,18 +62,29 @@ type DataProxy struct {
 // 影子的独立调度配置(priority/并发/分组/status 管理员可单独调)亦不在本备份范围,属已知局限
 // (外审第6轮裁决:保持排除 + 前端警告,而非升级格式做完整往返)。
 type DataAccount struct {
-	Name               string         `json:"name"`
-	Notes              *string        `json:"notes,omitempty"`
-	Platform           string         `json:"platform"`
-	Type               string         `json:"type"`
-	Credentials        map[string]any `json:"credentials"`
-	Extra              map[string]any `json:"extra,omitempty"`
-	ProxyKey           *string        `json:"proxy_key,omitempty"`
-	Concurrency        int            `json:"concurrency"`
-	Priority           int            `json:"priority"`
-	RateMultiplier     *float64       `json:"rate_multiplier,omitempty"`
-	ExpiresAt          *int64         `json:"expires_at,omitempty"`
-	AutoPauseOnExpired *bool          `json:"auto_pause_on_expired,omitempty"`
+	Name               string                 `json:"name"`
+	Notes              *string                `json:"notes,omitempty"`
+	Platform           string                 `json:"platform"`
+	Type               string                 `json:"type"`
+	Credentials        map[string]any         `json:"credentials"`
+	Extra              map[string]any         `json:"extra,omitempty"`
+	ProxyKey           *string                `json:"proxy_key,omitempty"`
+	EgressMode         string                 `json:"egress_mode,omitempty"`
+	EgressPool         *DataAccountEgressPool `json:"egress_pool,omitempty"`
+	Concurrency        int                    `json:"concurrency"`
+	Priority           int                    `json:"priority"`
+	RateMultiplier     *float64               `json:"rate_multiplier,omitempty"`
+	ExpiresAt          *int64                 `json:"expires_at,omitempty"`
+	AutoPauseOnExpired *bool                  `json:"auto_pause_on_expired,omitempty"`
+}
+
+// DataAccountEgressPool is the portable v2 account-pool representation. Route
+// database IDs are deliberately excluded: proxy routes use the existing
+// backup proxy_key and direct uses the fixed direct:default key.
+type DataAccountEgressPool struct {
+	RouteKeys            []string `json:"route_keys"`
+	PrimaryRouteKey      string   `json:"primary_route_key"`
+	ConcurrencyPerEgress int      `json:"concurrency_per_egress"`
 }
 
 type DataImportRequest struct {
@@ -78,12 +93,13 @@ type DataImportRequest struct {
 }
 
 type DataImportResult struct {
-	ProxyCreated   int               `json:"proxy_created"`
-	ProxyReused    int               `json:"proxy_reused"`
-	ProxyFailed    int               `json:"proxy_failed"`
-	AccountCreated int               `json:"account_created"`
-	AccountFailed  int               `json:"account_failed"`
-	Errors         []DataImportError `json:"errors,omitempty"`
+	ProxyCreated   int                 `json:"proxy_created"`
+	ProxyReused    int                 `json:"proxy_reused"`
+	ProxyFailed    int                 `json:"proxy_failed"`
+	AccountCreated int                 `json:"account_created"`
+	AccountFailed  int                 `json:"account_failed"`
+	Errors         []DataImportError   `json:"errors,omitempty"`
+	Warnings       []DataImportWarning `json:"warnings,omitempty"`
 }
 
 type DataImportError struct {
@@ -91,6 +107,13 @@ type DataImportError struct {
 	Name     string `json:"name,omitempty"`
 	ProxyKey string `json:"proxy_key,omitempty"`
 	Message  string `json:"message"`
+}
+
+type DataImportWarning struct {
+	Kind    string `json:"kind"`
+	Name    string `json:"name,omitempty"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 func buildProxyKey(protocol, host string, port int, username, password string) string {
@@ -199,6 +222,18 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 			v := acc.ExpiresAt.Unix()
 			expiresAt = &v
 		}
+		var egressMode string
+		var egressPool *DataAccountEgressPool
+		if isDataOpenAIOAuthAccount(acc.Platform, acc.Type) && acc.EgressMode == service.EgressModePool {
+			egressPool, err = buildExportDataAccountEgressPool(&acc, proxyKeyByID, includeProxies)
+			if err != nil {
+				response.ErrorFrom(c, err)
+				return
+			}
+			if egressPool != nil {
+				egressMode = service.EgressModePool
+			}
+		}
 		dataAccounts = append(dataAccounts, DataAccount{
 			Name:               acc.Name,
 			Notes:              acc.Notes,
@@ -207,6 +242,8 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 			Credentials:        acc.Credentials,
 			Extra:              acc.Extra,
 			ProxyKey:           proxyKey,
+			EgressMode:         egressMode,
+			EgressPool:         egressPool,
 			Concurrency:        acc.Concurrency,
 			Priority:           acc.Priority,
 			RateMultiplier:     acc.RateMultiplier,
@@ -216,6 +253,8 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 	}
 
 	payload := DataPayload{
+		Type:           dataType,
+		Version:        accountDataVersion,
 		ExportedAt:     time.Now().UTC().Format(time.RFC3339),
 		Proxies:        dataProxies,
 		Accounts:       dataAccounts,
@@ -400,6 +439,8 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 	}
 
+	egressRoutes := h.loadDataImportEgressRoutes(ctx, dataPayload)
+
 	// 收集需要异步设置隐私的 Antigravity OAuth 账号
 	var privacyAccounts []*service.Account
 
@@ -415,20 +456,24 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			continue
 		}
 
-		var proxyID *int64
-		if item.ProxyKey != nil && *item.ProxyKey != "" {
-			if id, ok := proxyKeyToID[*item.ProxyKey]; ok {
-				proxyID = &id
-			} else {
-				result.AccountFailed++
-				result.Errors = append(result.Errors, DataImportError{
-					Kind:     "account",
-					Name:     item.Name,
-					ProxyKey: *item.ProxyKey,
-					Message:  "proxy_key not found",
-				})
-				continue
-			}
+		poolRequested := dataPayload.Version == accountDataVersion && isDataOpenAIOAuthAccount(item.Platform, item.Type) &&
+			(item.EgressMode == service.EgressModePool || item.EgressPool != nil)
+		legacyProxyID, legacyProxyFound := resolveDataImportLegacyProxyID(item, proxyKeyToID, poolRequested)
+		if !poolRequested && item.ProxyKey != nil && strings.TrimSpace(*item.ProxyKey) != "" && !legacyProxyFound {
+			result.AccountFailed++
+			result.Errors = append(result.Errors, DataImportError{
+				Kind:     "account",
+				Name:     item.Name,
+				ProxyKey: *item.ProxyKey,
+				Message:  "proxy_key not found",
+			})
+			continue
+		}
+
+		var egressPool *service.ReplaceAccountPoolInput
+		var poolWarning *DataImportWarning
+		if poolRequested {
+			egressPool, poolWarning = resolveDataImportEgressPool(item, proxyKeyToID, egressRoutes)
 		}
 
 		enrichCredentialsFromIDToken(&item)
@@ -443,7 +488,8 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			Type:                 item.Type,
 			Credentials:          item.Credentials,
 			Extra:                item.Extra,
-			ProxyID:              proxyID,
+			ProxyID:              legacyProxyID,
+			EgressPool:           egressPool,
 			Concurrency:          item.Concurrency,
 			Priority:             item.Priority,
 			RateMultiplier:       item.RateMultiplier,
@@ -452,8 +498,23 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			AutoPauseOnExpired:   item.AutoPauseOnExpired,
 			SkipDefaultGroupBind: skipDefaultGroupBind,
 		}
+		if egressPool != nil {
+			accountInput.ProxyID = nil
+			accountInput.Concurrency = *egressPool.ConcurrencyPerEgress
+		}
 
 		created, err := h.adminService.CreateAccount(ctx, accountInput)
+		if err != nil && egressPool != nil && errors.Is(err, service.ErrEgressPoolInvalid) {
+			// Route state can change after the preflight. Retry only the known
+			// atomic pool-validation failure, preserving normal account failures.
+			accountInput.EgressPool = nil
+			accountInput.ProxyID = legacyProxyID
+			accountInput.Concurrency = item.Concurrency
+			created, err = h.adminService.CreateAccount(ctx, accountInput)
+			if err == nil {
+				poolWarning = newDataImportEgressFallbackWarning(item.Name)
+			}
+		}
 		if err != nil {
 			result.AccountFailed++
 			result.Errors = append(result.Errors, DataImportError{
@@ -468,6 +529,9 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			privacyAccounts = append(privacyAccounts, created)
 		}
 		h.scheduleGrokImportProbe(created)
+		if poolWarning != nil {
+			result.Warnings = append(result.Warnings, *poolWarning)
+		}
 		result.AccountCreated++
 	}
 
@@ -489,6 +553,155 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 	}
 
 	return result, nil
+}
+
+type dataImportEgressRouteIndex struct {
+	loaded                bool
+	proxyRouteIDByProxyID map[int64]int64
+	directDefaultRouteID  int64
+}
+
+func (h *AccountHandler) loadDataImportEgressRoutes(ctx context.Context, payload DataPayload) dataImportEgressRouteIndex {
+	index := dataImportEgressRouteIndex{proxyRouteIDByProxyID: make(map[int64]int64)}
+	if payload.Version != accountDataVersion || h == nil || h.egressService == nil {
+		return index
+	}
+	needsRoutes := false
+	for i := range payload.Accounts {
+		account := &payload.Accounts[i]
+		if isDataOpenAIOAuthAccount(account.Platform, account.Type) &&
+			(account.EgressMode == service.EgressModePool || account.EgressPool != nil) {
+			needsRoutes = true
+			break
+		}
+	}
+	if !needsRoutes {
+		return index
+	}
+
+	routes, err := h.egressService.ListAssignableRoutes(ctx)
+	if err != nil {
+		return index
+	}
+	index.loaded = true
+	now := time.Now()
+	for i := range routes {
+		route := &routes[i]
+		if !isRestorableDataImportEgressRoute(route, now) {
+			continue
+		}
+		switch route.Kind {
+		case service.EgressRouteKindProxy:
+			if _, exists := index.proxyRouteIDByProxyID[*route.ProxyID]; !exists {
+				index.proxyRouteIDByProxyID[*route.ProxyID] = route.ID
+			}
+		case service.EgressRouteKindDirect:
+			if index.directDefaultRouteID == 0 {
+				index.directDefaultRouteID = route.ID
+			}
+		}
+	}
+	return index
+}
+
+func isRestorableDataImportEgressRoute(route *service.EgressRoute, now time.Time) bool {
+	if route == nil || route.ID <= 0 || route.State != service.EgressRouteStateActive || route.VerifiedAt == nil ||
+		route.ExpectedIdentity == nil || route.ExpectedIdentity.Status != service.EgressIdentityStatusActive {
+		return false
+	}
+	switch route.Kind {
+	case service.EgressRouteKindDirect:
+		return route.RuntimeScope != nil && strings.TrimSpace(*route.RuntimeScope) == service.DefaultDirectEgressRuntimeScope
+	case service.EgressRouteKindProxy:
+		return route.ProxyID != nil && *route.ProxyID > 0 && route.Proxy != nil && route.Proxy.IsActive() && !route.Proxy.IsExpired(now)
+	default:
+		return false
+	}
+}
+
+func resolveDataImportEgressPool(
+	item DataAccount,
+	proxyKeyToID map[string]int64,
+	routes dataImportEgressRouteIndex,
+) (*service.ReplaceAccountPoolInput, *DataImportWarning) {
+	if item.EgressMode != service.EgressModePool || item.EgressPool == nil || !routes.loaded {
+		return nil, newDataImportEgressFallbackWarning(item.Name)
+	}
+	pool := item.EgressPool
+	if pool.ConcurrencyPerEgress < 1 || pool.ConcurrencyPerEgress > 10000 ||
+		len(pool.RouteKeys) == 0 || len(pool.RouteKeys) > service.MaxAccountEgressRoutes {
+		return nil, newDataImportEgressFallbackWarning(item.Name)
+	}
+
+	routeIDs := make([]int64, 0, len(pool.RouteKeys))
+	routeIDByKey := make(map[string]int64, len(pool.RouteKeys))
+	seenRouteIDs := make(map[int64]struct{}, len(pool.RouteKeys))
+	for _, rawKey := range pool.RouteKeys {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			return nil, newDataImportEgressFallbackWarning(item.Name)
+		}
+		routeID := int64(0)
+		if key == dataDirectDefaultRouteKey {
+			routeID = routes.directDefaultRouteID
+		} else if proxyID, ok := proxyKeyToID[key]; ok {
+			routeID = routes.proxyRouteIDByProxyID[proxyID]
+		}
+		if routeID <= 0 {
+			return nil, newDataImportEgressFallbackWarning(item.Name)
+		}
+		if _, duplicate := routeIDByKey[key]; duplicate {
+			return nil, newDataImportEgressFallbackWarning(item.Name)
+		}
+		if _, duplicate := seenRouteIDs[routeID]; duplicate {
+			return nil, newDataImportEgressFallbackWarning(item.Name)
+		}
+		routeIDByKey[key] = routeID
+		seenRouteIDs[routeID] = struct{}{}
+		routeIDs = append(routeIDs, routeID)
+	}
+	primaryRouteID := routeIDByKey[strings.TrimSpace(pool.PrimaryRouteKey)]
+	if primaryRouteID <= 0 {
+		return nil, newDataImportEgressFallbackWarning(item.Name)
+	}
+	concurrency := pool.ConcurrencyPerEgress
+	return &service.ReplaceAccountPoolInput{
+		Mode:                 service.EgressModePool,
+		RouteIDs:             routeIDs,
+		PrimaryRouteID:       primaryRouteID,
+		ConcurrencyPerEgress: &concurrency,
+	}, nil
+}
+
+func resolveDataImportLegacyProxyID(item DataAccount, proxyKeyToID map[string]int64, preferPoolPrimary bool) (*int64, bool) {
+	if preferPoolPrimary && item.EgressPool != nil {
+		primaryKey := strings.TrimSpace(item.EgressPool.PrimaryRouteKey)
+		if primaryKey == dataDirectDefaultRouteKey {
+			return nil, true
+		}
+		if proxyID, ok := proxyKeyToID[primaryKey]; ok {
+			id := proxyID
+			return &id, true
+		}
+	}
+	if item.ProxyKey == nil || strings.TrimSpace(*item.ProxyKey) == "" {
+		return nil, true
+	}
+	proxyID, ok := proxyKeyToID[*item.ProxyKey]
+	if !ok {
+		return nil, false
+	}
+	id := proxyID
+	return &id, true
+}
+
+func newDataImportEgressFallbackWarning(accountName string) *DataImportWarning {
+	return &DataImportWarning{
+		Kind:    "account",
+		Name:    accountName,
+		Code:    "EGRESS_POOL_NOT_RESTORED",
+		Message: "egress pool routes are not all present, verified, and active in this environment; account imported in legacy mode",
+	}
 }
 
 // DataAccount intentionally cannot encode parent_account_id or quota_dimension,
@@ -652,24 +865,111 @@ func (h *AccountHandler) resolveExportProxies(ctx context.Context, accounts []se
 	seen := make(map[int64]struct{})
 	ids := make([]int64, 0)
 	for i := range accounts {
-		if accounts[i].ProxyID == nil {
+		account := &accounts[i]
+		if account.ProxyID != nil {
+			id := *account.ProxyID
+			if id > 0 {
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					ids = append(ids, id)
+				}
+			}
+		}
+		if !isDataOpenAIOAuthAccount(account.Platform, account.Type) || account.EgressMode != service.EgressModePool {
 			continue
 		}
-		id := *accounts[i].ProxyID
-		if id <= 0 {
-			continue
+		for j := range account.EgressBindings {
+			route := account.EgressBindings[j].Route
+			if route == nil || route.Kind != service.EgressRouteKindProxy || route.ProxyID == nil || *route.ProxyID <= 0 {
+				continue
+			}
+			id := *route.ProxyID
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
 		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
 	}
 	if len(ids) == 0 {
 		return []service.Proxy{}, nil
 	}
 
 	return h.adminService.GetProxiesByIDs(ctx, ids)
+}
+
+func isDataOpenAIOAuthAccount(platform, accountType string) bool {
+	return platform == service.PlatformOpenAI && accountType == service.AccountTypeOAuth
+}
+
+func buildExportDataAccountEgressPool(account *service.Account, proxyKeyByID map[int64]string, includeProxies bool) (*DataAccountEgressPool, error) {
+	if account == nil || !isDataOpenAIOAuthAccount(account.Platform, account.Type) || account.EgressMode != service.EgressModePool {
+		return nil, nil
+	}
+	if account.Concurrency < 1 || account.Concurrency > 10000 || len(account.EgressBindings) == 0 || len(account.EgressBindings) > service.MaxAccountEgressRoutes {
+		return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+	}
+
+	bindings := append([]service.AccountEgressBinding(nil), account.EgressBindings...)
+	sort.SliceStable(bindings, func(i, j int) bool {
+		if bindings[i].Position == bindings[j].Position {
+			return bindings[i].RouteID < bindings[j].RouteID
+		}
+		return bindings[i].Position < bindings[j].Position
+	})
+
+	routeKeys := make([]string, 0, len(bindings))
+	seen := make(map[string]struct{}, len(bindings))
+	primaryRouteKey := ""
+	primaryCount := 0
+	for i := range bindings {
+		binding := &bindings[i]
+		if binding.Route == nil {
+			return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+		}
+		key := ""
+		switch binding.Route.Kind {
+		case service.EgressRouteKindDirect:
+			if binding.Route.RuntimeScope == nil || strings.TrimSpace(*binding.Route.RuntimeScope) != service.DefaultDirectEgressRuntimeScope {
+				return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+			}
+			key = dataDirectDefaultRouteKey
+		case service.EgressRouteKindProxy:
+			if binding.Route.ProxyID == nil || *binding.Route.ProxyID <= 0 {
+				return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+			}
+			var ok bool
+			key, ok = proxyKeyByID[*binding.Route.ProxyID]
+			if !ok {
+				// include_proxies=false intentionally keeps the historical
+				// no-proxy-reference behavior instead of leaking a credential-bearing
+				// proxy key through the account record.
+				if !includeProxies {
+					return nil, nil
+				}
+				return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+			}
+		default:
+			return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+		}
+		seen[key] = struct{}{}
+		routeKeys = append(routeKeys, key)
+		if binding.IsPrimary {
+			primaryCount++
+			primaryRouteKey = key
+		}
+	}
+	if primaryCount != 1 {
+		return nil, infraerrors.New(500, "ACCOUNT_EGRESS_EXPORT_INVALID", "OpenAI account egress pool cannot be exported")
+	}
+	return &DataAccountEgressPool{
+		RouteKeys:            routeKeys,
+		PrimaryRouteKey:      primaryRouteKey,
+		ConcurrencyPerEgress: account.Concurrency,
+	}, nil
 }
 
 func parseAccountIDs(c *gin.Context) ([]int64, error) {
@@ -720,7 +1020,7 @@ func validateDataHeader(payload DataPayload) error {
 	if payload.Type != "" && payload.Type != dataType && payload.Type != legacyDataType {
 		return fmt.Errorf("unsupported data type: %s", payload.Type)
 	}
-	if payload.Version != 0 && payload.Version != dataVersion {
+	if payload.Version != 0 && payload.Version != dataVersion && payload.Version != accountDataVersion {
 		return fmt.Errorf("unsupported data version: %d", payload.Version)
 	}
 	if payload.Proxies == nil {

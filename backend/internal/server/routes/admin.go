@@ -68,6 +68,9 @@ func RegisterAdminRoutes(
 		// 代理管理
 		registerProxyRoutes(admin, h, stepUpAuth)
 
+		// 出口路由/静态 IP 管理（凭据只在服务端探测，响应为脱敏投影）
+		registerEgressRouteRoutes(admin, h)
+
 		// 卡密管理
 		registerRedeemCodeRoutes(admin, h)
 
@@ -131,6 +134,16 @@ func RegisterAdminRoutes(
 
 		// 操作审计日志
 		registerAuditLogRoutes(admin, h, stepUpAuth)
+	}
+}
+
+func registerEgressRouteRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	egressRoutes := admin.Group("/egress-routes")
+	{
+		egressRoutes.GET("/assignable", h.Admin.EgressRoute.ListAssignable)
+		// Keep the fixed verify path before the parameterized confirmation path.
+		egressRoutes.POST("/verify", h.Admin.EgressRoute.Verify)
+		egressRoutes.POST("/:id/confirm-identity", h.Admin.EgressRoute.ConfirmIdentity)
 	}
 }
 

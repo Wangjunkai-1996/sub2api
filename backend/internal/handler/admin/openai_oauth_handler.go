@@ -114,8 +114,9 @@ func NewOpenAIOAuthHandler(
 
 // OpenAIGenerateAuthURLRequest represents the request for generating OpenAI auth URL
 type OpenAIGenerateAuthURLRequest struct {
-	ProxyID     *int64 `json:"proxy_id"`
-	RedirectURI string `json:"redirect_uri"`
+	ProxyID       *int64 `json:"proxy_id"`
+	EgressRouteID *int64 `json:"egress_route_id"`
+	RedirectURI   string `json:"redirect_uri"`
 }
 
 // GenerateAuthURL generates OpenAI OAuth authorization URL
@@ -127,9 +128,10 @@ func (h *OpenAIOAuthHandler) GenerateAuthURL(c *gin.Context) {
 		req = OpenAIGenerateAuthURLRequest{}
 	}
 
-	result, err := h.openaiOAuthService.GenerateAuthURL(
+	result, err := h.openaiOAuthService.GenerateAuthURLWithRoute(
 		c.Request.Context(),
 		req.ProxyID,
+		req.EgressRouteID,
 		req.RedirectURI,
 		oauthPlatformFromPath(c),
 	)
@@ -143,11 +145,12 @@ func (h *OpenAIOAuthHandler) GenerateAuthURL(c *gin.Context) {
 
 // OpenAIExchangeCodeRequest represents the request for exchanging OpenAI auth code
 type OpenAIExchangeCodeRequest struct {
-	SessionID   string `json:"session_id" binding:"required"`
-	Code        string `json:"code" binding:"required"`
-	State       string `json:"state" binding:"required"`
-	RedirectURI string `json:"redirect_uri"`
-	ProxyID     *int64 `json:"proxy_id"`
+	SessionID     string `json:"session_id" binding:"required"`
+	Code          string `json:"code" binding:"required"`
+	State         string `json:"state" binding:"required"`
+	RedirectURI   string `json:"redirect_uri"`
+	ProxyID       *int64 `json:"proxy_id"`
+	EgressRouteID *int64 `json:"egress_route_id"`
 }
 
 // ExchangeCode exchanges OpenAI authorization code for tokens
@@ -160,11 +163,12 @@ func (h *OpenAIOAuthHandler) ExchangeCode(c *gin.Context) {
 	}
 
 	tokenInfo, err := h.openaiOAuthService.ExchangeCode(c.Request.Context(), &service.OpenAIExchangeCodeInput{
-		SessionID:   req.SessionID,
-		Code:        req.Code,
-		State:       req.State,
-		RedirectURI: req.RedirectURI,
-		ProxyID:     req.ProxyID,
+		SessionID:     req.SessionID,
+		Code:          req.Code,
+		State:         req.State,
+		RedirectURI:   req.RedirectURI,
+		ProxyID:       req.ProxyID,
+		EgressRouteID: req.EgressRouteID,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)
@@ -176,10 +180,11 @@ func (h *OpenAIOAuthHandler) ExchangeCode(c *gin.Context) {
 
 // OpenAIRefreshTokenRequest represents the request for refreshing OpenAI token
 type OpenAIRefreshTokenRequest struct {
-	RefreshToken string `json:"refresh_token"`
-	RT           string `json:"rt"`
-	ClientID     string `json:"client_id"`
-	ProxyID      *int64 `json:"proxy_id"`
+	RefreshToken  string `json:"refresh_token"`
+	RT            string `json:"rt"`
+	ClientID      string `json:"client_id"`
+	ProxyID       *int64 `json:"proxy_id"`
+	EgressRouteID *int64 `json:"egress_route_id"`
 }
 
 type OpenAICodexPATCreateRequest struct {
@@ -188,6 +193,7 @@ type OpenAICodexPATCreateRequest struct {
 	Notes                   *string        `json:"notes"`
 	GroupIDs                []int64        `json:"group_ids"`
 	ProxyID                 *int64         `json:"proxy_id"`
+	EgressRouteID           *int64         `json:"egress_route_id"`
 	Concurrency             *int           `json:"concurrency"`
 	Priority                *int           `json:"priority"`
 	RateMultiplier          *float64       `json:"rate_multiplier"`
@@ -218,7 +224,7 @@ func (h *OpenAIOAuthHandler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthProxyURL(c.Request.Context(), req.ProxyID)
+	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthEgressURL(c.Request.Context(), req.ProxyID, req.EgressRouteID)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -231,7 +237,14 @@ func (h *OpenAIOAuthHandler) RefreshToken(c *gin.Context) {
 		clientID, _ = openai.OAuthClientConfigByPlatform(platform)
 	}
 
-	tokenInfo, err := h.openaiOAuthService.RefreshTokenWithClientID(c.Request.Context(), refreshToken, proxyURL, clientID)
+	var tokenInfo *service.OpenAITokenInfo
+	if req.EgressRouteID != nil {
+		// A verified direct route intentionally resolves to an empty URL. Keep
+		// that explicit choice instead of applying the legacy default proxy.
+		tokenInfo, err = h.openaiOAuthService.RefreshTokenWithResolvedEgress(c.Request.Context(), refreshToken, proxyURL, clientID)
+	} else {
+		tokenInfo, err = h.openaiOAuthService.RefreshTokenWithClientID(c.Request.Context(), refreshToken, proxyURL, clientID)
+	}
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -313,6 +326,7 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 		State                   string  `json:"state" binding:"required"`
 		RedirectURI             string  `json:"redirect_uri"`
 		ProxyID                 *int64  `json:"proxy_id"`
+		EgressRouteID           *int64  `json:"egress_route_id"`
 		Name                    string  `json:"name"`
 		Concurrency             int     `json:"concurrency"`
 		Priority                int     `json:"priority"`
@@ -326,11 +340,12 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 
 	// Exchange code for tokens
 	tokenInfo, err := h.openaiOAuthService.ExchangeCode(c.Request.Context(), &service.OpenAIExchangeCodeInput{
-		SessionID:   req.SessionID,
-		Code:        req.Code,
-		State:       req.State,
-		RedirectURI: req.RedirectURI,
-		ProxyID:     req.ProxyID,
+		SessionID:     req.SessionID,
+		Code:          req.Code,
+		State:         req.State,
+		RedirectURI:   req.RedirectURI,
+		ProxyID:       req.ProxyID,
+		EgressRouteID: req.EgressRouteID,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)
@@ -357,13 +372,32 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	proxyID := req.ProxyID
+	var egressPool *service.ReplaceAccountPoolInput
+	if tokenInfo.OAuthUsesEgressPool && tokenInfo.EgressRouteID != nil {
+		concurrency := req.Concurrency
+		if concurrency <= 0 {
+			concurrency = 3
+		}
+		routeID := *tokenInfo.EgressRouteID
+		egressPool = &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{routeID},
+			PrimaryRouteID:       routeID,
+			ConcurrencyPerEgress: &concurrency,
+		}
+		proxyID = nil
+	} else if proxyID == nil && tokenInfo.OAuthProxyID != nil {
+		proxyID = tokenInfo.OAuthProxyID
+	}
 	account, err := h.adminService.CreateAccount(c.Request.Context(), &service.CreateAccountInput{
 		Name:        name,
 		Platform:    platform,
 		Type:        "oauth",
 		Credentials: credentials,
 		Extra:       withOpenAIWindowWarmupPolicy(nil, policy),
-		ProxyID:     req.ProxyID,
+		ProxyID:     proxyID,
+		EgressPool:  egressPool,
 		Concurrency: req.Concurrency,
 		Priority:    req.Priority,
 		GroupIDs:    req.GroupIDs,
@@ -413,7 +447,7 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		return
 	}
 
-	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthProxyURL(c.Request.Context(), req.ProxyID)
+	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthEgressURL(c.Request.Context(), req.ProxyID, req.EgressRouteID)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -455,6 +489,18 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		skipDefaultGroupBind = *req.SkipDefaultGroupBind
 	}
 
+	var egressPool *service.ReplaceAccountPoolInput
+	proxyID := req.ProxyID
+	if req.EgressRouteID != nil {
+		routeID := *req.EgressRouteID
+		egressPool = &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{routeID},
+			PrimaryRouteID:       routeID,
+			ConcurrencyPerEgress: &concurrency,
+		}
+		proxyID = nil
+	}
 	account, err := h.adminService.CreateAccount(c.Request.Context(), &service.CreateAccountInput{
 		Name:                  buildOpenAICodexPATAccountName(req.Name, tokenInfo),
 		Notes:                 req.Notes,
@@ -462,7 +508,8 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		Type:                  service.AccountTypeOAuth,
 		Credentials:           credentials,
 		Extra:                 extra,
-		ProxyID:               req.ProxyID,
+		ProxyID:               proxyID,
+		EgressPool:            egressPool,
 		Concurrency:           concurrency,
 		Priority:              priority,
 		RateMultiplier:        req.RateMultiplier,

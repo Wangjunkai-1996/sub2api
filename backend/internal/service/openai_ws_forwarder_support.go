@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -179,6 +180,10 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	if prewarmResponseID != "" && stateStore != nil {
 		ttl := s.openAIWSResponseStickyTTL()
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, prewarmResponseID, stateStore.BindResponseAccount(ctx, groupID, prewarmResponseID, account.ID, ttl))
+		bindingID := strings.TrimSpace(lease.BindingID())
+		if bindingID != "" {
+			logOpenAIWSBindResponseEgressWarn(groupID, account.ID, prewarmResponseID, bindingID, bindOpenAIWSResponseEgress(stateStore, ctx, groupID, prewarmResponseID, bindingID, ttl))
+		}
 		stateStore.BindResponseConn(prewarmResponseID, lease.ConnID(), ttl)
 	}
 	logOpenAIWSModeInfo(
@@ -549,20 +554,52 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 	if accountID <= 0 || account == nil || store == nil {
 		return nil, nil
 	}
+	groupIDValue := derefGroupID(groupID)
+	requiredBindingID, hasResponseEgress := getOpenAIWSResponseEgress(store, ctx, groupIDValue, responseID)
+	poolEnforced := accountUsesEnforcedEgressPool(ctx, s.settingService, account)
+	if poolEnforced {
+		if !hasResponseEgress || strings.TrimSpace(requiredBindingID) == "" {
+			return nil, fmt.Errorf("%w: previous response %s has no egress binding", ErrAccountEgressNoRoute, responseID)
+		}
+		boundAccountID, _, validBinding := parseStableAccountEgressBindingID(requiredBindingID)
+		if !validBinding || boundAccountID != accountID {
+			return nil, fmt.Errorf("%w: previous response %s has an invalid egress binding", ErrAccountEgressConfigStale, responseID)
+		}
+		ctx = WithRequiredAccountEgressBinding(ctx, requiredBindingID)
+	}
 
-	result, acquireErr := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
-	if acquireErr == nil && result.Acquired {
+	result, acquireErr := s.tryAcquireAccountSlot(ctx, account)
+	if acquireErr == nil && result != nil && result.Acquired {
+		selectedAccount := selectionAccount(result, account)
+		selectedBindingID := ""
+		if selectedAccount != nil && selectedAccount.SelectedEgress != nil {
+			selectedBindingID = strings.TrimSpace(selectedAccount.SelectedEgress.BindingID)
+		}
+		if poolEnforced && selectedBindingID != requiredBindingID {
+			if result.ReleaseFunc != nil {
+				result.ReleaseFunc()
+			}
+			return nil, fmt.Errorf("%w: previous response %s acquired egress binding %q, want %q", ErrAccountEgressConfigStale, responseID, selectedBindingID, requiredBindingID)
+		}
 		logOpenAIWSBindResponseAccountWarn(
-			derefGroupID(groupID),
+			groupIDValue,
 			accountID,
 			responseID,
-			store.BindResponseAccount(ctx, derefGroupID(groupID), responseID, accountID, s.openAIWSResponseStickyTTL()),
+			store.BindResponseAccount(ctx, groupIDValue, responseID, accountID, s.openAIWSResponseStickyTTL()),
 		)
-		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account:     account,
-			Acquired:    true,
-			ReleaseFunc: result.ReleaseFunc,
-		}), nil
+		if selectedBindingID != "" {
+			logOpenAIWSBindResponseEgressWarn(
+				groupIDValue,
+				accountID,
+				responseID,
+				selectedBindingID,
+				bindOpenAIWSResponseEgress(store, ctx, groupIDValue, responseID, selectedBindingID, s.openAIWSResponseStickyTTL()),
+			)
+		}
+		return s.newAcquiredSelectionResult(ctx, selectedAccount, result.ReleaseFunc)
+	}
+	if isAccountEgressAdmissionError(acquireErr) {
+		return nil, acquireErr
 	}
 
 	cfg := s.schedulingConfig()

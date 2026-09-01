@@ -573,16 +573,16 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		)
 		return nil, true, nil
 	}
-	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
+	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account)
 	if acquireErr == nil && result != nil && result.Acquired {
 		if !req.PreserveStickyBinding {
 			_ = s.service.refreshStickySessionTTL(ctx, req.GroupID, sessionHash, s.service.openAIWSSessionStickyTTL())
 		}
-		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account:     account,
-			Acquired:    true,
-			ReleaseFunc: result.ReleaseFunc,
-		}), false, nil
+		selection, selectErr := s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
+		return selection, false, selectErr
+	}
+	if isAccountEgressAdmissionError(acquireErr) {
+		return nil, true, nil
 	}
 
 	cfg := s.service.schedulingConfig()
@@ -1174,6 +1174,8 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 	budget *openAISelectionProbeBudget,
 ) (*AccountSelectionResult, bool, error) {
 	compactBlocked := false
+	var lastEgressAdmissionErr error
+	hasLegacyCandidate := false
 	release := func(result *AcquireResult) {
 		if result != nil && result.ReleaseFunc != nil {
 			result.ReleaseFunc()
@@ -1184,16 +1186,24 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		if candidate.account == nil {
 			continue
 		}
-		if candidate.loadKnown && candidate.account.Concurrency > 0 &&
+		enforcedPool := accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account)
+		if !enforcedPool {
+			hasLegacyCandidate = true
+		}
+		if !enforcedPool && candidate.loadKnown && candidate.account.Concurrency > 0 &&
 			candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency {
 			continue
 		}
 
-		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, candidate.account.ID, candidate.account.Concurrency, budget)
+		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, candidate.account, budget)
 		if !attempted {
 			break
 		}
 		if acquireErr != nil {
+			if isAccountEgressAdmissionError(acquireErr) {
+				lastEgressAdmissionErr = acquireErr
+				continue
+			}
 			return nil, compactBlocked, acquireErr
 		}
 		if result == nil || !result.Acquired {
@@ -1220,13 +1230,26 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			continue
 		}
 
-		if fresh.Concurrency != candidate.account.Concurrency {
+		candidatePool := accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account)
+		freshPool := accountUsesEnforcedEgressPool(ctx, s.service.settingService, fresh)
+		admissionChanged := fresh.Concurrency != candidate.account.Concurrency || candidatePool != freshPool
+		if freshPool {
+			admissionChanged = admissionChanged || result.Egress == nil ||
+				result.Egress.ConfigVersion != accountEgressRuntimeVersion(fresh)
+		} else if result.Egress != nil {
+			admissionChanged = true
+		}
+		if admissionChanged {
 			release(result)
-			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh.ID, fresh.Concurrency, budget)
+			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget)
 			if !attempted {
 				continue
 			}
 			if acquireErr != nil {
+				if isAccountEgressAdmissionError(acquireErr) {
+					lastEgressAdmissionErr = acquireErr
+					continue
+				}
 				return nil, compactBlocked, acquireErr
 			}
 			if result == nil || !result.Acquired {
@@ -1236,25 +1259,31 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		if req.SessionHash != "" && !req.PreserveStickyBinding {
 			_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, fresh.ID)
 		}
-		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account:     fresh,
-			Acquired:    true,
-			ReleaseFunc: result.ReleaseFunc,
-		}), compactBlocked, nil
+		selection, selectErr := s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
+		if isAccountEgressAdmissionError(selectErr) {
+			lastEgressAdmissionErr = selectErr
+			continue
+		}
+		return selection, compactBlocked, selectErr
+	}
+	if lastEgressAdmissionErr != nil && !hasLegacyCandidate {
+		return nil, compactBlocked, lastEgressAdmissionErr
 	}
 	return nil, compactBlocked, nil
 }
 
 func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAIAccountSlot(
 	ctx context.Context,
-	accountID int64,
-	maxConcurrency int,
+	account *Account,
 	budget *openAISelectionProbeBudget,
 ) (*AcquireResult, bool, error) {
-	if s.service.concurrencyService != nil && maxConcurrency > 0 && !budget.recordAcquire(accountID) {
+	if account == nil {
+		return nil, true, ErrAccountEgressConfigStale
+	}
+	if s.service.concurrencyService != nil && account.Concurrency > 0 && !budget.recordAcquire(account.ID) {
 		return nil, false, nil
 	}
-	result, err := s.service.tryAcquireAccountSlot(ctx, accountID, maxConcurrency)
+	result, err := s.service.tryAcquireAccountSlot(ctx, account)
 	return result, true, err
 }
 
@@ -1272,6 +1301,7 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 	if !req.StickyWeighted {
 		return nil, nil
 	}
+	var lastEgressAdmissionErr error
 	for _, accountID := range []int64{req.StickyPreviousAccountID, req.StickyAccountID} {
 		if accountID <= 0 {
 			continue
@@ -1319,21 +1349,21 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 			isGrokModelQuotaBlocked(account.ID, upstreamModel, now) {
 			continue
 		}
-		result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+		result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account)
 		if acquireErr != nil {
+			if isAccountEgressAdmissionError(acquireErr) {
+				lastEgressAdmissionErr = acquireErr
+				continue
+			}
 			return nil, acquireErr
 		}
 		if result != nil && result.Acquired {
 			if req.SessionHash != "" && !req.PreserveStickyBinding {
 				_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, account.ID)
 			}
-			return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-				Account:     account,
-				Acquired:    true,
-				ReleaseFunc: result.ReleaseFunc,
-			}), nil
+			return s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
 		}
-		if s.service.concurrencyService != nil {
+		if s.service.concurrencyService != nil && !accountUsesEnforcedEgressPool(ctx, s.service.settingService, account) {
 			cfg := s.service.schedulingConfig()
 			return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 				Account: account,
@@ -1345,6 +1375,9 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 				},
 			}), nil
 		}
+	}
+	if lastEgressAdmissionErr != nil {
+		return nil, lastEgressAdmissionErr
 	}
 	return nil, nil
 }
@@ -1439,7 +1472,6 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 
 	filterStats := openAISelectionFilterStats{pool: len(accounts)}
 	filtered := make([]*Account, 0, len(accounts))
-	loadReq := make([]AccountWithConcurrency, 0, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]
 		if req.ExcludedIDs != nil {
@@ -1476,10 +1508,6 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			continue
 		}
 		filtered = append(filtered, account)
-		loadReq = append(loadReq, AccountWithConcurrency{
-			ID:             account.ID,
-			MaxConcurrency: account.EffectiveLoadFactor(),
-		})
 	}
 	if len(filtered) == 0 {
 		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false, filterStats.summary(""))
@@ -1487,7 +1515,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 
 	loadMap := map[int64]*AccountLoadInfo{}
 	if s.service.concurrencyService != nil {
-		if batchLoad, loadErr := s.service.concurrencyService.GetAccountsLoadBatch(ctx, loadReq); loadErr == nil {
+		if batchLoad, loadErr := getAccountLoadsForScheduling(ctx, s.service.concurrencyService, s.service.settingService, filtered, false); loadErr == nil {
 			loadMap = batchLoad
 		}
 	}
@@ -1599,8 +1627,7 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 	}
 
 	if s.service.concurrencyService != nil && !budget.acquireExhausted() {
-		loadReq := buildOpenAIAccountLoadRequest(filtered)
-		if freshLoadMap, loadErr := s.service.concurrencyService.GetAccountsLoadBatchFresh(ctx, loadReq); loadErr == nil {
+		if freshLoadMap, loadErr := getAccountLoadsForScheduling(ctx, s.service.concurrencyService, s.service.settingService, filtered, true); loadErr == nil {
 			freshPlan := s.buildOpenAIAccountLoadPlan(ctx, req, filtered, freshLoadMap)
 			if openAICostOverflowExpanded(req, freshPlan) {
 				budget.enableLimit()
@@ -1650,20 +1677,6 @@ func openAICostOverflowExpanded(req OpenAIAccountScheduleRequest, plan openAIAcc
 	return supported > plan.topK || unknown > plan.topK
 }
 
-func buildOpenAIAccountLoadRequest(accounts []*Account) []AccountWithConcurrency {
-	loadReq := make([]AccountWithConcurrency, 0, len(accounts))
-	for _, account := range accounts {
-		if account == nil {
-			continue
-		}
-		loadReq = append(loadReq, AccountWithConcurrency{
-			ID:             account.ID,
-			MaxConcurrency: account.EffectiveLoadFactor(),
-		})
-	}
-	return loadReq
-}
-
 func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
@@ -1687,6 +1700,7 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 
 	cfg := s.service.schedulingConfig()
 	compactBlocked := attempt.compactBlocked
+	var lastEgressAdmissionErr error
 	// WaitPlan.MaxConcurrency 使用 Concurrency（非 EffectiveLoadFactor），因为 WaitPlan 控制的是 Redis 实际并发槽位等待。
 	passes := 1
 	if budget != nil && budget.limited {
@@ -1700,7 +1714,8 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				continue
 			}
 			if budget != nil && budget.limited {
-				knownFull := candidate.loadKnown && candidate.account.Concurrency > 0 &&
+				knownFull := !accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account) &&
+					candidate.loadKnown && candidate.account.Concurrency > 0 &&
 					candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency
 				if budget.wasAttempted(candidate.account.ID) != wantAttempted || knownFull != wantKnownFull {
 					continue
@@ -1721,6 +1736,21 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				compactBlocked = true
 				continue
 			}
+			if accountUsesEnforcedEgressPool(ctx, s.service.settingService, fresh) {
+				result, acquireErr := s.service.tryAcquireAccountSlot(ctx, fresh)
+				if acquireErr == nil && result != nil && result.Acquired {
+					selection, selectErr := s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
+					return selection, candidateCount, topK, loadSkew, selectErr
+				}
+				if isAccountEgressAdmissionError(acquireErr) {
+					lastEgressAdmissionErr = acquireErr
+					continue
+				}
+				if acquireErr != nil {
+					return nil, candidateCount, topK, loadSkew, acquireErr
+				}
+				continue
+			}
 			return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 				Account: fresh,
 				WaitPlan: &AccountWaitPlan{
@@ -1733,6 +1763,9 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 		}
 	}
 
+	if lastEgressAdmissionErr != nil {
+		return nil, candidateCount, topK, loadSkew, lastEgressAdmissionErr
+	}
 	return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
 }
 

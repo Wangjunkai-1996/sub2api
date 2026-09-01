@@ -207,6 +207,7 @@ type OpenAIQuotaService struct {
 	proxyRepo            ProxyRepository
 	tokenProvider        *OpenAITokenProvider
 	privacyClientFactory PrivacyClientFactory
+	oauthEgressResolver  *OpenAIOAuthService
 	pluginTransport      openAIWindowPluginTransport
 	agentIdentityTaskMu  sync.Mutex
 	agentIdentityWS      agentIdentityWSConnectionInvalidator
@@ -235,6 +236,12 @@ func NewOpenAIQuotaService(
 func (s *OpenAIQuotaService) SetPluginTransport(transport openAIWindowPluginTransport) {
 	if s != nil {
 		s.pluginTransport = transport
+	}
+}
+
+func (s *OpenAIQuotaService) SetOAuthEgressResolver(resolver *OpenAIOAuthService) {
+	if s != nil {
+		s.oauthEgressResolver = resolver
 	}
 }
 
@@ -783,12 +790,16 @@ func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID 
 	}
 	fedRAMP = account.IsChatGPTAccountFedRAMP()
 
-	// account.Proxy is eager-loaded by accountRepo.GetByID (see
-	// repository.accountsToService), so we can read the proxy URL directly
-	// instead of round-tripping the DB again. Fall back to proxyRepo only
-	// when Proxy isn't pre-populated (defensive — e.g. callers that built
-	// the Account by hand).
-	if account.ProxyID != nil {
+	if account.EgressMode == EgressModePool {
+		if s.oauthEgressResolver == nil {
+			return "", "", "", false, infraerrors.New(http.StatusServiceUnavailable, "OPENAI_QUOTA_EGRESS_UNAVAILABLE", "account primary egress resolver is unavailable")
+		}
+		proxyURL, err = s.oauthEgressResolver.ResolveOpenAIAccountControlProxyURL(ctx, account)
+		if err != nil {
+			return "", "", "", false, err
+		}
+	} else if account.ProxyID != nil {
+		// Legacy accounts retain their existing eager proxy path.
 		switch {
 		case account.Proxy != nil:
 			proxyURL = account.Proxy.URL()

@@ -375,18 +375,46 @@
             />
           </template>
           <template #cell-proxy="{ row }">
-            <div class="flex flex-col gap-1">
-              <div v-if="row.proxy" class="flex items-center gap-2">
-                <span class="text-sm text-gray-700 dark:text-gray-300">{{ row.proxy.name }}</span>
-                <span v-if="row.proxy.country_code" class="text-xs text-gray-500 dark:text-gray-400">
-                  ({{ row.proxy.country_code }})
+            <div class="flex min-w-[9rem] flex-col gap-1">
+              <span
+                v-if="isInheritedEgress(row)"
+                class="inline-flex w-fit items-center gap-1 rounded bg-sky-50 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-300"
+              >
+                <Icon name="link" size="xs" />
+                {{ t('admin.accounts.egressPool.inherited') }}
+              </span>
+              <div v-if="accountEgressRoutes(row).length" class="flex max-w-[15rem] flex-wrap gap-1">
+                <span
+                  v-for="route in accountEgressRoutes(row).slice(0, 2)"
+                  :key="route.id"
+                  class="inline-flex min-w-0 max-w-[7rem] items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-700 dark:bg-dark-700 dark:text-gray-200"
+                  :title="egressRouteTitle(route)"
+                >
+                  <Icon :name="route.kind === 'direct' ? 'server' : 'globe'" size="xs" class="shrink-0" />
+                  <span class="truncate">{{ route.name }}</span>
+                </span>
+                <span
+                  v-if="accountEgressRoutes(row).length > 2"
+                  class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600 dark:bg-dark-700 dark:text-gray-300"
+                >
+                  +{{ accountEgressRoutes(row).length - 2 }}
                 </span>
               </div>
-              <span v-else class="text-sm text-gray-400 dark:text-dark-500">-</span>
-              <div v-if="row.proxy && row.proxy.expires_at" class="flex items-center gap-2 text-xs">
-                <span class="text-gray-600 dark:text-gray-300">{{ formatDateTime(row.proxy.expires_at) }}</span>
-                <span :class="proxyExpiryBadge(row.proxy)">{{ proxyExpiryText(row.proxy) }}</span>
+              <span v-else-if="configuredEgressCount(row) > 0" class="text-xs text-gray-600 dark:text-gray-300">
+                {{ t('admin.accounts.egressPool.routeCount', { count: configuredEgressCount(row) }) }}
+              </span>
+              <div v-else-if="row.proxy" class="flex items-center gap-2">
+                <span class="text-sm text-gray-700 dark:text-gray-300">{{ row.proxy.name }}</span>
+                <span v-if="row.proxy.country_code" class="text-xs text-gray-500 dark:text-gray-400">({{ row.proxy.country_code }})</span>
               </div>
+              <span v-else class="text-sm text-gray-400 dark:text-dark-500">-</span>
+              <span
+                v-if="degradedEgressCount(row) > 0"
+                class="inline-flex w-fit items-center gap-1 text-xs text-amber-700 dark:text-amber-300"
+              >
+                <Icon name="exclamationTriangle" size="xs" />
+                {{ t('admin.accounts.egressPool.degraded') }}
+              </span>
               <div v-if="row.proxy_fallback_origin_id" class="flex items-center gap-1">
                 <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" :title="t('admin.accounts.fallbackActiveTip', { origin: row.proxy_fallback_origin_name })">
                   {{ t('admin.accounts.fallbackActive') }}
@@ -498,8 +526,8 @@
       </template>
       <template #pagination><Pagination v-if="pagination.total > 0" :page="pagination.page" :total="pagination.total" :page-size="pagination.page_size" @update:page="handlePageChange" @update:pageSize="handlePageSizeChange" /></template>
     </TablePageLayout>
-    <CreateAccountModal :show="showCreate" :proxies="proxies" :groups="groups" @close="showCreate = false" @created="reload" />
-    <EditAccountModal :show="showEdit" :account="edAcc" :proxies="proxies" :groups="groups" @close="showEdit = false" @updated="handleAccountUpdated" />
+    <CreateAccountModal :show="showCreate" :egress-routes="egressRoutes" :groups="groups" @close="showCreate = false" @created="reload" />
+    <EditAccountModal :show="showEdit" :account="edAcc" :egress-routes="egressRoutes" :groups="groups" @close="showEdit = false" @updated="handleAccountUpdated" />
     <ReAuthAccountModal :show="showReAuth" :account="reAuthAcc" @close="closeReAuthModal" @reauthorized="handleAccountUpdated" />
     <AccountTestModal :show="showTest" :account="testingAcc" @close="closeTestModal" />
     <AccountStatsModal :show="showStats" :account="statsAcc" @close="closeStatsModal" />
@@ -513,7 +541,7 @@
       :selected-platforms="selPlatforms"
       :selected-types="selTypes"
       :target="bulkEditTarget ?? undefined"
-      :proxies="proxies"
+      :egress-routes="egressRoutes"
       :groups="groups"
       @close="showBulkEdit = false"
       @updated="handleBulkUpdated"
@@ -575,18 +603,17 @@ import TLSFingerprintProfilesModal from '@/components/admin/TLSFingerprintProfil
 import { fetchAllAccountIds } from '@/utils/accountSelection'
 import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey, buildOpenAIWarmupRefreshKey } from '@/utils/accountUsageRefresh'
 import { formatDateTime, formatRelativeTime } from '@/utils/format'
-import { proxyExpiryBadgeClass, proxyExpiryLabelKey } from '@/utils/proxyExpiry'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
-import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
+import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, AssignableEgressRoute, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
 const appStore = useAppStore()
 const authStore = useAuthStore()
 
-const proxies = ref<AccountProxy[]>([])
+const egressRoutes = ref<AssignableEgressRoute[]>([])
 const groups = ref<AdminGroup[]>([])
 const accountTableRef = ref<HTMLElement | null>(null)
 const dataTableRef = ref<InstanceType<typeof DataTable> | null>(null)
@@ -1390,6 +1417,10 @@ const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
   return (
     current.updated_at !== next.updated_at ||
     current.current_concurrency !== next.current_concurrency ||
+    current.egress_summary?.current_concurrency !== next.egress_summary?.current_concurrency ||
+    current.egress_summary?.effective_capacity !== next.egress_summary?.effective_capacity ||
+    current.egress_summary?.eligible_route_count !== next.egress_summary?.eligible_route_count ||
+    current.egress_revision !== next.egress_revision ||
     current.current_window_cost !== next.current_window_cost ||
     current.active_sessions !== next.active_sessions ||
     current.schedulable !== next.schedulable ||
@@ -1853,7 +1884,7 @@ const allColumns = computed(() => {
   }
   c.push({ key: 'usage', label: t('admin.accounts.columns.usageWindows'), sortable: false })
   c.push(
-    { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
+    { key: 'proxy', label: t('admin.accounts.columns.egress'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },
     { key: 'scheduler_score', label: t('admin.accounts.columns.schedulerScore'), sortable: false },
     { key: 'rate_multiplier', label: t('admin.accounts.columns.billingRateMultiplier'), sortable: true },
@@ -2260,6 +2291,8 @@ const accountMatchesCurrentFilters = (account: Account) => {
 const mergeRuntimeFields = (oldAccount: Account, updatedAccount: Account): Account => ({
   ...updatedAccount,
   current_concurrency: updatedAccount.current_concurrency ?? oldAccount.current_concurrency,
+  egress_summary: updatedAccount.egress_summary ?? oldAccount.egress_summary,
+  egress_pool: updatedAccount.egress_pool ?? oldAccount.egress_pool,
   current_window_cost: updatedAccount.current_window_cost ?? oldAccount.current_window_cost,
   active_sessions: updatedAccount.active_sessions ?? oldAccount.active_sessions,
   openai_window_warmup: updatedAccount.openai_window_warmup ?? oldAccount.openai_window_warmup
@@ -2599,11 +2632,39 @@ const isExpired = (value: number | null) => {
   if (!value) return false
   return value * 1000 <= Date.now()
 }
-// 所绑定代理的有效期(逻辑同 /admin/proxies,见 utils/proxyExpiry)
-const proxyExpiryBadge = (p: AccountProxy): string => proxyExpiryBadgeClass(p.expires_at, p.status)
-const proxyExpiryText = (p: AccountProxy): string => {
-  const { key, params } = proxyExpiryLabelKey(p.expires_at, p.status)
-  return params ? t(key, params) : t(key)
+const accountEgressRoutes = (account: Account): AssignableEgressRoute[] => {
+  const embedded = account.egress_summary?.routes ?? account.egress_pool?.routes ?? []
+  if (embedded.length > 0) return embedded
+  const routeIDs = account.egress_pool?.route_ids ?? []
+  return routeIDs
+    .map((id) => egressRoutes.value.find((route) => route.id === id))
+    .filter((route): route is AssignableEgressRoute => route != null)
+}
+
+const configuredEgressCount = (account: Account): number =>
+  account.egress_summary?.configured_route_count
+  ?? account.egress_pool?.route_ids?.length
+  ?? accountEgressRoutes(account).length
+
+const degradedEgressCount = (account: Account): number => {
+  if (account.egress_summary?.degraded_route_count != null) {
+    return account.egress_summary.degraded_route_count
+  }
+  const configured = account.egress_summary?.configured_route_count
+  const eligible = account.egress_summary?.eligible_route_count
+  return configured != null && eligible != null ? Math.max(0, configured - eligible) : 0
+}
+
+const isInheritedEgress = (account: Account): boolean =>
+  account.parent_account_id != null
+  || account.egress_mode === 'inherited'
+  || account.egress_summary?.inherited === true
+  || account.egress_pool?.inherited === true
+
+const egressRouteTitle = (route: AssignableEgressRoute): string => {
+  const parts = [route.name, route.observed_ip || route.ip_address, route.country_code || route.country]
+  if (route.probe_latency_ms != null) parts.push(`${route.probe_latency_ms}ms`)
+  return parts.filter((part): part is string => Boolean(part)).join(' / ')
 }
 
 // 表格滚动时关闭行操作菜单，并让顶部工具菜单继续贴紧触发按钮。
@@ -2643,14 +2704,17 @@ onMounted(async () => {
 
   load()
   loadUpstreamBillingProbeGlobalState()
-  const [proxiesResult, groupsResult] = await Promise.allSettled([
-    adminAPI.proxies.getAll(),
+  const egressRoutesRequest = adminAPI.egressRoutes?.getAssignable
+    ? adminAPI.egressRoutes.getAssignable()
+    : Promise.resolve([] as AssignableEgressRoute[])
+  const [egressRoutesResult, groupsResult] = await Promise.allSettled([
+    egressRoutesRequest,
     adminAPI.groups.getAll()
   ])
-  if (proxiesResult.status === 'fulfilled') {
-    proxies.value = proxiesResult.value
+  if (egressRoutesResult.status === 'fulfilled') {
+    egressRoutes.value = egressRoutesResult.value
   } else {
-    console.error('Failed to load proxies:', proxiesResult.reason)
+    console.error('Failed to load assignable egress routes:', egressRoutesResult.reason)
   }
   if (groupsResult.status === 'fulfilled') {
     groups.value = groupsResult.value

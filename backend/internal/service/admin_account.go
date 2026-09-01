@@ -461,11 +461,58 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	return account, nil
 }
 
+func requestedProxyMatchesPoolMirror(current *int64, requested int64) bool {
+	if requested == 0 {
+		return current == nil
+	}
+	return current != nil && *current == requested
+}
+
+func currentAccountPoolWrite(account *Account, concurrency int) (*ReplaceAccountPoolInput, error) {
+	if account == nil || account.ID <= 0 || account.EgressMode != EgressModePool || account.EgressRevision <= 0 {
+		return nil, ErrEgressPoolInvalid
+	}
+	routeIDs := make([]int64, 0, len(account.EgressBindings))
+	primaryRouteID := int64(0)
+	for _, binding := range account.EgressBindings {
+		if binding.RouteID <= 0 {
+			return nil, ErrEgressPoolInvalid
+		}
+		routeIDs = append(routeIDs, binding.RouteID)
+		if binding.IsPrimary {
+			if primaryRouteID != 0 {
+				return nil, ErrEgressPoolInvalid
+			}
+			primaryRouteID = binding.RouteID
+		}
+	}
+	if len(routeIDs) == 0 || primaryRouteID == 0 {
+		return nil, ErrEgressPoolInvalid
+	}
+	revision := account.EgressRevision
+	return &ReplaceAccountPoolInput{
+		Mode:                 EgressModePool,
+		RouteIDs:             routeIDs,
+		PrimaryRouteID:       primaryRouteID,
+		ConcurrencyPerEgress: &concurrency,
+		ExpectedRevision:     &revision,
+	}, nil
+}
+
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	if input == nil {
+		return nil, ErrAccountNilInput
+	}
+	if input.EgressPool != nil && input.ProxyID != nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool")
+	}
+	if input.EgressPool != nil && (input.Platform != PlatformOpenAI || input.Type != AccountTypeOAuth) {
+		return nil, ErrEgressAccountUnsupported
+	}
 	// New OpenAI OAuth/PAT accounts inherit the configured default proxy only
 	// when the caller did not explicitly choose one. API-key accounts and
 	// explicit proxy selections retain their existing behavior.
-	if input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil && s.settingService != nil {
+	if input.EgressPool == nil && input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil && s.settingService != nil {
 		proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
 		if err != nil {
 			return nil, err
@@ -523,14 +570,48 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err != nil {
 		return nil, err
 	}
-	if err := s.accountRepo.Create(ctx, account); err != nil {
-		return nil, err
-	}
+	if input.EgressPool != nil {
+		pool := *input.EgressPool
+		pool.RouteIDs = append([]int64(nil), input.EgressPool.RouteIDs...)
+		if strings.TrimSpace(pool.Mode) == "" {
+			pool.Mode = EgressModePool
+		}
+		if pool.ExpectedRevision != nil || pool.Mode != EgressModePool {
+			return nil, ErrEgressPoolInvalid
+		}
+		if pool.ConcurrencyPerEgress == nil {
+			concurrency := account.Concurrency
+			pool.ConcurrencyPerEgress = &concurrency
+		} else {
+			account.Concurrency = *pool.ConcurrencyPerEgress
+		}
+		if !validReplaceAccountPoolInput(pool) {
+			return nil, ErrEgressPoolInvalid
+		}
+		account.EgressMode = EgressModePool
+		account.EgressPoolWrite = &pool
+		account.ProxyID = nil
 
-	// 绑定分组
-	if len(groupIDs) > 0 {
-		if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
+		if s.accountDuplicateRepo == nil {
+			return nil, infraerrors.New(http.StatusInternalServerError, "ACCOUNT_EGRESS_ATOMIC_WRITER_UNAVAILABLE", "account egress atomic writer is unavailable")
+		}
+		groups := make([]AccountGroup, 0, len(groupIDs))
+		for index, groupID := range groupIDs {
+			groups = append(groups, AccountGroup{GroupID: groupID, Priority: index + 1})
+		}
+		if err := s.accountDuplicateRepo.CreateWithAccountGroups(ctx, account, groups); err != nil {
 			return nil, err
+		}
+	} else {
+		if err := s.accountRepo.Create(ctx, account); err != nil {
+			return nil, err
+		}
+
+		// 绑定分组
+		if len(groupIDs) > 0 {
+			if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -563,9 +644,29 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 }
 
 func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *UpdateAccountInput) (*Account, error) {
+	if input == nil {
+		return nil, ErrAccountNilInput
+	}
+	if input.EgressPool != nil && input.ProxyID != nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool")
+	}
+	if input.EgressPool != nil && input.GroupIDs != nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_GROUPS_CONFLICT", "egress_pool and group_ids must be updated in separate requests")
+	}
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if input.EgressPool != nil && (account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth) {
+		return nil, ErrEgressAccountUnsupported
+	}
+	if account.EgressMode == EgressModePool && input.EgressPool == nil && input.ProxyID != nil {
+		if !requestedProxyMatchesPoolMirror(account.ProxyID, *input.ProxyID) {
+			return nil, ErrEgressPoolVersionRequired
+		}
+		// Old clients often echo the mirrored proxy_id. It is not an independent
+		// pool mutation and must not overwrite the authoritative primary route.
+		input.ProxyID = nil
 	}
 	var normalizedExtra map[string]any
 	if input.Extra != nil {
@@ -765,6 +866,35 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	// 只在指针非 nil 时更新 Concurrency（支持设置为 0）
 	if input.Concurrency != nil {
 		account.Concurrency = normalizeAccountConcurrency(account.Platform, account.Type, *input.Concurrency)
+	}
+	if input.EgressPool == nil && input.Concurrency != nil && account.EgressMode == EgressModePool && !account.IsCredentialShadow() {
+		input.EgressPool, err = currentAccountPoolWrite(account, account.Concurrency)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if input.EgressPool != nil {
+		pool := *input.EgressPool
+		pool.RouteIDs = append([]int64(nil), input.EgressPool.RouteIDs...)
+		if strings.TrimSpace(pool.Mode) == "" {
+			pool.Mode = EgressModePool
+		}
+		if pool.ExpectedRevision == nil {
+			return nil, ErrEgressPoolInvalid
+		}
+		if pool.ConcurrencyPerEgress == nil {
+			concurrency := account.Concurrency
+			pool.ConcurrencyPerEgress = &concurrency
+		} else {
+			if input.Concurrency != nil && account.Concurrency != *pool.ConcurrencyPerEgress {
+				return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_CONCURRENCY_CONFLICT", "concurrency conflicts with egress_pool.concurrency_per_egress")
+			}
+			account.Concurrency = *pool.ConcurrencyPerEgress
+		}
+		if !validReplaceAccountPoolInput(pool) {
+			return nil, ErrEgressPoolInvalid
+		}
+		account.EgressPoolWrite = &pool
 	}
 	// 只在指针非 nil 时更新 Priority（支持设置为 0）
 	if input.Priority != nil {

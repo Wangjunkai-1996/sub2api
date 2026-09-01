@@ -176,6 +176,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 			)
 			if len(failedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, clientRequestModel, routingModel, service.PlatformOpenAI)
+				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}

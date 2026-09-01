@@ -142,9 +142,13 @@ const ModelWhitelistSelectorStub = defineComponent({
   template: '<div data-testid="model-whitelist-selector" />',
 })
 
-function mountModal(groups: any[] = []) {
+const defaultEgressRoutes = [
+  { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+]
+
+function mountModal(groups: any[] = [], extraProps: Record<string, unknown> = {}) {
   return mount(CreateAccountModal, {
-    props: { show: true, proxies: [], groups },
+    props: { show: true, proxies: [], egressRoutes: defaultEgressRoutes, groups, ...extraProps },
     global: {
       stubs: {
         BaseDialog: BaseDialogStub,
@@ -167,6 +171,12 @@ async function selectButtonByText(wrapper: ReturnType<typeof mountModal>, text: 
   const button = wrapper.findAll('button').find((candidate) => candidate.text().includes(text))
   expect(button).toBeDefined()
   await button?.trigger('click')
+  if (text === 'OpenAI') {
+    const firstEgressRoute = wrapper.find('input[id^="egress-route-"]')
+    if (firstEgressRoute.exists() && !(firstEgressRoute.element as HTMLInputElement).checked) {
+      await firstEgressRoute.setValue(true)
+    }
+  }
 }
 
 async function submitApiKeyAccount(
@@ -582,5 +592,78 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
     expect(exchangeCodeMock).toHaveBeenCalledTimes(1)
     expect(createAccountMock.mock.calls[0]?.[0]?.openai_codex_warmup_policy).toBe('initial_once')
+  })
+
+  it('submits a multi-route egress pool with one shared per-egress concurrency', async () => {
+    const egressRoutes = [
+      { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    const wrapper = mountModal([], { egressRoutes })
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Pooled account')
+    await wrapper.get('#egress-route-1').setValue(true)
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="egress-concurrency-per-route"]').setValue(4)
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+
+    const flow = wrapper.getComponent(OAuthAuthorizationFlowStub)
+    await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')
+    await flushPromises()
+    flow.vm.authCode = 'authorization-code'
+    flow.vm.oauthState = 'oauth-state'
+    await wrapper.vm.$nextTick()
+    await selectButtonByText(wrapper, 'admin.accounts.oauth.completeAuth')
+    await flushPromises()
+
+    const payload = createAccountMock.mock.calls[0]?.[0]
+    expect(payload).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1, 2],
+        primary_route_id: 1,
+        concurrency_per_egress: 4
+      }
+    })
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
+  })
+
+  it('uses the selected primary egress route for OAuth authorization', async () => {
+    const wrapper = mountModal([], {
+      egressRoutes: [
+        { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+      ]
+    })
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('OAuth account')
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')
+    await flushPromises()
+
+    expect(generateAuthUrlMock).toHaveBeenCalledWith('/admin/openai/generate-auth-url', {
+      egress_route_id: 2
+    })
+  })
+
+  it('keeps legacy proxy and concurrency fields for non-OpenAI accounts', async () => {
+    const wrapper = await submitApiKeyAccount('anthropic')
+    const payload = createAccountMock.mock.calls[0]?.[0]
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    expect(payload).toMatchObject({ proxy_id: null, concurrency: 10 })
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
+  })
+
+  it('keeps legacy proxy and concurrency fields for OpenAI API key accounts', async () => {
+    const wrapper = await submitApiKeyAccount('openai')
+    const payload = createAccountMock.mock.calls[0]?.[0]
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    expect(payload).toMatchObject({ proxy_id: null, concurrency: 10 })
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
   })
 })

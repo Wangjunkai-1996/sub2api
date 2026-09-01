@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/ent/account"
+	"github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	"github.com/Wei-Shaw/sub2api/ent/announcement"
 	"github.com/Wei-Shaw/sub2api/ent/announcementread"
@@ -20,6 +21,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/egressidentity"
+	"github.com/Wei-Shaw/sub2api/ent/egressroute"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
@@ -232,36 +235,64 @@ func init() {
 	accountDescExtra := accountFields[6].Descriptor()
 	// account.DefaultExtra holds the default value on creation for the extra field.
 	account.DefaultExtra = accountDescExtra.Default.(func() map[string]interface{})
+	// accountDescEgressRevision is the schema descriptor for egress_revision field.
+	accountDescEgressRevision := accountFields[10].Descriptor()
+	// account.DefaultEgressRevision holds the default value on creation for the egress_revision field.
+	account.DefaultEgressRevision = accountDescEgressRevision.Default.(int64)
+	// account.EgressRevisionValidator is a validator for the "egress_revision" field. It is called by the builders before save.
+	account.EgressRevisionValidator = accountDescEgressRevision.Validators[0].(func(int64) error)
 	// accountDescConcurrency is the schema descriptor for concurrency field.
-	accountDescConcurrency := accountFields[9].Descriptor()
+	accountDescConcurrency := accountFields[11].Descriptor()
 	// account.DefaultConcurrency holds the default value on creation for the concurrency field.
 	account.DefaultConcurrency = accountDescConcurrency.Default.(int)
 	// accountDescPriority is the schema descriptor for priority field.
-	accountDescPriority := accountFields[11].Descriptor()
+	accountDescPriority := accountFields[13].Descriptor()
 	// account.DefaultPriority holds the default value on creation for the priority field.
 	account.DefaultPriority = accountDescPriority.Default.(int)
 	// accountDescRateMultiplier is the schema descriptor for rate_multiplier field.
-	accountDescRateMultiplier := accountFields[12].Descriptor()
+	accountDescRateMultiplier := accountFields[14].Descriptor()
 	// account.DefaultRateMultiplier holds the default value on creation for the rate_multiplier field.
 	account.DefaultRateMultiplier = accountDescRateMultiplier.Default.(float64)
 	// accountDescStatus is the schema descriptor for status field.
-	accountDescStatus := accountFields[13].Descriptor()
+	accountDescStatus := accountFields[15].Descriptor()
 	// account.DefaultStatus holds the default value on creation for the status field.
 	account.DefaultStatus = accountDescStatus.Default.(string)
 	// account.StatusValidator is a validator for the "status" field. It is called by the builders before save.
 	account.StatusValidator = accountDescStatus.Validators[0].(func(string) error)
 	// accountDescAutoPauseOnExpired is the schema descriptor for auto_pause_on_expired field.
-	accountDescAutoPauseOnExpired := accountFields[17].Descriptor()
+	accountDescAutoPauseOnExpired := accountFields[19].Descriptor()
 	// account.DefaultAutoPauseOnExpired holds the default value on creation for the auto_pause_on_expired field.
 	account.DefaultAutoPauseOnExpired = accountDescAutoPauseOnExpired.Default.(bool)
 	// accountDescSchedulable is the schema descriptor for schedulable field.
-	accountDescSchedulable := accountFields[18].Descriptor()
+	accountDescSchedulable := accountFields[20].Descriptor()
 	// account.DefaultSchedulable holds the default value on creation for the schedulable field.
 	account.DefaultSchedulable = accountDescSchedulable.Default.(bool)
 	// accountDescSessionWindowStatus is the schema descriptor for session_window_status field.
-	accountDescSessionWindowStatus := accountFields[26].Descriptor()
+	accountDescSessionWindowStatus := accountFields[28].Descriptor()
 	// account.SessionWindowStatusValidator is a validator for the "session_window_status" field. It is called by the builders before save.
 	account.SessionWindowStatusValidator = accountDescSessionWindowStatus.Validators[0].(func(string) error)
+	accountegressbindingFields := schema.AccountEgressBinding{}.Fields()
+	_ = accountegressbindingFields
+	// accountegressbindingDescPosition is the schema descriptor for position field.
+	accountegressbindingDescPosition := accountegressbindingFields[2].Descriptor()
+	// accountegressbinding.DefaultPosition holds the default value on creation for the position field.
+	accountegressbinding.DefaultPosition = accountegressbindingDescPosition.Default.(int)
+	// accountegressbinding.PositionValidator is a validator for the "position" field. It is called by the builders before save.
+	accountegressbinding.PositionValidator = accountegressbindingDescPosition.Validators[0].(func(int) error)
+	// accountegressbindingDescIsPrimary is the schema descriptor for is_primary field.
+	accountegressbindingDescIsPrimary := accountegressbindingFields[3].Descriptor()
+	// accountegressbinding.DefaultIsPrimary holds the default value on creation for the is_primary field.
+	accountegressbinding.DefaultIsPrimary = accountegressbindingDescIsPrimary.Default.(bool)
+	// accountegressbindingDescCreatedAt is the schema descriptor for created_at field.
+	accountegressbindingDescCreatedAt := accountegressbindingFields[5].Descriptor()
+	// accountegressbinding.DefaultCreatedAt holds the default value on creation for the created_at field.
+	accountegressbinding.DefaultCreatedAt = accountegressbindingDescCreatedAt.Default.(func() time.Time)
+	// accountegressbindingDescUpdatedAt is the schema descriptor for updated_at field.
+	accountegressbindingDescUpdatedAt := accountegressbindingFields[6].Descriptor()
+	// accountegressbinding.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	accountegressbinding.DefaultUpdatedAt = accountegressbindingDescUpdatedAt.Default.(func() time.Time)
+	// accountegressbinding.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	accountegressbinding.UpdateDefaultUpdatedAt = accountegressbindingDescUpdatedAt.UpdateDefault.(func() time.Time)
 	accountgroupFields := schema.AccountGroup{}.Fields()
 	_ = accountgroupFields
 	// accountgroupDescPriority is the schema descriptor for priority field.
@@ -933,6 +964,50 @@ func init() {
 	compositemodelrouteDescEnabled := compositemodelrouteFields[7].Descriptor()
 	// compositemodelroute.DefaultEnabled holds the default value on creation for the enabled field.
 	compositemodelroute.DefaultEnabled = compositemodelrouteDescEnabled.Default.(bool)
+	egressidentityMixin := schema.EgressIdentity{}.Mixin()
+	egressidentityMixinFields0 := egressidentityMixin[0].Fields()
+	_ = egressidentityMixinFields0
+	egressidentityFields := schema.EgressIdentity{}.Fields()
+	_ = egressidentityFields
+	// egressidentityDescCreatedAt is the schema descriptor for created_at field.
+	egressidentityDescCreatedAt := egressidentityMixinFields0[0].Descriptor()
+	// egressidentity.DefaultCreatedAt holds the default value on creation for the created_at field.
+	egressidentity.DefaultCreatedAt = egressidentityDescCreatedAt.Default.(func() time.Time)
+	// egressidentityDescUpdatedAt is the schema descriptor for updated_at field.
+	egressidentityDescUpdatedAt := egressidentityMixinFields0[1].Descriptor()
+	// egressidentity.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	egressidentity.DefaultUpdatedAt = egressidentityDescUpdatedAt.Default.(func() time.Time)
+	// egressidentity.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	egressidentity.UpdateDefaultUpdatedAt = egressidentityDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// egressidentityDescPublicIP is the schema descriptor for public_ip field.
+	egressidentityDescPublicIP := egressidentityFields[0].Descriptor()
+	// egressidentity.PublicIPValidator is a validator for the "public_ip" field. It is called by the builders before save.
+	egressidentity.PublicIPValidator = egressidentityDescPublicIP.Validators[0].(func(string) error)
+	egressrouteMixin := schema.EgressRoute{}.Mixin()
+	egressrouteMixinFields0 := egressrouteMixin[0].Fields()
+	_ = egressrouteMixinFields0
+	egressrouteFields := schema.EgressRoute{}.Fields()
+	_ = egressrouteFields
+	// egressrouteDescCreatedAt is the schema descriptor for created_at field.
+	egressrouteDescCreatedAt := egressrouteMixinFields0[0].Descriptor()
+	// egressroute.DefaultCreatedAt holds the default value on creation for the created_at field.
+	egressroute.DefaultCreatedAt = egressrouteDescCreatedAt.Default.(func() time.Time)
+	// egressrouteDescUpdatedAt is the schema descriptor for updated_at field.
+	egressrouteDescUpdatedAt := egressrouteMixinFields0[1].Descriptor()
+	// egressroute.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	egressroute.DefaultUpdatedAt = egressrouteDescUpdatedAt.Default.(func() time.Time)
+	// egressroute.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	egressroute.UpdateDefaultUpdatedAt = egressrouteDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// egressrouteDescRuntimeScope is the schema descriptor for runtime_scope field.
+	egressrouteDescRuntimeScope := egressrouteFields[2].Descriptor()
+	// egressroute.RuntimeScopeValidator is a validator for the "runtime_scope" field. It is called by the builders before save.
+	egressroute.RuntimeScopeValidator = egressrouteDescRuntimeScope.Validators[0].(func(string) error)
+	// egressrouteDescRevision is the schema descriptor for revision field.
+	egressrouteDescRevision := egressrouteFields[8].Descriptor()
+	// egressroute.DefaultRevision holds the default value on creation for the revision field.
+	egressroute.DefaultRevision = egressrouteDescRevision.Default.(int64)
+	// egressroute.RevisionValidator is a validator for the "revision" field. It is called by the builders before save.
+	egressroute.RevisionValidator = egressrouteDescRevision.Validators[0].(func(int64) error)
 	errorpassthroughruleMixin := schema.ErrorPassthroughRule{}.Mixin()
 	errorpassthroughruleMixinFields0 := errorpassthroughruleMixin[0].Fields()
 	_ = errorpassthroughruleMixinFields0

@@ -13,7 +13,9 @@ const {
   listAccounts,
   listWithEtag,
   getBatchTodayStats,
+  getUpstreamBillingProbeSettings,
   getAllProxies,
+  getAssignableEgress,
   getAllGroups,
   duplicateAccount,
   createSparkShadow,
@@ -23,7 +25,9 @@ const {
   listAccounts: vi.fn(),
   listWithEtag: vi.fn(),
   getBatchTodayStats: vi.fn(),
+  getUpstreamBillingProbeSettings: vi.fn(),
   getAllProxies: vi.fn(),
+  getAssignableEgress: vi.fn(),
   getAllGroups: vi.fn(),
   duplicateAccount: vi.fn(),
   createSparkShadow: vi.fn(),
@@ -38,7 +42,7 @@ vi.mock('@/api/admin', () => ({
       listWithEtag,
       getBatchTodayStats,
       duplicate: duplicateAccount,
-      getUpstreamBillingProbeSettings: vi.fn().mockResolvedValue({ enabled: true, interval_minutes: 30 }),
+      getUpstreamBillingProbeSettings,
       createSparkShadow,
       delete: vi.fn(),
       batchClearError: vi.fn(),
@@ -46,6 +50,7 @@ vi.mock('@/api/admin', () => ({
       toggleSchedulable: vi.fn()
     },
     proxies: { getAll: getAllProxies },
+    egressRoutes: { getAssignable: getAssignableEgress },
     groups: { getAll: getAllGroups }
   }
 }))
@@ -107,13 +112,15 @@ const mountView = () =>
 describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getAllProxies, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getAllProxies, getAssignableEgress, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
     listAccounts.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20, pages: 0 })
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
+    getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: true, interval_minutes: 30 })
     getAllProxies.mockResolvedValue([])
+    getAssignableEgress.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     duplicateAccount.mockResolvedValue({ id: 998, name: 'parent-acc (Copy)' })
     createSparkShadow.mockResolvedValue({ id: 999, name: 'parent-acc (Spark)' })
@@ -134,6 +141,15 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     expect(duplicateAccount).toHaveBeenCalledWith(42)
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.duplicateSuccess')
     expect(listAccounts.mock.calls.length).toBeGreaterThan(1)
+    wrapper.unmount()
+  })
+
+  it('账号设置只加载脱敏的可分配出口，不再读取完整代理列表', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(getAssignableEgress).toHaveBeenCalledTimes(1)
+    expect(getAllProxies).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 
@@ -224,6 +240,7 @@ const mountViewWithRow = () =>
             <div v-for="(row, idx) in (data || [])" :key="idx">
               <slot name="cell-name" :row="row" :value="row.name" />
               <slot name="cell-platform_type" :row="row" />
+              <slot name="cell-proxy" :row="row" />
             </div>
           </div>`
         },
@@ -259,12 +276,14 @@ const mountViewWithRow = () =>
 describe('admin AccountsView — 账号行展示', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getAllProxies, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getAllProxies, getAssignableEgress, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
+    getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: true, interval_minutes: 30 })
     getAllProxies.mockResolvedValue([])
+    getAssignableEgress.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     vi.stubGlobal('confirm', vi.fn(() => true))
   })
@@ -304,6 +323,46 @@ describe('admin AccountsView — 账号行展示', () => {
     expect(badge.props('privacyMode')).toBe('false')
     expect(badge.props('subscriptionExpiresAt')).toBe('2027-01-01T00:00:00Z')
 
+    wrapper.unmount()
+  })
+
+  it('出口列显示两个节点、折叠剩余数量，并标记继承与降级', async () => {
+    listAccounts.mockResolvedValue({
+      items: [{
+        id: 100,
+        name: 'shadow',
+        platform: 'openai',
+        type: 'oauth',
+        parent_account_id: 1,
+        egress_mode: 'inherited',
+        egress_summary: {
+          configured_route_count: 3,
+          eligible_route_count: 2,
+          degraded_route_count: 1,
+          concurrency_per_egress: 4,
+          effective_capacity: 8,
+          routes: [
+            { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+            { id: 2, kind: 'proxy', name: 'RN-104', state: 'active', eligible: true },
+            { id: 3, kind: 'proxy', name: 'RN-67', state: 'expired', eligible: false }
+          ]
+        }
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.inherited')
+    expect(wrapper.text()).toContain('Local')
+    expect(wrapper.text()).toContain('RN-104')
+    expect(wrapper.text()).not.toContain('RN-67')
+    expect(wrapper.text()).toContain('+1')
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.degraded')
     wrapper.unmount()
   })
 

@@ -83,6 +83,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+	ctx = ContextWithSelectedAccountEgress(ctx, account)
 	// A handler may reuse the same gin context across account failover attempts.
 	// Never let an OAuth attempt's response aliases leak into the next account.
 	setCodexToolNameReverse(c, nil)
@@ -521,6 +522,31 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	sessionHash := ""
 	preferredConnID := ""
 	storeDisabled := false
+	requiredBindingID := ""
+	if account.SelectedEgress != nil {
+		requiredBindingID = strings.TrimSpace(account.SelectedEgress.BindingID)
+	}
+	validateResponseEgress := func(payload openAIWSClientPayload) error {
+		if requiredBindingID == "" || stateStore == nil || payload.previousResponseID == "" {
+			return nil
+		}
+		bindingID, ok := getOpenAIWSResponseEgress(stateStore, ctx, groupID, payload.previousResponseID)
+		if !ok || strings.TrimSpace(bindingID) == "" {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream continuation egress is unavailable; please restart the conversation",
+				fmt.Errorf("%w: response %s has no egress binding", ErrAccountEgressNoRoute, payload.previousResponseID),
+			)
+		}
+		if bindingID != requiredBindingID {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream continuation egress changed; please restart the conversation",
+				fmt.Errorf("%w: response binding %q does not match selected binding %q", ErrAccountEgressConfigStale, bindingID, requiredBindingID),
+			)
+		}
+		return nil
+	}
 	refreshIngressRouteState := func(payload openAIWSClientPayload) {
 		sessionHash = s.GenerateSessionHash(c, payload.rawForHash)
 		if turnState == "" && stateStore != nil && sessionHash != "" {
@@ -544,6 +570,18 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 	}
 	refreshIngressRouteState(firstPayload)
+	if err := validateResponseEgress(firstPayload); err != nil {
+		return err
+	}
+	if requiredBindingID != "" && stateStore != nil && storeDisabled && sessionHash != "" {
+		if bindingID, ok := getOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash); ok && bindingID != requiredBindingID {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream session egress changed; please restart the conversation",
+				fmt.Errorf("%w: session binding %q does not match selected binding %q", ErrAccountEgressConfigStale, bindingID, requiredBindingID),
+			)
+		}
+	}
 
 	if forceHTTPBridge || s.shouldBridgeOpenAIWSHTTP(account, firstPayload.payloadBytes, firstPayload.previousResponseID) {
 		logOpenAIWSModeInfo(
@@ -702,6 +740,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if responseID != "" && stateStore != nil {
 				ttl := s.openAIWSResponseStickyTTL()
 				logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+				if requiredBindingID != "" {
+					logOpenAIWSBindResponseEgressWarn(groupID, account.ID, responseID, requiredBindingID, bindOpenAIWSResponseEgress(stateStore, ctx, groupID, responseID, requiredBindingID, ttl))
+				}
+			}
+			if stateStore != nil && storeDisabled && sessionHash != "" && requiredBindingID != "" {
+				ttl := s.openAIWSSessionStickyTTL()
+				logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, requiredBindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, requiredBindingID, ttl))
 			}
 			nextClientMessage, readErr := readClientMessage()
 			if readErr != nil {
@@ -723,6 +768,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 			if parseErr != nil {
 				return parseErr
+			}
+			if validateErr := validateResponseEgress(nextPayload); validateErr != nil {
+				return validateErr
 			}
 			currentBridgePayload = nextPayload
 		}
@@ -746,9 +794,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
 	baseAcquireReq := openAIWSAcquireRequest{
-		Account: account,
-		WSURL:   wsURL,
-		Headers: wsHeaders,
+		Account:           account,
+		WSURL:             wsURL,
+		Headers:           wsHeaders,
+		RequiredBindingID: requiredBindingID,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -1764,10 +1813,19 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if responseID != "" && stateStore != nil {
 			ttl := s.openAIWSResponseStickyTTL()
 			logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+			bindingID := strings.TrimSpace(sessionLease.BindingID())
+			if bindingID != "" {
+				logOpenAIWSBindResponseEgressWarn(groupID, account.ID, responseID, bindingID, bindOpenAIWSResponseEgress(stateStore, ctx, groupID, responseID, bindingID, ttl))
+			}
 			stateStore.BindResponseConn(responseID, connID, ttl)
 		}
 		if stateStore != nil && storeDisabled && sessionHash != "" {
-			stateStore.BindSessionConn(groupID, sessionHash, connID, s.openAIWSSessionStickyTTL())
+			ttl := s.openAIWSSessionStickyTTL()
+			stateStore.BindSessionConn(groupID, sessionHash, connID, ttl)
+			bindingID := strings.TrimSpace(sessionLease.BindingID())
+			if bindingID != "" {
+				logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, bindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, bindingID, ttl))
+			}
 		}
 		if connID != "" {
 			preferredConnID = connID
@@ -1795,6 +1853,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 		if parseErr != nil {
 			return parseErr
+		}
+		if validateErr := validateResponseEgress(nextPayload); validateErr != nil {
+			return validateErr
 		}
 		nextRoutingFields := gjson.GetManyBytes(nextPayload.payloadRaw, "model", "service_tier")
 		if nextPayload.promptCacheKey != "" {

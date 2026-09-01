@@ -1,11 +1,36 @@
 <template>
   <div class="flex flex-col gap-0.5">
     <!-- 并发槽位 -->
-    <CapacityBadge :color-class="concurrencyClass" :current="currentConcurrency" :max="account.concurrency">
+    <CapacityBadge
+      :color-class="concurrencyClass"
+      :tooltip="egressCapacityTooltip"
+      :current="currentConcurrency"
+      :max="effectiveCapacity"
+    >
       <svg class="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
       </svg>
     </CapacityBadge>
+
+    <span
+      v-if="account.egress_summary"
+      class="whitespace-nowrap text-[10px] leading-tight text-gray-500 dark:text-gray-400"
+      data-testid="egress-capacity-formula"
+    >
+      {{ egressCapacityFormula }}
+    </span>
+
+    <div v-if="egressBreakdown.length > 1" class="flex flex-col gap-0.5" data-testid="egress-capacity-breakdown">
+      <span
+        v-for="binding in egressBreakdown"
+        :key="binding.route_id"
+        class="inline-flex max-w-[8.5rem] items-center gap-1 whitespace-nowrap text-[10px] leading-tight text-gray-500 dark:text-gray-400"
+        :title="binding.name || binding.observed_ip || String(binding.route_id)"
+      >
+        <span class="max-w-[4.75rem] truncate">{{ binding.name || binding.observed_ip || `#${binding.route_id}` }}</span>
+        <span class="font-mono">{{ binding.current_concurrency ?? 0 }}/{{ concurrencyPerEgress }}</span>
+      </span>
+    </div>
 
     <!-- 5h窗口费用限制 -->
     <CapacityBadge v-if="showWindowCost" :color-class="windowCostClass" :tooltip="windowCostTooltip" :current="'$' + formatCost(currentWindowCost)" :max="'$' + formatCost(account.window_cost_limit)">
@@ -49,11 +74,50 @@ const props = defineProps<{
 const { t } = useI18n()
 
 // ====== 并发 ======
-const currentConcurrency = computed(() => props.account.current_concurrency || 0)
+const effectiveCapacity = computed(() =>
+  props.account.egress_summary?.effective_capacity ?? props.account.concurrency
+)
+const concurrencyPerEgress = computed(() =>
+  props.account.egress_summary?.concurrency_per_egress
+  ?? props.account.egress_pool?.concurrency_per_egress
+  ?? props.account.concurrency
+)
+const currentConcurrency = computed(() =>
+  props.account.egress_summary?.current_concurrency ?? props.account.current_concurrency ?? 0
+)
+const egressBreakdown = computed(() =>
+  props.account.egress_summary?.bindings
+  ?? props.account.egress_summary?.route_usage
+  ?? props.account.egress_summary?.breakdown
+  ?? []
+)
+const egressCapacityFormula = computed(() => {
+  const summary = props.account.egress_summary
+  if (!summary) return ''
+  return t('admin.accounts.egressPool.capacityFormula', {
+    eligible: summary.eligible_route_count,
+    perEgress: summary.concurrency_per_egress,
+    capacity: summary.effective_capacity
+  })
+})
+const egressCapacityTooltip = computed(() => {
+  const summary = props.account.egress_summary
+  if (!summary) return ''
+  const degraded = summary.degraded_route_count
+    ?? Math.max(0, summary.configured_route_count - summary.eligible_route_count)
+  return [
+    egressCapacityFormula.value,
+    t('admin.accounts.egressPool.capacityDetail', {
+      configured: summary.configured_route_count,
+      eligible: summary.eligible_route_count,
+      degraded
+    })
+  ].join('\n')
+})
 
 const concurrencyClass = computed(() => {
   const current = currentConcurrency.value
-  const max = props.account.concurrency
+  const max = effectiveCapacity.value
   if (current >= max) return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
   if (current > 0) return 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
   return 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'

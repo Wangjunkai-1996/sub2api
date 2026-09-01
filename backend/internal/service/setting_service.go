@@ -236,6 +236,8 @@ type SettingService struct {
 	openAIQuotaAutoPauseSettingsCache atomic.Value // *cachedOpenAIQuotaAutoPauseSettings
 	openAIQuotaAutoPauseSettingsSF    singleflight.Group
 	openAIAPIKeyHealthBreakerCache    atomic.Value // *cachedOpenAIAPIKeyHealthBreakerSettings
+	accountEgressRolloutCache         atomic.Value // *cachedAccountEgressRolloutMode
+	accountEgressRolloutSF            singleflight.Group
 
 	channelMonitorRuntimeListenersMu sync.Mutex
 	channelMonitorRuntimeListeners   []func()

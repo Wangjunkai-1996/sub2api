@@ -26,8 +26,8 @@ func TestProxyUpdateInvalidatesBoundProbeSnapshotsAndEnqueuesOutboxAtomically(t 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "old.example", 8080, "user", "pass", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "expires_at"}).
+			AddRow("http", "old.example", 8080, "user", "pass", service.StatusActive, nil))
 	mock.ExpectExec(`(?s)UPDATE "proxies" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE "proxies" SET "backup_proxy_id" = NULL WHERE "backup_proxy_id" = \$1`).
 		WithArgs(int64(9)).
@@ -38,6 +38,15 @@ func TestProxyUpdateInvalidatesBoundProbeSnapshotsAndEnqueuesOutboxAtomically(t 
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(17)).AddRow(int64(18)))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)")).
 		WithArgs(service.SchedulerOutboxEventAccountBulkChanged, nil, nil, accountIDsPayloadMatcher{want: []int64{17, 18}}).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`(?s)INSERT INTO egress_routes.*ON CONFLICT \(proxy_id\) DO UPDATE.*expected_identity_id=NULL.*RETURNING id`).
+		WithArgs(service.EgressRouteKindProxy, int64(9), service.EgressRouteStatePendingVerification).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(44)))
+	mock.ExpectQuery(`(?s)WITH roots AS.*root\.platform=\$2.*root\.egress_mode=\$3.*UPDATE accounts.*RETURNING a\.id`).
+		WithArgs(int64(44), service.PlatformOpenAI, service.EgressModePool).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(27)))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox")).
+		WithArgs(service.SchedulerOutboxEventAccountChanged, int64(27), nil, nil, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -69,8 +78,8 @@ func TestProxyUpdateRollsBackWhenProbeInvalidationOutboxFails(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "old.example", 8080, "", "", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "expires_at"}).
+			AddRow("http", "old.example", 8080, "", "", service.StatusActive, nil))
 	mock.ExpectExec(`(?s)UPDATE "proxies" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE "proxies" SET "backup_proxy_id" = NULL WHERE "backup_proxy_id" = \$1`).
 		WithArgs(int64(9)).
@@ -102,8 +111,8 @@ func TestProxyUpdateSkipsProbeInvalidationForNonIdentityChange(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "same.example", 8080, "", "", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "expires_at"}).
+			AddRow("http", "same.example", 8080, "", "", service.StatusActive, nil))
 	mock.ExpectExec(`(?s)UPDATE "proxies" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE "proxies" SET "backup_proxy_id" = NULL WHERE "backup_proxy_id" = \$1`).
 		WithArgs(int64(9)).

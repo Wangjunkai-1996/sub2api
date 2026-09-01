@@ -113,10 +113,12 @@ func ProvideOpenAIOAuthService(
 	proxyRepo ProxyRepository,
 	oauthClient OpenAIOAuthClient,
 	settingService *SettingService,
+	egressService *EgressService,
 	privacyClientFactory PrivacyClientFactory,
 ) *OpenAIOAuthService {
 	svc := NewOpenAIOAuthService(proxyRepo, oauthClient)
 	svc.SetSettingService(settingService)
+	svc.SetEgressService(egressService)
 	svc.SetPrivacyClientFactory(privacyClientFactory)
 	return svc
 }
@@ -286,9 +288,11 @@ func ProvideOpenAIQuotaService(
 	privacyClientFactory PrivacyClientFactory,
 	pluginManager *PluginManager,
 	openAIGatewayService *OpenAIGatewayService,
+	openAIOAuthService *OpenAIOAuthService,
 ) *OpenAIQuotaService {
 	service := NewOpenAIQuotaService(accountRepo, proxyRepo, tokenProvider, privacyClientFactory)
 	service.SetPluginTransport(pluginManager)
+	service.SetOAuthEgressResolver(openAIOAuthService)
 	service.agentIdentityWS = openAIGatewayService
 	return service
 }
@@ -1040,6 +1044,7 @@ var ProviderSet = wire.NewSet(
 	NewSubscriptionService,
 	wire.Bind(new(DefaultSubscriptionAssigner), new(*SubscriptionService)),
 	ProvideConcurrencyService,
+	NewEgressService,
 	ProvideUserMessageQueueService,
 	NewUsageRecordWorkerPool,
 	ProvideSchedulerSnapshotService,

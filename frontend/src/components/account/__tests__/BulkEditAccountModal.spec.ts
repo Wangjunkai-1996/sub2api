@@ -755,6 +755,92 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
+  it('批量追加出口与统一并发可独立开启并合并为一个出口池操作', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      egressRoutes: [
+        { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+        { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('[data-testid="bulk-egress-operation-append"]').trigger('click')
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(6)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      egress_mode: 'pool',
+      egress_pool: {
+        operation: 'append',
+        route_ids: [2],
+        concurrency_per_egress: 6
+      }
+    })
+  })
+
+  it('仅调整统一并发时不隐式替换任何账号出口', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth']
+    })
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(8)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      egress_mode: 'pool',
+      egress_pool: {
+        operation: 'append',
+        route_ids: [],
+        concurrency_per_egress: 8
+      }
+    })
+  })
+
+  it('非 OpenAI 批量编辑继续提交 legacy 代理与并发字段', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['antigravity'],
+      selectedTypes: ['apikey']
+    })
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(5)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      proxy_id: 0,
+      concurrency: 5
+    })
+  })
+
+  it('OpenAI API Key 批量编辑继续提交 legacy 代理与并发字段', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['apikey']
+    })
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(7)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      proxy_id: 0,
+      concurrency: 7
+    })
+  })
+
   it('OpenAI API Key 批量编辑可统一关闭上游倍率自动探测', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],

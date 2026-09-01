@@ -13,6 +13,7 @@ import (
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
 	"github.com/Wei-Shaw/sub2api/ent/account"
+	"github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	"github.com/Wei-Shaw/sub2api/ent/announcement"
 	"github.com/Wei-Shaw/sub2api/ent/announcementread"
@@ -27,6 +28,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/egressidentity"
+	"github.com/Wei-Shaw/sub2api/ent/egressroute"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
@@ -66,6 +69,7 @@ const (
 	// Node types.
 	TypeAPIKey                        = "APIKey"
 	TypeAccount                       = "Account"
+	TypeAccountEgressBinding          = "AccountEgressBinding"
 	TypeAccountGroup                  = "AccountGroup"
 	TypeAnnouncement                  = "Announcement"
 	TypeAnnouncementRead              = "AnnouncementRead"
@@ -79,6 +83,8 @@ const (
 	TypeChannelMonitorHistory         = "ChannelMonitorHistory"
 	TypeChannelMonitorRequestTemplate = "ChannelMonitorRequestTemplate"
 	TypeCompositeModelRoute           = "CompositeModelRoute"
+	TypeEgressIdentity                = "EgressIdentity"
+	TypeEgressRoute                   = "EgressRoute"
 	TypeErrorPassthroughRule          = "ErrorPassthroughRule"
 	TypeGroup                         = "Group"
 	TypeIdempotencyRecord             = "IdempotencyRecord"
@@ -2298,6 +2304,9 @@ type AccountMutation struct {
 	extra                                *map[string]interface{}
 	proxy_fallback_origin_id             *int64
 	addproxy_fallback_origin_id          *int64
+	egress_mode                          *account.EgressMode
+	egress_revision                      *int64
+	addegress_revision                   *int64
 	concurrency                          *int
 	addconcurrency                       *int
 	load_factor                          *int
@@ -2327,6 +2336,9 @@ type AccountMutation struct {
 	clearedgroups                        bool
 	proxy                                *int64
 	clearedproxy                         bool
+	egress_routes                        map[int64]struct{}
+	removedegress_routes                 map[int64]struct{}
+	clearedegress_routes                 bool
 	parent                               *int64
 	clearedparent                        bool
 	children                             map[int64]struct{}
@@ -2961,6 +2973,98 @@ func (m *AccountMutation) ResetProxyFallbackOriginID() {
 	m.proxy_fallback_origin_id = nil
 	m.addproxy_fallback_origin_id = nil
 	delete(m.clearedFields, account.FieldProxyFallbackOriginID)
+}
+
+// SetEgressMode sets the "egress_mode" field.
+func (m *AccountMutation) SetEgressMode(am account.EgressMode) {
+	m.egress_mode = &am
+}
+
+// EgressMode returns the value of the "egress_mode" field in the mutation.
+func (m *AccountMutation) EgressMode() (r account.EgressMode, exists bool) {
+	v := m.egress_mode
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldEgressMode returns the old "egress_mode" field's value of the Account entity.
+// If the Account object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *AccountMutation) OldEgressMode(ctx context.Context) (v account.EgressMode, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldEgressMode is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldEgressMode requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldEgressMode: %w", err)
+	}
+	return oldValue.EgressMode, nil
+}
+
+// ResetEgressMode resets all changes to the "egress_mode" field.
+func (m *AccountMutation) ResetEgressMode() {
+	m.egress_mode = nil
+}
+
+// SetEgressRevision sets the "egress_revision" field.
+func (m *AccountMutation) SetEgressRevision(i int64) {
+	m.egress_revision = &i
+	m.addegress_revision = nil
+}
+
+// EgressRevision returns the value of the "egress_revision" field in the mutation.
+func (m *AccountMutation) EgressRevision() (r int64, exists bool) {
+	v := m.egress_revision
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldEgressRevision returns the old "egress_revision" field's value of the Account entity.
+// If the Account object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *AccountMutation) OldEgressRevision(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldEgressRevision is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldEgressRevision requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldEgressRevision: %w", err)
+	}
+	return oldValue.EgressRevision, nil
+}
+
+// AddEgressRevision adds i to the "egress_revision" field.
+func (m *AccountMutation) AddEgressRevision(i int64) {
+	if m.addegress_revision != nil {
+		*m.addegress_revision += i
+	} else {
+		m.addegress_revision = &i
+	}
+}
+
+// AddedEgressRevision returns the value that was added to the "egress_revision" field in this mutation.
+func (m *AccountMutation) AddedEgressRevision() (r int64, exists bool) {
+	v := m.addegress_revision
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetEgressRevision resets all changes to the "egress_revision" field.
+func (m *AccountMutation) ResetEgressRevision() {
+	m.egress_revision = nil
+	m.addegress_revision = nil
 }
 
 // SetConcurrency sets the "concurrency" field.
@@ -4014,6 +4118,60 @@ func (m *AccountMutation) ResetProxy() {
 	m.clearedproxy = false
 }
 
+// AddEgressRouteIDs adds the "egress_routes" edge to the EgressRoute entity by ids.
+func (m *AccountMutation) AddEgressRouteIDs(ids ...int64) {
+	if m.egress_routes == nil {
+		m.egress_routes = make(map[int64]struct{})
+	}
+	for i := range ids {
+		m.egress_routes[ids[i]] = struct{}{}
+	}
+}
+
+// ClearEgressRoutes clears the "egress_routes" edge to the EgressRoute entity.
+func (m *AccountMutation) ClearEgressRoutes() {
+	m.clearedegress_routes = true
+}
+
+// EgressRoutesCleared reports if the "egress_routes" edge to the EgressRoute entity was cleared.
+func (m *AccountMutation) EgressRoutesCleared() bool {
+	return m.clearedegress_routes
+}
+
+// RemoveEgressRouteIDs removes the "egress_routes" edge to the EgressRoute entity by IDs.
+func (m *AccountMutation) RemoveEgressRouteIDs(ids ...int64) {
+	if m.removedegress_routes == nil {
+		m.removedegress_routes = make(map[int64]struct{})
+	}
+	for i := range ids {
+		delete(m.egress_routes, ids[i])
+		m.removedegress_routes[ids[i]] = struct{}{}
+	}
+}
+
+// RemovedEgressRoutes returns the removed IDs of the "egress_routes" edge to the EgressRoute entity.
+func (m *AccountMutation) RemovedEgressRoutesIDs() (ids []int64) {
+	for id := range m.removedegress_routes {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// EgressRoutesIDs returns the "egress_routes" edge IDs in the mutation.
+func (m *AccountMutation) EgressRoutesIDs() (ids []int64) {
+	for id := range m.egress_routes {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// ResetEgressRoutes resets all changes to the "egress_routes" edge.
+func (m *AccountMutation) ResetEgressRoutes() {
+	m.egress_routes = nil
+	m.clearedegress_routes = false
+	m.removedegress_routes = nil
+}
+
 // SetParentID sets the "parent" edge to the Account entity by id.
 func (m *AccountMutation) SetParentID(id int64) {
 	m.parent = &id
@@ -4196,7 +4354,7 @@ func (m *AccountMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *AccountMutation) Fields() []string {
-	fields := make([]string, 0, 32)
+	fields := make([]string, 0, 34)
 	if m.created_at != nil {
 		fields = append(fields, account.FieldCreatedAt)
 	}
@@ -4232,6 +4390,12 @@ func (m *AccountMutation) Fields() []string {
 	}
 	if m.proxy_fallback_origin_id != nil {
 		fields = append(fields, account.FieldProxyFallbackOriginID)
+	}
+	if m.egress_mode != nil {
+		fields = append(fields, account.FieldEgressMode)
+	}
+	if m.egress_revision != nil {
+		fields = append(fields, account.FieldEgressRevision)
 	}
 	if m.concurrency != nil {
 		fields = append(fields, account.FieldConcurrency)
@@ -4325,6 +4489,10 @@ func (m *AccountMutation) Field(name string) (ent.Value, bool) {
 		return m.ProxyID()
 	case account.FieldProxyFallbackOriginID:
 		return m.ProxyFallbackOriginID()
+	case account.FieldEgressMode:
+		return m.EgressMode()
+	case account.FieldEgressRevision:
+		return m.EgressRevision()
 	case account.FieldConcurrency:
 		return m.Concurrency()
 	case account.FieldLoadFactor:
@@ -4398,6 +4566,10 @@ func (m *AccountMutation) OldField(ctx context.Context, name string) (ent.Value,
 		return m.OldProxyID(ctx)
 	case account.FieldProxyFallbackOriginID:
 		return m.OldProxyFallbackOriginID(ctx)
+	case account.FieldEgressMode:
+		return m.OldEgressMode(ctx)
+	case account.FieldEgressRevision:
+		return m.OldEgressRevision(ctx)
 	case account.FieldConcurrency:
 		return m.OldConcurrency(ctx)
 	case account.FieldLoadFactor:
@@ -4530,6 +4702,20 @@ func (m *AccountMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetProxyFallbackOriginID(v)
+		return nil
+	case account.FieldEgressMode:
+		v, ok := value.(account.EgressMode)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetEgressMode(v)
+		return nil
+	case account.FieldEgressRevision:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetEgressRevision(v)
 		return nil
 	case account.FieldConcurrency:
 		v, ok := value.(int)
@@ -4685,6 +4871,9 @@ func (m *AccountMutation) AddedFields() []string {
 	if m.addproxy_fallback_origin_id != nil {
 		fields = append(fields, account.FieldProxyFallbackOriginID)
 	}
+	if m.addegress_revision != nil {
+		fields = append(fields, account.FieldEgressRevision)
+	}
 	if m.addconcurrency != nil {
 		fields = append(fields, account.FieldConcurrency)
 	}
@@ -4709,6 +4898,8 @@ func (m *AccountMutation) AddedField(name string) (ent.Value, bool) {
 		return m.AddedOpenaiWarmupIdentityGeneration()
 	case account.FieldProxyFallbackOriginID:
 		return m.AddedProxyFallbackOriginID()
+	case account.FieldEgressRevision:
+		return m.AddedEgressRevision()
 	case account.FieldConcurrency:
 		return m.AddedConcurrency()
 	case account.FieldLoadFactor:
@@ -4739,6 +4930,13 @@ func (m *AccountMutation) AddField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.AddProxyFallbackOriginID(v)
+		return nil
+	case account.FieldEgressRevision:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddEgressRevision(v)
 		return nil
 	case account.FieldConcurrency:
 		v, ok := value.(int)
@@ -4936,6 +5134,12 @@ func (m *AccountMutation) ResetField(name string) error {
 	case account.FieldProxyFallbackOriginID:
 		m.ResetProxyFallbackOriginID()
 		return nil
+	case account.FieldEgressMode:
+		m.ResetEgressMode()
+		return nil
+	case account.FieldEgressRevision:
+		m.ResetEgressRevision()
+		return nil
 	case account.FieldConcurrency:
 		m.ResetConcurrency()
 		return nil
@@ -5002,12 +5206,15 @@ func (m *AccountMutation) ResetField(name string) error {
 
 // AddedEdges returns all edge names that were set/added in this mutation.
 func (m *AccountMutation) AddedEdges() []string {
-	edges := make([]string, 0, 5)
+	edges := make([]string, 0, 6)
 	if m.groups != nil {
 		edges = append(edges, account.EdgeGroups)
 	}
 	if m.proxy != nil {
 		edges = append(edges, account.EdgeProxy)
+	}
+	if m.egress_routes != nil {
+		edges = append(edges, account.EdgeEgressRoutes)
 	}
 	if m.parent != nil {
 		edges = append(edges, account.EdgeParent)
@@ -5035,6 +5242,12 @@ func (m *AccountMutation) AddedIDs(name string) []ent.Value {
 		if id := m.proxy; id != nil {
 			return []ent.Value{*id}
 		}
+	case account.EdgeEgressRoutes:
+		ids := make([]ent.Value, 0, len(m.egress_routes))
+		for id := range m.egress_routes {
+			ids = append(ids, id)
+		}
+		return ids
 	case account.EdgeParent:
 		if id := m.parent; id != nil {
 			return []ent.Value{*id}
@@ -5057,9 +5270,12 @@ func (m *AccountMutation) AddedIDs(name string) []ent.Value {
 
 // RemovedEdges returns all edge names that were removed in this mutation.
 func (m *AccountMutation) RemovedEdges() []string {
-	edges := make([]string, 0, 5)
+	edges := make([]string, 0, 6)
 	if m.removedgroups != nil {
 		edges = append(edges, account.EdgeGroups)
+	}
+	if m.removedegress_routes != nil {
+		edges = append(edges, account.EdgeEgressRoutes)
 	}
 	if m.removedchildren != nil {
 		edges = append(edges, account.EdgeChildren)
@@ -5077,6 +5293,12 @@ func (m *AccountMutation) RemovedIDs(name string) []ent.Value {
 	case account.EdgeGroups:
 		ids := make([]ent.Value, 0, len(m.removedgroups))
 		for id := range m.removedgroups {
+			ids = append(ids, id)
+		}
+		return ids
+	case account.EdgeEgressRoutes:
+		ids := make([]ent.Value, 0, len(m.removedegress_routes))
+		for id := range m.removedegress_routes {
 			ids = append(ids, id)
 		}
 		return ids
@@ -5098,12 +5320,15 @@ func (m *AccountMutation) RemovedIDs(name string) []ent.Value {
 
 // ClearedEdges returns all edge names that were cleared in this mutation.
 func (m *AccountMutation) ClearedEdges() []string {
-	edges := make([]string, 0, 5)
+	edges := make([]string, 0, 6)
 	if m.clearedgroups {
 		edges = append(edges, account.EdgeGroups)
 	}
 	if m.clearedproxy {
 		edges = append(edges, account.EdgeProxy)
+	}
+	if m.clearedegress_routes {
+		edges = append(edges, account.EdgeEgressRoutes)
 	}
 	if m.clearedparent {
 		edges = append(edges, account.EdgeParent)
@@ -5125,6 +5350,8 @@ func (m *AccountMutation) EdgeCleared(name string) bool {
 		return m.clearedgroups
 	case account.EdgeProxy:
 		return m.clearedproxy
+	case account.EdgeEgressRoutes:
+		return m.clearedegress_routes
 	case account.EdgeParent:
 		return m.clearedparent
 	case account.EdgeChildren:
@@ -5159,6 +5386,9 @@ func (m *AccountMutation) ResetEdge(name string) error {
 	case account.EdgeProxy:
 		m.ResetProxy()
 		return nil
+	case account.EdgeEgressRoutes:
+		m.ResetEgressRoutes()
+		return nil
 	case account.EdgeParent:
 		m.ResetParent()
 		return nil
@@ -5170,6 +5400,596 @@ func (m *AccountMutation) ResetEdge(name string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown Account edge %s", name)
+}
+
+// AccountEgressBindingMutation represents an operation that mutates the AccountEgressBinding nodes in the graph.
+type AccountEgressBindingMutation struct {
+	config
+	op             Op
+	typ            string
+	position       *int
+	addposition    *int
+	is_primary     *bool
+	status         *accountegressbinding.Status
+	created_at     *time.Time
+	updated_at     *time.Time
+	clearedFields  map[string]struct{}
+	account        *int64
+	clearedaccount bool
+	route          *int64
+	clearedroute   bool
+	done           bool
+	oldValue       func(context.Context) (*AccountEgressBinding, error)
+	predicates     []predicate.AccountEgressBinding
+}
+
+var _ ent.Mutation = (*AccountEgressBindingMutation)(nil)
+
+// accountegressbindingOption allows management of the mutation configuration using functional options.
+type accountegressbindingOption func(*AccountEgressBindingMutation)
+
+// newAccountEgressBindingMutation creates new mutation for the AccountEgressBinding entity.
+func newAccountEgressBindingMutation(c config, op Op, opts ...accountegressbindingOption) *AccountEgressBindingMutation {
+	m := &AccountEgressBindingMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeAccountEgressBinding,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m AccountEgressBindingMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m AccountEgressBindingMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// SetAccountID sets the "account_id" field.
+func (m *AccountEgressBindingMutation) SetAccountID(i int64) {
+	m.account = &i
+}
+
+// AccountID returns the value of the "account_id" field in the mutation.
+func (m *AccountEgressBindingMutation) AccountID() (r int64, exists bool) {
+	v := m.account
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetAccountID resets all changes to the "account_id" field.
+func (m *AccountEgressBindingMutation) ResetAccountID() {
+	m.account = nil
+}
+
+// SetRouteID sets the "route_id" field.
+func (m *AccountEgressBindingMutation) SetRouteID(i int64) {
+	m.route = &i
+}
+
+// RouteID returns the value of the "route_id" field in the mutation.
+func (m *AccountEgressBindingMutation) RouteID() (r int64, exists bool) {
+	v := m.route
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetRouteID resets all changes to the "route_id" field.
+func (m *AccountEgressBindingMutation) ResetRouteID() {
+	m.route = nil
+}
+
+// SetPosition sets the "position" field.
+func (m *AccountEgressBindingMutation) SetPosition(i int) {
+	m.position = &i
+	m.addposition = nil
+}
+
+// Position returns the value of the "position" field in the mutation.
+func (m *AccountEgressBindingMutation) Position() (r int, exists bool) {
+	v := m.position
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// AddPosition adds i to the "position" field.
+func (m *AccountEgressBindingMutation) AddPosition(i int) {
+	if m.addposition != nil {
+		*m.addposition += i
+	} else {
+		m.addposition = &i
+	}
+}
+
+// AddedPosition returns the value that was added to the "position" field in this mutation.
+func (m *AccountEgressBindingMutation) AddedPosition() (r int, exists bool) {
+	v := m.addposition
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetPosition resets all changes to the "position" field.
+func (m *AccountEgressBindingMutation) ResetPosition() {
+	m.position = nil
+	m.addposition = nil
+}
+
+// SetIsPrimary sets the "is_primary" field.
+func (m *AccountEgressBindingMutation) SetIsPrimary(b bool) {
+	m.is_primary = &b
+}
+
+// IsPrimary returns the value of the "is_primary" field in the mutation.
+func (m *AccountEgressBindingMutation) IsPrimary() (r bool, exists bool) {
+	v := m.is_primary
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetIsPrimary resets all changes to the "is_primary" field.
+func (m *AccountEgressBindingMutation) ResetIsPrimary() {
+	m.is_primary = nil
+}
+
+// SetStatus sets the "status" field.
+func (m *AccountEgressBindingMutation) SetStatus(a accountegressbinding.Status) {
+	m.status = &a
+}
+
+// Status returns the value of the "status" field in the mutation.
+func (m *AccountEgressBindingMutation) Status() (r accountegressbinding.Status, exists bool) {
+	v := m.status
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetStatus resets all changes to the "status" field.
+func (m *AccountEgressBindingMutation) ResetStatus() {
+	m.status = nil
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *AccountEgressBindingMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *AccountEgressBindingMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *AccountEgressBindingMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// SetUpdatedAt sets the "updated_at" field.
+func (m *AccountEgressBindingMutation) SetUpdatedAt(t time.Time) {
+	m.updated_at = &t
+}
+
+// UpdatedAt returns the value of the "updated_at" field in the mutation.
+func (m *AccountEgressBindingMutation) UpdatedAt() (r time.Time, exists bool) {
+	v := m.updated_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetUpdatedAt resets all changes to the "updated_at" field.
+func (m *AccountEgressBindingMutation) ResetUpdatedAt() {
+	m.updated_at = nil
+}
+
+// ClearAccount clears the "account" edge to the Account entity.
+func (m *AccountEgressBindingMutation) ClearAccount() {
+	m.clearedaccount = true
+	m.clearedFields[accountegressbinding.FieldAccountID] = struct{}{}
+}
+
+// AccountCleared reports if the "account" edge to the Account entity was cleared.
+func (m *AccountEgressBindingMutation) AccountCleared() bool {
+	return m.clearedaccount
+}
+
+// AccountIDs returns the "account" edge IDs in the mutation.
+// Note that IDs always returns len(IDs) <= 1 for unique edges, and you should use
+// AccountID instead. It exists only for internal usage by the builders.
+func (m *AccountEgressBindingMutation) AccountIDs() (ids []int64) {
+	if id := m.account; id != nil {
+		ids = append(ids, *id)
+	}
+	return
+}
+
+// ResetAccount resets all changes to the "account" edge.
+func (m *AccountEgressBindingMutation) ResetAccount() {
+	m.account = nil
+	m.clearedaccount = false
+}
+
+// ClearRoute clears the "route" edge to the EgressRoute entity.
+func (m *AccountEgressBindingMutation) ClearRoute() {
+	m.clearedroute = true
+	m.clearedFields[accountegressbinding.FieldRouteID] = struct{}{}
+}
+
+// RouteCleared reports if the "route" edge to the EgressRoute entity was cleared.
+func (m *AccountEgressBindingMutation) RouteCleared() bool {
+	return m.clearedroute
+}
+
+// RouteIDs returns the "route" edge IDs in the mutation.
+// Note that IDs always returns len(IDs) <= 1 for unique edges, and you should use
+// RouteID instead. It exists only for internal usage by the builders.
+func (m *AccountEgressBindingMutation) RouteIDs() (ids []int64) {
+	if id := m.route; id != nil {
+		ids = append(ids, *id)
+	}
+	return
+}
+
+// ResetRoute resets all changes to the "route" edge.
+func (m *AccountEgressBindingMutation) ResetRoute() {
+	m.route = nil
+	m.clearedroute = false
+}
+
+// Where appends a list predicates to the AccountEgressBindingMutation builder.
+func (m *AccountEgressBindingMutation) Where(ps ...predicate.AccountEgressBinding) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the AccountEgressBindingMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *AccountEgressBindingMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.AccountEgressBinding, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *AccountEgressBindingMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *AccountEgressBindingMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (AccountEgressBinding).
+func (m *AccountEgressBindingMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *AccountEgressBindingMutation) Fields() []string {
+	fields := make([]string, 0, 7)
+	if m.account != nil {
+		fields = append(fields, accountegressbinding.FieldAccountID)
+	}
+	if m.route != nil {
+		fields = append(fields, accountegressbinding.FieldRouteID)
+	}
+	if m.position != nil {
+		fields = append(fields, accountegressbinding.FieldPosition)
+	}
+	if m.is_primary != nil {
+		fields = append(fields, accountegressbinding.FieldIsPrimary)
+	}
+	if m.status != nil {
+		fields = append(fields, accountegressbinding.FieldStatus)
+	}
+	if m.created_at != nil {
+		fields = append(fields, accountegressbinding.FieldCreatedAt)
+	}
+	if m.updated_at != nil {
+		fields = append(fields, accountegressbinding.FieldUpdatedAt)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *AccountEgressBindingMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case accountegressbinding.FieldAccountID:
+		return m.AccountID()
+	case accountegressbinding.FieldRouteID:
+		return m.RouteID()
+	case accountegressbinding.FieldPosition:
+		return m.Position()
+	case accountegressbinding.FieldIsPrimary:
+		return m.IsPrimary()
+	case accountegressbinding.FieldStatus:
+		return m.Status()
+	case accountegressbinding.FieldCreatedAt:
+		return m.CreatedAt()
+	case accountegressbinding.FieldUpdatedAt:
+		return m.UpdatedAt()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *AccountEgressBindingMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	return nil, errors.New("edge schema AccountEgressBinding does not support getting old values")
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *AccountEgressBindingMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case accountegressbinding.FieldAccountID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetAccountID(v)
+		return nil
+	case accountegressbinding.FieldRouteID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRouteID(v)
+		return nil
+	case accountegressbinding.FieldPosition:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetPosition(v)
+		return nil
+	case accountegressbinding.FieldIsPrimary:
+		v, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetIsPrimary(v)
+		return nil
+	case accountegressbinding.FieldStatus:
+		v, ok := value.(accountegressbinding.Status)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetStatus(v)
+		return nil
+	case accountegressbinding.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	case accountegressbinding.FieldUpdatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpdatedAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown AccountEgressBinding field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *AccountEgressBindingMutation) AddedFields() []string {
+	var fields []string
+	if m.addposition != nil {
+		fields = append(fields, accountegressbinding.FieldPosition)
+	}
+	return fields
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *AccountEgressBindingMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case accountegressbinding.FieldPosition:
+		return m.AddedPosition()
+	}
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *AccountEgressBindingMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	case accountegressbinding.FieldPosition:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddPosition(v)
+		return nil
+	}
+	return fmt.Errorf("unknown AccountEgressBinding numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *AccountEgressBindingMutation) ClearedFields() []string {
+	return nil
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *AccountEgressBindingMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *AccountEgressBindingMutation) ClearField(name string) error {
+	return fmt.Errorf("unknown AccountEgressBinding nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *AccountEgressBindingMutation) ResetField(name string) error {
+	switch name {
+	case accountegressbinding.FieldAccountID:
+		m.ResetAccountID()
+		return nil
+	case accountegressbinding.FieldRouteID:
+		m.ResetRouteID()
+		return nil
+	case accountegressbinding.FieldPosition:
+		m.ResetPosition()
+		return nil
+	case accountegressbinding.FieldIsPrimary:
+		m.ResetIsPrimary()
+		return nil
+	case accountegressbinding.FieldStatus:
+		m.ResetStatus()
+		return nil
+	case accountegressbinding.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	case accountegressbinding.FieldUpdatedAt:
+		m.ResetUpdatedAt()
+		return nil
+	}
+	return fmt.Errorf("unknown AccountEgressBinding field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *AccountEgressBindingMutation) AddedEdges() []string {
+	edges := make([]string, 0, 2)
+	if m.account != nil {
+		edges = append(edges, accountegressbinding.EdgeAccount)
+	}
+	if m.route != nil {
+		edges = append(edges, accountegressbinding.EdgeRoute)
+	}
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *AccountEgressBindingMutation) AddedIDs(name string) []ent.Value {
+	switch name {
+	case accountegressbinding.EdgeAccount:
+		if id := m.account; id != nil {
+			return []ent.Value{*id}
+		}
+	case accountegressbinding.EdgeRoute:
+		if id := m.route; id != nil {
+			return []ent.Value{*id}
+		}
+	}
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *AccountEgressBindingMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 2)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *AccountEgressBindingMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *AccountEgressBindingMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 2)
+	if m.clearedaccount {
+		edges = append(edges, accountegressbinding.EdgeAccount)
+	}
+	if m.clearedroute {
+		edges = append(edges, accountegressbinding.EdgeRoute)
+	}
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *AccountEgressBindingMutation) EdgeCleared(name string) bool {
+	switch name {
+	case accountegressbinding.EdgeAccount:
+		return m.clearedaccount
+	case accountegressbinding.EdgeRoute:
+		return m.clearedroute
+	}
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *AccountEgressBindingMutation) ClearEdge(name string) error {
+	switch name {
+	case accountegressbinding.EdgeAccount:
+		m.ClearAccount()
+		return nil
+	case accountegressbinding.EdgeRoute:
+		m.ClearRoute()
+		return nil
+	}
+	return fmt.Errorf("unknown AccountEgressBinding unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *AccountEgressBindingMutation) ResetEdge(name string) error {
+	switch name {
+	case accountegressbinding.EdgeAccount:
+		m.ResetAccount()
+		return nil
+	case accountegressbinding.EdgeRoute:
+		m.ResetRoute()
+		return nil
+	}
+	return fmt.Errorf("unknown AccountEgressBinding edge %s", name)
 }
 
 // AccountGroupMutation represents an operation that mutates the AccountGroup nodes in the graph.
@@ -20840,6 +21660,1864 @@ func (m *CompositeModelRouteMutation) ResetEdge(name string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown CompositeModelRoute edge %s", name)
+}
+
+// EgressIdentityMutation represents an operation that mutates the EgressIdentity nodes in the graph.
+type EgressIdentityMutation struct {
+	config
+	op            Op
+	typ           string
+	id            *int64
+	created_at    *time.Time
+	updated_at    *time.Time
+	public_ip     *string
+	status        *egressidentity.Status
+	clearedFields map[string]struct{}
+	routes        map[int64]struct{}
+	removedroutes map[int64]struct{}
+	clearedroutes bool
+	done          bool
+	oldValue      func(context.Context) (*EgressIdentity, error)
+	predicates    []predicate.EgressIdentity
+}
+
+var _ ent.Mutation = (*EgressIdentityMutation)(nil)
+
+// egressidentityOption allows management of the mutation configuration using functional options.
+type egressidentityOption func(*EgressIdentityMutation)
+
+// newEgressIdentityMutation creates new mutation for the EgressIdentity entity.
+func newEgressIdentityMutation(c config, op Op, opts ...egressidentityOption) *EgressIdentityMutation {
+	m := &EgressIdentityMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeEgressIdentity,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withEgressIdentityID sets the ID field of the mutation.
+func withEgressIdentityID(id int64) egressidentityOption {
+	return func(m *EgressIdentityMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *EgressIdentity
+		)
+		m.oldValue = func(ctx context.Context) (*EgressIdentity, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().EgressIdentity.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withEgressIdentity sets the old EgressIdentity of the mutation.
+func withEgressIdentity(node *EgressIdentity) egressidentityOption {
+	return func(m *EgressIdentityMutation) {
+		m.oldValue = func(context.Context) (*EgressIdentity, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m EgressIdentityMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m EgressIdentityMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *EgressIdentityMutation) ID() (id int64, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *EgressIdentityMutation) IDs(ctx context.Context) ([]int64, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []int64{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().EgressIdentity.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *EgressIdentityMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *EgressIdentityMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCreatedAt returns the old "created_at" field's value of the EgressIdentity entity.
+// If the EgressIdentity object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressIdentityMutation) OldCreatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCreatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCreatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCreatedAt: %w", err)
+	}
+	return oldValue.CreatedAt, nil
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *EgressIdentityMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// SetUpdatedAt sets the "updated_at" field.
+func (m *EgressIdentityMutation) SetUpdatedAt(t time.Time) {
+	m.updated_at = &t
+}
+
+// UpdatedAt returns the value of the "updated_at" field in the mutation.
+func (m *EgressIdentityMutation) UpdatedAt() (r time.Time, exists bool) {
+	v := m.updated_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUpdatedAt returns the old "updated_at" field's value of the EgressIdentity entity.
+// If the EgressIdentity object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressIdentityMutation) OldUpdatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUpdatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUpdatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUpdatedAt: %w", err)
+	}
+	return oldValue.UpdatedAt, nil
+}
+
+// ResetUpdatedAt resets all changes to the "updated_at" field.
+func (m *EgressIdentityMutation) ResetUpdatedAt() {
+	m.updated_at = nil
+}
+
+// SetPublicIP sets the "public_ip" field.
+func (m *EgressIdentityMutation) SetPublicIP(s string) {
+	m.public_ip = &s
+}
+
+// PublicIP returns the value of the "public_ip" field in the mutation.
+func (m *EgressIdentityMutation) PublicIP() (r string, exists bool) {
+	v := m.public_ip
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldPublicIP returns the old "public_ip" field's value of the EgressIdentity entity.
+// If the EgressIdentity object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressIdentityMutation) OldPublicIP(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldPublicIP is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldPublicIP requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldPublicIP: %w", err)
+	}
+	return oldValue.PublicIP, nil
+}
+
+// ResetPublicIP resets all changes to the "public_ip" field.
+func (m *EgressIdentityMutation) ResetPublicIP() {
+	m.public_ip = nil
+}
+
+// SetStatus sets the "status" field.
+func (m *EgressIdentityMutation) SetStatus(e egressidentity.Status) {
+	m.status = &e
+}
+
+// Status returns the value of the "status" field in the mutation.
+func (m *EgressIdentityMutation) Status() (r egressidentity.Status, exists bool) {
+	v := m.status
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldStatus returns the old "status" field's value of the EgressIdentity entity.
+// If the EgressIdentity object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressIdentityMutation) OldStatus(ctx context.Context) (v egressidentity.Status, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldStatus is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldStatus requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldStatus: %w", err)
+	}
+	return oldValue.Status, nil
+}
+
+// ResetStatus resets all changes to the "status" field.
+func (m *EgressIdentityMutation) ResetStatus() {
+	m.status = nil
+}
+
+// AddRouteIDs adds the "routes" edge to the EgressRoute entity by ids.
+func (m *EgressIdentityMutation) AddRouteIDs(ids ...int64) {
+	if m.routes == nil {
+		m.routes = make(map[int64]struct{})
+	}
+	for i := range ids {
+		m.routes[ids[i]] = struct{}{}
+	}
+}
+
+// ClearRoutes clears the "routes" edge to the EgressRoute entity.
+func (m *EgressIdentityMutation) ClearRoutes() {
+	m.clearedroutes = true
+}
+
+// RoutesCleared reports if the "routes" edge to the EgressRoute entity was cleared.
+func (m *EgressIdentityMutation) RoutesCleared() bool {
+	return m.clearedroutes
+}
+
+// RemoveRouteIDs removes the "routes" edge to the EgressRoute entity by IDs.
+func (m *EgressIdentityMutation) RemoveRouteIDs(ids ...int64) {
+	if m.removedroutes == nil {
+		m.removedroutes = make(map[int64]struct{})
+	}
+	for i := range ids {
+		delete(m.routes, ids[i])
+		m.removedroutes[ids[i]] = struct{}{}
+	}
+}
+
+// RemovedRoutes returns the removed IDs of the "routes" edge to the EgressRoute entity.
+func (m *EgressIdentityMutation) RemovedRoutesIDs() (ids []int64) {
+	for id := range m.removedroutes {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// RoutesIDs returns the "routes" edge IDs in the mutation.
+func (m *EgressIdentityMutation) RoutesIDs() (ids []int64) {
+	for id := range m.routes {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// ResetRoutes resets all changes to the "routes" edge.
+func (m *EgressIdentityMutation) ResetRoutes() {
+	m.routes = nil
+	m.clearedroutes = false
+	m.removedroutes = nil
+}
+
+// Where appends a list predicates to the EgressIdentityMutation builder.
+func (m *EgressIdentityMutation) Where(ps ...predicate.EgressIdentity) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the EgressIdentityMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *EgressIdentityMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.EgressIdentity, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *EgressIdentityMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *EgressIdentityMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (EgressIdentity).
+func (m *EgressIdentityMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *EgressIdentityMutation) Fields() []string {
+	fields := make([]string, 0, 4)
+	if m.created_at != nil {
+		fields = append(fields, egressidentity.FieldCreatedAt)
+	}
+	if m.updated_at != nil {
+		fields = append(fields, egressidentity.FieldUpdatedAt)
+	}
+	if m.public_ip != nil {
+		fields = append(fields, egressidentity.FieldPublicIP)
+	}
+	if m.status != nil {
+		fields = append(fields, egressidentity.FieldStatus)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *EgressIdentityMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case egressidentity.FieldCreatedAt:
+		return m.CreatedAt()
+	case egressidentity.FieldUpdatedAt:
+		return m.UpdatedAt()
+	case egressidentity.FieldPublicIP:
+		return m.PublicIP()
+	case egressidentity.FieldStatus:
+		return m.Status()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *EgressIdentityMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case egressidentity.FieldCreatedAt:
+		return m.OldCreatedAt(ctx)
+	case egressidentity.FieldUpdatedAt:
+		return m.OldUpdatedAt(ctx)
+	case egressidentity.FieldPublicIP:
+		return m.OldPublicIP(ctx)
+	case egressidentity.FieldStatus:
+		return m.OldStatus(ctx)
+	}
+	return nil, fmt.Errorf("unknown EgressIdentity field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *EgressIdentityMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case egressidentity.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	case egressidentity.FieldUpdatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpdatedAt(v)
+		return nil
+	case egressidentity.FieldPublicIP:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetPublicIP(v)
+		return nil
+	case egressidentity.FieldStatus:
+		v, ok := value.(egressidentity.Status)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetStatus(v)
+		return nil
+	}
+	return fmt.Errorf("unknown EgressIdentity field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *EgressIdentityMutation) AddedFields() []string {
+	return nil
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *EgressIdentityMutation) AddedField(name string) (ent.Value, bool) {
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *EgressIdentityMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	}
+	return fmt.Errorf("unknown EgressIdentity numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *EgressIdentityMutation) ClearedFields() []string {
+	return nil
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *EgressIdentityMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *EgressIdentityMutation) ClearField(name string) error {
+	return fmt.Errorf("unknown EgressIdentity nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *EgressIdentityMutation) ResetField(name string) error {
+	switch name {
+	case egressidentity.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	case egressidentity.FieldUpdatedAt:
+		m.ResetUpdatedAt()
+		return nil
+	case egressidentity.FieldPublicIP:
+		m.ResetPublicIP()
+		return nil
+	case egressidentity.FieldStatus:
+		m.ResetStatus()
+		return nil
+	}
+	return fmt.Errorf("unknown EgressIdentity field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *EgressIdentityMutation) AddedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.routes != nil {
+		edges = append(edges, egressidentity.EdgeRoutes)
+	}
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *EgressIdentityMutation) AddedIDs(name string) []ent.Value {
+	switch name {
+	case egressidentity.EdgeRoutes:
+		ids := make([]ent.Value, 0, len(m.routes))
+		for id := range m.routes {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *EgressIdentityMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.removedroutes != nil {
+		edges = append(edges, egressidentity.EdgeRoutes)
+	}
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *EgressIdentityMutation) RemovedIDs(name string) []ent.Value {
+	switch name {
+	case egressidentity.EdgeRoutes:
+		ids := make([]ent.Value, 0, len(m.removedroutes))
+		for id := range m.removedroutes {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *EgressIdentityMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 1)
+	if m.clearedroutes {
+		edges = append(edges, egressidentity.EdgeRoutes)
+	}
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *EgressIdentityMutation) EdgeCleared(name string) bool {
+	switch name {
+	case egressidentity.EdgeRoutes:
+		return m.clearedroutes
+	}
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *EgressIdentityMutation) ClearEdge(name string) error {
+	switch name {
+	}
+	return fmt.Errorf("unknown EgressIdentity unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *EgressIdentityMutation) ResetEdge(name string) error {
+	switch name {
+	case egressidentity.EdgeRoutes:
+		m.ResetRoutes()
+		return nil
+	}
+	return fmt.Errorf("unknown EgressIdentity edge %s", name)
+}
+
+// EgressRouteMutation represents an operation that mutates the EgressRoute nodes in the graph.
+type EgressRouteMutation struct {
+	config
+	op                       Op
+	typ                      string
+	id                       *int64
+	created_at               *time.Time
+	updated_at               *time.Time
+	kind                     *egressroute.Kind
+	runtime_scope            *string
+	state                    *egressroute.State
+	last_observed_ip         *string
+	last_probed_at           *time.Time
+	verified_at              *time.Time
+	revision                 *int64
+	addrevision              *int64
+	last_error               *string
+	clearedFields            map[string]struct{}
+	proxy                    *int64
+	clearedproxy             bool
+	expected_identity        *int64
+	clearedexpected_identity bool
+	accounts                 map[int64]struct{}
+	removedaccounts          map[int64]struct{}
+	clearedaccounts          bool
+	done                     bool
+	oldValue                 func(context.Context) (*EgressRoute, error)
+	predicates               []predicate.EgressRoute
+}
+
+var _ ent.Mutation = (*EgressRouteMutation)(nil)
+
+// egressrouteOption allows management of the mutation configuration using functional options.
+type egressrouteOption func(*EgressRouteMutation)
+
+// newEgressRouteMutation creates new mutation for the EgressRoute entity.
+func newEgressRouteMutation(c config, op Op, opts ...egressrouteOption) *EgressRouteMutation {
+	m := &EgressRouteMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeEgressRoute,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withEgressRouteID sets the ID field of the mutation.
+func withEgressRouteID(id int64) egressrouteOption {
+	return func(m *EgressRouteMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *EgressRoute
+		)
+		m.oldValue = func(ctx context.Context) (*EgressRoute, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().EgressRoute.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withEgressRoute sets the old EgressRoute of the mutation.
+func withEgressRoute(node *EgressRoute) egressrouteOption {
+	return func(m *EgressRouteMutation) {
+		m.oldValue = func(context.Context) (*EgressRoute, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m EgressRouteMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m EgressRouteMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *EgressRouteMutation) ID() (id int64, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *EgressRouteMutation) IDs(ctx context.Context) ([]int64, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []int64{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().EgressRoute.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *EgressRouteMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *EgressRouteMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCreatedAt returns the old "created_at" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldCreatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCreatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCreatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCreatedAt: %w", err)
+	}
+	return oldValue.CreatedAt, nil
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *EgressRouteMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// SetUpdatedAt sets the "updated_at" field.
+func (m *EgressRouteMutation) SetUpdatedAt(t time.Time) {
+	m.updated_at = &t
+}
+
+// UpdatedAt returns the value of the "updated_at" field in the mutation.
+func (m *EgressRouteMutation) UpdatedAt() (r time.Time, exists bool) {
+	v := m.updated_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUpdatedAt returns the old "updated_at" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldUpdatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUpdatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUpdatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUpdatedAt: %w", err)
+	}
+	return oldValue.UpdatedAt, nil
+}
+
+// ResetUpdatedAt resets all changes to the "updated_at" field.
+func (m *EgressRouteMutation) ResetUpdatedAt() {
+	m.updated_at = nil
+}
+
+// SetKind sets the "kind" field.
+func (m *EgressRouteMutation) SetKind(e egressroute.Kind) {
+	m.kind = &e
+}
+
+// Kind returns the value of the "kind" field in the mutation.
+func (m *EgressRouteMutation) Kind() (r egressroute.Kind, exists bool) {
+	v := m.kind
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldKind returns the old "kind" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldKind(ctx context.Context) (v egressroute.Kind, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldKind is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldKind requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldKind: %w", err)
+	}
+	return oldValue.Kind, nil
+}
+
+// ResetKind resets all changes to the "kind" field.
+func (m *EgressRouteMutation) ResetKind() {
+	m.kind = nil
+}
+
+// SetProxyID sets the "proxy_id" field.
+func (m *EgressRouteMutation) SetProxyID(i int64) {
+	m.proxy = &i
+}
+
+// ProxyID returns the value of the "proxy_id" field in the mutation.
+func (m *EgressRouteMutation) ProxyID() (r int64, exists bool) {
+	v := m.proxy
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldProxyID returns the old "proxy_id" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldProxyID(ctx context.Context) (v *int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldProxyID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldProxyID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldProxyID: %w", err)
+	}
+	return oldValue.ProxyID, nil
+}
+
+// ClearProxyID clears the value of the "proxy_id" field.
+func (m *EgressRouteMutation) ClearProxyID() {
+	m.proxy = nil
+	m.clearedFields[egressroute.FieldProxyID] = struct{}{}
+}
+
+// ProxyIDCleared returns if the "proxy_id" field was cleared in this mutation.
+func (m *EgressRouteMutation) ProxyIDCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldProxyID]
+	return ok
+}
+
+// ResetProxyID resets all changes to the "proxy_id" field.
+func (m *EgressRouteMutation) ResetProxyID() {
+	m.proxy = nil
+	delete(m.clearedFields, egressroute.FieldProxyID)
+}
+
+// SetRuntimeScope sets the "runtime_scope" field.
+func (m *EgressRouteMutation) SetRuntimeScope(s string) {
+	m.runtime_scope = &s
+}
+
+// RuntimeScope returns the value of the "runtime_scope" field in the mutation.
+func (m *EgressRouteMutation) RuntimeScope() (r string, exists bool) {
+	v := m.runtime_scope
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldRuntimeScope returns the old "runtime_scope" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldRuntimeScope(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldRuntimeScope is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldRuntimeScope requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldRuntimeScope: %w", err)
+	}
+	return oldValue.RuntimeScope, nil
+}
+
+// ClearRuntimeScope clears the value of the "runtime_scope" field.
+func (m *EgressRouteMutation) ClearRuntimeScope() {
+	m.runtime_scope = nil
+	m.clearedFields[egressroute.FieldRuntimeScope] = struct{}{}
+}
+
+// RuntimeScopeCleared returns if the "runtime_scope" field was cleared in this mutation.
+func (m *EgressRouteMutation) RuntimeScopeCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldRuntimeScope]
+	return ok
+}
+
+// ResetRuntimeScope resets all changes to the "runtime_scope" field.
+func (m *EgressRouteMutation) ResetRuntimeScope() {
+	m.runtime_scope = nil
+	delete(m.clearedFields, egressroute.FieldRuntimeScope)
+}
+
+// SetExpectedIdentityID sets the "expected_identity_id" field.
+func (m *EgressRouteMutation) SetExpectedIdentityID(i int64) {
+	m.expected_identity = &i
+}
+
+// ExpectedIdentityID returns the value of the "expected_identity_id" field in the mutation.
+func (m *EgressRouteMutation) ExpectedIdentityID() (r int64, exists bool) {
+	v := m.expected_identity
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldExpectedIdentityID returns the old "expected_identity_id" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldExpectedIdentityID(ctx context.Context) (v *int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldExpectedIdentityID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldExpectedIdentityID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldExpectedIdentityID: %w", err)
+	}
+	return oldValue.ExpectedIdentityID, nil
+}
+
+// ClearExpectedIdentityID clears the value of the "expected_identity_id" field.
+func (m *EgressRouteMutation) ClearExpectedIdentityID() {
+	m.expected_identity = nil
+	m.clearedFields[egressroute.FieldExpectedIdentityID] = struct{}{}
+}
+
+// ExpectedIdentityIDCleared returns if the "expected_identity_id" field was cleared in this mutation.
+func (m *EgressRouteMutation) ExpectedIdentityIDCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldExpectedIdentityID]
+	return ok
+}
+
+// ResetExpectedIdentityID resets all changes to the "expected_identity_id" field.
+func (m *EgressRouteMutation) ResetExpectedIdentityID() {
+	m.expected_identity = nil
+	delete(m.clearedFields, egressroute.FieldExpectedIdentityID)
+}
+
+// SetState sets the "state" field.
+func (m *EgressRouteMutation) SetState(e egressroute.State) {
+	m.state = &e
+}
+
+// State returns the value of the "state" field in the mutation.
+func (m *EgressRouteMutation) State() (r egressroute.State, exists bool) {
+	v := m.state
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldState returns the old "state" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldState(ctx context.Context) (v egressroute.State, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldState is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldState requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldState: %w", err)
+	}
+	return oldValue.State, nil
+}
+
+// ResetState resets all changes to the "state" field.
+func (m *EgressRouteMutation) ResetState() {
+	m.state = nil
+}
+
+// SetLastObservedIP sets the "last_observed_ip" field.
+func (m *EgressRouteMutation) SetLastObservedIP(s string) {
+	m.last_observed_ip = &s
+}
+
+// LastObservedIP returns the value of the "last_observed_ip" field in the mutation.
+func (m *EgressRouteMutation) LastObservedIP() (r string, exists bool) {
+	v := m.last_observed_ip
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldLastObservedIP returns the old "last_observed_ip" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldLastObservedIP(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldLastObservedIP is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldLastObservedIP requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldLastObservedIP: %w", err)
+	}
+	return oldValue.LastObservedIP, nil
+}
+
+// ClearLastObservedIP clears the value of the "last_observed_ip" field.
+func (m *EgressRouteMutation) ClearLastObservedIP() {
+	m.last_observed_ip = nil
+	m.clearedFields[egressroute.FieldLastObservedIP] = struct{}{}
+}
+
+// LastObservedIPCleared returns if the "last_observed_ip" field was cleared in this mutation.
+func (m *EgressRouteMutation) LastObservedIPCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldLastObservedIP]
+	return ok
+}
+
+// ResetLastObservedIP resets all changes to the "last_observed_ip" field.
+func (m *EgressRouteMutation) ResetLastObservedIP() {
+	m.last_observed_ip = nil
+	delete(m.clearedFields, egressroute.FieldLastObservedIP)
+}
+
+// SetLastProbedAt sets the "last_probed_at" field.
+func (m *EgressRouteMutation) SetLastProbedAt(t time.Time) {
+	m.last_probed_at = &t
+}
+
+// LastProbedAt returns the value of the "last_probed_at" field in the mutation.
+func (m *EgressRouteMutation) LastProbedAt() (r time.Time, exists bool) {
+	v := m.last_probed_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldLastProbedAt returns the old "last_probed_at" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldLastProbedAt(ctx context.Context) (v *time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldLastProbedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldLastProbedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldLastProbedAt: %w", err)
+	}
+	return oldValue.LastProbedAt, nil
+}
+
+// ClearLastProbedAt clears the value of the "last_probed_at" field.
+func (m *EgressRouteMutation) ClearLastProbedAt() {
+	m.last_probed_at = nil
+	m.clearedFields[egressroute.FieldLastProbedAt] = struct{}{}
+}
+
+// LastProbedAtCleared returns if the "last_probed_at" field was cleared in this mutation.
+func (m *EgressRouteMutation) LastProbedAtCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldLastProbedAt]
+	return ok
+}
+
+// ResetLastProbedAt resets all changes to the "last_probed_at" field.
+func (m *EgressRouteMutation) ResetLastProbedAt() {
+	m.last_probed_at = nil
+	delete(m.clearedFields, egressroute.FieldLastProbedAt)
+}
+
+// SetVerifiedAt sets the "verified_at" field.
+func (m *EgressRouteMutation) SetVerifiedAt(t time.Time) {
+	m.verified_at = &t
+}
+
+// VerifiedAt returns the value of the "verified_at" field in the mutation.
+func (m *EgressRouteMutation) VerifiedAt() (r time.Time, exists bool) {
+	v := m.verified_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldVerifiedAt returns the old "verified_at" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldVerifiedAt(ctx context.Context) (v *time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldVerifiedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldVerifiedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldVerifiedAt: %w", err)
+	}
+	return oldValue.VerifiedAt, nil
+}
+
+// ClearVerifiedAt clears the value of the "verified_at" field.
+func (m *EgressRouteMutation) ClearVerifiedAt() {
+	m.verified_at = nil
+	m.clearedFields[egressroute.FieldVerifiedAt] = struct{}{}
+}
+
+// VerifiedAtCleared returns if the "verified_at" field was cleared in this mutation.
+func (m *EgressRouteMutation) VerifiedAtCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldVerifiedAt]
+	return ok
+}
+
+// ResetVerifiedAt resets all changes to the "verified_at" field.
+func (m *EgressRouteMutation) ResetVerifiedAt() {
+	m.verified_at = nil
+	delete(m.clearedFields, egressroute.FieldVerifiedAt)
+}
+
+// SetRevision sets the "revision" field.
+func (m *EgressRouteMutation) SetRevision(i int64) {
+	m.revision = &i
+	m.addrevision = nil
+}
+
+// Revision returns the value of the "revision" field in the mutation.
+func (m *EgressRouteMutation) Revision() (r int64, exists bool) {
+	v := m.revision
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldRevision returns the old "revision" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldRevision(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldRevision is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldRevision requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldRevision: %w", err)
+	}
+	return oldValue.Revision, nil
+}
+
+// AddRevision adds i to the "revision" field.
+func (m *EgressRouteMutation) AddRevision(i int64) {
+	if m.addrevision != nil {
+		*m.addrevision += i
+	} else {
+		m.addrevision = &i
+	}
+}
+
+// AddedRevision returns the value that was added to the "revision" field in this mutation.
+func (m *EgressRouteMutation) AddedRevision() (r int64, exists bool) {
+	v := m.addrevision
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetRevision resets all changes to the "revision" field.
+func (m *EgressRouteMutation) ResetRevision() {
+	m.revision = nil
+	m.addrevision = nil
+}
+
+// SetLastError sets the "last_error" field.
+func (m *EgressRouteMutation) SetLastError(s string) {
+	m.last_error = &s
+}
+
+// LastError returns the value of the "last_error" field in the mutation.
+func (m *EgressRouteMutation) LastError() (r string, exists bool) {
+	v := m.last_error
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldLastError returns the old "last_error" field's value of the EgressRoute entity.
+// If the EgressRoute object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *EgressRouteMutation) OldLastError(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldLastError is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldLastError requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldLastError: %w", err)
+	}
+	return oldValue.LastError, nil
+}
+
+// ClearLastError clears the value of the "last_error" field.
+func (m *EgressRouteMutation) ClearLastError() {
+	m.last_error = nil
+	m.clearedFields[egressroute.FieldLastError] = struct{}{}
+}
+
+// LastErrorCleared returns if the "last_error" field was cleared in this mutation.
+func (m *EgressRouteMutation) LastErrorCleared() bool {
+	_, ok := m.clearedFields[egressroute.FieldLastError]
+	return ok
+}
+
+// ResetLastError resets all changes to the "last_error" field.
+func (m *EgressRouteMutation) ResetLastError() {
+	m.last_error = nil
+	delete(m.clearedFields, egressroute.FieldLastError)
+}
+
+// ClearProxy clears the "proxy" edge to the Proxy entity.
+func (m *EgressRouteMutation) ClearProxy() {
+	m.clearedproxy = true
+	m.clearedFields[egressroute.FieldProxyID] = struct{}{}
+}
+
+// ProxyCleared reports if the "proxy" edge to the Proxy entity was cleared.
+func (m *EgressRouteMutation) ProxyCleared() bool {
+	return m.ProxyIDCleared() || m.clearedproxy
+}
+
+// ProxyIDs returns the "proxy" edge IDs in the mutation.
+// Note that IDs always returns len(IDs) <= 1 for unique edges, and you should use
+// ProxyID instead. It exists only for internal usage by the builders.
+func (m *EgressRouteMutation) ProxyIDs() (ids []int64) {
+	if id := m.proxy; id != nil {
+		ids = append(ids, *id)
+	}
+	return
+}
+
+// ResetProxy resets all changes to the "proxy" edge.
+func (m *EgressRouteMutation) ResetProxy() {
+	m.proxy = nil
+	m.clearedproxy = false
+}
+
+// ClearExpectedIdentity clears the "expected_identity" edge to the EgressIdentity entity.
+func (m *EgressRouteMutation) ClearExpectedIdentity() {
+	m.clearedexpected_identity = true
+	m.clearedFields[egressroute.FieldExpectedIdentityID] = struct{}{}
+}
+
+// ExpectedIdentityCleared reports if the "expected_identity" edge to the EgressIdentity entity was cleared.
+func (m *EgressRouteMutation) ExpectedIdentityCleared() bool {
+	return m.ExpectedIdentityIDCleared() || m.clearedexpected_identity
+}
+
+// ExpectedIdentityIDs returns the "expected_identity" edge IDs in the mutation.
+// Note that IDs always returns len(IDs) <= 1 for unique edges, and you should use
+// ExpectedIdentityID instead. It exists only for internal usage by the builders.
+func (m *EgressRouteMutation) ExpectedIdentityIDs() (ids []int64) {
+	if id := m.expected_identity; id != nil {
+		ids = append(ids, *id)
+	}
+	return
+}
+
+// ResetExpectedIdentity resets all changes to the "expected_identity" edge.
+func (m *EgressRouteMutation) ResetExpectedIdentity() {
+	m.expected_identity = nil
+	m.clearedexpected_identity = false
+}
+
+// AddAccountIDs adds the "accounts" edge to the Account entity by ids.
+func (m *EgressRouteMutation) AddAccountIDs(ids ...int64) {
+	if m.accounts == nil {
+		m.accounts = make(map[int64]struct{})
+	}
+	for i := range ids {
+		m.accounts[ids[i]] = struct{}{}
+	}
+}
+
+// ClearAccounts clears the "accounts" edge to the Account entity.
+func (m *EgressRouteMutation) ClearAccounts() {
+	m.clearedaccounts = true
+}
+
+// AccountsCleared reports if the "accounts" edge to the Account entity was cleared.
+func (m *EgressRouteMutation) AccountsCleared() bool {
+	return m.clearedaccounts
+}
+
+// RemoveAccountIDs removes the "accounts" edge to the Account entity by IDs.
+func (m *EgressRouteMutation) RemoveAccountIDs(ids ...int64) {
+	if m.removedaccounts == nil {
+		m.removedaccounts = make(map[int64]struct{})
+	}
+	for i := range ids {
+		delete(m.accounts, ids[i])
+		m.removedaccounts[ids[i]] = struct{}{}
+	}
+}
+
+// RemovedAccounts returns the removed IDs of the "accounts" edge to the Account entity.
+func (m *EgressRouteMutation) RemovedAccountsIDs() (ids []int64) {
+	for id := range m.removedaccounts {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// AccountsIDs returns the "accounts" edge IDs in the mutation.
+func (m *EgressRouteMutation) AccountsIDs() (ids []int64) {
+	for id := range m.accounts {
+		ids = append(ids, id)
+	}
+	return
+}
+
+// ResetAccounts resets all changes to the "accounts" edge.
+func (m *EgressRouteMutation) ResetAccounts() {
+	m.accounts = nil
+	m.clearedaccounts = false
+	m.removedaccounts = nil
+}
+
+// Where appends a list predicates to the EgressRouteMutation builder.
+func (m *EgressRouteMutation) Where(ps ...predicate.EgressRoute) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the EgressRouteMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *EgressRouteMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.EgressRoute, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *EgressRouteMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *EgressRouteMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (EgressRoute).
+func (m *EgressRouteMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *EgressRouteMutation) Fields() []string {
+	fields := make([]string, 0, 12)
+	if m.created_at != nil {
+		fields = append(fields, egressroute.FieldCreatedAt)
+	}
+	if m.updated_at != nil {
+		fields = append(fields, egressroute.FieldUpdatedAt)
+	}
+	if m.kind != nil {
+		fields = append(fields, egressroute.FieldKind)
+	}
+	if m.proxy != nil {
+		fields = append(fields, egressroute.FieldProxyID)
+	}
+	if m.runtime_scope != nil {
+		fields = append(fields, egressroute.FieldRuntimeScope)
+	}
+	if m.expected_identity != nil {
+		fields = append(fields, egressroute.FieldExpectedIdentityID)
+	}
+	if m.state != nil {
+		fields = append(fields, egressroute.FieldState)
+	}
+	if m.last_observed_ip != nil {
+		fields = append(fields, egressroute.FieldLastObservedIP)
+	}
+	if m.last_probed_at != nil {
+		fields = append(fields, egressroute.FieldLastProbedAt)
+	}
+	if m.verified_at != nil {
+		fields = append(fields, egressroute.FieldVerifiedAt)
+	}
+	if m.revision != nil {
+		fields = append(fields, egressroute.FieldRevision)
+	}
+	if m.last_error != nil {
+		fields = append(fields, egressroute.FieldLastError)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *EgressRouteMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case egressroute.FieldCreatedAt:
+		return m.CreatedAt()
+	case egressroute.FieldUpdatedAt:
+		return m.UpdatedAt()
+	case egressroute.FieldKind:
+		return m.Kind()
+	case egressroute.FieldProxyID:
+		return m.ProxyID()
+	case egressroute.FieldRuntimeScope:
+		return m.RuntimeScope()
+	case egressroute.FieldExpectedIdentityID:
+		return m.ExpectedIdentityID()
+	case egressroute.FieldState:
+		return m.State()
+	case egressroute.FieldLastObservedIP:
+		return m.LastObservedIP()
+	case egressroute.FieldLastProbedAt:
+		return m.LastProbedAt()
+	case egressroute.FieldVerifiedAt:
+		return m.VerifiedAt()
+	case egressroute.FieldRevision:
+		return m.Revision()
+	case egressroute.FieldLastError:
+		return m.LastError()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *EgressRouteMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case egressroute.FieldCreatedAt:
+		return m.OldCreatedAt(ctx)
+	case egressroute.FieldUpdatedAt:
+		return m.OldUpdatedAt(ctx)
+	case egressroute.FieldKind:
+		return m.OldKind(ctx)
+	case egressroute.FieldProxyID:
+		return m.OldProxyID(ctx)
+	case egressroute.FieldRuntimeScope:
+		return m.OldRuntimeScope(ctx)
+	case egressroute.FieldExpectedIdentityID:
+		return m.OldExpectedIdentityID(ctx)
+	case egressroute.FieldState:
+		return m.OldState(ctx)
+	case egressroute.FieldLastObservedIP:
+		return m.OldLastObservedIP(ctx)
+	case egressroute.FieldLastProbedAt:
+		return m.OldLastProbedAt(ctx)
+	case egressroute.FieldVerifiedAt:
+		return m.OldVerifiedAt(ctx)
+	case egressroute.FieldRevision:
+		return m.OldRevision(ctx)
+	case egressroute.FieldLastError:
+		return m.OldLastError(ctx)
+	}
+	return nil, fmt.Errorf("unknown EgressRoute field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *EgressRouteMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case egressroute.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	case egressroute.FieldUpdatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpdatedAt(v)
+		return nil
+	case egressroute.FieldKind:
+		v, ok := value.(egressroute.Kind)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetKind(v)
+		return nil
+	case egressroute.FieldProxyID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetProxyID(v)
+		return nil
+	case egressroute.FieldRuntimeScope:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRuntimeScope(v)
+		return nil
+	case egressroute.FieldExpectedIdentityID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetExpectedIdentityID(v)
+		return nil
+	case egressroute.FieldState:
+		v, ok := value.(egressroute.State)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetState(v)
+		return nil
+	case egressroute.FieldLastObservedIP:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetLastObservedIP(v)
+		return nil
+	case egressroute.FieldLastProbedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetLastProbedAt(v)
+		return nil
+	case egressroute.FieldVerifiedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetVerifiedAt(v)
+		return nil
+	case egressroute.FieldRevision:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRevision(v)
+		return nil
+	case egressroute.FieldLastError:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetLastError(v)
+		return nil
+	}
+	return fmt.Errorf("unknown EgressRoute field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *EgressRouteMutation) AddedFields() []string {
+	var fields []string
+	if m.addrevision != nil {
+		fields = append(fields, egressroute.FieldRevision)
+	}
+	return fields
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *EgressRouteMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case egressroute.FieldRevision:
+		return m.AddedRevision()
+	}
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *EgressRouteMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	case egressroute.FieldRevision:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddRevision(v)
+		return nil
+	}
+	return fmt.Errorf("unknown EgressRoute numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *EgressRouteMutation) ClearedFields() []string {
+	var fields []string
+	if m.FieldCleared(egressroute.FieldProxyID) {
+		fields = append(fields, egressroute.FieldProxyID)
+	}
+	if m.FieldCleared(egressroute.FieldRuntimeScope) {
+		fields = append(fields, egressroute.FieldRuntimeScope)
+	}
+	if m.FieldCleared(egressroute.FieldExpectedIdentityID) {
+		fields = append(fields, egressroute.FieldExpectedIdentityID)
+	}
+	if m.FieldCleared(egressroute.FieldLastObservedIP) {
+		fields = append(fields, egressroute.FieldLastObservedIP)
+	}
+	if m.FieldCleared(egressroute.FieldLastProbedAt) {
+		fields = append(fields, egressroute.FieldLastProbedAt)
+	}
+	if m.FieldCleared(egressroute.FieldVerifiedAt) {
+		fields = append(fields, egressroute.FieldVerifiedAt)
+	}
+	if m.FieldCleared(egressroute.FieldLastError) {
+		fields = append(fields, egressroute.FieldLastError)
+	}
+	return fields
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *EgressRouteMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *EgressRouteMutation) ClearField(name string) error {
+	switch name {
+	case egressroute.FieldProxyID:
+		m.ClearProxyID()
+		return nil
+	case egressroute.FieldRuntimeScope:
+		m.ClearRuntimeScope()
+		return nil
+	case egressroute.FieldExpectedIdentityID:
+		m.ClearExpectedIdentityID()
+		return nil
+	case egressroute.FieldLastObservedIP:
+		m.ClearLastObservedIP()
+		return nil
+	case egressroute.FieldLastProbedAt:
+		m.ClearLastProbedAt()
+		return nil
+	case egressroute.FieldVerifiedAt:
+		m.ClearVerifiedAt()
+		return nil
+	case egressroute.FieldLastError:
+		m.ClearLastError()
+		return nil
+	}
+	return fmt.Errorf("unknown EgressRoute nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *EgressRouteMutation) ResetField(name string) error {
+	switch name {
+	case egressroute.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	case egressroute.FieldUpdatedAt:
+		m.ResetUpdatedAt()
+		return nil
+	case egressroute.FieldKind:
+		m.ResetKind()
+		return nil
+	case egressroute.FieldProxyID:
+		m.ResetProxyID()
+		return nil
+	case egressroute.FieldRuntimeScope:
+		m.ResetRuntimeScope()
+		return nil
+	case egressroute.FieldExpectedIdentityID:
+		m.ResetExpectedIdentityID()
+		return nil
+	case egressroute.FieldState:
+		m.ResetState()
+		return nil
+	case egressroute.FieldLastObservedIP:
+		m.ResetLastObservedIP()
+		return nil
+	case egressroute.FieldLastProbedAt:
+		m.ResetLastProbedAt()
+		return nil
+	case egressroute.FieldVerifiedAt:
+		m.ResetVerifiedAt()
+		return nil
+	case egressroute.FieldRevision:
+		m.ResetRevision()
+		return nil
+	case egressroute.FieldLastError:
+		m.ResetLastError()
+		return nil
+	}
+	return fmt.Errorf("unknown EgressRoute field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *EgressRouteMutation) AddedEdges() []string {
+	edges := make([]string, 0, 3)
+	if m.proxy != nil {
+		edges = append(edges, egressroute.EdgeProxy)
+	}
+	if m.expected_identity != nil {
+		edges = append(edges, egressroute.EdgeExpectedIdentity)
+	}
+	if m.accounts != nil {
+		edges = append(edges, egressroute.EdgeAccounts)
+	}
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *EgressRouteMutation) AddedIDs(name string) []ent.Value {
+	switch name {
+	case egressroute.EdgeProxy:
+		if id := m.proxy; id != nil {
+			return []ent.Value{*id}
+		}
+	case egressroute.EdgeExpectedIdentity:
+		if id := m.expected_identity; id != nil {
+			return []ent.Value{*id}
+		}
+	case egressroute.EdgeAccounts:
+		ids := make([]ent.Value, 0, len(m.accounts))
+		for id := range m.accounts {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *EgressRouteMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 3)
+	if m.removedaccounts != nil {
+		edges = append(edges, egressroute.EdgeAccounts)
+	}
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *EgressRouteMutation) RemovedIDs(name string) []ent.Value {
+	switch name {
+	case egressroute.EdgeAccounts:
+		ids := make([]ent.Value, 0, len(m.removedaccounts))
+		for id := range m.removedaccounts {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *EgressRouteMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 3)
+	if m.clearedproxy {
+		edges = append(edges, egressroute.EdgeProxy)
+	}
+	if m.clearedexpected_identity {
+		edges = append(edges, egressroute.EdgeExpectedIdentity)
+	}
+	if m.clearedaccounts {
+		edges = append(edges, egressroute.EdgeAccounts)
+	}
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *EgressRouteMutation) EdgeCleared(name string) bool {
+	switch name {
+	case egressroute.EdgeProxy:
+		return m.clearedproxy
+	case egressroute.EdgeExpectedIdentity:
+		return m.clearedexpected_identity
+	case egressroute.EdgeAccounts:
+		return m.clearedaccounts
+	}
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *EgressRouteMutation) ClearEdge(name string) error {
+	switch name {
+	case egressroute.EdgeProxy:
+		m.ClearProxy()
+		return nil
+	case egressroute.EdgeExpectedIdentity:
+		m.ClearExpectedIdentity()
+		return nil
+	}
+	return fmt.Errorf("unknown EgressRoute unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *EgressRouteMutation) ResetEdge(name string) error {
+	switch name {
+	case egressroute.EdgeProxy:
+		m.ResetProxy()
+		return nil
+	case egressroute.EdgeExpectedIdentity:
+		m.ResetExpectedIdentity()
+		return nil
+	case egressroute.EdgeAccounts:
+		m.ResetAccounts()
+		return nil
+	}
+	return fmt.Errorf("unknown EgressRoute edge %s", name)
 }
 
 // ErrorPassthroughRuleMutation represents an operation that mutates the ErrorPassthroughRule nodes in the graph.

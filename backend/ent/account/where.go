@@ -105,6 +105,11 @@ func ProxyFallbackOriginID(v int64) predicate.Account {
 	return predicate.Account(sql.FieldEQ(FieldProxyFallbackOriginID, v))
 }
 
+// EgressRevision applies equality check predicate on the "egress_revision" field. It's identical to EgressRevisionEQ.
+func EgressRevision(v int64) predicate.Account {
+	return predicate.Account(sql.FieldEQ(FieldEgressRevision, v))
+}
+
 // Concurrency applies equality check predicate on the "concurrency" field. It's identical to ConcurrencyEQ.
 func Concurrency(v int) predicate.Account {
 	return predicate.Account(sql.FieldEQ(FieldConcurrency, v))
@@ -718,6 +723,66 @@ func ProxyFallbackOriginIDIsNil() predicate.Account {
 // ProxyFallbackOriginIDNotNil applies the NotNil predicate on the "proxy_fallback_origin_id" field.
 func ProxyFallbackOriginIDNotNil() predicate.Account {
 	return predicate.Account(sql.FieldNotNull(FieldProxyFallbackOriginID))
+}
+
+// EgressModeEQ applies the EQ predicate on the "egress_mode" field.
+func EgressModeEQ(v EgressMode) predicate.Account {
+	return predicate.Account(sql.FieldEQ(FieldEgressMode, v))
+}
+
+// EgressModeNEQ applies the NEQ predicate on the "egress_mode" field.
+func EgressModeNEQ(v EgressMode) predicate.Account {
+	return predicate.Account(sql.FieldNEQ(FieldEgressMode, v))
+}
+
+// EgressModeIn applies the In predicate on the "egress_mode" field.
+func EgressModeIn(vs ...EgressMode) predicate.Account {
+	return predicate.Account(sql.FieldIn(FieldEgressMode, vs...))
+}
+
+// EgressModeNotIn applies the NotIn predicate on the "egress_mode" field.
+func EgressModeNotIn(vs ...EgressMode) predicate.Account {
+	return predicate.Account(sql.FieldNotIn(FieldEgressMode, vs...))
+}
+
+// EgressRevisionEQ applies the EQ predicate on the "egress_revision" field.
+func EgressRevisionEQ(v int64) predicate.Account {
+	return predicate.Account(sql.FieldEQ(FieldEgressRevision, v))
+}
+
+// EgressRevisionNEQ applies the NEQ predicate on the "egress_revision" field.
+func EgressRevisionNEQ(v int64) predicate.Account {
+	return predicate.Account(sql.FieldNEQ(FieldEgressRevision, v))
+}
+
+// EgressRevisionIn applies the In predicate on the "egress_revision" field.
+func EgressRevisionIn(vs ...int64) predicate.Account {
+	return predicate.Account(sql.FieldIn(FieldEgressRevision, vs...))
+}
+
+// EgressRevisionNotIn applies the NotIn predicate on the "egress_revision" field.
+func EgressRevisionNotIn(vs ...int64) predicate.Account {
+	return predicate.Account(sql.FieldNotIn(FieldEgressRevision, vs...))
+}
+
+// EgressRevisionGT applies the GT predicate on the "egress_revision" field.
+func EgressRevisionGT(v int64) predicate.Account {
+	return predicate.Account(sql.FieldGT(FieldEgressRevision, v))
+}
+
+// EgressRevisionGTE applies the GTE predicate on the "egress_revision" field.
+func EgressRevisionGTE(v int64) predicate.Account {
+	return predicate.Account(sql.FieldGTE(FieldEgressRevision, v))
+}
+
+// EgressRevisionLT applies the LT predicate on the "egress_revision" field.
+func EgressRevisionLT(v int64) predicate.Account {
+	return predicate.Account(sql.FieldLT(FieldEgressRevision, v))
+}
+
+// EgressRevisionLTE applies the LTE predicate on the "egress_revision" field.
+func EgressRevisionLTE(v int64) predicate.Account {
+	return predicate.Account(sql.FieldLTE(FieldEgressRevision, v))
 }
 
 // ConcurrencyEQ applies the EQ predicate on the "concurrency" field.
@@ -1696,6 +1761,29 @@ func HasProxyWith(preds ...predicate.Proxy) predicate.Account {
 	})
 }
 
+// HasEgressRoutes applies the HasEdge predicate on the "egress_routes" edge.
+func HasEgressRoutes() predicate.Account {
+	return predicate.Account(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.M2M, false, EgressRoutesTable, EgressRoutesPrimaryKey...),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasEgressRoutesWith applies the HasEdge predicate on the "egress_routes" edge with a given conditions (other predicates).
+func HasEgressRoutesWith(preds ...predicate.EgressRoute) predicate.Account {
+	return predicate.Account(func(s *sql.Selector) {
+		step := newEgressRoutesStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
 // HasParent applies the HasEdge predicate on the "parent" edge.
 func HasParent() predicate.Account {
 	return predicate.Account(func(s *sql.Selector) {
@@ -1780,6 +1868,29 @@ func HasAccountGroups() predicate.Account {
 func HasAccountGroupsWith(preds ...predicate.AccountGroup) predicate.Account {
 	return predicate.Account(func(s *sql.Selector) {
 		step := newAccountGroupsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasEgressBindings applies the HasEdge predicate on the "egress_bindings" edge.
+func HasEgressBindings() predicate.Account {
+	return predicate.Account(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, true, EgressBindingsTable, EgressBindingsColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasEgressBindingsWith applies the HasEdge predicate on the "egress_bindings" edge with a given conditions (other predicates).
+func HasEgressBindingsWith(preds ...predicate.AccountEgressBinding) predicate.Account {
+	return predicate.Account(func(s *sql.Selector) {
+		step := newEgressBindingsStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

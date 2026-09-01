@@ -199,7 +199,10 @@ import {
   type AddMethod,
   type AuthInputMethod
 } from '@/composables/useAccountOAuth'
-import { useOpenAIOAuth } from '@/composables/useOpenAIOAuth'
+import {
+  useOpenAIOAuth,
+  type OpenAIOAuthEgressSelection
+} from '@/composables/useOpenAIOAuth'
 import { useGeminiOAuth } from '@/composables/useGeminiOAuth'
 import { useAntigravityOAuth } from '@/composables/useAntigravityOAuth'
 import { useGrokOAuth } from '@/composables/useGrokOAuth'
@@ -254,6 +257,16 @@ const isGemini = computed(() => props.account?.platform === 'gemini')
 const isAnthropic = computed(() => props.account?.platform === 'anthropic')
 const isAntigravity = computed(() => props.account?.platform === 'antigravity')
 const isGrok = computed(() => props.account?.platform === 'grok')
+
+const openAIOAuthEgress = computed<OpenAIOAuthEgressSelection | undefined>(() => {
+  const account = props.account
+  if (!account) return undefined
+  const primaryRouteId = account.egress_pool?.primary_route_id ?? account.egress_summary?.primary_route_id
+  if ((account.egress_mode === 'pool' || account.egress_mode === 'inherited') && primaryRouteId != null) {
+    return { egressRouteId: primaryRouteId }
+  }
+  return account.proxy_id != null ? { proxyId: account.proxy_id } : undefined
+})
 
 /**
  * Grok reauth default tab (password auth is hidden):
@@ -370,7 +383,7 @@ const handleGenerateUrl = async () => {
   if (!props.account) return
 
   if (isOpenAILike.value) {
-    await openaiOAuth.generateAuthUrl(props.account.proxy_id)
+    await openaiOAuth.generateAuthUrl(openAIOAuthEgress.value)
   } else if (isGemini.value) {
     const creds = (props.account.credentials || {}) as Record<string, unknown>
     const tierId = typeof creds.tier_id === 'string' ? creds.tier_id : undefined
@@ -407,7 +420,7 @@ const handleExchangeCode = async () => {
       authCode.trim(),
       sessionId,
       stateToUse,
-      props.account.proxy_id
+      openAIOAuthEgress.value
     )
     if (!tokenInfo) return
 

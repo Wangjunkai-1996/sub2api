@@ -98,6 +98,14 @@ func (Account) Fields() []ent.Field {
 		field.Int64("proxy_fallback_origin_id").
 			Optional().Nillable().
 			Comment("Original proxy id replaced by expiry-fallback; for manual revert. NULL = not in fallback."),
+		field.Enum("egress_mode").
+			Values("legacy", "pool").
+			Default("legacy").
+			Comment("legacy uses proxy_id; pool uses account_egress_bindings"),
+		field.Int64("egress_revision").
+			Default(1).
+			Min(1).
+			Comment("Monotonic egress configuration/cache fence"),
 
 		// concurrency: 账户最大并发请求数
 		// 用于限制同一时间对该账户发起的请求数量
@@ -221,6 +229,8 @@ func (Account) Edges() []ent.Edge {
 		edge.To("proxy", Proxy.Type).
 			Field("proxy_id").
 			Unique(),
+		edge.To("egress_routes", EgressRoute.Type).
+			Through("egress_bindings", AccountEgressBinding.Type),
 		// children/parent: linked spark shadow relationship.
 		// parent_account_id is nullable, and the active one-shadow-per-parent rule
 		// is enforced by the partial unique index in migration 154a.

@@ -244,7 +244,8 @@ const (
 
 // ConcurrencyService 管理账号和用户的并发限制。
 type ConcurrencyService struct {
-	cache ConcurrencyCache
+	cache                  ConcurrencyCache
+	accountEgressAllocator *AccountEgressAllocator
 
 	accountLoadCacheTTL atomic.Int64
 	accountLoadCacheMu  sync.RWMutex
@@ -262,6 +263,9 @@ func NewConcurrencyService(cache ConcurrencyCache) *ConcurrencyService {
 	svc := &ConcurrencyService{
 		cache:            cache,
 		accountLoadCache: make(map[string]cachedAccountLoadBatch),
+	}
+	if egressCache, ok := cache.(AccountEgressCache); ok {
+		svc.accountEgressAllocator = NewAccountEgressAllocator(egressCache)
 	}
 	svc.SetAccountLoadBatchCacheTTL(defaultAccountLoadBatchCacheTTL)
 	return svc
@@ -325,6 +329,8 @@ func (s *ConcurrencyService) SetAccountLoadBatchCacheTTL(ttl time.Duration) {
 type AcquireResult struct {
 	Acquired    bool
 	ReleaseFunc func() // Must be called when done (typically via defer)
+	Account     *Account
+	Egress      *ResolvedAccountEgress
 }
 
 // AccountExclusiveLease reserves an idle account for a short maintenance

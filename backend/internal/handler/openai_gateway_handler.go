@@ -1195,6 +1195,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			if len(failedAccountIDs) == 0 {
 				if err != nil {
 					cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+					cls = classifySelectionFailureError(err, cls)
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					}

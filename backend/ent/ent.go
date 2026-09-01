@@ -13,6 +13,7 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/Wei-Shaw/sub2api/ent/account"
+	"github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	"github.com/Wei-Shaw/sub2api/ent/announcement"
 	"github.com/Wei-Shaw/sub2api/ent/announcementread"
@@ -27,6 +28,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/egressidentity"
+	"github.com/Wei-Shaw/sub2api/ent/egressroute"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
@@ -113,6 +116,7 @@ func checkColumn(t, c string) error {
 		columnCheck = sql.NewColumnCheck(map[string]func(string) bool{
 			apikey.Table:                        apikey.ValidColumn,
 			account.Table:                       account.ValidColumn,
+			accountegressbinding.Table:          accountegressbinding.ValidColumn,
 			accountgroup.Table:                  accountgroup.ValidColumn,
 			announcement.Table:                  announcement.ValidColumn,
 			announcementread.Table:              announcementread.ValidColumn,
@@ -126,6 +130,8 @@ func checkColumn(t, c string) error {
 			channelmonitorhistory.Table:         channelmonitorhistory.ValidColumn,
 			channelmonitorrequesttemplate.Table: channelmonitorrequesttemplate.ValidColumn,
 			compositemodelroute.Table:           compositemodelroute.ValidColumn,
+			egressidentity.Table:                egressidentity.ValidColumn,
+			egressroute.Table:                   egressroute.ValidColumn,
 			errorpassthroughrule.Table:          errorpassthroughrule.ValidColumn,
 			group.Table:                         group.ValidColumn,
 			idempotencyrecord.Table:             idempotencyrecord.ValidColumn,

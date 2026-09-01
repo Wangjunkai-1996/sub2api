@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -36,11 +37,27 @@ type noAccountErrorClassification struct {
 
 var selectionModelRateLimitedPattern = regexp.MustCompile(`(?:model_rate_limited|rate_limited)=(\d+)`)
 
-// classifySelectionFailureError preserves the scheduler's compact reason when
-// every model-capable account is temporarily rate limited.
+// classifySelectionFailureError preserves typed admission failures before the
+// generic no-account diagnosis can collapse them into a model/pool response.
 func classifySelectionFailureError(err error, fallback noAccountErrorClassification) noAccountErrorClassification {
 	if err == nil {
 		return fallback
+	}
+	if errors.Is(err, service.ErrAccountEgressCapacityFull) {
+		return noAccountErrorClassification{
+			Status:  http.StatusTooManyRequests,
+			ErrType: "rate_limit_error",
+			Message: "Account egress capacity is full. Please retry later.",
+		}
+	}
+	if errors.Is(err, service.ErrAccountEgressUnavailable) ||
+		errors.Is(err, service.ErrAccountEgressNoRoute) ||
+		errors.Is(err, service.ErrAccountEgressConfigStale) {
+		return noAccountErrorClassification{
+			Status:  http.StatusServiceUnavailable,
+			ErrType: "api_error",
+			Message: "Account egress is temporarily unavailable. Please retry later.",
+		}
 	}
 	match := selectionModelRateLimitedPattern.FindStringSubmatch(strings.ToLower(err.Error()))
 	if len(match) != 2 {

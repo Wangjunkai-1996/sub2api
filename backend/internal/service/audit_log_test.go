@@ -76,6 +76,21 @@ func TestRedactAuditBody_BareSessionKeyRedacted(t *testing.T) {
 	}
 }
 
+func TestRedactAuditBody_EgressRouteArrayRedacted(t *testing.T) {
+	raw := []byte(`{"operation":"replace","route_ids":[11,12,13],"primary_route_id":11}`)
+	out := RedactAuditBody(raw, "application/json")
+
+	if strings.Contains(out, "[11,12,13]") {
+		t.Fatalf("redacted body still contains the egress route array: %s", out)
+	}
+	if !strings.Contains(out, `"route_ids":"***"`) {
+		t.Fatalf("route_ids should be redacted: %s", out)
+	}
+	if !strings.Contains(out, `"operation":"replace"`) {
+		t.Fatalf("operation should be preserved for accountability: %s", out)
+	}
+}
+
 // TestRedactAuditBody_AuthoritativeTablesSynced 覆盖曾经漏网的凭证字段：
 // 账号 credentials 敏感子键、支付渠道无分隔符密钥、字符串值内嵌凭证的 proxy_key / custom_key，
 // 以及 camelCase 等命名变体（归一化比对）。

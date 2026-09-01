@@ -302,13 +302,42 @@ function buildOpenAIOAuthParentAccount() {
   } as any
 }
 
-function mountModal(account = buildAccount()) {
+const defaultEgressRoute = {
+  id: 1,
+  kind: 'direct',
+  name: 'Local',
+  state: 'active',
+  eligible: true
+}
+
+function withDefaultOpenAIOAuthEgress(account: any) {
+  if (
+    account.platform !== 'openai' ||
+    account.type !== 'oauth' ||
+    account.parent_account_id != null ||
+    account.egress_pool
+  ) {
+    return account
+  }
+  return {
+    ...account,
+    egress_pool: {
+      route_ids: [defaultEgressRoute.id],
+      primary_route_id: defaultEgressRoute.id,
+      concurrency_per_egress: account.concurrency,
+      routes: [defaultEgressRoute]
+    }
+  }
+}
+
+function mountModal(account = buildAccount(), extraProps: Record<string, unknown> = {}) {
   return mount(EditAccountModal, {
     props: {
       show: true,
-      account,
+      account: withDefaultOpenAIOAuthEgress(account),
       proxies: [],
-      groups: []
+      groups: [],
+      ...extraProps
     },
     global: {
       stubs: {
@@ -802,6 +831,78 @@ describe('EditAccountModal', () => {
     })
     expect(payload).not.toHaveProperty('openai_codex_warmup_policy')
     expect(payload?.extra).not.toHaveProperty('openai_codex_warmup_policy')
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
+    expect(wrapper.get('[data-testid="egress-inherited-notice"]').exists()).toBe(true)
+  })
+
+  it('updates the versioned egress pool without legacy proxy or concurrency fields', async () => {
+    const account = {
+      ...buildAccount(),
+      type: 'oauth',
+      credentials: { access_token: 'oauth-token' },
+      egress_revision: 7,
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3,
+        revision: 7
+      }
+    }
+    const routes = [
+      { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account as any, { egressRoutes: routes })
+
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="egress-concurrency-per-route"]').setValue(5)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1, 2],
+        primary_route_id: 1,
+        concurrency_per_egress: 5,
+        revision: 7
+      }
+    })
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
+  })
+
+  it('keeps legacy proxy and concurrency fields for non-OpenAI accounts', async () => {
+    const account = buildGrokAPIKeyAccount()
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload).toMatchObject({ proxy_id: null, concurrency: 2 })
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
+  })
+
+  it('keeps legacy proxy and concurrency fields for OpenAI API key accounts', async () => {
+    const account = { ...buildAccount(), proxy_id: 9, concurrency: 4 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload).toMatchObject({ proxy_id: 9, concurrency: 4 })
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
   })
 
   it('submits OpenAI APIKey Responses support override mode', async () => {

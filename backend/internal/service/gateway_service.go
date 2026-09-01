@@ -572,6 +572,7 @@ type AccountWaitPlan struct {
 
 type AccountSelectionResult struct {
 	Account     *Account
+	Egress      *ResolvedAccountEgress
 	Acquired    bool
 	ReleaseFunc func()
 	WaitPlan    *AccountWaitPlan // nil means no wait allowed

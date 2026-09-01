@@ -17,6 +17,7 @@ import (
 type OpenAIOAuthService struct {
 	sessionStore         *openai.SessionStore
 	proxyRepo            ProxyRepository
+	egressService        *EgressService
 	settingService       *SettingService
 	oauthClient          OpenAIOAuthClient
 	privacyClientFactory PrivacyClientFactory // 用于调用 chatgpt.com/backend-api（ImpersonateChrome）
@@ -44,32 +45,26 @@ func (s *OpenAIOAuthService) SetSettingService(settingService *SettingService) {
 	s.settingService = settingService
 }
 
+// SetEgressService injects the route resolver used to fence OAuth sessions to
+// one stable egress without persisting a credential-bearing proxy URL.
+func (s *OpenAIOAuthService) SetEgressService(egressService *EgressService) {
+	s.egressService = egressService
+}
+
+type openAIOAuthEgressSelection struct {
+	RouteID         int64
+	RouteRevision   int64
+	ProxyID         *int64
+	Direct          bool
+	RequireVerified bool
+}
+
 // ResolveOpenAIOAuthProxyURL resolves an explicit proxy ID first, then the
 // optional system default. An absent default intentionally returns an empty URL
 // (direct connection); malformed, missing, or inactive configured defaults are
 // returned as errors and must never silently become direct connections.
 func (s *OpenAIOAuthService) ResolveOpenAIOAuthProxyURL(ctx context.Context, proxyID *int64) (string, error) {
-	if proxyID != nil {
-		if s == nil || s.proxyRepo == nil {
-			return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy repository is unavailable")
-		}
-		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
-		if err != nil {
-			if !errors.Is(err, ErrProxyNotFound) {
-				return "", infraerrors.Newf(http.StatusInternalServerError, "OPENAI_OAUTH_PROXY_READ_FAILED", "failed to load proxy %d: %v", *proxyID, err)
-			}
-			return "", infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %v", err)
-		}
-		if proxy == nil {
-			return "", infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %d", *proxyID)
-		}
-		return proxy.URL(), nil
-	}
-
-	if s == nil || s.settingService == nil {
-		return "", nil
-	}
-	proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
+	proxy, err := s.resolveOpenAIOAuthProxy(ctx, proxyID)
 	if err != nil {
 		return "", err
 	}
@@ -77,6 +72,232 @@ func (s *OpenAIOAuthService) ResolveOpenAIOAuthProxyURL(ctx context.Context, pro
 		return "", nil
 	}
 	return proxy.URL(), nil
+}
+
+// ResolveOpenAIOAuthEgressURL resolves either the pool-aware route selector or
+// the legacy proxy selector for one control-plane request. It returns the URL
+// only to the immediate transport caller; no session or DTO persists it.
+func (s *OpenAIOAuthService) ResolveOpenAIOAuthEgressURL(ctx context.Context, proxyID, routeID *int64) (string, error) {
+	selection, err := s.resolveOpenAIOAuthSelection(ctx, proxyID, routeID)
+	if err != nil {
+		return "", err
+	}
+	if selection.RouteID > 0 {
+		route, err := s.egressService.GetRoute(ctx, selection.RouteID)
+		if err != nil {
+			return "", err
+		}
+		return openAIOAuthRouteProxyURL(route, selection.RequireVerified)
+	}
+	if selection.Direct {
+		return "", nil
+	}
+	return s.ResolveOpenAIOAuthProxyURL(ctx, selection.ProxyID)
+}
+
+// ResolveOpenAIAccountControlProxyURL keeps token refresh, privacy, quota and
+// other account-scoped control traffic on the pool's current primary route.
+// Control traffic deliberately does not acquire a business concurrency lease.
+func (s *OpenAIOAuthService) ResolveOpenAIAccountControlProxyURL(ctx context.Context, account *Account) (string, error) {
+	if account == nil || account.Platform != PlatformOpenAI {
+		return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_INVALID_ACCOUNT", "account is not an OpenAI account")
+	}
+	if account.EgressMode != EgressModePool {
+		return s.ResolveOpenAIOAuthProxyURL(ctx, account.ProxyID)
+	}
+	if s == nil || s.egressService == nil {
+		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route resolver is unavailable")
+	}
+	var primary *AccountEgressBinding
+	for i := range account.EgressBindings {
+		binding := &account.EgressBindings[i]
+		if !binding.IsPrimary {
+			continue
+		}
+		if primary != nil {
+			return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "account has multiple primary egress routes")
+		}
+		primary = binding
+	}
+	if primary == nil || primary.Status != AccountEgressBindingStatusActive {
+		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "account primary egress route is unavailable")
+	}
+	route, err := s.egressService.GetRoute(ctx, primary.RouteID)
+	if err != nil {
+		return "", err
+	}
+	return openAIOAuthRouteProxyURL(route, true)
+}
+
+func (s *OpenAIOAuthService) resolveOpenAIOAuthProxy(ctx context.Context, proxyID *int64) (*Proxy, error) {
+	if proxyID != nil {
+		if s == nil || s.proxyRepo == nil {
+			return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy repository is unavailable")
+		}
+		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
+		if err != nil {
+			if !errors.Is(err, ErrProxyNotFound) {
+				return nil, infraerrors.Newf(http.StatusInternalServerError, "OPENAI_OAUTH_PROXY_READ_FAILED", "failed to load proxy %d: %v", *proxyID, err)
+			}
+			return nil, infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %v", err)
+		}
+		if proxy == nil {
+			return nil, infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %d", *proxyID)
+		}
+		if !proxy.IsActive() || proxy.IsExpired(time.Now()) {
+			return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_UNAVAILABLE", "proxy is inactive or expired")
+		}
+		return proxy, nil
+	}
+
+	if s == nil || s.settingService == nil {
+		return nil, nil
+	}
+	proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return proxy, nil
+}
+
+func (s *OpenAIOAuthService) resolveOpenAIOAuthSelection(ctx context.Context, proxyID, routeID *int64) (*openAIOAuthEgressSelection, error) {
+	if proxyID != nil && routeID != nil {
+		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_EGRESS_CONFLICT", "proxy_id and egress_route_id cannot be used together")
+	}
+	if routeID != nil {
+		if *routeID <= 0 || s == nil || s.egressService == nil {
+			return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route is unavailable")
+		}
+		route, err := s.egressService.GetRoute(ctx, *routeID)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := openAIOAuthRouteProxyURL(route, true); err != nil {
+			return nil, err
+		}
+		return openAIOAuthSelectionFromRoute(route, true), nil
+	}
+
+	proxy, err := s.resolveOpenAIOAuthProxy(ctx, proxyID)
+	if err != nil {
+		return nil, err
+	}
+	selection := &openAIOAuthEgressSelection{Direct: proxy == nil}
+	if proxy != nil {
+		selection.ProxyID = cloneOpenAIOAuthInt64(&proxy.ID)
+	}
+	// Legacy OAuth sessions are fenced by their proxy ID (or the explicit
+	// direct marker), not by an egress route revision. Routine route probes may
+	// advance route revisions and must not invalidate an authorization that did
+	// not opt into the pool contract.
+	return selection, nil
+}
+
+func openAIOAuthSelectionFromRoute(route *EgressRoute, requireVerified bool) *openAIOAuthEgressSelection {
+	selection := &openAIOAuthEgressSelection{RequireVerified: requireVerified}
+	if route == nil {
+		return selection
+	}
+	selection.RouteID = route.ID
+	selection.RouteRevision = route.Revision
+	selection.ProxyID = cloneOpenAIOAuthInt64(route.ProxyID)
+	selection.Direct = route.Kind == EgressRouteKindDirect
+	return selection
+}
+
+func (s *OpenAIOAuthService) resolveOpenAIOAuthSessionProxyURL(
+	ctx context.Context,
+	session *openai.OAuthSession,
+	proxyID, routeID *int64,
+) (string, error) {
+	if session == nil {
+		return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_SESSION_NOT_FOUND", "session not found or expired")
+	}
+	if proxyID != nil && routeID != nil {
+		return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_EGRESS_CONFLICT", "proxy_id and egress_route_id cannot be used together")
+	}
+
+	if session.EgressRouteID > 0 {
+		if routeID != nil && *routeID != session.EgressRouteID {
+			return "", infraerrors.New(http.StatusConflict, "OPENAI_OAUTH_EGRESS_SESSION_STALE", "OAuth egress route changed; restart authorization")
+		}
+		if s == nil || s.egressService == nil {
+			return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route resolver is unavailable")
+		}
+		route, err := s.egressService.GetRoute(ctx, session.EgressRouteID)
+		if err != nil {
+			return "", err
+		}
+		if route.Revision != session.EgressRouteRevision {
+			return "", infraerrors.New(http.StatusConflict, "OPENAI_OAUTH_EGRESS_SESSION_STALE", "OAuth egress route changed; restart authorization")
+		}
+		if proxyID != nil && (route.ProxyID == nil || *route.ProxyID != *proxyID) {
+			return "", infraerrors.New(http.StatusConflict, "OPENAI_OAUTH_EGRESS_SESSION_STALE", "OAuth egress route changed; restart authorization")
+		}
+		return openAIOAuthRouteProxyURL(route, session.RequireVerifiedEgress)
+	}
+
+	// Compatibility for sessions created by older focused tests or by a service
+	// instance without an egress repository. The session still stores only an
+	// ID/direct marker, never a credential-bearing URL.
+	if session.ProxyID != nil {
+		if routeID != nil || (proxyID != nil && *proxyID != *session.ProxyID) {
+			return "", infraerrors.New(http.StatusConflict, "OPENAI_OAUTH_EGRESS_SESSION_STALE", "OAuth proxy changed; restart authorization")
+		}
+		return s.ResolveOpenAIOAuthProxyURL(ctx, session.ProxyID)
+	}
+	if session.DirectEgress {
+		if proxyID != nil || routeID != nil {
+			return "", infraerrors.New(http.StatusConflict, "OPENAI_OAUTH_EGRESS_SESSION_STALE", "OAuth egress changed; restart authorization")
+		}
+		return "", nil
+	}
+	if routeID != nil {
+		selection, err := s.resolveOpenAIOAuthSelection(ctx, nil, routeID)
+		if err != nil {
+			return "", err
+		}
+		route, err := s.egressService.GetRoute(ctx, selection.RouteID)
+		if err != nil {
+			return "", err
+		}
+		return openAIOAuthRouteProxyURL(route, true)
+	}
+	return s.ResolveOpenAIOAuthProxyURL(ctx, proxyID)
+}
+
+func openAIOAuthRouteProxyURL(route *EgressRoute, requireVerified bool) (string, error) {
+	if route == nil || route.ID <= 0 || route.Revision <= 0 {
+		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route is unavailable")
+	}
+	if route.State == EgressRouteStateExpired || route.State == EgressRouteStateRetired || route.State == EgressRouteStateInactive || route.State == EgressRouteStateIdentityMismatch {
+		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route is unavailable")
+	}
+	if requireVerified && (route.State != EgressRouteStateActive || route.ExpectedIdentity == nil || route.ExpectedIdentity.Status != EgressIdentityStatusActive) {
+		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNVERIFIED", "egress route must be verified before OAuth authorization")
+	}
+	switch route.Kind {
+	case EgressRouteKindDirect:
+		if route.RuntimeScope == nil || strings.TrimSpace(*route.RuntimeScope) != DefaultDirectEgressRuntimeScope {
+			return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "direct egress route is unavailable")
+		}
+		return "", nil
+	case EgressRouteKindProxy:
+		if route.ProxyID == nil || route.Proxy == nil || !route.Proxy.IsActive() || route.Proxy.IsExpired(time.Now()) {
+			return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "proxy egress route is unavailable")
+		}
+		return route.Proxy.URL(), nil
+	default:
+		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route is unavailable")
+	}
+}
+
+func cloneOpenAIOAuthInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // ResolveOpenAIOAuthDefaultProxyID returns the configured default proxy ID for
@@ -105,10 +326,15 @@ type OpenAIAuthURLResult struct {
 
 // GenerateAuthURL generates an OpenAI OAuth authorization URL
 func (s *OpenAIOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64, redirectURI, platform string) (*OpenAIAuthURLResult, error) {
-	// Resolve before creating/storing the session so a bad configured default is
-	// reported to the caller and cannot produce a session that later falls back
-	// to a direct connection.
-	proxyURL, err := s.ResolveOpenAIOAuthProxyURL(ctx, proxyID)
+	return s.GenerateAuthURLWithRoute(ctx, proxyID, nil, redirectURI, platform)
+}
+
+// GenerateAuthURLWithRoute supports the pool-aware OAuth contract while
+// retaining proxy_id compatibility for legacy callers. A route and proxy may
+// never be supplied together because that would make the session's egress
+// fence ambiguous.
+func (s *OpenAIOAuthService) GenerateAuthURLWithRoute(ctx context.Context, proxyID, routeID *int64, redirectURI, platform string) (*OpenAIAuthURLResult, error) {
+	selection, err := s.resolveOpenAIOAuthSelection(ctx, proxyID, routeID)
 	if err != nil {
 		return nil, err
 	}
@@ -141,12 +367,16 @@ func (s *OpenAIOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 
 	// Store session
 	session := &openai.OAuthSession{
-		State:        state,
-		CodeVerifier: codeVerifier,
-		ClientID:     clientID,
-		RedirectURI:  redirectURI,
-		ProxyURL:     proxyURL,
-		CreatedAt:    time.Now(),
+		State:                 state,
+		CodeVerifier:          codeVerifier,
+		ClientID:              clientID,
+		EgressRouteID:         selection.RouteID,
+		EgressRouteRevision:   selection.RouteRevision,
+		RequireVerifiedEgress: selection.RequireVerified,
+		ProxyID:               cloneOpenAIOAuthInt64(selection.ProxyID),
+		DirectEgress:          selection.Direct,
+		RedirectURI:           redirectURI,
+		CreatedAt:             time.Now(),
 	}
 	s.sessionStore.Set(sessionID, session)
 
@@ -161,11 +391,12 @@ func (s *OpenAIOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 
 // OpenAIExchangeCodeInput represents the input for code exchange
 type OpenAIExchangeCodeInput struct {
-	SessionID   string
-	Code        string
-	State       string
-	RedirectURI string
-	ProxyID     *int64
+	SessionID     string
+	Code          string
+	State         string
+	RedirectURI   string
+	ProxyID       *int64
+	EgressRouteID *int64
 }
 
 // OpenAITokenInfo represents the token information for OpenAI
@@ -185,6 +416,10 @@ type OpenAITokenInfo struct {
 	PlanType              string `json:"plan_type,omitempty"`
 	SubscriptionExpiresAt string `json:"subscription_expires_at,omitempty"`
 	PrivacyMode           string `json:"privacy_mode,omitempty"`
+	EgressRouteID         *int64 `json:"egress_route_id,omitempty"`
+	EgressRouteRevision   int64  `json:"egress_route_revision,omitempty"`
+	OAuthUsesEgressPool   bool   `json:"-"`
+	OAuthProxyID          *int64 `json:"-"`
 }
 
 // ExchangeCode exchanges authorization code for tokens
@@ -201,22 +436,9 @@ func (s *OpenAIOAuthService) ExchangeCode(ctx context.Context, input *OpenAIExch
 		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_INVALID_STATE", "invalid oauth state")
 	}
 
-	// Get proxy URL: an explicit input ID wins; otherwise preserve the URL
-	// captured at authorization time. If that session predates default-proxy
-	// support and has no URL, resolve the current default before any upstream
-	// request.
-	proxyURL := session.ProxyURL
-	var err error
-	if input.ProxyID != nil {
-		proxyURL, err = s.ResolveOpenAIOAuthProxyURL(ctx, input.ProxyID)
-		if err != nil {
-			return nil, err
-		}
-	} else if strings.TrimSpace(proxyURL) == "" {
-		proxyURL, err = s.ResolveOpenAIOAuthProxyURL(ctx, nil)
-		if err != nil {
-			return nil, err
-		}
+	proxyURL, err := s.resolveOpenAIOAuthSessionProxyURL(ctx, session, input.ProxyID, input.EgressRouteID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Use redirect URI from session or input
@@ -250,12 +472,18 @@ func (s *OpenAIOAuthService) ExchangeCode(ctx context.Context, input *OpenAIExch
 	s.sessionStore.Delete(input.SessionID)
 
 	tokenInfo := &OpenAITokenInfo{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		IDToken:      tokenResp.IDToken,
-		ExpiresIn:    int64(tokenResp.ExpiresIn),
-		ExpiresAt:    time.Now().Unix() + int64(tokenResp.ExpiresIn),
-		ClientID:     clientID,
+		AccessToken:         tokenResp.AccessToken,
+		RefreshToken:        tokenResp.RefreshToken,
+		IDToken:             tokenResp.IDToken,
+		ExpiresIn:           int64(tokenResp.ExpiresIn),
+		ExpiresAt:           time.Now().Unix() + int64(tokenResp.ExpiresIn),
+		ClientID:            clientID,
+		EgressRouteRevision: session.EgressRouteRevision,
+		OAuthUsesEgressPool: session.RequireVerifiedEgress,
+		OAuthProxyID:        cloneOpenAIOAuthInt64(session.ProxyID),
+	}
+	if session.EgressRouteID > 0 {
+		tokenInfo.EgressRouteID = cloneOpenAIOAuthInt64(&session.EgressRouteID)
 	}
 
 	if userInfo != nil {
@@ -285,7 +513,13 @@ func (s *OpenAIOAuthService) RefreshTokenWithClientID(ctx context.Context, refre
 		}
 		proxyURL = resolvedProxyURL
 	}
+	return s.RefreshTokenWithResolvedEgress(ctx, refreshToken, proxyURL, clientID)
+}
 
+// RefreshTokenWithResolvedEgress refreshes through a caller-resolved route.
+// An empty proxyURL is an explicit direct route and must not fall back to the
+// configured legacy default proxy.
+func (s *OpenAIOAuthService) RefreshTokenWithResolvedEgress(ctx context.Context, refreshToken string, proxyURL string, clientID string) (*OpenAITokenInfo, error) {
 	tokenResp, err := s.oauthClient.RefreshTokenWithClientID(ctx, refreshToken, proxyURL, clientID)
 	if err != nil {
 		return nil, err
@@ -416,13 +650,9 @@ func (s *OpenAIOAuthService) RefreshAccountToken(ctx context.Context, account *A
 		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_INVALID_ACCOUNT_TYPE", "account is not an OAuth account")
 	}
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		var err error
-		proxyURL, err = s.ResolveOpenAIOAuthProxyURL(ctx, account.ProxyID)
-		if err != nil {
-			return nil, err
-		}
+	proxyURL, err := s.ResolveOpenAIAccountControlProxyURL(ctx, account)
+	if err != nil {
+		return nil, err
 	}
 
 	accessToken := account.GetCredential("access_token")
@@ -459,6 +689,9 @@ func (s *OpenAIOAuthService) RefreshAccountToken(ctx context.Context, account *A
 	}
 
 	clientID := account.GetCredential("client_id")
+	if account.EgressMode == EgressModePool {
+		return s.RefreshTokenWithResolvedEgress(ctx, refreshToken, proxyURL, clientID)
+	}
 	return s.RefreshTokenWithClientID(ctx, refreshToken, proxyURL, clientID)
 }
 

@@ -1159,9 +1159,12 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if err != nil {
 			return nil, err
 		}
-		result, err := s.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+		result, err := s.tryAcquireAccountSlot(ctx, account)
 		if err == nil && result != nil && result.Acquired {
-			return s.newAcquiredSelectionResult(ctx, account, result.ReleaseFunc)
+			return s.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
+		}
+		if isAccountEgressAdmissionError(err) {
+			return nil, err
 		}
 		if stickyAccountID > 0 && stickyAccountID == account.ID && s.concurrencyService != nil {
 			waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, account.ID)
@@ -1204,6 +1207,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	// rewriting the durable binding here would make a short burst migrate the
 	// whole conversation to a cache-cold account.
 	stickySpillover := false
+	var lastEgressAdmissionErr error
 	if sessionHash != "" {
 		accountID := stickyAccountID
 		if accountID > 0 && !isExcluded(accountID) {
@@ -1226,9 +1230,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					} else if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 					} else {
-						result, err := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
+						result, err := s.tryAcquireAccountSlot(ctx, account)
 						if err == nil && result != nil && result.Acquired {
-							selection, selectErr := s.newAcquiredSelectionResult(ctx, account, result.ReleaseFunc)
+							selection, selectErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
 							if selectErr != nil {
 								return nil, selectErr
 							}
@@ -1236,16 +1240,21 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 							return selection, nil
 						}
 
-						waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
-						if waitingCount < cfg.StickySessionMaxWaiting {
-							return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
-								AccountID:      accountID,
-								MaxConcurrency: account.Concurrency,
-								Timeout:        cfg.StickySessionWaitTimeout,
-								MaxWaiting:     cfg.StickySessionMaxWaiting,
-							})
+						if isAccountEgressAdmissionError(err) {
+							lastEgressAdmissionErr = err
+							stickySpillover = true
+						} else {
+							waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
+							if waitingCount < cfg.StickySessionMaxWaiting {
+								return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
+									AccountID:      accountID,
+									MaxConcurrency: account.Concurrency,
+									Timeout:        cfg.StickySessionWaitTimeout,
+									MaxWaiting:     cfg.StickySessionMaxWaiting,
+								})
+							}
+							stickySpillover = true
 						}
-						stickySpillover = true
 					}
 				}
 			}
@@ -1305,14 +1314,6 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	rateOrder := openAILegacyUpstreamRateOrder{}
 	if preferLowUpstreamRate {
 		rateOrder = newOpenAILegacyUpstreamRateOrder(candidates, time.Now(), s.openAIOAuthSchedulingRateMultiplier(ctx))
-	}
-
-	accountLoads := make([]AccountWithConcurrency, 0, len(candidates))
-	for _, acc := range candidates {
-		accountLoads = append(accountLoads, AccountWithConcurrency{
-			ID:             acc.ID,
-			MaxConcurrency: acc.EffectiveLoadFactor(),
-		})
 	}
 
 	tryAcquireFromLoadMap := func(loadMap map[int64]*AccountLoadInfo) (*AccountSelectionResult, bool, error) {
@@ -1391,9 +1392,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 				continue
 			}
-			result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, fresh.Concurrency)
+			result, err := s.tryAcquireAccountSlot(ctx, fresh)
 			if err == nil && result != nil && result.Acquired {
-				selection, selectErr := s.newAcquiredSelectionResult(ctx, fresh, result.ReleaseFunc)
+				selection, selectErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 				if selectErr != nil {
 					return nil, true, selectErr
 				}
@@ -1402,11 +1403,14 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				}
 				return selection, true, nil
 			}
+			if isAccountEgressAdmissionError(err) {
+				lastEgressAdmissionErr = err
+			}
 		}
 		return nil, true, nil
 	}
 
-	loadMap, err := s.concurrencyService.GetAccountsLoadBatch(ctx, accountLoads)
+	loadMap, err := getAccountLoadsForScheduling(ctx, s.concurrencyService, s.settingService, candidates, false)
 	if err != nil {
 		ordered := append([]*Account(nil), candidates...)
 		sortAccountsByPriorityAndLastUsed(ordered, false)
@@ -1430,9 +1434,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 				continue
 			}
-			result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, fresh.Concurrency)
+			result, err := s.tryAcquireAccountSlot(ctx, fresh)
 			if err == nil && result != nil && result.Acquired {
-				selection, selectErr := s.newAcquiredSelectionResult(ctx, fresh, result.ReleaseFunc)
+				selection, selectErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 				if selectErr != nil {
 					return nil, selectErr
 				}
@@ -1441,6 +1445,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				}
 				return selection, nil
 			}
+			if isAccountEgressAdmissionError(err) {
+				lastEgressAdmissionErr = err
+			}
 		}
 	} else {
 		if selection, attempted, selectErr := tryAcquireFromLoadMap(loadMap); selectErr != nil {
@@ -1448,7 +1455,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		} else if selection != nil {
 			return selection, nil
 		} else if attempted {
-			if freshLoadMap, loadErr := s.concurrencyService.GetAccountsLoadBatchFresh(ctx, accountLoads); loadErr == nil {
+			if freshLoadMap, loadErr := getAccountLoadsForScheduling(ctx, s.concurrencyService, s.settingService, candidates, true); loadErr == nil {
 				if selection, _, selectErr := tryAcquireFromLoadMap(freshLoadMap); selectErr != nil {
 					return nil, selectErr
 				} else if selection != nil {
@@ -1480,6 +1487,20 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 			continue
 		}
+		if accountUsesEnforcedEgressPool(ctx, s.settingService, fresh) {
+			result, acquireErr := s.tryAcquireAccountSlot(ctx, fresh)
+			if acquireErr == nil && result != nil && result.Acquired {
+				return s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
+			}
+			if isAccountEgressAdmissionError(acquireErr) {
+				lastEgressAdmissionErr = acquireErr
+				continue
+			}
+			if acquireErr != nil {
+				return nil, acquireErr
+			}
+			continue
+		}
 		return s.newSelectionResult(ctx, fresh, false, nil, &AccountWaitPlan{
 			AccountID:      fresh.ID,
 			MaxConcurrency: fresh.Concurrency,
@@ -1490,6 +1511,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 
 	if requireCompact && baseCandidateCount > 0 {
 		return nil, ErrNoAvailableCompactAccounts
+	}
+	if lastEgressAdmissionErr != nil {
+		return nil, lastEgressAdmissionErr
 	}
 	return nil, ErrNoAvailableAccounts
 }
@@ -1526,11 +1550,8 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 	return accounts, nil
 }
 
-func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int) (*AcquireResult, error) {
-	if s.concurrencyService == nil {
-		return &AcquireResult{Acquired: true, ReleaseFunc: func() {}}, nil
-	}
-	return s.concurrencyService.AcquireAccountSlot(ctx, accountID, maxConcurrency)
+func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, account *Account) (*AcquireResult, error) {
+	return acquireAccountSlotForSelection(ctx, s.concurrencyService, s.settingService, account)
 }
 
 func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccount(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
@@ -1728,16 +1749,76 @@ func (s *OpenAIGatewayService) hydrateSelectedAccount(ctx context.Context, accou
 	if hydrated == nil {
 		return nil, fmt.Errorf("selected openai account %d not found during hydration", account.ID)
 	}
-	return hydrated, nil
+	return mergeOpenAIHydratedAccount(hydrated, account), nil
+}
+
+// mergeOpenAIHydratedAccount uses the cache entry for scheduler-only fields and
+// retains admission-critical values (including transport identity) from the
+// account that already passed the DB recheck. A lagging full snapshot must not
+// restore an old concurrency limit or egress configuration after that check.
+func mergeOpenAIHydratedAccount(hydrated, authority *Account) *Account {
+	if hydrated == nil {
+		return nil
+	}
+	merged := hydrated.CloneForRequest()
+	if authority == nil {
+		return merged
+	}
+	merged.Concurrency = authority.Concurrency
+	merged.ProxyID = cloneAccountInt64(authority.ProxyID)
+	if authority.Proxy != nil {
+		proxy := *authority.Proxy
+		merged.Proxy = &proxy
+	} else {
+		merged.Proxy = nil
+	}
+	merged.EgressMode = authority.EgressMode
+	merged.EgressRevision = authority.EgressRevision
+	merged.EgressBindings = cloneAccountEgressBindings(authority.EgressBindings)
+	merged.UpdatedAt = authority.UpdatedAt
+	return merged
 }
 
 func (s *OpenAIGatewayService) newSelectionResult(ctx context.Context, account *Account, acquired bool, release func(), waitPlan *AccountWaitPlan) (*AccountSelectionResult, error) {
+	var selectedEgress *ResolvedAccountEgress
+	if account != nil {
+		selectedEgress = account.SelectedEgress
+	}
+	if selectedEgress != nil {
+		// Scheduler cache entries intentionally omit egress proxy credentials. The
+		// selected binding is resolved against a new authoritative account read so
+		// route/version changes fail closed and a proxy route can never degrade to
+		// an implicit direct connection.
+		if s.accountRepo == nil {
+			return nil, ErrAccountEgressConfigStale
+		}
+		latest, err := s.accountRepo.GetByID(ctx, account.ID)
+		if err != nil || latest == nil {
+			return nil, ErrAccountEgressConfigStale
+		}
+		hydrated, err := WithResolvedAccountEgress(latest, selectedEgress)
+		if err != nil {
+			return nil, err
+		}
+		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+			Account:     hydrated,
+			Egress:      hydrated.SelectedEgress,
+			Acquired:    acquired,
+			ReleaseFunc: release,
+			WaitPlan:    waitPlan,
+		}), nil
+	}
 	hydrated, err := s.hydrateSelectedAccount(ctx, account)
 	if err != nil {
 		return nil, err
 	}
+	if hydrated == nil {
+		return nil, fmt.Errorf("selected openai account is unavailable during hydration")
+	}
+	hydrated = hydrated.CloneForRequest()
 	return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 		Account:     hydrated,
+		Egress:      hydrated.SelectedEgress,
 		Acquired:    acquired,
 		ReleaseFunc: release,
 		WaitPlan:    waitPlan,

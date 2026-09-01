@@ -11,7 +11,7 @@
       @submit.prevent="handleSubmit"
       class="space-y-5"
     >
-      <div>
+      <div v-if="account?.platform === 'openai'">
         <label class="input-label">{{ t('common.name') }}</label>
         <input v-model="form.name" type="text" required class="input" data-tour="edit-account-form-name" />
       </div>
@@ -1506,7 +1506,26 @@
         </div>
       </div>
 
-      <div v-if="!isSparkShadow">
+      <div v-if="usesEgressPool">
+        <div class="mb-1 flex items-center gap-2">
+          <label class="input-label mb-0">{{ t('admin.accounts.egressPool.title') }}</label>
+        </div>
+        <p v-if="!isSparkShadow" class="mb-2 text-xs text-gray-500 dark:text-gray-400">
+          {{ t('admin.accounts.egressPool.description') }}
+        </p>
+        <EgressPoolSelector
+          :routes="egressRoutes"
+          :selected-routes="accountEgressRoutes"
+          :selected-route-ids="egressRouteIds"
+          :primary-route-id="primaryEgressRouteId"
+          :require-primary="true"
+          :disabled="isSparkShadow"
+          :inherited="isSparkShadow"
+          @update:selected-route-ids="egressRouteIds = $event"
+          @update:primary-route-id="primaryEgressRouteId = $event"
+        />
+      </div>
+      <div v-else>
         <div class="mb-1 flex items-center gap-2">
           <label class="input-label mb-0">{{ t('admin.accounts.proxy') }}</label>
           <ProxyAdBanner />
@@ -1516,9 +1535,13 @@
 
       <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div>
-          <label class="input-label">{{ t('admin.accounts.concurrency') }}</label>
+          <label class="input-label">{{ usesEgressPool ? t('admin.accounts.egressPool.perEgressConcurrency') : t('admin.accounts.concurrency') }}</label>
           <input v-model.number="form.concurrency" type="number" min="1" class="input"
+            :data-testid="usesEgressPool ? 'egress-concurrency-per-route' : undefined"
+            :disabled="usesEgressPool && isSparkShadow"
+            :class="usesEgressPool && isSparkShadow && 'cursor-not-allowed opacity-60'"
             @input="form.concurrency = Math.max(1, form.concurrency || 1)" />
+          <p v-if="usesEgressPool" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
           <label class="input-label">{{ t('admin.accounts.loadFactor') }}</label>
@@ -2874,6 +2897,8 @@ import { useQuotaNotifyState } from '@/composables/useQuotaNotifyState'
 import type {
   Account,
   Proxy,
+  AssignableEgressRoute,
+  AccountEgressPoolWrite,
   AdminGroup,
   CheckMixedChannelResponse,
   OpenAICompactMode,
@@ -2887,6 +2912,7 @@ import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import Icon from '@/components/icons/Icon.vue'
+import EgressPoolSelector from '@/components/account/EgressPoolSelector.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
@@ -2941,11 +2967,15 @@ import {
 interface Props {
   show: boolean
   account: Account | null
-  proxies: Proxy[]
+  proxies?: Proxy[]
+  egressRoutes?: AssignableEgressRoute[]
   groups: AdminGroup[]
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  proxies: () => [],
+  egressRoutes: () => []
+})
 const emit = defineEmits<{
   close: []
   updated: [account: Account]
@@ -2955,9 +2985,11 @@ const { t } = useI18n()
 const appStore = useAppStore()
 const authStore = useAuthStore()
 
-// Spark 影子账号(parent_account_id 非空):代理恒继承母账号,不可独立编辑(外审 B/P1),
-// 故隐藏代理选择器。
+// Spark shadows inherit the parent's entire egress policy and cannot override it.
 const isSparkShadow = computed(() => props.account?.parent_account_id != null)
+const accountEgressRoutes = computed(() =>
+  props.account?.egress_pool?.routes ?? props.account?.egress_summary?.routes ?? []
+)
 
 const hideAccountLongContextBilling = computed(() => {
   return allSelectedGroupsEnableLongContextPricing(form.group_ids, props.groups)
@@ -3595,6 +3627,24 @@ const form = reactive({
   expires_at: null as number | null
 })
 
+const egressRouteIds = ref<number[]>([])
+const primaryEgressRouteId = ref<number | null>(null)
+
+const buildEgressPool = (): AccountEgressPoolWrite => ({
+  route_ids: [...egressRouteIds.value],
+  primary_route_id: primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null,
+  concurrency_per_egress: Math.max(1, Number(form.concurrency) || 1),
+  ...(props.account?.egress_revision != null
+    ? { revision: props.account.egress_revision }
+    : props.account?.egress_pool?.revision != null
+      ? { revision: props.account.egress_pool.revision }
+      : {})
+})
+
+const usesEgressPool = computed(
+  () => props.account?.platform === 'openai' && props.account?.type === 'oauth'
+)
+
 const handleUpstreamBillingRateSyncChange = (enabled: boolean) => {
   upstreamBillingRateSyncEnabled.value = enabled
   if (enabled) {
@@ -3693,8 +3743,23 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   mixedChannelWarningAction.value = null
   form.name = newAccount.name
   form.notes = newAccount.notes || ''
+  const accountUsesEgressPool = newAccount.platform === 'openai' && newAccount.type === 'oauth'
+  const pool = accountUsesEgressPool ? newAccount.egress_pool : null
+  const legacyRoute = accountUsesEgressPool
+    ? props.egressRoutes.find((route) => route.proxy_id === newAccount.proxy_id)
+    : undefined
+  egressRouteIds.value = pool?.route_ids?.length
+    ? [...pool.route_ids]
+    : legacyRoute
+      ? [legacyRoute.id]
+      : []
+  primaryEgressRouteId.value = pool?.primary_route_id ?? legacyRoute?.id ?? null
   form.proxy_id = newAccount.proxy_id
-  form.concurrency = newAccount.concurrency
+  form.concurrency = accountUsesEgressPool
+    ? pool?.concurrency_per_egress
+      ?? newAccount.egress_summary?.concurrency_per_egress
+      ?? newAccount.concurrency
+    : newAccount.concurrency
   form.load_factor = newAccount.load_factor ?? null
   form.priority = newAccount.priority
   form.rate_multiplier = newAccount.rate_multiplier ?? 1
@@ -4627,6 +4692,11 @@ const handleSubmit = async () => {
   if (!props.account) return
   const accountID = props.account.id
 
+  if (usesEgressPool.value && !isSparkShadow.value && egressRouteIds.value.length === 0) {
+    appStore.showError(t('admin.accounts.egressPool.noSelection'))
+    return
+  }
+
   if (form.status !== 'active' && form.status !== 'inactive' && form.status !== 'error') {
     appStore.showError(t('admin.accounts.pleaseSelectStatus'))
     return
@@ -4641,9 +4711,19 @@ const handleSubmit = async () => {
 
   const updatePayload: Record<string, unknown> = { ...form }
   try {
-    // 后端期望 proxy_id: 0 表示清除代理，而不是 null
-    if (updatePayload.proxy_id === null) {
-      updatePayload.proxy_id = 0
+    if (usesEgressPool.value) {
+      delete updatePayload.proxy_id
+      delete updatePayload.concurrency
+      if (!isSparkShadow.value) {
+        updatePayload.egress_mode = 'pool'
+        updatePayload.egress_pool = buildEgressPool()
+      } else {
+        delete updatePayload.egress_mode
+        delete updatePayload.egress_pool
+      }
+    } else {
+      delete updatePayload.egress_mode
+      delete updatePayload.egress_pool
     }
     if (form.expires_at === null) {
       updatePayload.expires_at = 0

@@ -665,7 +665,7 @@
         </div>
       </div>
 
-      <!-- Proxy -->
+      <!-- Proxy / OpenAI egress pool -->
       <div class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
           <label
@@ -673,7 +673,7 @@
             class="input-label mb-0"
             for="bulk-edit-proxy-enabled"
           >
-            {{ t('admin.accounts.proxy') }}
+            {{ allOpenAIOAuthOnly ? t('admin.accounts.egressPool.title') : t('admin.accounts.proxy') }}
           </label>
           <input
             v-model="enableProxy"
@@ -683,7 +683,36 @@
             class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
           />
         </div>
-        <div id="bulk-edit-proxy-body" :class="!enableProxy && 'pointer-events-none opacity-50'">
+        <div v-if="allOpenAIOAuthOnly" id="bulk-edit-proxy-body" class="space-y-3" :class="!enableProxy && 'pointer-events-none opacity-50'">
+          <div class="inline-flex w-full rounded-md border border-gray-200 p-1 dark:border-dark-600" role="group" :aria-label="t('admin.accounts.egressPool.bulk.operation')">
+            <button
+              v-for="operation in egressOperationOptions"
+              :key="operation.value"
+              type="button"
+              class="min-w-0 flex-1 rounded px-2 py-1.5 text-xs font-medium transition-colors"
+              :class="egressOperation === operation.value
+                ? 'bg-primary-600 text-white'
+                : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-dark-700'"
+              :disabled="!enableProxy"
+              :data-testid="`bulk-egress-operation-${operation.value}`"
+              @click="egressOperation = operation.value"
+            >
+              {{ operation.label }}
+            </button>
+          </div>
+          <p class="text-xs text-gray-500 dark:text-gray-400">{{ egressOperationHint }}</p>
+          <EgressPoolSelector
+            :routes="egressRoutes"
+            :selected-route-ids="egressRouteIds"
+            :primary-route-id="primaryEgressRouteId"
+            :require-primary="egressOperation === 'replace'"
+            :disabled="!enableProxy"
+            aria-labelledby="bulk-edit-proxy-label"
+            @update:selected-route-ids="egressRouteIds = $event"
+            @update:primary-route-id="primaryEgressRouteId = $event"
+          />
+        </div>
+        <div v-else id="bulk-edit-proxy-body" :class="!enableProxy && 'pointer-events-none opacity-50'">
           <ProxySelector
             v-model="proxyId"
             :proxies="proxies"
@@ -701,7 +730,7 @@
               class="input-label mb-0"
               for="bulk-edit-concurrency-enabled"
             >
-              {{ t('admin.accounts.concurrency') }}
+              {{ allOpenAIOAuthOnly ? t('admin.accounts.egressPool.perEgressConcurrency') : t('admin.accounts.concurrency') }}
             </label>
             <input
               v-model="enableConcurrency"
@@ -722,6 +751,7 @@
             aria-labelledby="bulk-edit-concurrency-label"
             @input="concurrency = Math.max(1, concurrency || 1)"
           />
+          <p v-if="allOpenAIOAuthOnly" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
           <div class="mb-3 flex items-center justify-between">
@@ -1478,6 +1508,9 @@ import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
 import type {
   Proxy as ProxyConfig,
+  AssignableEgressRoute,
+  AccountEgressPoolOperation,
+  BulkAccountEgressPoolWrite,
   AdminGroup,
   AccountPlatform,
   AccountType,
@@ -1488,6 +1521,7 @@ import type {
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
+import EgressPoolSelector from '@/components/account/EgressPoolSelector.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
@@ -1527,11 +1561,15 @@ interface Props {
     selectedPlatforms?: AccountPlatform[]
     selectedTypes?: AccountType[]
   }
-  proxies: ProxyConfig[]
+  proxies?: ProxyConfig[]
+  egressRoutes?: AssignableEgressRoute[]
   groups: AdminGroup[]
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  proxies: () => [],
+  egressRoutes: () => []
+})
 const emit = defineEmits<{
   close: []
   updated: []
@@ -1552,7 +1590,6 @@ const allTargetsGrok = computed(
     targetSelectedPlatforms.value.every((p) => p === 'grok')
 )
 const isMixedPlatform = computed(() => targetSelectedPlatforms.value.length > 1)
-
 const allOpenAIPassthroughCapable = computed(() => {
   return (
     targetSelectedPlatforms.value.length === 1 &&
@@ -1685,12 +1722,24 @@ const interceptWarmupRequests = ref(false)
 const headerOverrideEnabled = ref(false)
 const headerOverrideRows = ref<HeaderOverrideRow[]>([])
 const proxyId = ref<number | null>(null)
+const egressRouteIds = ref<number[]>([])
+const primaryEgressRouteId = ref<number | null>(null)
+const egressOperation = ref<AccountEgressPoolOperation>('replace')
 const concurrency = ref(1)
 const loadFactor = ref<number | null>(null)
 const priority = ref(1)
 const rateMultiplier = ref(1)
 const status = ref<'active' | 'inactive'>('active')
 const groupIds = ref<number[]>([])
+
+const egressOperationOptions = computed(() => [
+  { value: 'replace' as const, label: t('admin.accounts.egressPool.bulk.replace') },
+  { value: 'append' as const, label: t('admin.accounts.egressPool.bulk.append') },
+  { value: 'remove' as const, label: t('admin.accounts.egressPool.bulk.remove') }
+])
+const egressOperationHint = computed(() =>
+  t(`admin.accounts.egressPool.bulk.${egressOperation.value}Hint`)
+)
 const openaiPassthroughEnabled = ref(false)
 // Codex namespace 工具摊平兼容开关（仅 OAuth），缺省关闭即原样保留
 const openaiFlattenNamespacesEnabled = ref(false)
@@ -1935,13 +1984,26 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     return updates.extra as Record<string, unknown>
   }
 
-  if (enableProxy.value) {
-    // 后端期望 proxy_id: 0 表示清除代理，而不是 null
-    updates.proxy_id = proxyId.value === null ? 0 : proxyId.value
-  }
-
-  if (enableConcurrency.value) {
-    updates.concurrency = concurrency.value
+  if (allOpenAIOAuthOnly.value && (enableProxy.value || enableConcurrency.value)) {
+    const pool: BulkAccountEgressPoolWrite = {
+      operation: enableProxy.value ? egressOperation.value : 'append',
+      route_ids: enableProxy.value ? [...egressRouteIds.value] : []
+    }
+    if (enableProxy.value && egressOperation.value === 'replace') {
+      pool.primary_route_id = primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null
+    }
+    if (enableConcurrency.value) {
+      pool.concurrency_per_egress = Math.max(1, Number(concurrency.value) || 1)
+    }
+    updates.egress_mode = 'pool'
+    updates.egress_pool = pool
+  } else {
+    if (enableProxy.value) {
+      updates.proxy_id = proxyId.value === null ? 0 : proxyId.value
+    }
+    if (enableConcurrency.value) {
+      updates.concurrency = concurrency.value
+    }
   }
 
   if (enableLoadFactor.value) {
@@ -2182,6 +2244,10 @@ const preCheckMixedChannelRisk = async (built: Record<string, unknown>): Promise
 }
 
 const handleSubmit = async () => {
+  if (allOpenAIOAuthOnly.value && enableProxy.value && egressRouteIds.value.length === 0) {
+    appStore.showError(t('admin.accounts.egressPool.noSelection'))
+    return
+  }
   if (targetMode.value === 'selected' && props.accountIds.length === 0) {
     appStore.showError(t('admin.accounts.bulkEdit.noSelection'))
     return
@@ -2383,6 +2449,9 @@ watch(
       headerOverrideEnabled.value = false
       headerOverrideRows.value = []
       proxyId.value = null
+      egressRouteIds.value = []
+      primaryEgressRouteId.value = null
+      egressOperation.value = 'replace'
       concurrency.value = 1
       loadFactor.value = null
       priority.value = 1

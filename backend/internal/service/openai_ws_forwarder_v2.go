@@ -37,6 +37,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
+	ctx = ContextWithSelectedAccountEgress(ctx, account)
 	responseModelObserver := &upstreamResponseModelObserver{}
 
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -199,6 +200,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		Account: account,
 		WSURL:   wsURL,
 		Headers: wsHeaders,
+		RequiredBindingID: func() string {
+			if account.SelectedEgress == nil {
+				return ""
+			}
+			return strings.TrimSpace(account.SelectedEgress.BindingID)
+		}(),
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -746,10 +753,19 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if responseID != "" && stateStore != nil {
 		ttl := s.openAIWSResponseStickyTTL()
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+		bindingID := strings.TrimSpace(lease.BindingID())
+		if bindingID != "" {
+			logOpenAIWSBindResponseEgressWarn(groupID, account.ID, responseID, bindingID, bindOpenAIWSResponseEgress(stateStore, ctx, groupID, responseID, bindingID, ttl))
+		}
 		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
 	}
 	if stateStore != nil && storeDisabled && sessionHash != "" {
-		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), s.openAIWSSessionStickyTTL())
+		ttl := s.openAIWSSessionStickyTTL()
+		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), ttl)
+		bindingID := strings.TrimSpace(lease.BindingID())
+		if bindingID != "" {
+			logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, bindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, bindingID, ttl))
+		}
 	}
 	firstTokenMsValue := -1
 	if firstTokenMs != nil {

@@ -108,6 +108,7 @@ func (h *OpenAIGatewayHandler) ResponsesInputTokens(c *gin.Context) {
 	if err != nil {
 		reqLog.Warn("openai_input_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)))
 		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, routingModel, reqModel)
+		cls = classifySelectionFailureError(err, cls)
 		if !cls.ModelNotFound {
 			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 		}

@@ -42,7 +42,7 @@ const (
 	// ordinary request slots, because idle ingress sessions do not hold a turn slot.
 	openAIWSIngressLeaseKeyPrefix  = "concurrency:openai_ws_ingress:api_key:"
 	openAIWSIngressLeaseTTLSeconds = 60
-	liveLeaseTTLSeconds            = 60
+	liveLeaseTTLSeconds            = int64(service.LiveConcurrencyLeaseTTL / time.Second)
 	// 等待队列计数器格式: concurrency:wait:{userID}
 	waitQueueKeyPrefix = "concurrency:wait:"
 	// 账号级等待队列计数器格式: wait:account:{accountID}
@@ -114,24 +114,46 @@ var (
 		local key = KEYS[1]
 		local liveKey = KEYS[2]
 		local exclusiveKey = KEYS[3]
+		local modeKey = KEYS[4]
+		local poolTotalKey = KEYS[5]
+		local egressExclusiveKey = KEYS[6]
+		local legacyRegularMirrorKey = KEYS[7]
 		local maxConcurrency = tonumber(ARGV[1])
 		local ttl = tonumber(ARGV[2])
 		local requestID = ARGV[3]
-		local now = tonumber(redis.call('TIME')[1])
+		local poolTTL = tonumber(ARGV[4])
+		local timeResult = redis.call('TIME')
+		local now = tonumber(timeResult[1])
+		local nowMillis = now * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
 		local expireBefore = now - ttl
 		redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
 		redis.call('ZREMRANGEBYSCORE', liveKey, '-inf', now - 60)
-		if redis.call('EXISTS', exclusiveKey) == 1 then return {0, now} end
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyRegularMirrorKey, '-inf', expireBefore)
+		if redis.call('EXISTS', exclusiveKey) == 1 or redis.call('EXISTS', egressExclusiveKey) == 1 then return {0, now} end
+		local mode = redis.call('GET', modeKey)
+		if mode == false then
+			redis.call('SET', modeKey, 'legacy')
+		elseif mode == 'pool' then
+			if redis.call('ZCARD', poolTotalKey) > 0 then return {0, now} end
+			redis.call('SET', modeKey, 'legacy')
+		elseif mode ~= 'legacy' then
+			return {0, now}
+		end
 		local exists = redis.call('ZSCORE', key, requestID)
 		if exists ~= false then
 			redis.call('ZADD', key, now, requestID)
+			redis.call('ZADD', legacyRegularMirrorKey, now, requestID)
 			redis.call('EXPIRE', key, ttl)
+			redis.call('EXPIRE', legacyRegularMirrorKey, ttl)
 			return {1, now}
 		end
 		local count = redis.call('ZCARD', key) + redis.call('ZCARD', liveKey)
 		if count < maxConcurrency then
 			redis.call('ZADD', key, now, requestID)
+			redis.call('ZADD', legacyRegularMirrorKey, now, requestID)
 			redis.call('EXPIRE', key, ttl)
+			redis.call('EXPIRE', legacyRegularMirrorKey, ttl)
 			return {1, now}
 		end
 		return {0, now}
@@ -178,18 +200,44 @@ var (
 		local userLive = KEYS[4]
 		local apiLive = KEYS[5]
 		local accountExclusive = KEYS[6]
+		local modeKey = KEYS[7]
+		local poolTotalKey = KEYS[8]
+		local egressExclusiveKey = KEYS[9]
+		local legacyLiveMirror = KEYS[10]
 		local accountMax = tonumber(ARGV[1])
 		local userMax = tonumber(ARGV[2])
 		local ttl = tonumber(ARGV[3])
 		local leaseID = ARGV[4]
 		local replacing = tonumber(ARGV[5])
-		local now = tonumber(redis.call('TIME')[1])
+		local poolTTL = tonumber(ARGV[6])
+		local timeResult = redis.call('TIME')
+		local now = tonumber(timeResult[1])
+		local nowMillis = now * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
 		local liveExpireBefore = now - ttl
 		redis.call('ZREMRANGEBYSCORE', accountLive, '-inf', liveExpireBefore)
 		redis.call('ZREMRANGEBYSCORE', userLive, '-inf', liveExpireBefore)
 		redis.call('ZREMRANGEBYSCORE', apiLive, '-inf', liveExpireBefore)
-		if redis.call('EXISTS', accountExclusive) == 1 then return 0 end
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyLiveMirror, '-inf', liveExpireBefore)
+		if redis.call('EXISTS', accountExclusive) == 1 or redis.call('EXISTS', egressExclusiveKey) == 1 then return 0 end
+		local mode = redis.call('GET', modeKey)
+		if mode == false then
+			redis.call('SET', modeKey, 'legacy')
+		elseif mode == 'pool' then
+			if redis.call('ZCARD', poolTotalKey) > 0 then return 0 end
+			redis.call('SET', modeKey, 'legacy')
+		elseif mode ~= 'legacy' then
+			return 0
+		end
 		if redis.call('ZSCORE', accountLive, leaseID) ~= false then
+			redis.call('ZADD', accountLive, now, leaseID)
+			redis.call('ZADD', userLive, now, leaseID)
+			redis.call('ZADD', apiLive, now, leaseID)
+			redis.call('ZADD', legacyLiveMirror, now, leaseID)
+			redis.call('EXPIRE', accountLive, ttl)
+			redis.call('EXPIRE', userLive, ttl)
+			redis.call('EXPIRE', apiLive, ttl)
+			redis.call('EXPIRE', legacyLiveMirror, ttl)
 			return 1
 		end
 		local accountCount = redis.call('ZCARD', accountRegular) + redis.call('ZCARD', accountLive)
@@ -201,9 +249,11 @@ var (
 		redis.call('ZADD', accountLive, now, leaseID)
 		redis.call('ZADD', userLive, now, leaseID)
 		redis.call('ZADD', apiLive, now, leaseID)
+		redis.call('ZADD', legacyLiveMirror, now, leaseID)
 		redis.call('EXPIRE', accountLive, ttl)
 		redis.call('EXPIRE', userLive, ttl)
 		redis.call('EXPIRE', apiLive, ttl)
+		redis.call('EXPIRE', legacyLiveMirror, ttl)
 		return 1
 	`)
 
@@ -213,12 +263,97 @@ var (
 		local leaseID = ARGV[2]
 		local now = tonumber(redis.call('TIME')[1])
 		local expireBefore = now - ttl
-		for _, key in ipairs(KEYS) do
+		for index = 1, 3 do
+			local key = KEYS[index]
 			redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
 			if redis.call('ZSCORE', key, leaseID) == false then return 0 end
 		end
 		for _, key in ipairs(KEYS) do
 			redis.call('ZADD', key, now, leaseID)
+			redis.call('EXPIRE', key, ttl)
+		end
+		return 1
+	`)
+
+	// Pool-mode Live leases do not add an accountLive member: the account's
+	// capacity is represented by the account-egress lease. They still reserve
+	// user/API-key live slots and atomically verify that the exact egress lease
+	// and identity member are present.
+	acquireLiveEgressLeaseScript = redis.NewScript(`
+		redis.replicate_commands()
+		local egressMetadata = KEYS[1]
+		local egressIdentity = KEYS[2]
+		local egressTotal = KEYS[3]
+		local egressExclusive = KEYS[4]
+		local userRegular = KEYS[5]
+		local userLive = KEYS[6]
+		local apiLive = KEYS[7]
+		local modeKey = KEYS[8]
+		local userMax = tonumber(ARGV[1])
+		local ttl = tonumber(ARGV[2])
+		local liveLeaseID = ARGV[3]
+		local replacing = tonumber(ARGV[4])
+		local egressMember = ARGV[5]
+		local expectedBindingHash = ARGV[6]
+		local expectedIdentityHash = ARGV[7]
+		local now = tonumber(redis.call('TIME')[1])
+		local expireBefore = now - ttl
+		redis.call('ZREMRANGEBYSCORE', userLive, '-inf', expireBefore)
+		redis.call('ZREMRANGEBYSCORE', apiLive, '-inf', expireBefore)
+		if redis.call('GET', modeKey) ~= 'pool' then return 0 end
+		if redis.call('EXISTS', egressExclusive) == 1 then return 0 end
+		if redis.call('HGET', egressMetadata, 'binding_hash') ~= expectedBindingHash or
+			redis.call('HGET', egressMetadata, 'identity_hash') ~= expectedIdentityHash or
+			redis.call('ZSCORE', egressIdentity, egressMember) == false or
+			redis.call('ZSCORE', egressTotal, egressMember) == false then
+			return 0
+		end
+		if redis.call('ZSCORE', userLive, liveLeaseID) ~= false then
+			redis.call('ZADD', userLive, now, liveLeaseID)
+			redis.call('ZADD', apiLive, now, liveLeaseID)
+			redis.call('EXPIRE', userLive, ttl)
+			redis.call('EXPIRE', apiLive, ttl)
+			return 1
+		end
+		local userCount = redis.call('ZCARD', userRegular) + redis.call('ZCARD', userLive)
+		local allowance = 0
+		if replacing == 1 then allowance = 1 end
+		if userMax > 0 and userCount >= userMax + allowance then return 0 end
+		redis.call('ZADD', userLive, now, liveLeaseID)
+		redis.call('ZADD', apiLive, now, liveLeaseID)
+		redis.call('EXPIRE', userLive, ttl)
+		redis.call('EXPIRE', apiLive, ttl)
+		return 1
+	`)
+
+	refreshLiveEgressLeaseScript = redis.NewScript(`
+		redis.replicate_commands()
+		local egressMetadata = KEYS[1]
+		local egressIdentity = KEYS[2]
+		local egressTotal = KEYS[3]
+		local userLive = KEYS[4]
+		local apiLive = KEYS[5]
+		local modeKey = KEYS[6]
+		local ttl = tonumber(ARGV[1])
+		local liveLeaseID = ARGV[2]
+		local egressMember = ARGV[3]
+		local expectedBindingHash = ARGV[4]
+		local expectedIdentityHash = ARGV[5]
+		local now = tonumber(redis.call('TIME')[1])
+		local expireBefore = now - ttl
+		if redis.call('GET', modeKey) ~= 'pool' or
+			redis.call('HGET', egressMetadata, 'binding_hash') ~= expectedBindingHash or
+			redis.call('HGET', egressMetadata, 'identity_hash') ~= expectedIdentityHash or
+			redis.call('ZSCORE', egressIdentity, egressMember) == false or
+			redis.call('ZSCORE', egressTotal, egressMember) == false then
+			return 0
+		end
+		for _, key in ipairs({userLive, apiLive}) do
+			redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
+			if redis.call('ZSCORE', key, liveLeaseID) == false then return 0 end
+		end
+		for _, key in ipairs({userLive, apiLive}) do
+			redis.call('ZADD', key, now, liveLeaseID)
 			redis.call('EXPIRE', key, ttl)
 		end
 		return 1
@@ -230,20 +365,31 @@ var (
 		local liveKey = KEYS[2]
 		local waitKey = KEYS[3]
 		local exclusiveKey = KEYS[4]
+		local egressExclusiveKey = KEYS[5]
+		local poolTotalKey = KEYS[6]
+		local poolWaitersKey = KEYS[7]
 		local token = ARGV[1]
 		local ttl = tonumber(ARGV[2])
 		local regularTTL = tonumber(ARGV[3])
 		local liveTTL = tonumber(ARGV[4])
-		local now = tonumber(redis.call('TIME')[1])
+		local poolTTL = tonumber(ARGV[5])
+		local poolWaiterTTL = tonumber(ARGV[6])
+		local timeResult = redis.call('TIME')
+		local now = tonumber(timeResult[1])
+		local nowMillis = now * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
 		redis.call('ZREMRANGEBYSCORE', regularKey, '-inf', now - regularTTL)
 		redis.call('ZREMRANGEBYSCORE', liveKey, '-inf', now - liveTTL)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		redis.call('ZREMRANGEBYSCORE', poolWaitersKey, '-inf', now * 1000000 + tonumber(timeResult[2]) - poolWaiterTTL * 1000)
 		local waiting = tonumber(redis.call('GET', waitKey) or '0')
-		if redis.call('ZCARD', regularKey) > 0 or redis.call('ZCARD', liveKey) > 0 or waiting > 0 then
+		if redis.call('ZCARD', regularKey) > 0 or redis.call('ZCARD', liveKey) > 0 or redis.call('ZCARD', poolTotalKey) > 0 or redis.call('ZCARD', poolWaitersKey) > 0 or waiting > 0 then
 			return 0
 		end
-		if redis.call('SET', exclusiveKey, token, 'EX', ttl, 'NX') == false then
+		if redis.call('EXISTS', exclusiveKey) == 1 or redis.call('EXISTS', egressExclusiveKey) == 1 then
 			return 0
 		end
+		redis.call('SET', exclusiveKey, token, 'EX', ttl)
+		redis.call('SET', egressExclusiveKey, token, 'EX', ttl)
 		return 1
 	`)
 
@@ -253,28 +399,44 @@ var (
 		local liveKey = KEYS[2]
 		local waitKey = KEYS[3]
 		local exclusiveKey = KEYS[4]
+		local egressExclusiveKey = KEYS[5]
+		local poolTotalKey = KEYS[6]
+		local poolWaitersKey = KEYS[7]
 		local token = ARGV[1]
 		local ttl = tonumber(ARGV[2])
 		local regularTTL = tonumber(ARGV[3])
 		local liveTTL = tonumber(ARGV[4])
+		local poolTTL = tonumber(ARGV[5])
+		local poolWaiterTTL = tonumber(ARGV[6])
 		if redis.call('GET', exclusiveKey) ~= token then return 0 end
-		local now = tonumber(redis.call('TIME')[1])
+		local egressToken = redis.call('GET', egressExclusiveKey)
+		if egressToken ~= false and egressToken ~= token then return 0 end
+		local timeResult = redis.call('TIME')
+		local now = tonumber(timeResult[1])
+		local nowMillis = now * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
 		redis.call('ZREMRANGEBYSCORE', regularKey, '-inf', now - regularTTL)
 		redis.call('ZREMRANGEBYSCORE', liveKey, '-inf', now - liveTTL)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		redis.call('ZREMRANGEBYSCORE', poolWaitersKey, '-inf', now * 1000000 + tonumber(timeResult[2]) - poolWaiterTTL * 1000)
 		local waiting = tonumber(redis.call('GET', waitKey) or '0')
-		if redis.call('ZCARD', regularKey) > 0 or redis.call('ZCARD', liveKey) > 0 or waiting > 0 then
+		if redis.call('ZCARD', regularKey) > 0 or redis.call('ZCARD', liveKey) > 0 or redis.call('ZCARD', poolTotalKey) > 0 or redis.call('ZCARD', poolWaitersKey) > 0 or waiting > 0 then
 			return 0
 		end
 		redis.call('EXPIRE', exclusiveKey, ttl)
+		redis.call('SET', egressExclusiveKey, token, 'EX', ttl)
 		return 1
 	`)
 
 	releaseAccountExclusiveScript = redis.NewScript(`
-		local key = KEYS[1]
 		local token = ARGV[1]
-		if redis.call('GET', key) ~= token then return 0 end
-		redis.call('DEL', key)
-		return 1
+		local released = 0
+		for _, key in ipairs(KEYS) do
+			if redis.call('GET', key) == token then
+				redis.call('DEL', key)
+				released = 1
+			end
+		end
+		return released
 	`)
 
 	// trackSlotScript 记录 stats-only 槽位，不做并发上限判断。
@@ -709,7 +871,15 @@ func runScriptInt64Pair(ctx context.Context, rdb *redis.Client, script *redis.Sc
 func (c *concurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
 	key := accountSlotKey(accountID)
 	// 时间戳在 Lua 脚本内使用 Redis TIME 命令获取，确保多实例时钟一致
-	result, now, err := runScriptInt64Pair(ctx, c.rdb, acquireAccountScript, []string{key, liveAccountSlotKey(accountID), warmupAccountExclusiveKey(accountID)}, maxConcurrency, c.slotTTLSeconds, requestID)
+	result, now, err := runScriptInt64Pair(ctx, c.rdb, acquireAccountScript, []string{
+		key,
+		liveAccountSlotKey(accountID),
+		warmupAccountExclusiveKey(accountID),
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressExclusiveKey(accountID),
+		accountEgressLegacyRegularKey(accountID),
+	}, maxConcurrency, c.slotTTLSeconds, requestID, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL))
 	if err != nil {
 		return false, err
 	}
@@ -724,8 +894,14 @@ func (c *concurrencyCache) AcquireUnboundedAccountSlot(ctx context.Context, acco
 	const maxExactRedisInteger = int64(1<<53 - 1)
 	key := accountSlotKey(accountID)
 	result, now, err := runScriptInt64Pair(ctx, c.rdb, acquireAccountScript, []string{
-		key, liveAccountSlotKey(accountID), warmupAccountExclusiveKey(accountID),
-	}, maxExactRedisInteger, c.slotTTLSeconds, requestID)
+		key,
+		liveAccountSlotKey(accountID),
+		warmupAccountExclusiveKey(accountID),
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressExclusiveKey(accountID),
+		accountEgressLegacyRegularKey(accountID),
+	}, maxExactRedisInteger, c.slotTTLSeconds, requestID, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL))
 	if err != nil {
 		return false, err
 	}
@@ -737,7 +913,10 @@ func (c *concurrencyCache) AcquireUnboundedAccountSlot(ctx context.Context, acco
 
 func (c *concurrencyCache) ReleaseAccountSlot(ctx context.Context, accountID int64, requestID string) error {
 	key := accountSlotKey(accountID)
-	if err := c.rdb.ZRem(ctx, key, requestID).Err(); err != nil {
+	pipe := c.rdb.Pipeline()
+	pipe.ZRem(ctx, key, requestID)
+	pipe.ZRem(ctx, accountEgressLegacyRegularKey(accountID), requestID)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 	// 释放后用真实负载刷新索引；若没有槽位和等待计数，会移除索引 member。
@@ -911,7 +1090,44 @@ func (c *concurrencyCache) AcquireLiveLease(
 		liveUserSlotKey(userID),
 		liveAPIKeySlotKey(apiKeyID),
 		warmupAccountExclusiveKey(accountID),
-	}, accountMax, userMax, liveLeaseTTLSeconds, leaseID, replacing).Int()
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressExclusiveKey(accountID),
+		accountEgressLegacyLiveKey(accountID),
+	}, accountMax, userMax, liveLeaseTTLSeconds, leaseID, replacing, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL)).Int()
+	return result == 1, err
+}
+
+func (c *concurrencyCache) AcquireLiveLeaseForEgress(
+	ctx context.Context,
+	egress service.AccountEgressLeaseRef,
+	userID int64,
+	userMax int,
+	apiKeyID int64,
+	leaseID string,
+	replacingRegularSlots bool,
+) (bool, error) {
+	if c == nil || c.rdb == nil || egress.AccountID <= 0 || egress.ID == "" || egress.BindingID == "" || egress.IdentityID == "" || userID <= 0 || apiKeyID <= 0 || leaseID == "" {
+		return false, nil
+	}
+	replacing := 0
+	if replacingRegularSlots {
+		replacing = 1
+	}
+	result, err := acquireLiveEgressLeaseScript.Run(ctx, c.rdb, []string{
+		accountEgressLeaseKey(egress.AccountID, egress.ID),
+		accountEgressIdentityKey(egress.AccountID, egress.IdentityID),
+		accountEgressTotalKey(egress.AccountID),
+		accountEgressExclusiveKey(egress.AccountID),
+		userSlotKey(userID),
+		liveUserSlotKey(userID),
+		liveAPIKeySlotKey(apiKeyID),
+		accountEgressModeKey(egress.AccountID),
+	}, userMax, liveLeaseTTLSeconds, leaseID, replacing,
+		accountEgressIDHash(egress.ID),
+		accountEgressIDHash(egress.BindingID),
+		accountEgressIDHash(egress.IdentityID),
+	).Int()
 	return result == 1, err
 }
 
@@ -923,7 +1139,33 @@ func (c *concurrencyCache) RefreshLiveLease(ctx context.Context, accountID, user
 		liveAccountSlotKey(accountID),
 		liveUserSlotKey(userID),
 		liveAPIKeySlotKey(apiKeyID),
+		accountEgressLegacyLiveKey(accountID),
 	}, liveLeaseTTLSeconds, leaseID).Int()
+	return result == 1, err
+}
+
+func (c *concurrencyCache) RefreshLiveLeaseForEgress(
+	ctx context.Context,
+	egress service.AccountEgressLeaseRef,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+) (bool, error) {
+	if c == nil || c.rdb == nil || egress.AccountID <= 0 || egress.ID == "" || egress.BindingID == "" || egress.IdentityID == "" || userID <= 0 || apiKeyID <= 0 || leaseID == "" {
+		return false, nil
+	}
+	result, err := refreshLiveEgressLeaseScript.Run(ctx, c.rdb, []string{
+		accountEgressLeaseKey(egress.AccountID, egress.ID),
+		accountEgressIdentityKey(egress.AccountID, egress.IdentityID),
+		accountEgressTotalKey(egress.AccountID),
+		liveUserSlotKey(userID),
+		liveAPIKeySlotKey(apiKeyID),
+		accountEgressModeKey(egress.AccountID),
+	}, liveLeaseTTLSeconds, leaseID,
+		accountEgressIDHash(egress.ID),
+		accountEgressIDHash(egress.BindingID),
+		accountEgressIDHash(egress.IdentityID),
+	).Int()
 	return result == 1, err
 }
 
@@ -933,6 +1175,24 @@ func (c *concurrencyCache) ReleaseLiveLease(ctx context.Context, accountID, user
 	}
 	pipe := c.rdb.TxPipeline()
 	pipe.ZRem(ctx, liveAccountSlotKey(accountID), leaseID)
+	pipe.ZRem(ctx, liveUserSlotKey(userID), leaseID)
+	pipe.ZRem(ctx, liveAPIKeySlotKey(apiKeyID), leaseID)
+	pipe.ZRem(ctx, accountEgressLegacyLiveKey(accountID), leaseID)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (c *concurrencyCache) ReleaseLiveLeaseForEgress(
+	ctx context.Context,
+	egress service.AccountEgressLeaseRef,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+) error {
+	if c == nil || c.rdb == nil || userID <= 0 || apiKeyID <= 0 || leaseID == "" {
+		return nil
+	}
+	pipe := c.rdb.TxPipeline()
 	pipe.ZRem(ctx, liveUserSlotKey(userID), leaseID)
 	pipe.ZRem(ctx, liveAPIKeySlotKey(apiKeyID), leaseID)
 	_, err := pipe.Exec(ctx)
@@ -955,7 +1215,10 @@ func (c *concurrencyCache) AcquireAccountExclusive(ctx context.Context, accountI
 		liveAccountSlotKey(accountID),
 		accountWaitKey(accountID),
 		warmupAccountExclusiveKey(accountID),
-	}, token, ttlSeconds, c.slotTTLSeconds, liveLeaseTTLSeconds).Int()
+		accountEgressExclusiveKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressWaitersKey(accountID),
+	}, token, ttlSeconds, c.slotTTLSeconds, liveLeaseTTLSeconds, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL), accountEgressDurationMilliseconds(2*time.Minute)).Int()
 	return result == 1, err
 }
 
@@ -975,7 +1238,10 @@ func (c *concurrencyCache) RefreshAccountExclusive(ctx context.Context, accountI
 		liveAccountSlotKey(accountID),
 		accountWaitKey(accountID),
 		warmupAccountExclusiveKey(accountID),
-	}, token, ttlSeconds, c.slotTTLSeconds, liveLeaseTTLSeconds).Int()
+		accountEgressExclusiveKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressWaitersKey(accountID),
+	}, token, ttlSeconds, c.slotTTLSeconds, liveLeaseTTLSeconds, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL), accountEgressDurationMilliseconds(2*time.Minute)).Int()
 	return result == 1, err
 }
 
@@ -985,6 +1251,7 @@ func (c *concurrencyCache) ReleaseAccountExclusive(ctx context.Context, accountI
 	}
 	result, err := releaseAccountExclusiveScript.Run(ctx, c.rdb, []string{
 		warmupAccountExclusiveKey(accountID),
+		accountEgressExclusiveKey(accountID),
 	}, token).Int()
 	return result == 1, err
 }
