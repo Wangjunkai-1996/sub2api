@@ -4638,7 +4638,8 @@ const canExchangeCode = computed(() => {
   return authCode.trim() && oauth.sessionId.value && !oauth.loading.value
 })
 
-// Watchers
+// Keep resetForm hoisted: this watcher runs immediately while AccountsView mounts
+// the initially closed dialog.
 watch(
   () => props.show,
   (newVal) => {
@@ -5039,7 +5040,7 @@ const buildMixedChannelDetails = (resp?: CheckMixedChannelResponse) => {
   }
 }
 
-const clearMixedChannelDialog = () => {
+function clearMixedChannelDialog() {
   showMixedChannelWarning.value = false
   mixedChannelWarningDetails.value = null
   mixedChannelWarningRawMessage.value = ''
@@ -5135,7 +5136,7 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
 }
 
 // Methods
-const resetForm = () => {
+function resetForm() {
   step.value = 1
   form.name = ''
   form.notes = ''

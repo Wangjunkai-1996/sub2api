@@ -143,7 +143,7 @@ const ModelWhitelistSelectorStub = defineComponent({
 })
 
 const defaultEgressRoutes = [
-  { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+  { id: 1, kind: 'proxy', name: 'sys1-ipv4', state: 'active', eligible: true },
 ]
 
 function mountModal(groups: any[] = [], extraProps: Record<string, unknown> = {}) {
@@ -242,6 +242,11 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       refresh_token: 'refresh-token',
       expires_at: 123,
     })
+  })
+
+  it('mounts safely while initially closed', () => {
+    const wrapper = mountModal([], { show: false })
+    wrapper.unmount()
   })
 
   it('hides only the redundant account toggle when every selected group enables tier pricing', async () => {
@@ -596,7 +601,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
   it('submits a multi-route egress pool with one shared per-egress concurrency', async () => {
     const egressRoutes = [
-      { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+      { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
       { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
     ]
     const wrapper = mountModal([], { egressRoutes })
@@ -620,8 +625,8 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(payload).toMatchObject({
       egress_mode: 'pool',
       egress_pool: {
-        route_ids: [1, 2],
-        primary_route_id: 1,
+        route_ids: [2, 1],
+        primary_route_id: 2,
         concurrency_per_egress: 4
       }
     })
