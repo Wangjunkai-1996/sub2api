@@ -51,6 +51,15 @@ const routes: AssignableEgressRoute[] = [
     state: 'expired',
     eligible: false,
     observed_ip: '198.51.100.67'
+  },
+  {
+    id: 4,
+    kind: 'proxy',
+    name: 'RackNerd 67',
+    proxy_id: 68,
+    state: 'active',
+    eligible: true,
+    observed_ip: '198.51.100.68'
   }
 ]
 
@@ -70,16 +79,24 @@ describe('EgressPoolSelector', () => {
     verifyMock.mockReset()
   })
 
+  it('shows only explicit proxy routes and hides direct routes even when previously selected', () => {
+    const wrapper = mountSelector([1, 2], 1)
+
+    expect(wrapper.find('[data-testid="egress-route-1"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="verify-egress-1"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="egress-route-2"]').exists()).toBe(true)
+  })
+
   it('selects multiple routes and assigns the first selected route as primary', async () => {
     const wrapper = mountSelector()
 
-    await wrapper.get('#egress-route-1').setValue(true)
-    expect(wrapper.emitted('update:selectedRouteIds')?.[0]).toEqual([[1]])
-    expect(wrapper.emitted('update:primaryRouteId')?.[0]).toEqual([1])
-
-    await wrapper.setProps({ selectedRouteIds: [1], primaryRouteId: 1 })
     await wrapper.get('#egress-route-2').setValue(true)
-    expect(wrapper.emitted('update:selectedRouteIds')?.[1]).toEqual([[1, 2]])
+    expect(wrapper.emitted('update:selectedRouteIds')?.[0]).toEqual([[2]])
+    expect(wrapper.emitted('update:primaryRouteId')?.[0]).toEqual([2])
+
+    await wrapper.setProps({ selectedRouteIds: [2], primaryRouteId: 2 })
+    await wrapper.get('#egress-route-4').setValue(true)
+    expect(wrapper.emitted('update:selectedRouteIds')?.[1]).toEqual([[2, 4]])
   })
 
   it('keeps an invalid selected route removable but prevents selecting an invalid unselected route', async () => {

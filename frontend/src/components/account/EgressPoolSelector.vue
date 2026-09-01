@@ -140,10 +140,13 @@ const verifyErrors = reactive<Record<number, string>>({})
 
 const visibleRoutes = computed(() => {
   const byID = new Map<number, AssignableEgressRoute>()
-  for (const route of [...props.routes, ...props.selectedRoutes]) byID.set(route.id, route)
-  for (const [id, route] of Object.entries(verifiedRoutes)) byID.set(Number(id), route)
+  for (const route of [...props.routes, ...props.selectedRoutes]) {
+    if (route.kind === 'proxy') byID.set(route.id, route)
+  }
+  for (const [id, route] of Object.entries(verifiedRoutes)) {
+    if (route.kind === 'proxy') byID.set(Number(id), route)
+  }
   return Array.from(byID.values()).sort((left, right) => {
-    if (left.kind !== right.kind) return left.kind === 'direct' ? -1 : 1
     return routeLabel(left).localeCompare(routeLabel(right))
   })
 })

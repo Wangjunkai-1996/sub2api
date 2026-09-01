@@ -1910,7 +1910,24 @@ const cols = computed(() =>
   )
 )
 
-const handleEdit = (a: Account) => { edAcc.value = a; showEdit.value = true }
+const refreshAssignableEgressRoutes = async () => {
+  if (!adminAPI.egressRoutes?.getAssignable) return
+  try {
+    const routes = await adminAPI.egressRoutes.getAssignable()
+    egressRoutes.value = routes
+  } catch (error) {
+    // Keep the last known routes so a transient refresh failure never blocks account editing.
+    console.error('Failed to load assignable egress routes:', error)
+  }
+}
+
+const handleEdit = async (a: Account) => {
+  if (a.platform === 'openai' && a.type === 'oauth') {
+    await refreshAssignableEgressRoutes()
+  }
+  edAcc.value = a
+  showEdit.value = true
+}
 const openMenu = (a: Account, e: MouseEvent) => {
   menu.acc = a
 
@@ -2704,18 +2721,10 @@ onMounted(async () => {
 
   load()
   loadUpstreamBillingProbeGlobalState()
-  const egressRoutesRequest = adminAPI.egressRoutes?.getAssignable
-    ? adminAPI.egressRoutes.getAssignable()
-    : Promise.resolve([] as AssignableEgressRoute[])
-  const [egressRoutesResult, groupsResult] = await Promise.allSettled([
-    egressRoutesRequest,
+  const [, groupsResult] = await Promise.allSettled([
+    refreshAssignableEgressRoutes(),
     adminAPI.groups.getAll()
   ])
-  if (egressRoutesResult.status === 'fulfilled') {
-    egressRoutes.value = egressRoutesResult.value
-  } else {
-    console.error('Failed to load assignable egress routes:', egressRoutesResult.reason)
-  }
   if (groupsResult.status === 'fulfilled') {
     groups.value = groupsResult.value
   } else {

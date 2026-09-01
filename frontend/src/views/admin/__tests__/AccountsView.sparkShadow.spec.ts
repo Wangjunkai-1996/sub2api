@@ -241,6 +241,7 @@ const mountViewWithRow = () =>
               <slot name="cell-name" :row="row" :value="row.name" />
               <slot name="cell-platform_type" :row="row" />
               <slot name="cell-proxy" :row="row" />
+              <slot name="cell-actions" :row="row" />
             </div>
           </div>`
         },
@@ -260,7 +261,12 @@ const mountViewWithRow = () =>
         ErrorPassthroughRulesModal: true,
         TLSFingerprintProfilesModal: true,
         CreateAccountModal: true,
-        EditAccountModal: true,
+        EditAccountModal: {
+          props: ['show', 'account', 'egressRoutes'],
+          template: `<div data-test="edit-account-modal" :data-show="String(show)">
+            <span v-for="route in egressRoutes" :key="route.id" data-test="edit-egress-route">{{ route.name }}</span>
+          </div>`
+        },
         BulkEditAccountModal: true,
         PlatformTypeBadge: true,
         AccountCapacityCell: true,
@@ -292,6 +298,42 @@ describe('admin AccountsView — 账号行展示', () => {
     vi.useRealTimers()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
+  })
+
+  it('打开 OpenAI OAuth 编辑弹窗前重新加载可分配出口', async () => {
+    const account = {
+      id: 11049,
+      name: 'openai-oauth',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active',
+      schedulable: true
+    }
+    const refreshedRoutes = [{
+      id: 12,
+      kind: 'proxy',
+      name: 'racknerd-104-ipv4',
+      state: 'active',
+      eligible: true,
+      observed_ip: '104.223.77.152'
+    }]
+    listAccounts.mockResolvedValue({ items: [account], total: 1, page: 1, page_size: 20, pages: 1 })
+    getAssignableEgress
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(refreshedRoutes)
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+
+    const editButton = wrapper.findAll('button').find(button => button.text() === 'common.edit')
+    expect(editButton).toBeTruthy()
+    await editButton!.trigger('click')
+    await flushPromises()
+
+    expect(getAssignableEgress).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-show')).toBe('true')
+    expect(wrapper.get('[data-test="edit-egress-route"]').text()).toBe('racknerd-104-ipv4')
+    wrapper.unmount()
   })
 
   it('影子行 email 单元格显示 parent_email，PlatformTypeBadge 接收 parent_plan_type/parent_privacy_mode', async () => {
