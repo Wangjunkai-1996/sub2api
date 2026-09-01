@@ -4664,10 +4664,17 @@ const handleClose = () => {
   emit('close')
 }
 
-const submitUpdateAccount = async (accountID: number, updatePayload: Record<string, unknown>) => {
+const submitUpdateAccount = async (
+  accountID: number,
+  updatePayload: Record<string, unknown>,
+  followUpPayload?: Record<string, unknown>
+) => {
   submitting.value = true
   try {
-    const updatedAccount = await adminAPI.accounts.update(accountID, withAntigravityConfirmFlag(updatePayload))
+    let updatedAccount = await adminAPI.accounts.update(accountID, withAntigravityConfirmFlag(updatePayload))
+    if (followUpPayload) {
+      updatedAccount = await adminAPI.accounts.update(accountID, followUpPayload)
+    }
     appStore.showSuccess(t('admin.accounts.accountUpdated'))
     emit('updated', updatedAccount)
     handleClose()
@@ -4677,7 +4684,7 @@ const submitUpdateAccount = async (accountID: number, updatePayload: Record<stri
         message: error.message,
         onConfirm: async () => {
           antigravityMixedChannelConfirmed.value = true
-          await submitUpdateAccount(accountID, updatePayload)
+          await submitUpdateAccount(accountID, updatePayload, followUpPayload)
         }
       })
       return
@@ -4710,13 +4717,39 @@ const handleSubmit = async () => {
 	}
 
   const updatePayload: Record<string, unknown> = { ...form }
+  let groupUpdatePayload: Record<string, unknown> | undefined
   try {
     if (usesEgressPool.value) {
       delete updatePayload.proxy_id
       delete updatePayload.concurrency
       if (!isSparkShadow.value) {
-        updatePayload.egress_mode = 'pool'
-        updatePayload.egress_pool = buildEgressPool()
+        const nextPool = buildEgressPool()
+        const currentPool = props.account.egress_pool
+        const currentRouteIDs = currentPool?.route_ids ?? []
+        const egressPoolChanged = !currentPool
+          || currentRouteIDs.length !== nextPool.route_ids.length
+          || currentRouteIDs.some((routeID, index) => routeID !== nextPool.route_ids[index])
+          || currentPool.primary_route_id !== nextPool.primary_route_id
+          || currentPool.concurrency_per_egress !== nextPool.concurrency_per_egress
+          || (props.account.egress_mode != null && props.account.egress_mode !== 'pool')
+        const currentGroupIDs = [...(props.account.group_ids ?? [])].sort((left, right) => left - right)
+        const nextGroupIDs = [...form.group_ids].sort((left, right) => left - right)
+        const groupsChanged = currentGroupIDs.length !== nextGroupIDs.length
+          || currentGroupIDs.some((groupID, index) => groupID !== nextGroupIDs[index])
+
+        if (egressPoolChanged) {
+          updatePayload.egress_mode = 'pool'
+          updatePayload.egress_pool = nextPool
+        } else {
+          delete updatePayload.egress_mode
+          delete updatePayload.egress_pool
+        }
+        if (!groupsChanged) {
+          delete updatePayload.group_ids
+        } else if (egressPoolChanged) {
+          delete updatePayload.group_ids
+          groupUpdatePayload = { group_ids: [...form.group_ids] }
+        }
       } else {
         delete updatePayload.egress_mode
         delete updatePayload.egress_pool
@@ -5411,13 +5444,13 @@ const handleSubmit = async () => {
     }
 
     const canContinue = await ensureAntigravityMixedChannelConfirmed(async () => {
-      await submitUpdateAccount(accountID, updatePayload)
+      await submitUpdateAccount(accountID, updatePayload, groupUpdatePayload)
     })
     if (!canContinue) {
       return
     }
 
-    await submitUpdateAccount(accountID, updatePayload)
+    await submitUpdateAccount(accountID, updatePayload, groupUpdatePayload)
   } catch (error: any) {
     appStore.showError(error.message || t('admin.accounts.failedToUpdate'))
   }

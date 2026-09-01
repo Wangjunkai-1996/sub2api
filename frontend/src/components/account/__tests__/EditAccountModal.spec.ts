@@ -2,16 +2,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 import { mount } from '@vue/test-utils'
 
-const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode } = vi.hoisted(() => ({
+const { updateAccountMock, checkMixedChannelRiskMock, showErrorMock, showSuccessMock, authIsSimpleMode } = vi.hoisted(() => ({
   updateAccountMock: vi.fn(),
   checkMixedChannelRiskMock: vi.fn(),
+  showErrorMock: vi.fn(),
+  showSuccessMock: vi.fn(),
   authIsSimpleMode: { value: true }
 }))
 
 vi.mock('@/stores/app', () => ({
   useAppStore: () => ({
-    showError: vi.fn(),
-    showSuccess: vi.fn(),
+    showError: showErrorMock,
+    showSuccess: showSuccessMock,
     showInfo: vi.fn()
   })
 }))
@@ -355,6 +357,8 @@ function mountModal(account = buildAccount(), extraProps: Record<string, unknown
 describe('EditAccountModal', () => {
   beforeEach(() => {
     authIsSimpleMode.value = true
+    showErrorMock.mockReset()
+    showSuccessMock.mockReset()
   })
 
   it('reopening the same account rehydrates the OpenAI whitelist from props', async () => {
@@ -873,6 +877,78 @@ describe('EditAccountModal', () => {
     })
     expect(payload).not.toHaveProperty('proxy_id')
     expect(payload).not.toHaveProperty('concurrency')
+    expect(payload).not.toHaveProperty('group_ids')
+  })
+
+  it('updates changed egress and groups in separate requests', async () => {
+    authIsSimpleMode.value = false
+    const account = {
+      ...buildOpenAIOAuthParentAccount(),
+      group_ids: [3],
+      egress_mode: 'pool',
+      egress_revision: 7,
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3,
+        revision: 7
+      }
+    }
+    const routes = [
+      { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    updateAccountMock
+      .mockReset()
+      .mockResolvedValueOnce(account)
+      .mockResolvedValueOnce({ ...account, group_ids: [7] })
+    const wrapper = mountModal(account as any, { egressRoutes: routes })
+
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="set-shadow-group"]').trigger('click')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(2)
+    expect(updateAccountMock.mock.calls[0]?.[1]).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: { route_ids: [1, 2] }
+    })
+    expect(updateAccountMock.mock.calls[0]?.[1]).not.toHaveProperty('group_ids')
+    expect(updateAccountMock.mock.calls[1]?.[1]).toEqual({ group_ids: [7] })
+    expect(showSuccessMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report success when the separate group update fails', async () => {
+    authIsSimpleMode.value = false
+    const account = {
+      ...buildOpenAIOAuthParentAccount(),
+      group_ids: [3],
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 1,
+        revision: 1
+      }
+    }
+    const routes = [
+      { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    updateAccountMock
+      .mockReset()
+      .mockResolvedValueOnce(account)
+      .mockRejectedValueOnce(new Error('group update failed'))
+    const wrapper = mountModal(account as any, { egressRoutes: routes })
+
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="set-shadow-group"]').trigger('click')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(2)
+    expect(showSuccessMock).not.toHaveBeenCalled()
+    expect(showErrorMock).toHaveBeenCalledWith('group update failed')
+    expect(wrapper.emitted('updated')).toBeUndefined()
   })
 
   it('keeps legacy proxy and concurrency fields for non-OpenAI accounts', async () => {
