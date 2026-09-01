@@ -541,7 +541,10 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		clearBinding()
 		return nil, false, nil
 	}
-	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+	account, err = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+	if err != nil {
+		return nil, false, err
+	}
 	if account == nil || !s.service.openAIAccountMatchesSchedulingGroup(account, req.GroupID) || !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		clearBinding()
 		return nil, false, nil
@@ -1219,7 +1222,11 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			break
 		}
-		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		fresh, recheckErr := s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		if recheckErr != nil {
+			release(result)
+			return nil, compactBlocked, recheckErr
+		}
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			release(result)
 			continue
@@ -1318,7 +1325,10 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 		if !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 			continue
 		}
-		account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+		account, err = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+		if err != nil {
+			return nil, err
+		}
 		if account == nil {
 			if accountID == req.StickyAccountID && strings.TrimSpace(req.SessionHash) != "" {
 				_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, req.SessionHash)
@@ -1728,7 +1738,10 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 			if !s.consumeOpenAISelectionDBRecheck(budget) {
 				return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
 			}
-			fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			fresh, err := s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			if err != nil {
+				return nil, candidateCount, topK, loadSkew, err
+			}
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 				continue
 			}

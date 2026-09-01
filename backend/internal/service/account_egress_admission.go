@@ -176,7 +176,16 @@ func getAccountLoadsForScheduling(
 }
 
 func selectionAccount(acquired *AcquireResult, fallback *Account) *Account {
-	if acquired != nil && acquired.Account != nil {
+	// A pool admission attaches the resolved transport to its request-local
+	// account and must win. Legacy admission only mirrors the candidate that was
+	// used to reserve a slot; prefer the later DB-rechecked account in fallback.
+	if acquired != nil && acquired.Egress != nil && acquired.Account != nil {
+		return acquired.Account
+	}
+	if fallback != nil {
+		return fallback
+	}
+	if acquired != nil {
 		return acquired.Account
 	}
 	return fallback

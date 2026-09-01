@@ -110,6 +110,20 @@ func TestAccountEgressAdmissionKeepsOpenAINonOAuthOnLegacyPath(t *testing.T) {
 		"the supported account type must reach enforced pool admission")
 }
 
+func TestSelectionAccountPrefersFreshLegacyAccountAndResolvedPoolAccount(t *testing.T) {
+	stale := &Account{ID: 1, Name: "stale"}
+	fresh := &Account{ID: 1, Name: "fresh"}
+	require.Same(t, fresh, selectionAccount(&AcquireResult{Acquired: true, Account: stale}, fresh))
+
+	resolved := &ResolvedAccountEgress{BindingID: "1:9"}
+	selected := &Account{ID: 1, Name: "selected"}
+	require.Same(t, selected, selectionAccount(&AcquireResult{
+		Acquired: true,
+		Account:  selected,
+		Egress:   resolved,
+	}, fresh))
+}
+
 func timePointer(value time.Time) *time.Time {
 	return &value
 }

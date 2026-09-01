@@ -102,7 +102,7 @@ func (s *OpenAIOAuthService) ResolveOpenAIAccountControlProxyURL(ctx context.Con
 	if account == nil || account.Platform != PlatformOpenAI {
 		return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_INVALID_ACCOUNT", "account is not an OpenAI account")
 	}
-	if account.EgressMode != EgressModePool {
+	if !s.accountUsesEnforcedEgressPool(ctx, account) {
 		return s.ResolveOpenAIOAuthProxyURL(ctx, account.ProxyID)
 	}
 	if s == nil || s.egressService == nil {
@@ -127,6 +127,10 @@ func (s *OpenAIOAuthService) ResolveOpenAIAccountControlProxyURL(ctx context.Con
 		return "", err
 	}
 	return openAIOAuthRouteProxyURL(route, true)
+}
+
+func (s *OpenAIOAuthService) accountUsesEnforcedEgressPool(ctx context.Context, account *Account) bool {
+	return s != nil && accountUsesEnforcedEgressPool(ctx, s.settingService, account)
 }
 
 func (s *OpenAIOAuthService) resolveOpenAIOAuthProxy(ctx context.Context, proxyID *int64) (*Proxy, error) {
@@ -689,7 +693,7 @@ func (s *OpenAIOAuthService) RefreshAccountToken(ctx context.Context, account *A
 	}
 
 	clientID := account.GetCredential("client_id")
-	if account.EgressMode == EgressModePool {
+	if s.accountUsesEnforcedEgressPool(ctx, account) {
 		return s.RefreshTokenWithResolvedEgress(ctx, refreshToken, proxyURL, clientID)
 	}
 	return s.RefreshTokenWithClientID(ctx, refreshToken, proxyURL, clientID)

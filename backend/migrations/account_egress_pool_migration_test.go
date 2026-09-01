@@ -11,8 +11,9 @@ func TestAccountEgressPoolMigrations(t *testing.T) {
 	foundation := compactMigrationSQL(t, "240_account_egress_pool_foundation.sql")
 	backfill := compactMigrationSQL(t, "241_account_egress_pool_backfill.sql")
 	validation := compactMigrationSQL(t, "242_validate_account_egress_pool_constraints.sql")
+	permissions := compactMigrationSQL(t, "243_account_egress_pool_runtime_permissions.sql")
 
-	for _, sql := range []string{foundation, backfill, validation} {
+	for _, sql := range []string{foundation, backfill, validation, permissions} {
 		require.Contains(t, sql, "SET LOCAL lock_timeout = '3s'")
 		require.Contains(t, sql, "SET LOCAL statement_timeout = '30s'")
 		require.NotContains(t, strings.ToUpper(sql), "DROP TABLE")
@@ -44,6 +45,13 @@ func TestAccountEgressPoolMigrations(t *testing.T) {
 	require.Contains(t, validation, "ALTER TABLE accounts VALIDATE CONSTRAINT accounts_egress_mode_check")
 	require.Contains(t, validation, "ALTER TABLE accounts VALIDATE CONSTRAINT accounts_egress_revision_check")
 	require.Contains(t, validation, "ALTER TABLE accounts VALIDATE CONSTRAINT accounts_pool_concurrency_check")
+
+	require.Contains(t, permissions, "relation.relname = 'accounts'")
+	require.Contains(t, permissions, "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE")
+	require.Contains(t, permissions, "public.egress_identities, public.egress_routes, public.account_egress_bindings")
+	require.Contains(t, permissions, "GRANT USAGE, SELECT, UPDATE ON SEQUENCE")
+	require.Contains(t, permissions, "public.egress_identities_id_seq, public.egress_routes_id_seq")
+	require.Contains(t, permissions, "ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public")
 }
 
 func compactMigrationSQL(t *testing.T, name string) string {

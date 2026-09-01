@@ -22,16 +22,20 @@ type openAISnapshotCacheStub struct {
 
 type schedulerTestOpenAIAccountRepo struct {
 	AccountRepository
-	accounts []Account
+	accounts   []Account
+	getByIDErr error
 }
 
 func (r schedulerTestOpenAIAccountRepo) GetByID(ctx context.Context, id int64) (*Account, error) {
+	if r.getByIDErr != nil {
+		return nil, r.getByIDErr
+	}
 	for i := range r.accounts {
 		if r.accounts[i].ID == id {
 			return &r.accounts[i], nil
 		}
 	}
-	return nil, errors.New("account not found")
+	return nil, ErrAccountNotFound
 }
 
 func (r schedulerTestOpenAIAccountRepo) ListSchedulableByGroupIDAndPlatform(ctx context.Context, groupID int64, platform string) ([]Account, error) {
@@ -2197,7 +2201,8 @@ func TestOpenAIGatewayService_RecheckSelectedOpenAIAccountFromDB_SimpleModeUsesF
 	requestedGroupID := int64(100)
 
 	for _, groupID := range []*int64{nil, &requestedGroupID} {
-		fresh := svc.recheckSelectedOpenAIAccountFromDB(context.Background(), &grouped, groupID, PlatformOpenAI, "gpt-5.1", false, "")
+		fresh, err := svc.recheckSelectedOpenAIAccountFromDB(context.Background(), &grouped, groupID, PlatformOpenAI, "gpt-5.1", false, "")
+		require.NoError(t, err)
 		require.NotNil(t, fresh)
 		require.Equal(t, grouped.ID, fresh.ID)
 	}
@@ -2210,8 +2215,40 @@ func TestOpenAIGatewayService_RecheckSelectedOpenAIAccountFromDB_SimpleModeUsesF
 		cfg:               &config.Config{RunMode: config.RunModeStandard},
 		schedulerSnapshot: &SchedulerSnapshotService{cache: &openAISnapshotCacheStub{}},
 	}
-	require.Nil(t, standardSvc.recheckSelectedOpenAIAccountFromDB(context.Background(), &grouped, nil, PlatformOpenAI, "gpt-5.1", false, ""))
-	require.NotNil(t, standardSvc.recheckSelectedOpenAIAccountFromDB(context.Background(), &ungrouped, nil, PlatformOpenAI, "gpt-5.1", false, ""))
+	fresh, err := standardSvc.recheckSelectedOpenAIAccountFromDB(context.Background(), &grouped, nil, PlatformOpenAI, "gpt-5.1", false, "")
+	require.NoError(t, err)
+	require.Nil(t, fresh)
+	fresh, err = standardSvc.recheckSelectedOpenAIAccountFromDB(context.Background(), &ungrouped, nil, PlatformOpenAI, "gpt-5.1", false, "")
+	require.NoError(t, err)
+	require.NotNil(t, fresh)
+}
+
+func TestOpenAIGatewayService_SelectAccountWithLoadAwareness_DBRecheckErrorPropagates(t *testing.T) {
+	dbErr := errors.New("database unavailable")
+	account := &Account{
+		ID:          34311,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo: schedulerTestOpenAIAccountRepo{
+			accounts:   []Account{*account},
+			getByIDErr: dbErr,
+		},
+		cfg: &config.Config{RunMode: config.RunModeStandard},
+		schedulerSnapshot: &SchedulerSnapshotService{cache: &openAISnapshotCacheStub{
+			snapshotAccounts: []*Account{account},
+			accountsByID:     map[int64]*Account{account.ID: account},
+		}},
+	}
+
+	selection, err := svc.SelectAccountWithLoadAwareness(context.Background(), nil, "", "gpt-5.1", nil)
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, dbErr)
+	require.NotErrorIs(t, err, ErrNoAvailableAccounts)
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseSticky(t *testing.T) {

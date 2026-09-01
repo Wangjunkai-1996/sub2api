@@ -158,7 +158,10 @@ func TestOpenAIOAuthResolvedDirectRefreshDoesNotUseDefaultProxy(t *testing.T) {
 func TestOpenAIOAuthPoolAccountRefreshKeepsPrimaryDirectRoute(t *testing.T) {
 	route := activeDirectOpenAIOAuthRoute(83, 5)
 	repo := &openAIOAuthEgressRepoStub{route: route}
-	settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "invalid"}}
+	settings := &settingRepoStub{values: map[string]string{
+		SettingKeyAccountEgressPoolRolloutMode: string(AccountEgressPoolRolloutEnforce),
+		SettingKeyOpenAIOAuthDefaultProxyID:    "invalid",
+	}}
 	client := &openAIDefaultProxyOAuthClientStub{}
 	svc := NewOpenAIOAuthService(nil, client)
 	svc.SetEgressService(NewEgressService(repo, nil))
@@ -184,7 +187,32 @@ func TestOpenAIOAuthPoolAccountRefreshKeepsPrimaryDirectRoute(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "at-refresh", info.AccessToken)
 	require.Empty(t, client.refreshProxyURL)
-	require.Zero(t, settings.getValueCalls)
+	require.Equal(t, 1, settings.getValueCalls, "only the rollout gate should be read")
+}
+
+func TestOpenAIOAuthPoolAccountUsesLegacyProxyWhileRolloutOff(t *testing.T) {
+	proxyID := int64(71)
+	proxy := activeOpenAIDefaultProxy(proxyID, "legacy.example.test", 3128)
+	proxyRepo := &mockProxyRepoForOAuth{getByIDFunc: func(context.Context, int64) (*Proxy, error) {
+		return proxy, nil
+	}}
+	settings := &settingRepoStub{values: map[string]string{
+		SettingKeyAccountEgressPoolRolloutMode: string(AccountEgressPoolRolloutOff),
+	}}
+	svc := NewOpenAIOAuthService(proxyRepo, &openAIDefaultProxyOAuthClientStub{})
+	svc.SetSettingService(newOpenAIDefaultProxySettingService(settings, proxyRepo))
+	defer svc.Stop()
+
+	proxyURL, err := svc.ResolveOpenAIAccountControlProxyURL(context.Background(), &Account{
+		ID:         102,
+		Platform:   PlatformOpenAI,
+		Type:       AccountTypeOAuth,
+		EgressMode: EgressModePool,
+		ProxyID:    &proxyID,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, proxy.URL(), proxyURL)
 }
 
 var _ EgressRepository = (*openAIOAuthEgressRepoStub)(nil)

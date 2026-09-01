@@ -790,15 +790,20 @@ func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID 
 	}
 	fedRAMP = account.IsChatGPTAccountFedRAMP()
 
+	useLegacyProxy := true
 	if account.EgressMode == EgressModePool {
 		if s.oauthEgressResolver == nil {
 			return "", "", "", false, infraerrors.New(http.StatusServiceUnavailable, "OPENAI_QUOTA_EGRESS_UNAVAILABLE", "account primary egress resolver is unavailable")
 		}
-		proxyURL, err = s.oauthEgressResolver.ResolveOpenAIAccountControlProxyURL(ctx, account)
-		if err != nil {
-			return "", "", "", false, err
+		if s.oauthEgressResolver.accountUsesEnforcedEgressPool(ctx, account) {
+			useLegacyProxy = false
+			proxyURL, err = s.oauthEgressResolver.ResolveOpenAIAccountControlProxyURL(ctx, account)
+			if err != nil {
+				return "", "", "", false, err
+			}
 		}
-	} else if account.ProxyID != nil {
+	}
+	if useLegacyProxy && account.ProxyID != nil {
 		// Legacy accounts retain their existing eager proxy path.
 		switch {
 		case account.Proxy != nil:

@@ -3663,8 +3663,10 @@ func (r *accountRepository) loadAccountEgressHydration(
 		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
 	}
 
-	sourceIDs := make([]int64, 0, len(accounts))
+	allSourceIDs := make([]int64, 0, len(accounts))
+	sourceIDsToLoad := make([]int64, 0, len(accounts))
 	seenSourceIDs := make(map[int64]struct{}, len(accounts))
+	sourceByID := make(map[int64]*dbent.Account, len(accounts))
 	for _, account := range accounts {
 		if account == nil {
 			continue
@@ -3672,29 +3674,35 @@ func (r *accountRepository) loadAccountEgressHydration(
 		sourceID := account.ID
 		if account.ParentAccountID != nil {
 			sourceID = *account.ParentAccountID
+		} else {
+			// The caller already loaded this entity and accountsToService loaded
+			// its proxy separately. Only shadows require another account query.
+			sourceByID[sourceID] = account
 		}
 		if _, exists := seenSourceIDs[sourceID]; exists {
 			continue
 		}
 		seenSourceIDs[sourceID] = struct{}{}
-		sourceIDs = append(sourceIDs, sourceID)
+		allSourceIDs = append(allSourceIDs, sourceID)
+		if account.ParentAccountID != nil {
+			sourceIDsToLoad = append(sourceIDsToLoad, sourceID)
+		}
 	}
-	if len(sourceIDs) == 0 {
+	if len(allSourceIDs) == 0 {
 		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
 	}
 
-	sourceByID := make(map[int64]*dbent.Account, len(sourceIDs))
 	// Keep each IN list below PostgreSQL's bind-parameter limit. This path is
 	// used by scheduler pages as well as admin bulk reads, so a large page must
 	// not fail merely because parent/shadow source IDs were accumulated into a
 	// single query.
-	for start := 0; start < len(sourceIDs); start += accountEgressHydrationBatchSize {
+	for start := 0; start < len(sourceIDsToLoad); start += accountEgressHydrationBatchSize {
 		end := start + accountEgressHydrationBatchSize
-		if end > len(sourceIDs) {
-			end = len(sourceIDs)
+		if end > len(sourceIDsToLoad) {
+			end = len(sourceIDsToLoad)
 		}
 		sources, err := r.client.Account.Query().
-			Where(dbaccount.IDIn(sourceIDs[start:end]...)).
+			Where(dbaccount.IDIn(sourceIDsToLoad[start:end]...)).
 			WithProxy().
 			All(ctx)
 		if err != nil {
@@ -3705,14 +3713,21 @@ func (r *accountRepository) loadAccountEgressHydration(
 		}
 	}
 
-	bindingsBySource := make(map[int64][]*dbent.AccountEgressBinding, len(sourceIDs))
-	for start := 0; start < len(sourceIDs); start += accountEgressHydrationBatchSize {
+	poolSourceIDs := make([]int64, 0, len(sourceByID))
+	for _, sourceID := range allSourceIDs {
+		if source := sourceByID[sourceID]; source != nil && string(source.EgressMode) == service.EgressModePool {
+			poolSourceIDs = append(poolSourceIDs, sourceID)
+		}
+	}
+
+	bindingsBySource := make(map[int64][]*dbent.AccountEgressBinding, len(poolSourceIDs))
+	for start := 0; start < len(poolSourceIDs); start += accountEgressHydrationBatchSize {
 		end := start + accountEgressHydrationBatchSize
-		if end > len(sourceIDs) {
-			end = len(sourceIDs)
+		if end > len(poolSourceIDs) {
+			end = len(poolSourceIDs)
 		}
 		bindings, err := r.client.AccountEgressBinding.Query().
-			Where(dbaccountegressbinding.AccountIDIn(sourceIDs[start:end]...)).
+			Where(dbaccountegressbinding.AccountIDIn(poolSourceIDs[start:end]...)).
 			Order(
 				dbent.Asc(dbaccountegressbinding.FieldAccountID),
 				dbent.Asc(dbaccountegressbinding.FieldPosition),

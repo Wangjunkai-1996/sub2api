@@ -3,9 +3,39 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestMergeOpenAIHydratedAccountPreservesDBRecheckAuthority(t *testing.T) {
+	hydrated := &Account{
+		ID:          901,
+		Name:        "stale-cache",
+		Status:      StatusDisabled,
+		Schedulable: false,
+		Credentials: map[string]any{"access_token": "stale"},
+		Extra:       map[string]any{"source": "cache"},
+		UpdatedAt:   time.Now().Add(-time.Minute),
+	}
+	authority := &Account{
+		ID:          901,
+		Name:        "fresh-db",
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{"access_token": "fresh"},
+		Extra:       map[string]any{"source": "database"},
+		UpdatedAt:   time.Now(),
+	}
+
+	merged := mergeOpenAIHydratedAccount(hydrated, authority)
+
+	require.Equal(t, "fresh-db", merged.Name)
+	require.Equal(t, StatusActive, merged.Status)
+	require.True(t, merged.Schedulable)
+	require.Equal(t, "fresh", merged.GetCredential("access_token"))
+	require.Equal(t, "database", merged.Extra["source"])
+}
 
 type openAIEgressHydrationAccountRepo struct {
 	AccountRepository
