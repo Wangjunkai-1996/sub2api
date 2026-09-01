@@ -14,7 +14,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const accountEgressKeyPrefix = "concurrency:egress:"
+const (
+	accountEgressKeyPrefix = "concurrency:egress:"
+
+	// accountEgressConfigNamespace is deliberately part of the config hash key
+	// rather than AccountEgressPoolConfig.Version. The scheduler projection
+	// changed from treating redacted proxy snapshots as unhealthy to treating a
+	// ProxyID-only route as eligible. During a blue-green rollout an old binary
+	// can therefore publish the same semantic version with a different digest.
+	// Keeping the new projection in an additive namespace prevents that old
+	// writer from replacing the corrected config, while preserving the semantic
+	// version stored on request and Live records and sharing lease counters.
+	accountEgressConfigNamespace = "v2"
+)
 
 // Every account-egress key uses one {acct:N} hash tag. Legacy account and Live
 // admissions maintain tagged mirror ZSETs so the pool allocator never mixes
@@ -578,7 +590,7 @@ func accountEgressBaseKey(accountID int64) string {
 }
 
 func accountEgressConfigKey(accountID int64) string {
-	return accountEgressBaseKey(accountID) + ":config"
+	return accountEgressBaseKey(accountID) + ":config:" + accountEgressConfigNamespace
 }
 
 func accountEgressWaitersKey(accountID int64) string {

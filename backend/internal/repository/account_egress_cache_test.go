@@ -85,6 +85,25 @@ func syncAccountEgressTestConfig(t *testing.T, cache *concurrencyCache, config s
 	require.Equal(t, service.AccountEgressConfigSyncOK, result[config.AccountID])
 }
 
+// syncAccountEgressConfigAtKey models an older binary that still writes the
+// pre-v2 config hash. It intentionally uses the production script so this
+// regression test covers the same equal-version/different-digest race as a
+// mixed blue-green deployment.
+func syncAccountEgressConfigAtKey(t *testing.T, cache *concurrencyCache, key string, config service.AccountEgressPoolConfig) {
+	t.Helper()
+	digest, err := config.Digest()
+	require.NoError(t, err)
+	candidates := config.SortedCandidates()
+	args := make([]any, 0, 5+len(candidates)*2)
+	args = append(args, config.Version, digest, config.PerIdentityConcurrency, config.MaxWaiting, len(candidates))
+	for _, candidate := range candidates {
+		args = append(args, accountEgressIDHash(candidate.BindingID), accountEgressBindingMapping(candidate))
+	}
+	raw, err := accountEgressSyncConfigScript.Run(context.Background(), cache.rdb, []string{key}, args...).Result()
+	require.NoError(t, err)
+	require.Equal(t, "OK", fmt.Sprint(raw))
+}
+
 func acquireAccountEgressTest(
 	t *testing.T,
 	cache *concurrencyCache,
@@ -139,6 +158,39 @@ func TestAccountEgressKeysShareAccountHashTag(t *testing.T) {
 	}
 	require.NotContains(t, keys[len(keys)-2], "192.0.2.10")
 	require.NotContains(t, keys[len(keys)-1], "unsafe-key-chars")
+}
+
+func TestAccountEgressConfigNamespaceIsAdditiveForMixedVersions(t *testing.T) {
+	accountID := int64(43)
+	legacyKey := accountEgressBaseKey(accountID) + ":config"
+	currentKey := accountEgressConfigKey(accountID)
+
+	require.NotEqual(t, legacyKey, currentKey)
+	require.Equal(t, accountEgressBaseKey(accountID)+":config:v2", currentKey)
+	require.Contains(t, legacyKey, "{acct:43}")
+	require.Contains(t, currentKey, "{acct:43}")
+}
+
+func TestAccountEgressConfigNamespaceBlocksLegacyHealthOverwrite(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	current := accountEgressTestConfig(1000, 1, 0, accountEgressTestCandidate(0, 10, "ip:a"))
+	syncAccountEgressTestConfig(t, cache, current)
+
+	legacy := current
+	legacy.Candidates = append([]service.AccountEgressCandidate(nil), current.Candidates...)
+	legacy.Candidates[0].Healthy = false
+	syncAccountEgressConfigAtKey(t, cache, accountEgressBaseKey(current.AccountID)+":config", legacy)
+
+	digest, err := current.Digest()
+	require.NoError(t, err)
+	require.Equal(t, digest, cache.rdb.HGet(context.Background(), accountEgressConfigKey(current.AccountID), "digest").Val())
+	require.Equal(t,
+		accountEgressBindingMapping(legacy.Candidates[0]),
+		cache.rdb.HGet(context.Background(), accountEgressBaseKey(current.AccountID)+":config", "binding:"+accountEgressIDHash(legacy.Candidates[0].BindingID)).Val(),
+	)
+
+	result := acquireAccountEgressTest(t, cache, current, "mixed-version", "", "")
+	require.Equal(t, service.AccountEgressStatusAcquired, result.Status)
 }
 
 func TestAccountEgressConfigVersionFence(t *testing.T) {
