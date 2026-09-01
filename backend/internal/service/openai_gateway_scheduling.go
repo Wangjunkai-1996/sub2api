@@ -1801,8 +1801,10 @@ func mergeOpenAIHydratedAccount(hydrated, authority *Account) *Account {
 
 func (s *OpenAIGatewayService) newSelectionResult(ctx context.Context, account *Account, acquired bool, release func(), waitPlan *AccountWaitPlan) (*AccountSelectionResult, error) {
 	var selectedEgress *ResolvedAccountEgress
+	var legacyEgressAdmission *LegacyAccountEgressAdmission
 	if account != nil {
 		selectedEgress = account.SelectedEgress
+		legacyEgressAdmission = account.LegacyEgressAdmission
 	}
 	if selectedEgress != nil {
 		// Scheduler cache entries intentionally omit egress proxy credentials. The
@@ -1827,6 +1829,51 @@ func (s *OpenAIGatewayService) newSelectionResult(ctx context.Context, account *
 			ReleaseFunc: release,
 			WaitPlan:    waitPlan,
 		}), nil
+	}
+	if legacyEgressAdmission != nil {
+		// Once an identity-aware legacy slot exists, the final authoritative read
+		// must still name the same primary route and identity. A mismatch cannot
+		// fall back to an unattributed legacy request because that would move an
+		// already-counted request to a different public IP.
+		if s.accountRepo == nil {
+			return nil, ErrAccountEgressConfigStale
+		}
+		latest, err := s.accountRepo.GetByID(ctx, account.ID)
+		if err != nil || latest == nil {
+			return nil, ErrAccountEgressConfigStale
+		}
+		hydrated, err := WithLegacyAccountEgressAdmission(latest, legacyEgressAdmission)
+		if err != nil {
+			return nil, err
+		}
+		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+			Account:     hydrated,
+			Acquired:    acquired,
+			ReleaseFunc: release,
+			WaitPlan:    waitPlan,
+		}), nil
+	}
+	rollout := AccountEgressPoolRolloutOff
+	if s.settingService != nil {
+		rollout = s.settingService.GetAccountEgressPoolRolloutMode(ctx)
+	}
+	if accountUsesLegacyEgressMirror(s.concurrencyService, account, rollout) && s.accountRepo != nil {
+		// A WaitPlan has not acquired a slot yet, so an incomplete marker may
+		// safely retain the old legacy behavior. When the current authoritative
+		// primary is complete, carry it to the handler so its later acquire is
+		// identity-aware.
+		if latest, err := s.accountRepo.GetByID(ctx, account.ID); err == nil && latest != nil {
+			if admission, resolveErr := resolveLegacyAccountEgressAdmission(latest); resolveErr == nil {
+				if hydrated, hydrateErr := WithLegacyAccountEgressAdmission(latest, admission); hydrateErr == nil {
+					return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+						Account:     hydrated,
+						Acquired:    acquired,
+						ReleaseFunc: release,
+						WaitPlan:    waitPlan,
+					}), nil
+				}
+			}
+		}
 	}
 	hydrated, err := s.hydrateSelectedAccount(ctx, account)
 	if err != nil {

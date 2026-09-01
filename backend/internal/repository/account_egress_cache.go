@@ -105,19 +105,33 @@ var (
 		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', leaseCutoff)
 		redis.call('ZREMRANGEBYSCORE', legacyRegularKey, '-inf', nowSeconds - legacyRegularTTL)
 		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
-		local identityCount = #KEYS - 9
+		local identityKeyCount = #KEYS - 9
+		if identityKeyCount % 3 ~= 0 then
+			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, nowMillis, storedVersion}
+		end
+		local identityCount = identityKeyCount / 3
 		local identityLoads = {}
+		local legacyIdentityLoads = {}
 		local activeTotal = 0
+		local mappedLegacyTotal = 0
 		for identityIndex = 1, identityCount do
 			local identityKey = KEYS[9 + identityIndex]
+			local legacyRegularIdentityKey = KEYS[9 + identityCount + identityIndex]
+			local legacyLiveIdentityKey = KEYS[9 + identityCount * 2 + identityIndex]
 			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', leaseCutoff)
+			redis.call('ZREMRANGEBYSCORE', legacyRegularIdentityKey, '-inf', nowSeconds - legacyRegularTTL)
+			redis.call('ZREMRANGEBYSCORE', legacyLiveIdentityKey, '-inf', nowSeconds - legacyLiveTTL)
 			local load = redis.call('ZCARD', identityKey)
+			local legacyLoad = redis.call('ZCARD', legacyRegularIdentityKey) + redis.call('ZCARD', legacyLiveIdentityKey)
 			identityLoads[identityIndex] = load
+			legacyIdentityLoads[identityIndex] = legacyLoad
 			activeTotal = activeTotal + load
+			mappedLegacyTotal = mappedLegacyTotal + legacyLoad
 		end
 		local candidates = {}
 		local eligibleIdentities = {}
 		local effectiveCapacity = 0
+		local primaryIdentityIndex = 0
 		local offset = 14
 		for candidateIndex = 1, candidateCount do
 			local candidate = {
@@ -136,6 +150,9 @@ var (
 				return {'CONFIG_STALE', '', '0', '', activeTotal, effectiveCapacity, redis.call('ZCARD', waitersKey), nowMillis, storedVersion}
 			end
 			candidates[candidateIndex] = candidate
+			if candidate.primary == 1 then
+				primaryIdentityIndex = candidate.identityIndex
+			end
 			if candidate.healthy == 1 and candidate.identityIndex > 0 then
 				eligibleIdentities[candidate.identityIndex] = true
 			end
@@ -184,13 +201,14 @@ var (
 		end
 		local legacyActive = redis.call('ZCARD', legacyRegularKey) + redis.call('ZCARD', legacyLiveKey)
 		local mode = redis.call('GET', modeKey)
+		local blockNewPool = false
 		if mode == false then
 			if poolTotalCount > 0 then
 				redis.call('SET', modeKey, 'pool')
 				mode = 'pool'
 			elseif legacyActive > 0 then
-				redis.call('SET', modeKey, 'legacy')
-				mode = 'legacy'
+				redis.call('SET', modeKey, 'transition')
+				mode = 'transition'
 			else
 				redis.call('SET', modeKey, 'pool')
 				mode = 'pool'
@@ -201,15 +219,37 @@ var (
 				return result('CONFIG_STALE', nil)
 			end
 			if legacyActive > 0 then
-				return enqueue('LEGACY_DRAINING')
+				redis.call('SET', modeKey, 'transition')
+				mode = 'transition'
+			else
+				redis.call('SET', modeKey, 'pool')
+				mode = 'pool'
 			end
-			redis.call('SET', modeKey, 'pool')
+		elseif mode == 'transition' then
+			if legacyActive == 0 then
+				redis.call('SET', modeKey, 'pool')
+				mode = 'pool'
+			end
+		elseif mode == 'to_legacy' then
+			blockNewPool = true
 		elseif mode == 'pool' then
 			if legacyActive > 0 then
 				return result('CONFIG_STALE', nil)
 			end
 		else
 			return result('CONFIG_STALE', nil)
+		end
+		if mode == 'transition' and legacyActive > 0 then
+			if primaryIdentityIndex <= 0 then
+				return result('CONFIG_STALE', nil)
+			end
+			if mappedLegacyTotal ~= legacyActive then
+				return enqueue('LEGACY_DRAINING')
+			end
+			for identityIndex = 1, identityCount do
+				identityLoads[identityIndex] = identityLoads[identityIndex] + legacyIdentityLoads[identityIndex]
+			end
+			activeTotal = activeTotal + legacyActive
 		end
 
 		local metadataBindingHash = redis.call('HGET', metadataKey, 'binding_hash')
@@ -248,6 +288,10 @@ var (
 		end
 		if redis.call('ZSCORE', poolTotalKey, leaseMember) ~= false then
 			return result('CONFIG_STALE', nil)
+		end
+		if blockNewPool then
+			redis.call('ZREM', waitersKey, leaseMember)
+			return result('LEGACY_DRAINING', nil)
 		end
 
 		local waiterScore = redis.call('ZSCORE', waitersKey, leaseMember)
@@ -367,7 +411,8 @@ var (
 		local nowMillis = tonumber(timeResult[1]) * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
 		redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowMillis - ttl)
 		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - ttl)
-		if redis.call('GET', modeKey) ~= 'pool' then
+		local mode = redis.call('GET', modeKey)
+		if mode ~= 'pool' and mode ~= 'transition' and mode ~= 'to_legacy' then
 			return 0
 		end
 		if redis.call('HGET', metadataKey, 'lease_member') ~= leaseMember then
@@ -391,6 +436,7 @@ var (
 		local metadataKey = KEYS[1]
 		local identityKey = KEYS[2]
 		local poolTotalKey = KEYS[3]
+		local modeKey = KEYS[4]
 		local leaseMember = ARGV[1]
 		local expectedIdentityHash = ARGV[2]
 		local metadataMember = redis.call('HGET', metadataKey, 'lease_member')
@@ -402,7 +448,48 @@ var (
 		redis.call('ZREM', identityKey, leaseMember)
 		redis.call('ZREM', poolTotalKey, leaseMember)
 		redis.call('DEL', metadataKey)
+		if redis.call('GET', modeKey) == 'to_legacy' and redis.call('ZCARD', poolTotalKey) == 0 then
+			redis.call('SET', modeKey, 'legacy')
+		end
 		return 1
+	`)
+
+	accountEgressBeginPoolTransitionScript = redis.NewScript(`
+		local modeKey = KEYS[1]
+		local poolTotalKey = KEYS[2]
+		local legacyRegularKey = KEYS[3]
+		local legacyLiveKey = KEYS[4]
+		local poolTTL = tonumber(ARGV[1])
+		local legacyRegularTTL = tonumber(ARGV[2])
+		local legacyLiveTTL = tonumber(ARGV[3])
+		local timeResult = redis.call('TIME')
+		local nowSeconds = tonumber(timeResult[1])
+		local nowMillis = nowSeconds * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyRegularKey, '-inf', nowSeconds - legacyRegularTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
+		local legacyActive = redis.call('ZCARD', legacyRegularKey) + redis.call('ZCARD', legacyLiveKey)
+		if legacyActive > 0 then
+			redis.call('SET', modeKey, 'transition')
+			return 'transition'
+		end
+		redis.call('SET', modeKey, 'pool')
+		return 'pool'
+	`)
+
+	accountEgressBeginLegacyTransitionScript = redis.NewScript(`
+		local modeKey = KEYS[1]
+		local poolTotalKey = KEYS[2]
+		local poolTTL = tonumber(ARGV[1])
+		local timeResult = redis.call('TIME')
+		local nowMillis = tonumber(timeResult[1]) * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		if redis.call('ZCARD', poolTotalKey) > 0 then
+			redis.call('SET', modeKey, 'to_legacy')
+			return 'to_legacy'
+		end
+		redis.call('SET', modeKey, 'legacy')
+		return 'legacy'
 	`)
 
 	accountEgressLoadSnapshotScript = redis.NewScript(`
@@ -428,20 +515,44 @@ var (
 		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
 		redis.call('ZREMRANGEBYSCORE', waitersKey, '-inf', nowMicros - waiterTTL * 1000)
 
+		local legacyRegularCount = redis.call('ZCARD', legacyRegularKey)
+		local legacyLiveCount = redis.call('ZCARD', legacyLiveKey)
+		local mode = redis.call('GET', modeKey) or ''
+		if mode == 'transition' and legacyRegularCount + legacyLiveCount == 0 then
+			redis.call('SET', modeKey, 'pool')
+			mode = 'pool'
+		elseif mode == 'to_legacy' and redis.call('ZCARD', poolTotalKey) == 0 then
+			redis.call('SET', modeKey, 'legacy')
+			mode = 'legacy'
+		end
+
 		local result = {
 			redis.call('HGET', configKey, 'version') or '',
 			redis.call('HGET', configKey, 'digest') or '',
 			redis.call('HGET', configKey, 'limit') or '',
-			redis.call('GET', modeKey) or '',
+			mode,
 			redis.call('ZCARD', poolTotalKey),
-			redis.call('ZCARD', legacyRegularKey),
-			redis.call('ZCARD', legacyLiveKey),
+			legacyRegularCount,
+			legacyLiveCount,
 			redis.call('ZCARD', waitersKey),
 			redis.call('EXISTS', exclusiveKey)
 		}
-		for identityIndex = 8, #KEYS do
-			local identityKey = KEYS[identityIndex]
+		local identityKeyCount = #KEYS - 7
+		if identityKeyCount % 3 ~= 0 then return result end
+		local identityCount = identityKeyCount / 3
+		for identityIndex = 1, identityCount do
+			local identityKey = KEYS[7 + identityIndex]
 			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowMillis - leaseTTL)
+			table.insert(result, redis.call('ZCARD', identityKey))
+		end
+		for identityIndex = 1, identityCount do
+			local identityKey = KEYS[7 + identityCount + identityIndex]
+			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowSeconds - legacyRegularTTL)
+			table.insert(result, redis.call('ZCARD', identityKey))
+		end
+		for identityIndex = 1, identityCount do
+			local identityKey = KEYS[7 + identityCount * 2 + identityIndex]
+			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowSeconds - legacyLiveTTL)
 			table.insert(result, redis.call('ZCARD', identityKey))
 		end
 		return result
@@ -496,6 +607,14 @@ func accountEgressLegacyRegularKey(accountID int64) string {
 
 func accountEgressLegacyLiveKey(accountID int64) string {
 	return accountEgressBaseKey(accountID) + ":legacy:live"
+}
+
+func accountEgressLegacyRegularIdentityKey(accountID int64, identityID string) string {
+	return accountEgressBaseKey(accountID) + ":legacy:identity:" + accountEgressIDHash(identityID) + ":regular"
+}
+
+func accountEgressLegacyLiveIdentityKey(accountID int64, identityID string) string {
+	return accountEgressBaseKey(accountID) + ":legacy:identity:" + accountEgressIDHash(identityID) + ":live"
 }
 
 func accountEgressIdentityKey(accountID int64, identityID string) string {
@@ -628,6 +747,12 @@ func (c *concurrencyCache) AcquireAccountEgress(
 	}
 	for _, identityID := range identities {
 		keys = append(keys, accountEgressIdentityKey(request.Config.AccountID, identityID))
+	}
+	for _, identityID := range identities {
+		keys = append(keys, accountEgressLegacyRegularIdentityKey(request.Config.AccountID, identityID))
+	}
+	for _, identityID := range identities {
+		keys = append(keys, accountEgressLegacyLiveIdentityKey(request.Config.AccountID, identityID))
 	}
 
 	args := make([]any, 0, 13+len(candidates)*9)
@@ -783,7 +908,35 @@ func (c *concurrencyCache) ReleaseAccountEgressLease(ctx context.Context, lease 
 		accountEgressLeaseKey(lease.AccountID, lease.ID),
 		accountEgressIdentityKey(lease.AccountID, lease.IdentityID),
 		accountEgressTotalKey(lease.AccountID),
+		accountEgressModeKey(lease.AccountID),
 	}, member, accountEgressIDHash(lease.IdentityID)).Err()
+}
+
+// BeginAccountEgressPoolTransition fences new legacy admissions before pool
+// selection starts. Existing legacy leases remain refreshable while their
+// admission-time identity mirrors are drained or bridged.
+func (c *concurrencyCache) BeginAccountEgressPoolTransition(ctx context.Context, accountID int64) (string, error) {
+	if c == nil || c.rdb == nil || accountID <= 0 {
+		return "", errors.New("account egress redis cache is unavailable")
+	}
+	return accountEgressBeginPoolTransitionScript.Run(ctx, c.rdb, []string{
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressLegacyRegularKey(accountID),
+		accountEgressLegacyLiveKey(accountID),
+	}, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL), c.slotTTLSeconds, liveLeaseTTLSeconds).Text()
+}
+
+// BeginAccountEgressLegacyTransition fences new pool and legacy admissions
+// until existing pool leases drain. The final pool release advances to legacy.
+func (c *concurrencyCache) BeginAccountEgressLegacyTransition(ctx context.Context, accountID int64) (string, error) {
+	if c == nil || c.rdb == nil || accountID <= 0 {
+		return "", errors.New("account egress redis cache is unavailable")
+	}
+	return accountEgressBeginLegacyTransitionScript.Run(ctx, c.rdb, []string{
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+	}, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL)).Text()
 }
 
 func (c *concurrencyCache) GetAccountEgressLoadsBatch(
@@ -839,6 +992,12 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		for _, identityID := range orderedIdentities {
 			keys = append(keys, accountEgressIdentityKey(config.AccountID, identityID))
 		}
+		for _, identityID := range orderedIdentities {
+			keys = append(keys, accountEgressLegacyRegularIdentityKey(config.AccountID, identityID))
+		}
+		for _, identityID := range orderedIdentities {
+			keys = append(keys, accountEgressLegacyLiveIdentityKey(config.AccountID, identityID))
+		}
 		commands = append(commands, loadCommands{
 			config:      config,
 			digest:      digest,
@@ -861,8 +1020,8 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		if err != nil {
 			return nil, fmt.Errorf("read account %d egress load snapshot: %w", command.config.AccountID, err)
 		}
-		if len(values) != 9+len(command.identityIDs) {
-			return nil, fmt.Errorf("invalid account %d egress load snapshot length: got %d, want %d", command.config.AccountID, len(values), 9+len(command.identityIDs))
+		if len(values) != 9+len(command.identityIDs)*3 {
+			return nil, fmt.Errorf("invalid account %d egress load snapshot length: got %d, want %d", command.config.AccountID, len(values), 9+len(command.identityIDs)*3)
 		}
 		if fmt.Sprint(values[0]) == "" {
 			results[command.config.AccountID] = service.AccountEgressLoadInfo{
@@ -889,7 +1048,7 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			}
 			return value, nil
 		}
-		activeTotal := 0
+		poolActiveTotal := 0
 		identityLoads := make(map[string]int, len(command.identityIDs))
 		for index, identityID := range command.identityIDs {
 			active, parseErr := intAt(9+index, "identity load")
@@ -897,17 +1056,17 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 				return nil, parseErr
 			}
 			identityLoads[identityID] = active
-			activeTotal += active
+			poolActiveTotal += active
 		}
 		totalCount, err := intAt(4, "total count")
 		if err != nil {
 			return nil, err
 		}
-		if totalCount != activeTotal {
+		if totalCount != poolActiveTotal {
 			results[command.config.AccountID] = service.AccountEgressLoadInfo{
 				AccountID:     command.config.AccountID,
 				Status:        service.AccountEgressStatusConfigStale,
-				ActiveTotal:   activeTotal,
+				ActiveTotal:   poolActiveTotal,
 				IdentityLoads: identityLoads,
 				ConfigVersion: command.config.Version,
 			}
@@ -916,6 +1075,31 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		waitingCount, err := intAt(7, "waiting count")
 		if err != nil {
 			return nil, err
+		}
+		legacyRegular, err := intAt(5, "legacy regular count")
+		if err != nil {
+			return nil, err
+		}
+		legacyLive, err := intAt(6, "legacy live count")
+		if err != nil {
+			return nil, err
+		}
+		legacyActive := legacyRegular + legacyLive
+		activeTotal := poolActiveTotal + legacyActive
+		mappedLegacyTotal := 0
+		identityCount := len(command.identityIDs)
+		for index, identityID := range command.identityIDs {
+			legacyRegularLoad, parseErr := intAt(9+identityCount+index, "legacy regular identity load")
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			legacyLiveLoad, parseErr := intAt(9+identityCount*2+index, "legacy live identity load")
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			legacyIdentityLoad := legacyRegularLoad + legacyLiveLoad
+			identityLoads[identityID] += legacyIdentityLoad
+			mappedLegacyTotal += legacyIdentityLoad
 		}
 		effectiveCapacity := command.config.EffectiveCapacity()
 		status := service.AccountEgressStatusAcquired
@@ -935,21 +1119,12 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 				loadRate = 100
 			}
 		}
-		legacyRegular, err := intAt(5, "legacy regular count")
-		if err != nil {
-			return nil, err
-		}
-		legacyLive, err := intAt(6, "legacy live count")
-		if err != nil {
-			return nil, err
-		}
-		legacyActive := int64(legacyRegular + legacyLive)
 		mode := fmt.Sprint(values[3])
-		if mode != "" && mode != "legacy" && mode != "pool" {
+		if mode != "" && mode != "legacy" && mode != "transition" && mode != "to_legacy" && mode != "pool" {
 			status = service.AccountEgressStatusConfigStale
-		} else if (mode == "pool" && legacyActive > 0) || (mode == "legacy" && activeTotal > 0) {
+		} else if (mode == "pool" && legacyActive > 0) || (mode == "legacy" && poolActiveTotal > 0) {
 			status = service.AccountEgressStatusConfigStale
-		} else if legacyActive > 0 {
+		} else if mappedLegacyTotal != legacyActive {
 			status = service.AccountEgressStatusLegacyDraining
 			if loadRate < 100 {
 				loadRate = 100

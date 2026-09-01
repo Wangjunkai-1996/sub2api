@@ -34,8 +34,15 @@ func RequiredAccountEgressBindingFromContext(ctx context.Context) string {
 }
 
 func AccountEgressLeaseLost(account *Account) bool {
-	return account != nil && account.SelectedEgress != nil && account.SelectedEgress.Lease != nil &&
-		errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseLost)
+	if account == nil {
+		return false
+	}
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil &&
+		errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseLost) {
+		return true
+	}
+	return account.LegacyEgressAdmission != nil && account.LegacyEgressAdmission.Lease != nil &&
+		errors.Is(context.Cause(account.LegacyEgressAdmission.Lease.Context()), ErrAccountEgressLeaseLost)
 }
 
 // CloneForRequest returns an account value that callers may safely decorate
@@ -51,6 +58,7 @@ func (a *Account) CloneForRequest() *Account {
 	cloned.AccountGroups = append([]AccountGroup(nil), a.AccountGroups...)
 	cloned.Groups = append([]*Group(nil), a.Groups...)
 	cloned.EgressBindings = cloneAccountEgressBindings(a.EgressBindings)
+	cloned.LegacyEgressAdmission = a.LegacyEgressAdmission.clone()
 	if a.Proxy != nil {
 		proxy := *a.Proxy
 		cloned.Proxy = &proxy
@@ -282,6 +290,23 @@ func WithResolvedAccountEgress(account *Account, resolved *ResolvedAccountEgress
 // PreserveSelectedAccountEgress reapplies request-local routing after a fresh
 // account read used by terminal policy checks.
 func PreserveSelectedAccountEgress(latest, selected *Account) (*Account, error) {
+	if selected != nil && selected.LegacyEgressAdmission != nil {
+		if latest == nil {
+			return nil, errors.New("latest account is nil")
+		}
+		latest = latest.CloneForRequest()
+		admission := selected.LegacyEgressAdmission
+		if admission.RouteKind == EgressRouteKindProxy && admission.ProxyID != nil && selected.Proxy != nil &&
+			selected.Proxy.ID == *admission.ProxyID {
+			if binding := findAccountEgressBindingByID(latest, admission.BindingID, admission.RouteID); binding != nil &&
+				binding.Route != nil && binding.Route.Kind == EgressRouteKindProxy && binding.Route.Proxy == nil &&
+				binding.Route.ProxyID != nil && *binding.Route.ProxyID == *admission.ProxyID {
+				proxy := *selected.Proxy
+				binding.Route.Proxy = &proxy
+			}
+		}
+		return WithLegacyAccountEgressAdmission(latest, admission)
+	}
 	if selected == nil || selected.SelectedEgress == nil {
 		if latest == nil {
 			return nil, errors.New("latest account is nil")
@@ -376,21 +401,37 @@ func OpenAIAccountControlProxyURL(account *Account) (string, error) {
 }
 
 func ContextWithSelectedAccountEgress(ctx context.Context, account *Account) context.Context {
-	if account == nil || account.SelectedEgress == nil {
+	if account == nil {
 		return ctx
 	}
-	selected := account.SelectedEgress
-	ctx = WithHTTPUpstreamEgress(ctx, HTTPUpstreamEgress{
-		BindingID:    selected.BindingID,
-		RouteID:      selected.RouteID,
-		IdentityID:   selected.IdentityID,
-		PoolRevision: selected.ConfigVersion,
-	})
-	if selected.Lease == nil {
+	var leaseCtx context.Context
+	if selected := account.SelectedEgress; selected != nil {
+		ctx = WithHTTPUpstreamEgress(ctx, HTTPUpstreamEgress{
+			BindingID:    selected.BindingID,
+			RouteID:      selected.RouteID,
+			IdentityID:   selected.IdentityID,
+			PoolRevision: selected.ConfigVersion,
+		})
+		if selected.Lease != nil {
+			leaseCtx = selected.Lease.Context()
+		}
+	} else if admission := account.LegacyEgressAdmission; admission != nil {
+		ctx = WithHTTPUpstreamEgress(ctx, HTTPUpstreamEgress{
+			BindingID:    admission.BindingID,
+			RouteID:      admission.RouteID,
+			IdentityID:   admission.IdentityID,
+			PoolRevision: admission.ConfigVersion,
+		})
+		if admission.Lease != nil {
+			leaseCtx = admission.Lease.Context()
+		}
+	} else {
+		return ctx
+	}
+	if leaseCtx == nil {
 		return ctx
 	}
 	routed, cancel := context.WithCancelCause(ctx)
-	leaseCtx := selected.Lease.Context()
 	context.AfterFunc(leaseCtx, func() {
 		cancel(context.Cause(leaseCtx))
 	})

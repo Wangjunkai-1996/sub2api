@@ -181,3 +181,65 @@ func (s *AccountEgressCacheSuite) TestConcurrentCacheInstancesNeverExceedIdentit
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), int64(4), count)
 }
+
+func (s *AccountEgressCacheSuite) TestTransitionBridgeCountsLegacyByAdmissionIdentityAcrossClients() {
+	primary := accountEgressTestCandidate(0, 10501, "ip:primary")
+	second := accountEgressTestCandidate(1, 10502, "ip:second")
+	third := accountEgressTestCandidate(2, 10503, "ip:third")
+	config := accountEgressTestConfig(20501, 3, 0, primary, second, third)
+	syncAccountEgressTestConfig(s.T(), s.cache, config)
+	other := NewConcurrencyCache(s.rdb, 15, 120).(*concurrencyCache)
+
+	for index := 0; index < 3; index++ {
+		acquired, err := s.cache.AcquireAccountSlotForEgress(s.ctx, config.AccountID, 3, fmt.Sprintf("bridge-legacy-%d", index), primary.IdentityID)
+		require.NoError(s.T(), err)
+		require.True(s.T(), acquired)
+	}
+
+	type outcome struct {
+		result service.AccountEgressAcquireResult
+		err    error
+	}
+	outcomes := make(chan outcome, 32)
+	var wg sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			cache := s.cache
+			if index%2 == 1 {
+				cache = other
+			}
+			result, err := cache.AcquireAccountEgress(context.Background(), service.AccountEgressCacheAcquireRequest{
+				AccountEgressAcquireRequest: service.AccountEgressAcquireRequest{Config: config, LeaseID: fmt.Sprintf("bridge-pool-%d", index)},
+				LeaseTTL:                    service.AccountEgressLeaseTTL,
+				WaiterTTL:                   2 * time.Minute,
+			})
+			outcomes <- outcome{result: result, err: err}
+		}(index)
+	}
+	wg.Wait()
+	close(outcomes)
+	acquiredPool := 0
+	for outcome := range outcomes {
+		require.NoError(s.T(), outcome.err)
+		if outcome.result.Status == service.AccountEgressStatusAcquired {
+			acquiredPool++
+		}
+	}
+	require.Equal(s.T(), 6, acquiredPool)
+	require.Equal(s.T(), "transition", s.rdb.Get(s.ctx, accountEgressModeKey(config.AccountID)).Val())
+
+	loads, err := s.cache.GetAccountEgressLoadsBatch(s.ctx, []service.AccountEgressPoolConfig{config}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 9, loads[config.AccountID].ActiveTotal)
+	require.Equal(s.T(), map[string]int{
+		primary.IdentityID: 3,
+		second.IdentityID:  3,
+		third.IdentityID:   3,
+	}, loads[config.AccountID].IdentityLoads)
+
+	require.NoError(s.T(), s.cache.ReleaseAccountSlotForEgress(s.ctx, config.AccountID, "bridge-legacy-0", primary.IdentityID))
+	primaryPool := acquireAccountEgressTest(s.T(), other, config, "bridge-primary-after-release", primary.BindingID, "")
+	require.Equal(s.T(), service.AccountEgressStatusAcquired, primaryPool.Status)
+}

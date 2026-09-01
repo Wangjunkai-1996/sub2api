@@ -118,10 +118,12 @@ var (
 		local poolTotalKey = KEYS[5]
 		local egressExclusiveKey = KEYS[6]
 		local legacyRegularMirrorKey = KEYS[7]
+		local legacyRegularIdentityKey = KEYS[8]
 		local maxConcurrency = tonumber(ARGV[1])
 		local ttl = tonumber(ARGV[2])
 		local requestID = ARGV[3]
 		local poolTTL = tonumber(ARGV[4])
+		local identityMapped = tonumber(ARGV[5])
 		local timeResult = redis.call('TIME')
 		local now = tonumber(timeResult[1])
 		local nowMillis = now * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
@@ -130,33 +132,96 @@ var (
 		redis.call('ZREMRANGEBYSCORE', liveKey, '-inf', now - 60)
 		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
 		redis.call('ZREMRANGEBYSCORE', legacyRegularMirrorKey, '-inf', expireBefore)
+		if identityMapped == 1 then
+			redis.call('ZREMRANGEBYSCORE', legacyRegularIdentityKey, '-inf', expireBefore)
+		end
 		if redis.call('EXISTS', exclusiveKey) == 1 or redis.call('EXISTS', egressExclusiveKey) == 1 then return {0, now} end
 		local mode = redis.call('GET', modeKey)
 		if mode == false then
 			redis.call('SET', modeKey, 'legacy')
-		elseif mode == 'pool' then
-			if redis.call('ZCARD', poolTotalKey) > 0 then return {0, now} end
-			redis.call('SET', modeKey, 'legacy')
-		elseif mode ~= 'legacy' then
-			return {0, now}
+			mode = 'legacy'
 		end
 		local exists = redis.call('ZSCORE', key, requestID)
-		if exists ~= false then
+		if exists ~= false and (mode == 'legacy' or mode == 'transition' or mode == 'to_legacy') then
+			if redis.call('ZSCORE', legacyRegularMirrorKey, requestID) == false then return {0, now} end
+			if identityMapped == 1 and redis.call('ZSCORE', legacyRegularIdentityKey, requestID) == false then return {0, now} end
 			redis.call('ZADD', key, now, requestID)
 			redis.call('ZADD', legacyRegularMirrorKey, now, requestID)
+			if identityMapped == 1 then redis.call('ZADD', legacyRegularIdentityKey, now, requestID) end
 			redis.call('EXPIRE', key, ttl)
 			redis.call('EXPIRE', legacyRegularMirrorKey, ttl)
+			if identityMapped == 1 then redis.call('EXPIRE', legacyRegularIdentityKey, ttl) end
 			return {1, now}
+		end
+		if mode == 'pool' then
+			if redis.call('ZCARD', poolTotalKey) > 0 then
+				redis.call('SET', modeKey, 'to_legacy')
+				return {0, now}
+			end
+			redis.call('SET', modeKey, 'legacy')
+			mode = 'legacy'
+		elseif mode == 'to_legacy' then
+			if redis.call('ZCARD', poolTotalKey) > 0 then return {0, now} end
+			redis.call('SET', modeKey, 'legacy')
+			mode = 'legacy'
+		elseif mode ~= 'legacy' then
+			return {0, now}
 		end
 		local count = redis.call('ZCARD', key) + redis.call('ZCARD', liveKey)
 		if count < maxConcurrency then
 			redis.call('ZADD', key, now, requestID)
 			redis.call('ZADD', legacyRegularMirrorKey, now, requestID)
+			if identityMapped == 1 then redis.call('ZADD', legacyRegularIdentityKey, now, requestID) end
 			redis.call('EXPIRE', key, ttl)
 			redis.call('EXPIRE', legacyRegularMirrorKey, ttl)
+			if identityMapped == 1 then redis.call('EXPIRE', legacyRegularIdentityKey, ttl) end
 			return {1, now}
 		end
 		return {0, now}
+	`)
+
+	refreshAccountSlotScript = redis.NewScript(`
+		redis.replicate_commands()
+		local key = KEYS[1]
+		local legacyRegularMirrorKey = KEYS[2]
+		local legacyRegularIdentityKey = KEYS[3]
+		local modeKey = KEYS[4]
+		local ttl = tonumber(ARGV[1])
+		local requestID = ARGV[2]
+		local timeResult = redis.call('TIME')
+		local now = tonumber(timeResult[1])
+		local expireBefore = now - ttl
+		redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
+		redis.call('ZREMRANGEBYSCORE', legacyRegularMirrorKey, '-inf', expireBefore)
+		redis.call('ZREMRANGEBYSCORE', legacyRegularIdentityKey, '-inf', expireBefore)
+		local mode = redis.call('GET', modeKey)
+		if mode ~= 'legacy' and mode ~= 'transition' and mode ~= 'to_legacy' then
+			return {0, now}
+		end
+		if redis.call('ZSCORE', key, requestID) == false or
+			redis.call('ZSCORE', legacyRegularMirrorKey, requestID) == false or
+			redis.call('ZSCORE', legacyRegularIdentityKey, requestID) == false then
+			return {0, now}
+		end
+		redis.call('ZADD', key, 'XX', now, requestID)
+		redis.call('ZADD', legacyRegularMirrorKey, 'XX', now, requestID)
+		redis.call('ZADD', legacyRegularIdentityKey, 'XX', now, requestID)
+		redis.call('EXPIRE', key, ttl)
+		redis.call('EXPIRE', legacyRegularMirrorKey, ttl)
+		redis.call('EXPIRE', legacyRegularIdentityKey, ttl)
+		return {1, now}
+	`)
+
+	releaseAccountSlotScript = redis.NewScript(`
+		local key = KEYS[1]
+		local legacyRegularMirrorKey = KEYS[2]
+		local legacyRegularIdentityKey = KEYS[3]
+		local requestID = ARGV[1]
+		local identityMapped = tonumber(ARGV[2])
+		redis.call('ZREM', key, requestID)
+		redis.call('ZREM', legacyRegularMirrorKey, requestID)
+		if identityMapped == 1 then redis.call('ZREM', legacyRegularIdentityKey, requestID) end
+		return 1
 	`)
 
 	// getCountScript 统计有序集合中的槽位数量并清理过期条目
@@ -204,12 +269,16 @@ var (
 		local poolTotalKey = KEYS[8]
 		local egressExclusiveKey = KEYS[9]
 		local legacyLiveMirror = KEYS[10]
+		local legacyLiveIdentity = KEYS[11]
+		local legacyRegularIdentity = KEYS[12]
 		local accountMax = tonumber(ARGV[1])
 		local userMax = tonumber(ARGV[2])
 		local ttl = tonumber(ARGV[3])
 		local leaseID = ARGV[4]
 		local replacing = tonumber(ARGV[5])
 		local poolTTL = tonumber(ARGV[6])
+		local identityMapped = tonumber(ARGV[7])
+		local regularTTL = tonumber(ARGV[8])
 		local timeResult = redis.call('TIME')
 		local now = tonumber(timeResult[1])
 		local nowMillis = now * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
@@ -219,26 +288,58 @@ var (
 		redis.call('ZREMRANGEBYSCORE', apiLive, '-inf', liveExpireBefore)
 		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
 		redis.call('ZREMRANGEBYSCORE', legacyLiveMirror, '-inf', liveExpireBefore)
+		if identityMapped == 1 then
+			redis.call('ZREMRANGEBYSCORE', legacyLiveIdentity, '-inf', liveExpireBefore)
+			redis.call('ZREMRANGEBYSCORE', legacyRegularIdentity, '-inf', now - regularTTL)
+		end
 		if redis.call('EXISTS', accountExclusive) == 1 or redis.call('EXISTS', egressExclusiveKey) == 1 then return 0 end
 		local mode = redis.call('GET', modeKey)
 		if mode == false then
 			redis.call('SET', modeKey, 'legacy')
-		elseif mode == 'pool' then
-			if redis.call('ZCARD', poolTotalKey) > 0 then return 0 end
-			redis.call('SET', modeKey, 'legacy')
-		elseif mode ~= 'legacy' then
-			return 0
+			mode = 'legacy'
 		end
-		if redis.call('ZSCORE', accountLive, leaseID) ~= false then
+		local exists = redis.call('ZSCORE', accountLive, leaseID)
+		if exists ~= false and (mode == 'legacy' or mode == 'transition' or mode == 'to_legacy') then
+			if redis.call('ZSCORE', userLive, leaseID) == false or
+				redis.call('ZSCORE', apiLive, leaseID) == false or
+				redis.call('ZSCORE', legacyLiveMirror, leaseID) == false or
+				(identityMapped == 1 and redis.call('ZSCORE', legacyLiveIdentity, leaseID) == false) then
+				return 0
+			end
 			redis.call('ZADD', accountLive, now, leaseID)
 			redis.call('ZADD', userLive, now, leaseID)
 			redis.call('ZADD', apiLive, now, leaseID)
 			redis.call('ZADD', legacyLiveMirror, now, leaseID)
+			if identityMapped == 1 then redis.call('ZADD', legacyLiveIdentity, now, leaseID) end
 			redis.call('EXPIRE', accountLive, ttl)
 			redis.call('EXPIRE', userLive, ttl)
 			redis.call('EXPIRE', apiLive, ttl)
 			redis.call('EXPIRE', legacyLiveMirror, ttl)
+			if identityMapped == 1 then redis.call('EXPIRE', legacyLiveIdentity, ttl) end
 			return 1
+		end
+		if mode == 'pool' then
+			if redis.call('ZCARD', poolTotalKey) > 0 then
+				redis.call('SET', modeKey, 'to_legacy')
+				return 0
+			end
+			redis.call('SET', modeKey, 'legacy')
+			mode = 'legacy'
+		elseif mode == 'to_legacy' and redis.call('ZCARD', poolTotalKey) == 0 then
+			redis.call('SET', modeKey, 'legacy')
+			mode = 'legacy'
+		end
+		if mode == 'transition' or mode == 'to_legacy' then
+			-- Only an already admitted regular request may finish promotion to Live
+			-- while either transition fence blocks new legacy admissions.
+			if replacing ~= 1 then return 0 end
+			if identityMapped == 1 then
+				if redis.call('ZCARD', legacyRegularIdentity) == 0 then return 0 end
+			elseif redis.call('ZCARD', accountRegular) == 0 then
+				return 0
+			end
+		elseif mode ~= 'legacy' then
+			return 0
 		end
 		local accountCount = redis.call('ZCARD', accountRegular) + redis.call('ZCARD', accountLive)
 		local userCount = redis.call('ZCARD', userRegular) + redis.call('ZCARD', userLive)
@@ -250,28 +351,56 @@ var (
 		redis.call('ZADD', userLive, now, leaseID)
 		redis.call('ZADD', apiLive, now, leaseID)
 		redis.call('ZADD', legacyLiveMirror, now, leaseID)
+		if identityMapped == 1 then redis.call('ZADD', legacyLiveIdentity, now, leaseID) end
 		redis.call('EXPIRE', accountLive, ttl)
 		redis.call('EXPIRE', userLive, ttl)
 		redis.call('EXPIRE', apiLive, ttl)
 		redis.call('EXPIRE', legacyLiveMirror, ttl)
+		if identityMapped == 1 then redis.call('EXPIRE', legacyLiveIdentity, ttl) end
 		return 1
 	`)
 
 	refreshLiveLeaseScript = redis.NewScript(`
 		redis.replicate_commands()
+		local accountLive = KEYS[1]
+		local userLive = KEYS[2]
+		local apiLive = KEYS[3]
+		local legacyLiveMirror = KEYS[4]
+		local legacyLiveIdentity = KEYS[5]
+		local modeKey = KEYS[6]
 		local ttl = tonumber(ARGV[1])
 		local leaseID = ARGV[2]
+		local identityMapped = tonumber(ARGV[3])
 		local now = tonumber(redis.call('TIME')[1])
 		local expireBefore = now - ttl
-		for index = 1, 3 do
-			local key = KEYS[index]
+		local mode = redis.call('GET', modeKey)
+		if mode ~= 'legacy' and mode ~= 'transition' and mode ~= 'to_legacy' then return 0 end
+		for _, key in ipairs({accountLive, userLive, apiLive, legacyLiveMirror}) do
 			redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
 			if redis.call('ZSCORE', key, leaseID) == false then return 0 end
 		end
-		for _, key in ipairs(KEYS) do
-			redis.call('ZADD', key, now, leaseID)
+		if identityMapped == 1 then
+			redis.call('ZREMRANGEBYSCORE', legacyLiveIdentity, '-inf', expireBefore)
+			if redis.call('ZSCORE', legacyLiveIdentity, leaseID) == false then return 0 end
+		end
+		for _, key in ipairs({accountLive, userLive, apiLive, legacyLiveMirror}) do
+			redis.call('ZADD', key, 'XX', now, leaseID)
 			redis.call('EXPIRE', key, ttl)
 		end
+		if identityMapped == 1 then
+			redis.call('ZADD', legacyLiveIdentity, 'XX', now, leaseID)
+			redis.call('EXPIRE', legacyLiveIdentity, ttl)
+		end
+		return 1
+	`)
+
+	releaseLiveLeaseScript = redis.NewScript(`
+		local leaseID = ARGV[1]
+		local identityMapped = tonumber(ARGV[2])
+		for index = 1, 4 do
+			redis.call('ZREM', KEYS[index], leaseID)
+		end
+		if identityMapped == 1 then redis.call('ZREM', KEYS[5], leaseID) end
 		return 1
 	`)
 
@@ -300,7 +429,8 @@ var (
 		local expireBefore = now - ttl
 		redis.call('ZREMRANGEBYSCORE', userLive, '-inf', expireBefore)
 		redis.call('ZREMRANGEBYSCORE', apiLive, '-inf', expireBefore)
-		if redis.call('GET', modeKey) ~= 'pool' then return 0 end
+		local mode = redis.call('GET', modeKey)
+		if mode ~= 'pool' and mode ~= 'transition' and mode ~= 'to_legacy' then return 0 end
 		if redis.call('EXISTS', egressExclusive) == 1 then return 0 end
 		if redis.call('HGET', egressMetadata, 'binding_hash') ~= expectedBindingHash or
 			redis.call('HGET', egressMetadata, 'identity_hash') ~= expectedIdentityHash or
@@ -341,7 +471,8 @@ var (
 		local expectedIdentityHash = ARGV[5]
 		local now = tonumber(redis.call('TIME')[1])
 		local expireBefore = now - ttl
-		if redis.call('GET', modeKey) ~= 'pool' or
+		local mode = redis.call('GET', modeKey)
+		if (mode ~= 'pool' and mode ~= 'transition' and mode ~= 'to_legacy') or
 			redis.call('HGET', egressMetadata, 'binding_hash') ~= expectedBindingHash or
 			redis.call('HGET', egressMetadata, 'identity_hash') ~= expectedIdentityHash or
 			redis.call('ZSCORE', egressIdentity, egressMember) == false or
@@ -869,7 +1000,36 @@ func runScriptInt64Pair(ctx context.Context, rdb *redis.Client, script *redis.Sc
 // Account slot operations
 
 func (c *concurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
+	return c.acquireLegacyAccountSlot(ctx, accountID, int64(maxConcurrency), requestID, "")
+}
+
+func (c *concurrencyCache) AcquireAccountSlotForEgress(
+	ctx context.Context,
+	accountID int64,
+	maxConcurrency int,
+	requestID string,
+	identityID string,
+) (bool, error) {
+	if identityID == "" {
+		return false, errors.New("account egress identity is required")
+	}
+	return c.acquireLegacyAccountSlot(ctx, accountID, int64(maxConcurrency), requestID, identityID)
+}
+
+func (c *concurrencyCache) acquireLegacyAccountSlot(
+	ctx context.Context,
+	accountID int64,
+	maxConcurrency int64,
+	requestID string,
+	identityID string,
+) (bool, error) {
 	key := accountSlotKey(accountID)
+	identityKey := accountEgressLegacyRegularKey(accountID)
+	identityMapped := 0
+	if identityID != "" {
+		identityKey = accountEgressLegacyRegularIdentityKey(accountID, identityID)
+		identityMapped = 1
+	}
 	// 时间戳在 Lua 脚本内使用 Redis TIME 命令获取，确保多实例时钟一致
 	result, now, err := runScriptInt64Pair(ctx, c.rdb, acquireAccountScript, []string{
 		key,
@@ -879,7 +1039,8 @@ func (c *concurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int
 		accountEgressTotalKey(accountID),
 		accountEgressExclusiveKey(accountID),
 		accountEgressLegacyRegularKey(accountID),
-	}, maxConcurrency, c.slotTTLSeconds, requestID, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL))
+		identityKey,
+	}, maxConcurrency, c.slotTTLSeconds, requestID, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL), identityMapped)
 	if err != nil {
 		return false, err
 	}
@@ -892,16 +1053,24 @@ func (c *concurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int
 
 func (c *concurrencyCache) AcquireUnboundedAccountSlot(ctx context.Context, accountID int64, requestID string) (bool, error) {
 	const maxExactRedisInteger = int64(1<<53 - 1)
-	key := accountSlotKey(accountID)
-	result, now, err := runScriptInt64Pair(ctx, c.rdb, acquireAccountScript, []string{
-		key,
-		liveAccountSlotKey(accountID),
-		warmupAccountExclusiveKey(accountID),
-		accountEgressModeKey(accountID),
-		accountEgressTotalKey(accountID),
-		accountEgressExclusiveKey(accountID),
+	return c.acquireLegacyAccountSlot(ctx, accountID, maxExactRedisInteger, requestID, "")
+}
+
+func (c *concurrencyCache) RefreshAccountSlotForEgress(
+	ctx context.Context,
+	accountID int64,
+	requestID string,
+	identityID string,
+) (bool, error) {
+	if c == nil || c.rdb == nil || accountID <= 0 || requestID == "" || identityID == "" {
+		return false, nil
+	}
+	result, now, err := runScriptInt64Pair(ctx, c.rdb, refreshAccountSlotScript, []string{
+		accountSlotKey(accountID),
 		accountEgressLegacyRegularKey(accountID),
-	}, maxExactRedisInteger, c.slotTTLSeconds, requestID, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL))
+		accountEgressLegacyRegularIdentityKey(accountID, identityID),
+		accountEgressModeKey(accountID),
+	}, c.slotTTLSeconds, requestID)
 	if err != nil {
 		return false, err
 	}
@@ -912,11 +1081,33 @@ func (c *concurrencyCache) AcquireUnboundedAccountSlot(ctx context.Context, acco
 }
 
 func (c *concurrencyCache) ReleaseAccountSlot(ctx context.Context, accountID int64, requestID string) error {
-	key := accountSlotKey(accountID)
-	pipe := c.rdb.Pipeline()
-	pipe.ZRem(ctx, key, requestID)
-	pipe.ZRem(ctx, accountEgressLegacyRegularKey(accountID), requestID)
-	if _, err := pipe.Exec(ctx); err != nil {
+	return c.releaseLegacyAccountSlot(ctx, accountID, requestID, "")
+}
+
+func (c *concurrencyCache) ReleaseAccountSlotForEgress(
+	ctx context.Context,
+	accountID int64,
+	requestID string,
+	identityID string,
+) error {
+	if identityID == "" {
+		return errors.New("account egress identity is required")
+	}
+	return c.releaseLegacyAccountSlot(ctx, accountID, requestID, identityID)
+}
+
+func (c *concurrencyCache) releaseLegacyAccountSlot(ctx context.Context, accountID int64, requestID, identityID string) error {
+	identityKey := accountEgressLegacyRegularKey(accountID)
+	identityMapped := 0
+	if identityID != "" {
+		identityKey = accountEgressLegacyRegularIdentityKey(accountID, identityID)
+		identityMapped = 1
+	}
+	if err := releaseAccountSlotScript.Run(ctx, c.rdb, []string{
+		accountSlotKey(accountID),
+		accountEgressLegacyRegularKey(accountID),
+		identityKey,
+	}, requestID, identityMapped).Err(); err != nil {
 		return err
 	}
 	// 释放后用真实负载刷新索引；若没有槽位和等待计数，会移除索引 member。
@@ -1076,12 +1267,55 @@ func (c *concurrencyCache) AcquireLiveLease(
 	leaseID string,
 	replacingRegularSlots bool,
 ) (bool, error) {
+	return c.acquireLegacyLiveLease(
+		ctx, accountID, accountMax, userID, userMax, apiKeyID, leaseID, "", replacingRegularSlots,
+	)
+}
+
+func (c *concurrencyCache) AcquireLiveLeaseForLegacyEgress(
+	ctx context.Context,
+	accountID int64,
+	accountMax int,
+	userID int64,
+	userMax int,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+	replacingRegularSlots bool,
+) (bool, error) {
+	if identityID == "" {
+		return false, errors.New("account egress identity is required")
+	}
+	return c.acquireLegacyLiveLease(
+		ctx, accountID, accountMax, userID, userMax, apiKeyID, leaseID, identityID, replacingRegularSlots,
+	)
+}
+
+func (c *concurrencyCache) acquireLegacyLiveLease(
+	ctx context.Context,
+	accountID int64,
+	accountMax int,
+	userID int64,
+	userMax int,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+	replacingRegularSlots bool,
+) (bool, error) {
 	if c == nil || c.rdb == nil || accountID <= 0 || userID <= 0 || apiKeyID <= 0 || leaseID == "" {
 		return false, nil
 	}
 	replacing := 0
 	if replacingRegularSlots {
 		replacing = 1
+	}
+	identityMapped := 0
+	liveIdentityKey := accountEgressLegacyLiveKey(accountID)
+	regularIdentityKey := accountEgressLegacyRegularKey(accountID)
+	if identityID != "" {
+		identityMapped = 1
+		liveIdentityKey = accountEgressLegacyLiveIdentityKey(accountID, identityID)
+		regularIdentityKey = accountEgressLegacyRegularIdentityKey(accountID, identityID)
 	}
 	result, err := acquireLiveLeaseScript.Run(ctx, c.rdb, []string{
 		accountSlotKey(accountID),
@@ -1094,7 +1328,11 @@ func (c *concurrencyCache) AcquireLiveLease(
 		accountEgressTotalKey(accountID),
 		accountEgressExclusiveKey(accountID),
 		accountEgressLegacyLiveKey(accountID),
-	}, accountMax, userMax, liveLeaseTTLSeconds, leaseID, replacing, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL)).Int()
+		liveIdentityKey,
+		regularIdentityKey,
+	}, accountMax, userMax, liveLeaseTTLSeconds, leaseID, replacing,
+		accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL), identityMapped, c.slotTTLSeconds,
+	).Int()
 	return result == 1, err
 }
 
@@ -1132,15 +1370,48 @@ func (c *concurrencyCache) AcquireLiveLeaseForEgress(
 }
 
 func (c *concurrencyCache) RefreshLiveLease(ctx context.Context, accountID, userID, apiKeyID int64, leaseID string) (bool, error) {
+	return c.refreshLegacyLiveLease(ctx, accountID, userID, apiKeyID, leaseID, "")
+}
+
+func (c *concurrencyCache) RefreshLiveLeaseForLegacyEgress(
+	ctx context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) (bool, error) {
+	if identityID == "" {
+		return false, errors.New("account egress identity is required")
+	}
+	return c.refreshLegacyLiveLease(ctx, accountID, userID, apiKeyID, leaseID, identityID)
+}
+
+func (c *concurrencyCache) refreshLegacyLiveLease(
+	ctx context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) (bool, error) {
 	if c == nil || c.rdb == nil || leaseID == "" {
 		return false, nil
+	}
+	identityMapped := 0
+	identityKey := accountEgressLegacyLiveKey(accountID)
+	if identityID != "" {
+		identityMapped = 1
+		identityKey = accountEgressLegacyLiveIdentityKey(accountID, identityID)
 	}
 	result, err := refreshLiveLeaseScript.Run(ctx, c.rdb, []string{
 		liveAccountSlotKey(accountID),
 		liveUserSlotKey(userID),
 		liveAPIKeySlotKey(apiKeyID),
 		accountEgressLegacyLiveKey(accountID),
-	}, liveLeaseTTLSeconds, leaseID).Int()
+		identityKey,
+		accountEgressModeKey(accountID),
+	}, liveLeaseTTLSeconds, leaseID, identityMapped).Int()
 	return result == 1, err
 }
 
@@ -1170,16 +1441,47 @@ func (c *concurrencyCache) RefreshLiveLeaseForEgress(
 }
 
 func (c *concurrencyCache) ReleaseLiveLease(ctx context.Context, accountID, userID, apiKeyID int64, leaseID string) error {
+	return c.releaseLegacyLiveLease(ctx, accountID, userID, apiKeyID, leaseID, "")
+}
+
+func (c *concurrencyCache) ReleaseLiveLeaseForLegacyEgress(
+	ctx context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) error {
+	if identityID == "" {
+		return errors.New("account egress identity is required")
+	}
+	return c.releaseLegacyLiveLease(ctx, accountID, userID, apiKeyID, leaseID, identityID)
+}
+
+func (c *concurrencyCache) releaseLegacyLiveLease(
+	ctx context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) error {
 	if c == nil || c.rdb == nil || leaseID == "" {
 		return nil
 	}
-	pipe := c.rdb.TxPipeline()
-	pipe.ZRem(ctx, liveAccountSlotKey(accountID), leaseID)
-	pipe.ZRem(ctx, liveUserSlotKey(userID), leaseID)
-	pipe.ZRem(ctx, liveAPIKeySlotKey(apiKeyID), leaseID)
-	pipe.ZRem(ctx, accountEgressLegacyLiveKey(accountID), leaseID)
-	_, err := pipe.Exec(ctx)
-	return err
+	identityMapped := 0
+	identityKey := accountEgressLegacyLiveKey(accountID)
+	if identityID != "" {
+		identityMapped = 1
+		identityKey = accountEgressLegacyLiveIdentityKey(accountID, identityID)
+	}
+	return releaseLiveLeaseScript.Run(ctx, c.rdb, []string{
+		liveAccountSlotKey(accountID),
+		liveUserSlotKey(userID),
+		liveAPIKeySlotKey(apiKeyID),
+		accountEgressLegacyLiveKey(accountID),
+		identityKey,
+	}, leaseID, identityMapped).Err()
 }
 
 func (c *concurrencyCache) ReleaseLiveLeaseForEgress(

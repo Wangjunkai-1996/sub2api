@@ -210,13 +210,25 @@ func (s *liveTestStore) MarkLiveCallClosed(_ context.Context, callHash string, _
 
 type liveTestConcurrencyCache struct {
 	ConcurrencyCache
-	mu                 sync.Mutex
-	releases           int
-	egressOwned        bool
-	egressRefreshErr   error
-	egressAcquires     int
-	egressRefreshes    int
-	egressLiveReleases int
+	mu                     sync.Mutex
+	releases               int
+	egressOwned            bool
+	egressRefreshErr       error
+	egressAcquires         int
+	egressRefreshes        int
+	egressLiveReleases     int
+	legacyOwned            bool
+	legacyAcquires         int
+	legacyRefreshes        int
+	legacyLiveReleases     int
+	legacyAccountID        int64
+	legacyAccountMax       int
+	legacyUserID           int64
+	legacyUserMax          int
+	legacyAPIKeyID         int64
+	legacyLeaseID          string
+	legacyIdentityID       string
+	legacyReplacingRegular bool
 }
 
 func (c *liveTestConcurrencyCache) AcquireLiveLease(
@@ -293,6 +305,69 @@ func (c *liveTestConcurrencyCache) ReleaseLiveLeaseForEgress(
 	c.mu.Lock()
 	c.egressLiveReleases++
 	c.mu.Unlock()
+	return nil
+}
+
+func (c *liveTestConcurrencyCache) AcquireLiveLeaseForLegacyEgress(
+	_ context.Context,
+	accountID int64,
+	accountMax int,
+	userID int64,
+	userMax int,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+	replacingRegularSlots bool,
+) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyAcquires++
+	c.legacyAccountID = accountID
+	c.legacyAccountMax = accountMax
+	c.legacyUserID = userID
+	c.legacyUserMax = userMax
+	c.legacyAPIKeyID = apiKeyID
+	c.legacyLeaseID = leaseID
+	c.legacyIdentityID = identityID
+	c.legacyReplacingRegular = replacingRegularSlots
+	return c.legacyOwned, nil
+}
+
+func (c *liveTestConcurrencyCache) RefreshLiveLeaseForLegacyEgress(
+	_ context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyRefreshes++
+	c.legacyAccountID = accountID
+	c.legacyUserID = userID
+	c.legacyAPIKeyID = apiKeyID
+	c.legacyLeaseID = leaseID
+	c.legacyIdentityID = identityID
+	return c.legacyOwned, nil
+}
+
+func (c *liveTestConcurrencyCache) ReleaseLiveLeaseForLegacyEgress(
+	_ context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyLiveReleases++
+	c.legacyAccountID = accountID
+	c.legacyUserID = userID
+	c.legacyAPIKeyID = apiKeyID
+	c.legacyLeaseID = leaseID
+	c.legacyIdentityID = identityID
 	return nil
 }
 
@@ -395,6 +470,103 @@ func liveTestPoolRecord(callID string) *LiveCallRecord {
 		ExpiresAt:           time.Now().Add(time.Hour),
 		Controller:          LiveControllerPending,
 	}
+}
+
+func liveTestLegacyEgressRecord(t *testing.T, callID string) *LiveCallRecord {
+	t.Helper()
+	account := legacyEgressTestAccount()
+	admission, err := resolveLegacyAccountEgressAdmission(account)
+	require.NoError(t, err)
+	return &LiveCallRecord{
+		CallID:                    callID,
+		CallHash:                  hashLiveCallID(callID),
+		AccountID:                 account.ID,
+		APIKeyID:                  22,
+		UserID:                    33,
+		LeaseID:                   "live-lease-" + callID,
+		LegacyEgressBindingID:     admission.BindingID,
+		LegacyEgressRouteID:       admission.RouteID,
+		LegacyEgressIdentityID:    admission.IdentityID,
+		LegacyEgressConfigVersion: admission.ConfigVersion,
+		CreatedAt:                 time.Now().Add(-time.Second),
+		ExpiresAt:                 time.Now().Add(time.Hour),
+		Controller:                LiveControllerPending,
+	}
+}
+
+func TestLegacyLiveLeaseRefreshAndReleaseUsePersistedIdentity(t *testing.T) {
+	record := liveTestLegacyEgressRecord(t, "legacy-refresh-release")
+	cache := &liveTestConcurrencyCache{legacyOwned: true}
+	service := &OpenAIGatewayService{concurrencyService: NewConcurrencyService(cache)}
+
+	require.True(t, service.refreshLiveLease(record))
+	service.releaseLiveConcurrencyLease(record)
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	require.Equal(t, 1, cache.legacyRefreshes)
+	require.Equal(t, 1, cache.legacyLiveReleases)
+	require.Zero(t, cache.releases)
+	require.Equal(t, record.AccountID, cache.legacyAccountID)
+	require.Equal(t, record.UserID, cache.legacyUserID)
+	require.Equal(t, record.APIKeyID, cache.legacyAPIKeyID)
+	require.Equal(t, record.LeaseID, cache.legacyLeaseID)
+	require.Equal(t, record.LegacyEgressIdentityID, cache.legacyIdentityID)
+}
+
+func TestLiveObserverRestoresPersistedLegacyEgress(t *testing.T) {
+	account := legacyEgressTestAccount()
+	account.Credentials = map[string]any{
+		"access_token":       "test-access-token",
+		"chatgpt_account_id": "acct_test",
+	}
+	record := liveTestLegacyEgressRecord(t, "legacy-observer")
+	attestationCipher := newLiveAttestationCipher(&config.Config{
+		JWT: config.JWTConfig{Secret: "legacy-live-observer-secret"},
+	})
+	var err error
+	record.AttestationCiphertext, err = attestationCipher.Encrypt(`{"v":1,"s":0,"t":"v1.sideband"}`)
+	require.NoError(t, err)
+	store := &liveTestStore{}
+	require.NoError(t, store.SaveLiveCall(context.Background(), record, time.Hour))
+	upstream := newLiveTestFrameConn()
+	upstream.reads <- liveTestFrame{
+		messageType: coderws.MessageText,
+		payload:     []byte(`{"type":"session.ended"}`),
+	}
+	dialer := &liveTestDialer{conn: upstream}
+	cache := &liveTestConcurrencyCache{legacyOwned: true}
+	service := &OpenAIGatewayService{
+		accountRepo:               &liveTestAccountRepo{account: account},
+		cache:                     store,
+		concurrencyService:        NewConcurrencyService(cache),
+		openaiWSPassthroughDialer: dialer,
+		liveAttestationCipher:     attestationCipher,
+	}
+
+	service.observeLiveCall(record)
+
+	require.Equal(t, account.Proxy.URL(), dialer.proxy)
+	require.Equal(t, "wss://chatgpt.com/backend-api/codex/legacy-observer", dialer.url)
+	cache.mu.Lock()
+	require.Equal(t, 1, cache.legacyLiveReleases)
+	require.Equal(t, record.LegacyEgressIdentityID, cache.legacyIdentityID)
+	cache.mu.Unlock()
+}
+
+func TestLiveSidebandRejectsChangedLegacyEgressConfig(t *testing.T) {
+	record := liveTestLegacyEgressRecord(t, "legacy-config-changed")
+	changed := legacyEgressTestAccount()
+	changed.EgressRevision++
+	dialer := &liveTestDialer{conn: newLiveTestFrameConn()}
+	service := &OpenAIGatewayService{
+		accountRepo:               &liveTestAccountRepo{account: changed},
+		openaiWSPassthroughDialer: dialer,
+	}
+
+	_, err := service.dialLiveSideband(context.Background(), record)
+	require.ErrorIs(t, err, ErrLiveUnavailable)
+	require.Empty(t, dialer.url)
 }
 
 func TestLiveControllerClaimFailureDoesNotRestoreEgressLease(t *testing.T) {

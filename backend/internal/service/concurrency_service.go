@@ -70,6 +70,31 @@ type AccountUnboundedSlotCache interface {
 	AcquireUnboundedAccountSlot(context.Context, int64, string) (bool, error)
 }
 
+// AccountEgressLegacySlotCache mirrors a rollout-off regular admission into
+// the exact public identity selected at admission time. It is optional so
+// caches used by tests and non-OpenAI paths preserve their legacy contract.
+type AccountEgressLegacySlotCache interface {
+	AcquireAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		maxConcurrency int,
+		requestID string,
+		identityID string,
+	) (bool, error)
+	RefreshAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		requestID string,
+		identityID string,
+	) (bool, error)
+	ReleaseAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		requestID string,
+		identityID string,
+	) error
+}
+
 type APIKeyConcurrencyCache interface {
 	TrackAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) error
 	ReleaseAPIKeySlot(ctx context.Context, apiKeyID int64, requestID string) error
@@ -327,10 +352,11 @@ func (s *ConcurrencyService) SetAccountLoadBatchCacheTTL(ttl time.Duration) {
 
 // AcquireResult represents the result of acquiring a concurrency slot
 type AcquireResult struct {
-	Acquired    bool
-	ReleaseFunc func() // Must be called when done (typically via defer)
-	Account     *Account
-	Egress      *ResolvedAccountEgress
+	Acquired              bool
+	ReleaseFunc           func() // Must be called when done (typically via defer)
+	Account               *Account
+	Egress                *ResolvedAccountEgress
+	LegacyEgressAdmission *LegacyAccountEgressAdmission
 }
 
 // AccountExclusiveLease reserves an idle account for a short maintenance
@@ -453,6 +479,41 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 
 	// Generate unique request ID for this slot
 	requestID := generateRequestID()
+	legacyEgressAdmission := legacyAccountEgressAdmissionFromContext(ctx, accountID)
+	if legacyEgressAdmission != nil && s != nil && s.cache != nil {
+		if cache, ok := s.cache.(AccountEgressLegacySlotCache); ok {
+			acquired, err := cache.AcquireAccountSlotForEgress(
+				ctx,
+				accountID,
+				maxConcurrency,
+				requestID,
+				legacyEgressAdmission.IdentityID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !acquired {
+				return &AcquireResult{
+					Acquired:              false,
+					LegacyEgressAdmission: legacyEgressAdmission,
+				}, nil
+			}
+
+			lease := newLegacyAccountEgressLease(
+				legacyEgressAdmission.leaseContext(ctx),
+				cache,
+				accountID,
+				requestID,
+				legacyEgressAdmission.IdentityID,
+			)
+			legacyEgressAdmission.Lease = lease
+			return &AcquireResult{
+				Acquired:              true,
+				ReleaseFunc:           lease.Release,
+				LegacyEgressAdmission: legacyEgressAdmission,
+			}, nil
+		}
+	}
 
 	acquired, err := s.cache.AcquireAccountSlot(ctx, accountID, maxConcurrency, requestID)
 	if err != nil {

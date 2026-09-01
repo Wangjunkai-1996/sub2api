@@ -338,6 +338,7 @@ func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
 		return nil, service.ErrNoAvailableAccounts
 	}
 	ctx := service.ContextWithSelectionProfitGate(c.Request.Context(), selection)
+	c.Request = c.Request.WithContext(ctx)
 	account := selection.Account
 	if selection.Acquired {
 		if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, selection.ReleaseFunc, reqLog); recheckErr != nil {

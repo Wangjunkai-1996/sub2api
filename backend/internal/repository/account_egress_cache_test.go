@@ -322,16 +322,146 @@ func TestAccountEgressLegacyPoolGateDrainsBothDirections(t *testing.T) {
 	legacyAcquired, err = cache.AcquireAccountSlot(ctx, config.AccountID, 1, "legacy-blocked")
 	require.NoError(t, err)
 	require.False(t, legacyAcquired)
+	require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 	liveAcquired, err := cache.AcquireLiveLease(ctx, config.AccountID, 1, 9001, 1, 9002, "legacy-live-blocked", false)
 	require.NoError(t, err)
 	require.False(t, liveAcquired)
 	releaseAccountEgressTest(t, cache, config, pool)
+	require.Equal(t, "legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 
 	liveAcquired, err = cache.AcquireLiveLease(ctx, config.AccountID, 1, 9001, 1, 9002, "legacy-live", false)
 	require.NoError(t, err)
 	require.True(t, liveAcquired)
 	require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressLegacyLiveKey(config.AccountID)).Val())
 	require.Equal(t, service.AccountEgressStatusLegacyDraining, acquireAccountEgressTest(t, cache, config, "pool-live-blocked", "", "").Status)
+}
+
+func TestAccountEgressTransitionBridgesLegacyByAdmissionIdentity(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	primary := accountEgressTestCandidate(0, 72, "ip:primary")
+	second := accountEgressTestCandidate(1, 73, "ip:second")
+	third := accountEgressTestCandidate(2, 74, "ip:third")
+	config := accountEgressTestConfig(1015, 3, 0, primary, second, third)
+	syncAccountEgressTestConfig(t, cache, config)
+	ctx := context.Background()
+
+	for index := 0; index < 3; index++ {
+		acquired, err := cache.AcquireAccountSlotForEgress(ctx, config.AccountID, 3, fmt.Sprintf("transition-legacy-%d", index), primary.IdentityID)
+		require.NoError(t, err)
+		require.True(t, acquired)
+	}
+	loads, err := cache.GetAccountEgressLoadsBatch(ctx, []service.AccountEgressPoolConfig{config}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressStatusAcquired, loads[config.AccountID].Status)
+	require.Equal(t, 3, loads[config.AccountID].ActiveTotal)
+	require.Equal(t, 33, loads[config.AccountID].LoadRate)
+	require.Equal(t, 3, loads[config.AccountID].IdentityLoads[primary.IdentityID])
+
+	poolLeases := make([]service.AccountEgressAcquireResult, 0, 7)
+	for index := 0; index < 6; index++ {
+		result := acquireAccountEgressTest(t, cache, config, fmt.Sprintf("transition-pool-%d", index), "", "")
+		require.Equal(t, service.AccountEgressStatusAcquired, result.Status)
+		poolLeases = append(poolLeases, result)
+	}
+	require.Equal(t, "transition", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	firstPoolRef := service.AccountEgressLeaseRef{
+		AccountID: config.AccountID, ID: poolLeases[0].LeaseID, BindingID: poolLeases[0].BindingID,
+		IdentityID: poolLeases[0].IdentityID, ConfigVersion: poolLeases[0].ConfigVersion,
+	}
+	owned, err := cache.RefreshAccountEgressLeases(ctx, []service.AccountEgressLeaseRef{firstPoolRef}, service.AccountEgressLeaseTTL)
+	require.NoError(t, err)
+	require.True(t, owned[firstPoolRef.Key()])
+	require.Equal(t, service.AccountEgressStatusFull, acquireAccountEgressTest(t, cache, config, "transition-tenth", "", "").Status)
+
+	legacyBlocked, err := cache.AcquireAccountSlot(ctx, config.AccountID, 3, "transition-new-legacy-blocked")
+	require.NoError(t, err)
+	require.False(t, legacyBlocked)
+
+	loads, err = cache.GetAccountEgressLoadsBatch(ctx, []service.AccountEgressPoolConfig{config}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(t, err)
+	load := loads[config.AccountID]
+	require.Equal(t, service.AccountEgressStatusAcquired, load.Status)
+	require.Equal(t, 9, load.ActiveTotal)
+	require.Equal(t, map[string]int{
+		primary.IdentityID: 3,
+		second.IdentityID:  3,
+		third.IdentityID:   3,
+	}, load.IdentityLoads)
+
+	require.NoError(t, cache.ReleaseAccountSlotForEgress(ctx, config.AccountID, "transition-legacy-0", primary.IdentityID))
+	primaryPool := acquireAccountEgressTest(t, cache, config, "transition-primary-pool", primary.BindingID, "")
+	require.Equal(t, service.AccountEgressStatusAcquired, primaryPool.Status)
+	poolLeases = append(poolLeases, primaryPool)
+
+	loads, err = cache.GetAccountEgressLoadsBatch(ctx, []service.AccountEgressPoolConfig{config}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 9, loads[config.AccountID].ActiveTotal)
+	require.Equal(t, 3, loads[config.AccountID].IdentityLoads[primary.IdentityID])
+
+	for index := 1; index < 3; index++ {
+		require.NoError(t, cache.ReleaseAccountSlotForEgress(ctx, config.AccountID, fmt.Sprintf("transition-legacy-%d", index), primary.IdentityID))
+	}
+	loads, err = cache.GetAccountEgressLoadsBatch(ctx, []service.AccountEgressPoolConfig{config}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, 7, loads[config.AccountID].ActiveTotal)
+
+	for _, lease := range poolLeases {
+		releaseAccountEgressTest(t, cache, config, lease)
+	}
+}
+
+func TestAccountEgressLegacyLoadKeepsAdmissionIdentityWhenPrimaryChanges(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	first := accountEgressTestCandidate(0, 75, "ip:first")
+	second := accountEgressTestCandidate(1, 76, "ip:second")
+	config := accountEgressTestConfig(1016, 1, 0, first, second)
+	syncAccountEgressTestConfig(t, cache, config)
+	ctx := context.Background()
+
+	acquired, err := cache.AcquireAccountSlotForEgress(ctx, config.AccountID, 1, "legacy-on-first", first.IdentityID)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	updated := config
+	updated.Version = 2
+	updated.Candidates = append([]service.AccountEgressCandidate(nil), config.Candidates...)
+	updated.Candidates[0].Primary = false
+	updated.Candidates[1].Primary = true
+	syncAccountEgressTestConfig(t, cache, updated)
+
+	loads, err := cache.GetAccountEgressLoadsBatch(ctx, []service.AccountEgressPoolConfig{updated}, service.AccountEgressLeaseTTL, 2*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{first.IdentityID: 1, second.IdentityID: 0}, loads[config.AccountID].IdentityLoads)
+
+	secondLease := acquireAccountEgressTest(t, cache, updated, "pool-on-second", second.BindingID, "")
+	require.Equal(t, service.AccountEgressStatusAcquired, secondLease.Status)
+	require.Equal(t, second.IdentityID, secondLease.IdentityID)
+	require.Equal(t, service.AccountEgressStatusFull, acquireAccountEgressTest(t, cache, updated, "pool-over-first", first.BindingID, "").Status)
+
+	releaseAccountEgressTest(t, cache, updated, secondLease)
+	require.NoError(t, cache.ReleaseAccountSlotForEgress(ctx, config.AccountID, "legacy-on-first", first.IdentityID))
+}
+
+func TestLegacyAdmissionInitiatesPoolToLegacyTransition(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	candidate := accountEgressTestCandidate(0, 77, "ip:only")
+	config := accountEgressTestConfig(1017, 1, 0, candidate)
+	syncAccountEgressTestConfig(t, cache, config)
+	ctx := context.Background()
+
+	pool := acquireAccountEgressTest(t, cache, config, "pool-owner", "", "")
+	require.Equal(t, service.AccountEgressStatusAcquired, pool.Status)
+	legacy, err := cache.AcquireAccountSlotForEgress(ctx, config.AccountID, 1, "legacy-blocked", candidate.IdentityID)
+	require.NoError(t, err)
+	require.False(t, legacy)
+	require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, service.AccountEgressStatusLegacyDraining, acquireAccountEgressTest(t, cache, config, "pool-blocked", "", "").Status)
+	releaseAccountEgressTest(t, cache, config, pool)
+	require.Equal(t, "legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	legacy, err = cache.AcquireAccountSlotForEgress(ctx, config.AccountID, 1, "legacy-allowed", candidate.IdentityID)
+	require.NoError(t, err)
+	require.True(t, legacy)
 }
 
 func TestAccountEgressWarmupGateCoversPoolLeasesAndWaiters(t *testing.T) {

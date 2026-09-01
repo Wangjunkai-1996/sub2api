@@ -55,9 +55,19 @@ func acquireAccountSlotForSelectionWithBinding(
 		if concurrency == nil {
 			return &AcquireResult{Acquired: true, ReleaseFunc: func() {}, Account: account.CloneForRequest()}, nil
 		}
-		result, err := concurrency.AcquireAccountSlot(ctx, account.ID, account.Concurrency)
+		admissionCtx := ctx
+		if accountUsesLegacyEgressMirror(concurrency, account, rollout) {
+			if admission, resolveErr := resolveLegacyAccountEgressAdmission(account); resolveErr == nil {
+				admissionCtx = contextWithLegacyAccountEgressAdmission(ctx, admission)
+			}
+		}
+		result, err := concurrency.AcquireAccountSlot(admissionCtx, account.ID, account.Concurrency)
 		if result != nil && result.Acquired {
-			result.Account = account.CloneForRequest()
+			requestAccount := account.CloneForRequest()
+			if result.LegacyEgressAdmission != nil {
+				requestAccount.LegacyEgressAdmission = result.LegacyEgressAdmission
+			}
+			result.Account = requestAccount
 		}
 		return result, err
 	}
@@ -86,6 +96,20 @@ func acquireAccountSlotForSelectionWithBinding(
 		Account:     requestAccount,
 		Egress:      resolved,
 	}, nil
+}
+
+func accountUsesLegacyEgressMirror(
+	concurrency *ConcurrencyService,
+	account *Account,
+	rollout AccountEgressPoolRolloutMode,
+) bool {
+	if concurrency == nil || concurrency.cache == nil || !accountSupportsEgressPoolRuntime(account) ||
+		account.EgressMode != EgressModePool ||
+		(rollout != AccountEgressPoolRolloutOff && rollout != AccountEgressPoolRolloutShadow) {
+		return false
+	}
+	_, supported := concurrency.cache.(AccountEgressLegacySlotCache)
+	return supported
 }
 
 func isAccountEgressAdmissionError(err error) bool {
@@ -179,7 +203,8 @@ func selectionAccount(acquired *AcquireResult, fallback *Account) *Account {
 	// A pool admission attaches the resolved transport to its request-local
 	// account and must win. Legacy admission only mirrors the candidate that was
 	// used to reserve a slot; prefer the later DB-rechecked account in fallback.
-	if acquired != nil && acquired.Egress != nil && acquired.Account != nil {
+	if acquired != nil && acquired.Account != nil &&
+		(acquired.Egress != nil || acquired.LegacyEgressAdmission != nil) {
 		return acquired.Account
 	}
 	if fallback != nil {

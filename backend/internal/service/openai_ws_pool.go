@@ -635,6 +635,9 @@ func openAIWSRequestBindingID(req openAIWSAcquireRequest) string {
 	if req.Account != nil && req.Account.SelectedEgress != nil {
 		return stringsTrim(req.Account.SelectedEgress.BindingID)
 	}
+	if req.Account != nil && req.Account.LegacyEgressAdmission != nil {
+		return stringsTrim(req.Account.LegacyEgressAdmission.BindingID)
+	}
 	return ""
 }
 

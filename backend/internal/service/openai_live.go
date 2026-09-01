@@ -110,6 +110,17 @@ func (s *OpenAIGatewayService) liveEgressConcurrencyCache() (LiveEgressConcurren
 	return cache, nil
 }
 
+func (s *OpenAIGatewayService) liveLegacyEgressConcurrencyCache() (LiveLegacyEgressConcurrencyCache, error) {
+	if s == nil || s.concurrencyService == nil || s.concurrencyService.cache == nil {
+		return nil, ErrLiveUnavailable
+	}
+	cache, ok := s.concurrencyService.cache.(LiveLegacyEgressConcurrencyCache)
+	if !ok {
+		return nil, ErrLiveUnavailable
+	}
+	return cache, nil
+}
+
 func liveCallEgressRef(record *LiveCallRecord) (AccountEgressLeaseRef, bool, error) {
 	if record == nil {
 		return AccountEgressLeaseRef{}, false, ErrLiveUnavailable
@@ -136,6 +147,55 @@ func liveCallEgressRef(record *LiveCallRecord) (AccountEgressLeaseRef, bool, err
 		return AccountEgressLeaseRef{}, true, ErrLiveUnavailable
 	}
 	return ref, true, nil
+}
+
+func liveCallLegacyEgressAdmission(record *LiveCallRecord) (*LegacyAccountEgressAdmission, bool, error) {
+	if record == nil {
+		return nil, false, ErrLiveUnavailable
+	}
+	hasPoolEgress := strings.TrimSpace(record.EgressBindingID) != "" ||
+		strings.TrimSpace(record.EgressLeaseID) != "" || record.EgressRouteID > 0 ||
+		strings.TrimSpace(record.EgressIdentityID) != "" || record.EgressConfigVersion > 0
+	hasLegacyEgress := strings.TrimSpace(record.LegacyEgressBindingID) != "" ||
+		record.LegacyEgressRouteID > 0 || strings.TrimSpace(record.LegacyEgressIdentityID) != "" ||
+		record.LegacyEgressConfigVersion > 0
+	if !hasLegacyEgress {
+		return nil, false, nil
+	}
+	if hasPoolEgress || record.AccountID <= 0 || strings.TrimSpace(record.LegacyEgressBindingID) == "" ||
+		record.LegacyEgressRouteID <= 0 || strings.TrimSpace(record.LegacyEgressIdentityID) == "" ||
+		record.LegacyEgressConfigVersion <= 0 {
+		return nil, true, ErrLiveUnavailable
+	}
+	accountID, routeID, ok := parseStableAccountEgressBindingID(record.LegacyEgressBindingID)
+	if !ok || accountID != record.AccountID || routeID != record.LegacyEgressRouteID {
+		return nil, true, ErrLiveUnavailable
+	}
+	return &LegacyAccountEgressAdmission{
+		AccountID:     record.AccountID,
+		BindingID:     strings.TrimSpace(record.LegacyEgressBindingID),
+		RouteID:       record.LegacyEgressRouteID,
+		IdentityID:    strings.TrimSpace(record.LegacyEgressIdentityID),
+		ConfigVersion: record.LegacyEgressConfigVersion,
+	}, true, nil
+}
+
+func withLiveLegacyEgressAdmission(account *Account, record *LiveCallRecord) (*Account, bool, error) {
+	persisted, legacyMode, err := liveCallLegacyEgressAdmission(record)
+	if err != nil || !legacyMode {
+		return account, legacyMode, err
+	}
+	current, err := resolveLegacyAccountEgressAdmission(account)
+	if err != nil || current.AccountID != persisted.AccountID || current.BindingID != persisted.BindingID ||
+		current.RouteID != persisted.RouteID || current.IdentityID != persisted.IdentityID ||
+		current.ConfigVersion != persisted.ConfigVersion {
+		return nil, true, ErrLiveUnavailable
+	}
+	hydrated, err := WithLegacyAccountEgressAdmission(account, current)
+	if err != nil {
+		return nil, true, ErrLiveUnavailable
+	}
+	return hydrated, true, nil
 }
 
 func accountEgressLeaseMatchesRef(lease *AccountEgressLease, ref AccountEgressLeaseRef) bool {
@@ -413,6 +473,22 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 			LeaseID:   leaseID,
 		}
 		poolMode := selection.Egress != nil
+		legacyEgressMode := !poolMode && account.LegacyEgressAdmission != nil
+		if legacyEgressMode {
+			admission := account.LegacyEgressAdmission
+			if admission.Lease == nil || context.Cause(admission.Lease.Context()) != nil {
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+			provisionalRecord.LegacyEgressBindingID = admission.BindingID
+			provisionalRecord.LegacyEgressRouteID = admission.RouteID
+			provisionalRecord.LegacyEgressIdentityID = admission.IdentityID
+			provisionalRecord.LegacyEgressConfigVersion = admission.ConfigVersion
+			if _, _, legacyErr := liveCallLegacyEgressAdmission(provisionalRecord); legacyErr != nil {
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+		}
 		var acquired bool
 		var acquireErr error
 		if poolMode {
@@ -450,6 +526,23 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 				userMaxConcurrency,
 				identity.APIKeyID,
 				leaseID,
+				true,
+			)
+		} else if legacyEgressMode {
+			legacyCache, cacheErr := s.liveLegacyEgressConcurrencyCache()
+			if cacheErr != nil {
+				selection.ReleaseFunc()
+				return nil, cacheErr
+			}
+			acquired, acquireErr = legacyCache.AcquireLiveLeaseForLegacyEgress(
+				ctx,
+				account.ID,
+				account.Concurrency,
+				identity.UserID,
+				userMaxConcurrency,
+				identity.APIKeyID,
+				leaseID,
+				provisionalRecord.LegacyEgressIdentityID,
 				true,
 			)
 		} else {
@@ -528,6 +621,11 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 				s.releaseLiveCallLeases(record)
 				return nil, rememberErr
 			}
+		} else if legacyEgressMode {
+			record.LegacyEgressBindingID = provisionalRecord.LegacyEgressBindingID
+			record.LegacyEgressRouteID = provisionalRecord.LegacyEgressRouteID
+			record.LegacyEgressIdentityID = provisionalRecord.LegacyEgressIdentityID
+			record.LegacyEgressConfigVersion = provisionalRecord.LegacyEgressConfigVersion
 		}
 		mappingTTL := s.liveMaxSessionDuration() + 5*time.Minute
 		if saveErr := store.SaveLiveCall(ctx, record, mappingTTL); saveErr != nil {
@@ -746,9 +844,11 @@ func (s *OpenAIGatewayService) dialLiveSideband(ctx context.Context, record *Liv
 	if account == nil || !account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityLive) {
 		return nil, ErrLiveUnavailable
 	}
-	if _, poolMode, egressErr := liveCallEgressRef(record); egressErr != nil {
+	_, poolMode, egressErr := liveCallEgressRef(record)
+	if egressErr != nil {
 		return nil, egressErr
-	} else if poolMode {
+	}
+	if poolMode {
 		lease, leaseErr := s.ensureLiveEgressLease(record)
 		if leaseErr != nil {
 			return nil, leaseErr
@@ -765,6 +865,15 @@ func (s *OpenAIGatewayService) dialLiveSideband(ctx context.Context, record *Liv
 			return nil, ErrLiveUnavailable
 		}
 		ctx = ContextWithSelectedAccountEgress(ctx, account)
+	} else {
+		var legacyMode bool
+		account, legacyMode, err = withLiveLegacyEgressAdmission(account, record)
+		if err != nil {
+			return nil, err
+		}
+		if legacyMode {
+			ctx = ContextWithSelectedAccountEgress(ctx, account)
+		}
 	}
 	headers, err := s.liveSidebandHeaders(ctx, account, record)
 	if err != nil {
@@ -1136,6 +1245,28 @@ func (s *OpenAIGatewayService) finalizeLiveCallAfterExpiry(record *LiveCallRecor
 }
 
 func (s *OpenAIGatewayService) refreshLiveLease(record *LiveCallRecord) bool {
+	legacyAdmission, legacyMode, legacyErr := liveCallLegacyEgressAdmission(record)
+	if legacyErr != nil {
+		return false
+	}
+	if legacyMode {
+		cache, cacheErr := s.liveLegacyEgressConcurrencyCache()
+		if cacheErr != nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+		refreshed, refreshErr := cache.RefreshLiveLeaseForLegacyEgress(
+			ctx,
+			record.AccountID,
+			record.UserID,
+			record.APIKeyID,
+			record.LeaseID,
+			legacyAdmission.IdentityID,
+		)
+		cancel()
+		return refreshErr == nil && refreshed
+	}
+
 	ref, poolMode, err := liveCallEgressRef(record)
 	if err != nil {
 		return false
@@ -1186,6 +1317,25 @@ func (s *OpenAIGatewayService) refreshLiveLease(record *LiveCallRecord) bool {
 
 func (s *OpenAIGatewayService) releaseLiveConcurrencyLease(record *LiveCallRecord) {
 	if record == nil {
+		return
+	}
+	legacyAdmission, legacyMode, legacyErr := liveCallLegacyEgressAdmission(record)
+	if legacyErr != nil {
+		return
+	}
+	if legacyMode {
+		if cache, err := s.liveLegacyEgressConcurrencyCache(); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+			_ = cache.ReleaseLiveLeaseForLegacyEgress(
+				ctx,
+				record.AccountID,
+				record.UserID,
+				record.APIKeyID,
+				record.LeaseID,
+				legacyAdmission.IdentityID,
+			)
+			cancel()
+		}
 		return
 	}
 	ref, poolMode, refErr := liveCallEgressRef(record)

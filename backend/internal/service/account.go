@@ -35,8 +35,9 @@ type Account struct {
 	EgressMode                     string
 	EgressRevision                 int64
 	EgressBindings                 []AccountEgressBinding
-	SelectedEgress                 *ResolvedAccountEgress   `json:"-"` // request-local only; never persisted or cached
-	EgressPoolWrite                *ReplaceAccountPoolInput `json:"-"` // request-local admin write intent
+	SelectedEgress                 *ResolvedAccountEgress        `json:"-"` // request-local only; never persisted or cached
+	LegacyEgressAdmission          *LegacyAccountEgressAdmission `json:"-"` // request-local rollout-off identity fence
+	EgressPoolWrite                *ReplaceAccountPoolInput      `json:"-"` // request-local admin write intent
 	Concurrency                    int
 	Priority                       int
 	// RateMultiplier 账号计费倍率（>=0，允许 0 表示该账号计费为 0）。

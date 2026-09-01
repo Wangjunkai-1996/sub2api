@@ -69,14 +69,20 @@ type LiveCallRecord struct {
 	EgressIdentityID    string
 	EgressConfigVersion int64
 	EgressLease         *AccountEgressLease `json:"-"`
-	Model               string
-	CreatedAt           time.Time
-	ExpiresAt           time.Time
-	Controller          string
-	ControllerOwner     string
-	UserAgent           string
-	IPAddress           string
-	InboundEndpoint     string
+	// Legacy egress fields keep rollout-off/shadow Live calls pinned to the
+	// admission-time identity without persisting proxy URLs or credentials.
+	LegacyEgressBindingID     string
+	LegacyEgressRouteID       int64
+	LegacyEgressIdentityID    string
+	LegacyEgressConfigVersion int64
+	Model                     string
+	CreatedAt                 time.Time
+	ExpiresAt                 time.Time
+	Controller                string
+	ControllerOwner           string
+	UserAgent                 string
+	IPAddress                 string
+	InboundEndpoint           string
 	// AttestationCiphertext 仅用于让同一会话的 Sideband 复用创建时的证明。
 	AttestationCiphertext string
 }
@@ -111,6 +117,39 @@ type LiveConcurrencyCache interface {
 	) (bool, error)
 	RefreshLiveLease(ctx context.Context, accountID, userID, apiKeyID int64, leaseID string) (bool, error)
 	ReleaseLiveLease(ctx context.Context, accountID, userID, apiKeyID int64, leaseID string) error
+}
+
+// LiveLegacyEgressConcurrencyCache is the rollout-off companion to
+// LiveConcurrencyCache. It keeps an admitted Live call attributed to the
+// public identity selected when the regular request entered the system.
+type LiveLegacyEgressConcurrencyCache interface {
+	AcquireLiveLeaseForLegacyEgress(
+		ctx context.Context,
+		accountID int64,
+		accountMax int,
+		userID int64,
+		userMax int,
+		apiKeyID int64,
+		leaseID string,
+		identityID string,
+		replacingRegularSlots bool,
+	) (bool, error)
+	RefreshLiveLeaseForLegacyEgress(
+		ctx context.Context,
+		accountID int64,
+		userID int64,
+		apiKeyID int64,
+		leaseID string,
+		identityID string,
+	) (bool, error)
+	ReleaseLiveLeaseForLegacyEgress(
+		ctx context.Context,
+		accountID int64,
+		userID int64,
+		apiKeyID int64,
+		leaseID string,
+		identityID string,
+	) error
 }
 
 // LiveEgressConcurrencyCache is the pool-mode companion to LiveConcurrencyCache.
