@@ -60,6 +60,38 @@ func TestAccountEgressRuntimeRejectsInactiveOrExpiredProxy(t *testing.T) {
 	}
 }
 
+func TestAccountEgressRuntimeAcceptsRedactedSchedulerProxy(t *testing.T) {
+	proxyID := int64(9)
+	account := &Account{
+		ID:          27,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		EgressMode:  EgressModePool,
+		Concurrency: 4,
+		EgressBindings: []AccountEgressBinding{{
+			BindingID: StableAccountEgressBindingID(27, 44),
+			AccountID: 27,
+			RouteID:   44,
+			IsPrimary: true,
+			Status:    AccountEgressBindingStatusActive,
+			Route: &EgressRoute{
+				ID:               44,
+				Kind:             EgressRouteKindProxy,
+				ProxyID:          &proxyID,
+				State:            EgressRouteStateActive,
+				ExpectedIdentity: &EgressIdentity{ID: 5, Status: EgressIdentityStatusActive},
+				// Scheduler cache projections omit Proxy credentials.
+			},
+		}},
+	}
+
+	config, err := AccountEgressPoolConfigForRuntime(account, 0)
+	require.NoError(t, err)
+	require.Len(t, config.Candidates, 1)
+	require.True(t, config.Candidates[0].Healthy)
+	require.Equal(t, 4, config.EffectiveCapacity())
+}
+
 func TestAccountEgressPoolRuntimeIsRestrictedToOpenAIOAuth(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

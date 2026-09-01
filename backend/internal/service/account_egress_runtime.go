@@ -160,7 +160,15 @@ func AccountEgressPoolConfigForRuntime(account *Account, maxWaiting int) (Accoun
 			case EgressRouteKindDirect:
 				healthy = route.RuntimeScope != nil && strings.TrimSpace(*route.RuntimeScope) != ""
 			case EgressRouteKindProxy:
-				healthy = route.ProxyID != nil && route.Proxy != nil && route.Proxy.IsActive() && !route.Proxy.IsExpired(now)
+				// Scheduler snapshots intentionally redact the credential-bearing Proxy
+				// object. A route with a valid ProxyID and no hydrated Proxy is therefore
+				// still eligible for admission; the authoritative account read in
+				// WithResolvedAccountEgress performs the final active/expiry check before
+				// transport use. When a Proxy is present, validate it here as usual.
+				healthy = route.ProxyID != nil
+				if healthy && route.Proxy != nil {
+					healthy = route.Proxy.IsActive() && !route.Proxy.IsExpired(now)
+				}
 			default:
 				healthy = false
 			}
