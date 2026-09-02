@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,6 +14,89 @@ import (
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
+
+func TestEgressRepositoryApplyAccountPoolsReplacesTwoAccountsWithThreeProxyRoutes(t *testing.T) {
+	ctx := context.Background()
+	routeIDs := make([]int64, 0, 3)
+	proxyIDs := make([]int64, 0, 3)
+	for index, publicIP := range []string{"192.0.2.201", "192.0.2.202", "192.0.2.203"} {
+		proxyID := insertProxyOnlyContractProxy(t)
+		identityID := insertProxyOnlyContractIdentity(t, publicIP)
+		routeID := insertProxyOnlyContractProxyRoute(t, proxyID)
+		_, err := integrationDB.ExecContext(ctx, `
+			UPDATE egress_routes
+			SET expected_identity_id=$2, state=$3, last_observed_ip=$4::inet,
+				last_probed_at=NOW(), verified_at=NOW(), revision=revision+1
+			WHERE id=$1`, routeID, identityID, service.EgressRouteStateActive, publicIP)
+		require.NoError(t, err, "activate proxy route %d", index)
+		routeIDs = append(routeIDs, routeID)
+		proxyIDs = append(proxyIDs, proxyID)
+	}
+
+	accountIDs := []int64{
+		insertProxyOnlyContractAccount(t, service.EgressModeLegacy, nil),
+		insertProxyOnlyContractAccount(t, service.EgressModeLegacy, nil),
+	}
+	initialRevisions := make(map[int64]int64, len(accountIDs))
+	for _, accountID := range accountIDs {
+		var revision int64
+		require.NoError(t, integrationDB.QueryRowContext(ctx,
+			`SELECT egress_revision FROM accounts WHERE id=$1`, accountID,
+		).Scan(&revision))
+		initialRevisions[accountID] = revision
+	}
+
+	primaryRouteID := routeIDs[0]
+	concurrencyPerEgress := 3
+	repo := NewEgressRepository(integrationEntClient, integrationDB)
+	require.NoError(t, repo.ApplyAccountPools(ctx, accountIDs, service.ApplyAccountPoolsInput{
+		Operation:            service.AccountPoolOperationReplace,
+		RouteIDs:             routeIDs,
+		PrimaryRouteID:       &primaryRouteID,
+		ConcurrencyPerEgress: &concurrencyPerEgress,
+	}))
+
+	for _, accountID := range accountIDs {
+		var (
+			mode        string
+			concurrency int
+			proxyID     int64
+			revision    int64
+		)
+		require.NoError(t, integrationDB.QueryRowContext(ctx, `
+			SELECT egress_mode, concurrency, proxy_id, egress_revision
+			FROM accounts WHERE id=$1`, accountID,
+		).Scan(&mode, &concurrency, &proxyID, &revision))
+		require.Equal(t, service.EgressModePool, mode)
+		require.Equal(t, concurrencyPerEgress, concurrency)
+		require.Equal(t, proxyIDs[0], proxyID, "proxy_id must mirror the primary route")
+		require.Equal(t, initialRevisions[accountID]+1, revision)
+
+		rows, err := integrationDB.QueryContext(ctx, `
+			SELECT route_id, position, is_primary, status
+			FROM account_egress_bindings
+			WHERE account_id=$1
+			ORDER BY position`, accountID)
+		require.NoError(t, err)
+		var boundRouteIDs []int64
+		for rows.Next() {
+			var (
+				routeID  int64
+				position int
+				primary  bool
+				status   string
+			)
+			require.NoError(t, rows.Scan(&routeID, &position, &primary, &status))
+			require.Equal(t, len(boundRouteIDs), position)
+			require.Equal(t, len(boundRouteIDs) == 0, primary)
+			require.Equal(t, service.AccountEgressBindingStatusActive, status)
+			boundRouteIDs = append(boundRouteIDs, routeID)
+		}
+		require.NoError(t, rows.Err())
+		require.NoError(t, rows.Close())
+		require.True(t, slices.Equal(routeIDs, boundRouteIDs))
+	}
+}
 
 func TestAccountEgressProxyOnlyConcurrentPoolSwitchAndDirectBinding(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -208,6 +292,18 @@ func insertProxyOnlyContractProxy(t *testing.T) int64 {
 		RETURNING id`, fmt.Sprintf("proxy-only-contract-%d", time.Now().UnixNano())).Scan(&id)
 	require.NoError(t, err)
 	t.Cleanup(func() { _, _ = integrationDB.Exec(`DELETE FROM proxies WHERE id=$1`, id) })
+	return id
+}
+
+func insertProxyOnlyContractIdentity(t *testing.T, publicIP string) int64 {
+	t.Helper()
+	var id int64
+	err := integrationDB.QueryRowContext(context.Background(), `
+		INSERT INTO egress_identities (public_ip, status, created_at, updated_at)
+		VALUES ($1::inet, 'active', NOW(), NOW())
+		RETURNING id`, publicIP).Scan(&id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = integrationDB.Exec(`DELETE FROM egress_identities WHERE id=$1`, id) })
 	return id
 }
 

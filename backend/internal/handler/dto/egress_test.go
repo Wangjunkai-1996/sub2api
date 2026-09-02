@@ -223,7 +223,7 @@ func TestEgressRouteEligibilityRequiresFreshVerification(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			route := base
 			route.VerifiedAt = test.verifiedAt
-			got, reason := egressRouteEligibility(&route, now)
+			got, reason := service.EgressRouteEligibility(&route, now)
 			require.Equal(t, test.want, got)
 			require.Equal(t, test.reason, reason)
 		})

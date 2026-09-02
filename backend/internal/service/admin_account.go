@@ -509,17 +509,28 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if input.EgressPool != nil && (input.Platform != PlatformOpenAI || input.Type != AccountTypeOAuth) {
 		return nil, ErrEgressAccountUnsupported
 	}
-	// New OpenAI OAuth/PAT accounts inherit the configured default proxy only
-	// when the caller did not explicitly choose one. API-key accounts and
-	// explicit proxy selections retain their existing behavior.
+	// New OpenAI OAuth/PAT accounts inherit the complete eligible static-IP
+	// pool when the caller did not explicitly choose a pool or legacy proxy.
+	// The configured OAuth proxy remains the authoritative authentication and
+	// primary route; explicit caller choices are never overwritten.
 	if input.EgressPool == nil && input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil && s.settingService != nil {
 		proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if proxy != nil {
-			proxyID := proxy.ID
-			input.ProxyID = &proxyID
+			if s.egressService == nil {
+				return nil, ErrEgressMutationFrozen
+			}
+			routes, err := s.egressService.ListAssignableRoutes(ctx)
+			if err != nil {
+				return nil, err
+			}
+			pool, err := DefaultOpenAIOAuthEgressPool(routes, proxy.ID, time.Now())
+			if err != nil {
+				return nil, err
+			}
+			input.EgressPool = &pool
 		}
 	}
 

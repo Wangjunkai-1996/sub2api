@@ -97,6 +97,15 @@ func hasAccountEgressFields(mode *string, pool *BulkAccountEgressPoolRequest) bo
 	return mode != nil || pool != nil
 }
 
+func cloneReplaceAccountPoolInput(input *service.ReplaceAccountPoolInput) *service.ReplaceAccountPoolInput {
+	if input == nil {
+		return nil
+	}
+	cloned := *input
+	cloned.RouteIDs = append([]int64(nil), input.RouteIDs...)
+	return &cloned
+}
+
 // validateOpenAIEgressWrite keeps the first runtime rollout deliberately
 // scoped to OpenAI accounts.  Other platforms continue using their existing
 // proxy/concurrency path until they have a corresponding runtime allocator.

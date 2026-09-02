@@ -2884,8 +2884,8 @@
           :disabled="!egressMutationEnabled"
           :verifying-route-id="egressVerifyingRouteId"
           :verify-errors="egressVerifyErrors"
-          @update:selected-route-ids="egressRouteIds = $event"
-          @update:primary-route-id="primaryEgressRouteId = $event"
+          @update:selected-route-ids="handleEgressRouteIdsUpdate"
+          @update:primary-route-id="handlePrimaryEgressRouteUpdate"
           @verify="emit('verify-egress-route', $event)"
         />
       </div>
@@ -2902,7 +2902,7 @@
           <label class="input-label">{{ usesEgressPool ? t('admin.accounts.egressPool.perEgressConcurrency') : t('admin.accounts.concurrency') }}</label>
           <input v-model.number="form.concurrency" type="number" min="1" class="input"
             :data-testid="usesEgressPool ? 'egress-concurrency-per-route' : undefined"
-            @input="form.concurrency = Math.max(1, form.concurrency || 1)" />
+            @input="handleEgressConcurrencyInput" />
           <p v-if="usesEgressPool" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
@@ -3934,6 +3934,8 @@ interface Props {
   show: boolean
   proxies?: ProxyOption[]
   egressRoutes?: AssignableEgressRoute[]
+  defaultEgressRouteId?: number | null
+  defaultEgressConcurrency?: number | null
   egressMutationEnabled?: boolean
   egressVerifyingRouteId?: number | null
   egressVerifyErrors?: Record<number, string>
@@ -3943,6 +3945,8 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
   proxies: () => [],
   egressRoutes: () => [],
+  defaultEgressRouteId: null,
+  defaultEgressConcurrency: null,
   egressMutationEnabled: true,
   egressVerifyingRouteId: null,
   egressVerifyErrors: () => ({})
@@ -4577,7 +4581,49 @@ const form = reactive({
 
 const egressRouteIds = ref<number[]>([])
 const primaryEgressRouteId = ref<number | null>(null)
+const egressDefaultsInitialized = ref(false)
+const egressDefaultsTouched = ref(false)
+const legacyConcurrencyBeforeEgress = ref(10)
 const usesEgressPool = computed(() => form.platform === 'openai' && form.type === 'oauth')
+
+const initializeOpenAIEgressDefaults = () => {
+  if (!props.show || !usesEgressPool.value || egressDefaultsTouched.value) return
+  const routeIds = Array.from(new Set(
+    props.egressRoutes
+      .filter((route) => route.kind === 'proxy' && route.eligible)
+      .map((route) => route.id)
+  ))
+  if (routeIds.length === 0) return
+
+  if (!egressDefaultsInitialized.value) {
+    legacyConcurrencyBeforeEgress.value = form.concurrency
+  }
+  egressRouteIds.value = routeIds
+  primaryEgressRouteId.value = props.defaultEgressRouteId != null && routeIds.includes(props.defaultEgressRouteId)
+    ? props.defaultEgressRouteId
+    : null
+  form.concurrency = props.defaultEgressConcurrency != null
+    && Number.isSafeInteger(props.defaultEgressConcurrency)
+    && props.defaultEgressConcurrency > 0
+    ? props.defaultEgressConcurrency
+    : 3
+  egressDefaultsInitialized.value = true
+}
+
+const handleEgressRouteIdsUpdate = (routeIds: number[]) => {
+  egressDefaultsTouched.value = true
+  egressRouteIds.value = routeIds
+}
+
+const handlePrimaryEgressRouteUpdate = (routeId: number | null) => {
+  egressDefaultsTouched.value = true
+  primaryEgressRouteId.value = routeId
+}
+
+const handleEgressConcurrencyInput = () => {
+  if (usesEgressPool.value) egressDefaultsTouched.value = true
+  form.concurrency = Math.max(1, form.concurrency || 1)
+}
 
 const buildEgressPool = (): AccountEgressPoolWrite => buildCreateAccountEgressPatch({
   routeIds: egressRouteIds.value,
@@ -4706,6 +4752,30 @@ watch(
     } else {
       form.type = 'apikey'
     }
+  },
+  { immediate: true }
+)
+
+watch(
+  [
+    () => props.show,
+    usesEgressPool,
+    () => props.egressRoutes,
+    () => props.defaultEgressRouteId,
+    () => props.defaultEgressConcurrency
+  ],
+  ([show, usesPool], previous) => {
+    const previouslyUsedPool = previous?.[1] === true
+    if (!show) return
+    if (!usesPool) {
+      if (previouslyUsedPool && egressDefaultsInitialized.value) {
+        form.concurrency = legacyConcurrencyBeforeEgress.value
+        egressDefaultsInitialized.value = false
+        egressDefaultsTouched.value = false
+      }
+      return
+    }
+    initializeOpenAIEgressDefaults()
   },
   { immediate: true }
 )
@@ -5167,6 +5237,9 @@ function resetForm() {
   form.proxy_id = null
   egressRouteIds.value = []
   primaryEgressRouteId.value = null
+  egressDefaultsInitialized.value = false
+  egressDefaultsTouched.value = false
+  legacyConcurrencyBeforeEgress.value = 10
   form.concurrency = 10
   form.load_factor = null
   form.priority = 1
@@ -5489,6 +5562,13 @@ const handleSubmit = async () => {
     appStore.showError(t('admin.accounts.egressPool.noSelection'))
     return
   }
+  if (usesEgressPool.value && (
+    primaryEgressRouteId.value == null
+    || !egressRouteIds.value.includes(primaryEgressRouteId.value)
+  )) {
+    appStore.showError(t('admin.accounts.egressPool.primaryRequired'))
+    return
+  }
   // For OAuth-based type, handle OAuth flow (goes to step 2)
   if (isOAuthFlow.value) {
     if (!isGrokSSOInputMethod.value && !form.name.trim()) {
@@ -5748,7 +5828,7 @@ const goBackToBasicInfo = () => {
 
 const handleGenerateUrl = async () => {
   if (form.platform === 'openai') {
-    await openaiOAuth.generateAuthUrl({ egressRouteId: primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null })
+    await openaiOAuth.generateAuthUrl({ egressRouteId: primaryEgressRouteId.value })
   } else if (form.platform === 'gemini') {
     await geminiOAuth.generateAuthUrl(
       form.proxy_id,
@@ -6157,7 +6237,7 @@ const handleOpenAIExchange = async (authCode: string) => {
       authCode.trim(),
       oauthClient.sessionId.value,
       stateToUse,
-      { egressRouteId: primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null }
+      { egressRouteId: primaryEgressRouteId.value }
     )
     if (!tokenInfo) return
 
@@ -6432,7 +6512,7 @@ const handleOpenAIBatchRT = async (refreshTokenInput: string, clientId?: string)
       try {
         const tokenInfo = await oauthClient.validateRefreshToken(
           refreshTokens[i],
-          { egressRouteId: primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null },
+          { egressRouteId: primaryEgressRouteId.value },
           clientId
         )
         if (!tokenInfo) {

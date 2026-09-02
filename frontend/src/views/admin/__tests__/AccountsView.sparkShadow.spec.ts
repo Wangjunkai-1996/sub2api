@@ -111,8 +111,8 @@ const mountView = () =>
         ErrorPassthroughRulesModal: true,
         TLSFingerprintProfilesModal: true,
         CreateAccountModal: {
-          props: ['show', 'proxies', 'egressRoutes'],
-          template: '<div data-test="create-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" />'
+          props: ['show', 'proxies', 'egressRoutes', 'defaultEgressRouteId', 'defaultEgressConcurrency'],
+          template: '<div data-test="create-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" :data-default-route-id="String(defaultEgressRouteId ?? \'\')" :data-default-concurrency="String(defaultEgressConcurrency ?? \'\')" />'
         },
         EditAccountModal: true,
         BulkEditAccountModal: {
@@ -184,6 +184,8 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
       .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
       .mockResolvedValueOnce({
         items: [{ id: 2, kind: 'proxy', name: 'fresh-route', state: 'active', eligible: true }],
+        default_route_id: 2,
+        default_concurrency: 3,
         capabilities: { mutation_enabled: true }
       })
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -199,6 +201,8 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     expect(modal.attributes('data-show')).toBe('true')
     expect(modal.attributes('data-proxy-count')).toBe('0')
     expect(modal.attributes('data-route-count')).toBe('1')
+    expect(modal.attributes('data-default-route-id')).toBe('2')
+    expect(modal.attributes('data-default-concurrency')).toBe('3')
     wrapper.unmount()
   })
 
@@ -541,7 +545,7 @@ describe('admin AccountsView — 账号行展示', () => {
           effective_capacity: 8,
           routes: [
             { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
-            { id: 2, kind: 'proxy', name: 'RN-104', state: 'active', eligible: true },
+            { id: 2, kind: 'proxy', name: 'RN-104', state: 'active', eligible: true, observed_ip: '104.223.77.152' },
             { id: 3, kind: 'proxy', name: 'RN-67', state: 'expired', eligible: false }
           ]
         }
@@ -559,6 +563,9 @@ describe('admin AccountsView — 账号行展示', () => {
     expect(wrapper.text()).toContain('Local')
     expect(wrapper.text()).toContain('RN-104')
     expect(wrapper.text()).not.toContain('RN-67')
+    const routeChip = wrapper.findAll('span[title]').find((node) => node.text().includes('RN-104'))
+    expect(routeChip?.attributes('title')).toContain('104.***.***.152')
+    expect(routeChip?.attributes('title')).not.toContain('104.223.77.152')
     expect(wrapper.text()).toContain('+1')
     expect(wrapper.text()).toContain('admin.accounts.egressPool.degraded')
     wrapper.unmount()

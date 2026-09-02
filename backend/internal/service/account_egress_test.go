@@ -269,3 +269,52 @@ func TestValidApplyAccountPoolsInputRejectsEmptyRouteNoOpAndReplace(t *testing.T
 		ConcurrencyPerEgress: &concurrency,
 	}))
 }
+
+func TestDefaultOpenAIOAuthEgressPoolSelectsAllEligibleProxyRoutes(t *testing.T) {
+	now := time.Now()
+	defaultProxyID := int64(20)
+	otherProxyID := int64(30)
+	directScope := DefaultDirectEgressRuntimeScope
+	routes := []EgressRoute{
+		{
+			ID: 1, Kind: EgressRouteKindDirect, RuntimeScope: &directScope,
+			State: EgressRouteStateActive, VerifiedAt: &now,
+			ExpectedIdentity: &EgressIdentity{ID: 1, PublicIP: "203.0.113.1", Status: EgressIdentityStatusActive},
+		},
+		eligibleProxyRoute(2, defaultProxyID, "203.0.113.20", now),
+		eligibleProxyRoute(3, otherProxyID, "203.0.113.30", now),
+		{
+			ID: 4, Kind: EgressRouteKindProxy, ProxyID: &otherProxyID,
+			State: EgressRouteStateInactive, VerifiedAt: &now,
+			ExpectedIdentity: &EgressIdentity{ID: 4, PublicIP: "203.0.113.40", Status: EgressIdentityStatusActive},
+			Proxy:            &Proxy{ID: otherProxyID, Status: StatusActive},
+		},
+	}
+
+	pool, err := DefaultOpenAIOAuthEgressPool(routes, defaultProxyID, now)
+
+	require.NoError(t, err)
+	require.Equal(t, []int64{2, 3}, pool.RouteIDs)
+	require.Equal(t, int64(2), pool.PrimaryRouteID)
+	require.NotNil(t, pool.ConcurrencyPerEgress)
+	require.Equal(t, DefaultOpenAIOAuthEgressConcurrency, *pool.ConcurrencyPerEgress)
+}
+
+func TestDefaultOpenAIOAuthEgressPoolRequiresConfiguredIPv4Primary(t *testing.T) {
+	now := time.Now()
+	defaultProxyID := int64(20)
+	routes := []EgressRoute{eligibleProxyRoute(2, defaultProxyID, "2001:db8::20", now)}
+
+	_, err := DefaultOpenAIOAuthEgressPool(routes, defaultProxyID, now)
+
+	require.ErrorIs(t, err, ErrOpenAIOAuthDefaultEgress)
+}
+
+func eligibleProxyRoute(routeID, proxyID int64, publicIP string, verifiedAt time.Time) EgressRoute {
+	return EgressRoute{
+		ID: routeID, Kind: EgressRouteKindProxy, ProxyID: &proxyID,
+		State: EgressRouteStateActive, VerifiedAt: &verifiedAt,
+		ExpectedIdentity: &EgressIdentity{ID: routeID, PublicIP: publicIP, Status: EgressIdentityStatusActive},
+		Proxy:            &Proxy{ID: proxyID, Status: StatusActive},
+	}
+}

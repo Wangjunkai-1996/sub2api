@@ -1042,6 +1042,10 @@ export interface AccountEgressCatalogCapabilities {
 export interface AssignableEgressRouteCatalog {
   items: AssignableEgressRoute[]
   generation?: string | number | null
+  /** Server-authoritative route selected for OAuth handshakes. */
+  default_route_id?: number | null
+  /** Authoritative default capacity assigned to each selected static egress. */
+  default_concurrency?: number | null
   capabilities: AccountEgressCatalogCapabilities
 }
 

@@ -33,11 +33,12 @@ const (
 	AccountEgressBindingStatusActive   = "active"
 	AccountEgressBindingStatusDraining = "draining"
 
-	DefaultDirectEgressRuntimeScope = "default"
-	MaxAccountEgressRoutes          = 32
-	MaxBulkAccountEgressAccounts    = 1000
-	MaxEgressVerifyBatchSize        = 32
-	MaxEgressVerifyConcurrency      = 4
+	DefaultDirectEgressRuntimeScope     = "default"
+	DefaultOpenAIOAuthEgressConcurrency = 3
+	MaxAccountEgressRoutes              = 32
+	MaxBulkAccountEgressAccounts        = 1000
+	MaxEgressVerifyBatchSize            = 32
+	MaxEgressVerifyConcurrency          = 4
 
 	AccountPoolOperationAppend  = "append"
 	AccountPoolOperationRemove  = "remove"
@@ -61,6 +62,7 @@ var (
 	ErrEgressPoolConflict        = infraerrors.Conflict("ACCOUNT_EGRESS_REVISION_CONFLICT", "account egress pool changed; reload it and try again")
 	ErrEgressPoolVersionRequired = infraerrors.Conflict("EGRESS_POOL_VERSION_REQUIRED", "account uses an egress pool; reload it and update the pool contract")
 	ErrEgressMutationFrozen      = infraerrors.New(http.StatusLocked, "ACCOUNT_EGRESS_MUTATION_FROZEN", "account egress mutations are temporarily frozen")
+	ErrOpenAIOAuthDefaultEgress  = infraerrors.BadRequest("OPENAI_OAUTH_DEFAULT_EGRESS_UNAVAILABLE", "configured OpenAI OAuth default proxy is not an eligible IPv4 egress route")
 )
 
 // EgressIdentity is the durable normalized public IP used as one capacity unit.
@@ -213,6 +215,106 @@ func (s *EgressService) ListAssignableRoutes(ctx context.Context) ([]EgressRoute
 		return nil, ErrEgressRouteInvalid
 	}
 	return s.repo.ListAssignableRoutes(ctx)
+}
+
+// DefaultOpenAIOAuthEgressPool builds the server-authoritative pool used when
+// an OpenAI OAuth account does not provide an explicit route selection. Every
+// currently eligible proxy route participates; the configured OAuth proxy is
+// the primary only when its verified identity is IPv4.
+func DefaultOpenAIOAuthEgressPool(routes []EgressRoute, defaultProxyID int64, now time.Time) (ReplaceAccountPoolInput, error) {
+	if defaultProxyID <= 0 {
+		return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
+	}
+
+	routeIDs := make([]int64, 0, len(routes))
+	seen := make(map[int64]struct{}, len(routes))
+	primaryRouteID := int64(0)
+	for i := range routes {
+		route := &routes[i]
+		eligible, _ := EgressRouteEligibility(route, now)
+		if !eligible || route.Kind != EgressRouteKindProxy || route.ID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[route.ID]; duplicate {
+			continue
+		}
+		seen[route.ID] = struct{}{}
+		routeIDs = append(routeIDs, route.ID)
+
+		if route.ProxyID == nil || *route.ProxyID != defaultProxyID || route.ExpectedIdentity == nil {
+			continue
+		}
+		identityIP, err := netip.ParseAddr(strings.TrimSpace(route.ExpectedIdentity.PublicIP))
+		if err == nil && identityIP.Unmap().Is4() {
+			if primaryRouteID != 0 && primaryRouteID != route.ID {
+				return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
+			}
+			primaryRouteID = route.ID
+		}
+	}
+
+	if len(routeIDs) == 0 || len(routeIDs) > MaxAccountEgressRoutes || primaryRouteID == 0 {
+		return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
+	}
+	concurrency := DefaultOpenAIOAuthEgressConcurrency
+	return ReplaceAccountPoolInput{
+		Mode:                 EgressModePool,
+		RouteIDs:             routeIDs,
+		PrimaryRouteID:       primaryRouteID,
+		ConcurrencyPerEgress: &concurrency,
+	}, nil
+}
+
+// EgressRouteEligibility is shared by the admin catalog and default-pool
+// builder so the UI cannot advertise a route that server defaults reject.
+func EgressRouteEligibility(route *EgressRoute, now time.Time) (bool, string) {
+	if route == nil {
+		return false, "route_unavailable"
+	}
+	switch route.State {
+	case EgressRouteStateActive:
+	case EgressRouteStatePendingVerification:
+		return false, "pending_verification"
+	case EgressRouteStateInactive:
+		return false, "route_inactive"
+	case EgressRouteStateExpired:
+		return false, "route_expired"
+	case EgressRouteStateIdentityMismatch:
+		return false, "identity_mismatch"
+	case EgressRouteStateRetired:
+		return false, "route_retired"
+	default:
+		return false, "route_unavailable"
+	}
+	if route.ExpectedIdentity == nil || route.ExpectedIdentity.ID <= 0 ||
+		route.ExpectedIdentity.Status != EgressIdentityStatusActive {
+		return false, "identity_unavailable"
+	}
+	if route.VerifiedAt == nil || route.VerifiedAt.IsZero() {
+		return false, "pending_verification"
+	}
+	if !IsEgressIdentityVerificationFresh(route.VerifiedAt, now) {
+		return false, "verification_stale"
+	}
+	switch route.Kind {
+	case EgressRouteKindDirect:
+		if route.RuntimeScope == nil || strings.TrimSpace(*route.RuntimeScope) == "" {
+			return false, "direct_route_unavailable"
+		}
+	case EgressRouteKindProxy:
+		if route.ProxyID == nil || route.Proxy == nil {
+			return false, "proxy_unavailable"
+		}
+		if !route.Proxy.IsActive() {
+			return false, "proxy_inactive"
+		}
+		if route.Proxy.IsExpired(now) {
+			return false, "proxy_expired"
+		}
+	default:
+		return false, "route_kind_invalid"
+	}
+	return true, ""
 }
 
 func (s *EgressService) GetRoute(ctx context.Context, routeID int64) (*EgressRoute, error) {

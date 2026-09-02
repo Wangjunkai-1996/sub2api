@@ -46,8 +46,11 @@ type AccountEgressCatalogCapabilities struct {
 }
 
 type AssignableEgressRouteCatalog struct {
-	Items        []AssignableEgressRoute          `json:"items"`
-	Capabilities AccountEgressCatalogCapabilities `json:"capabilities"`
+	Items              []AssignableEgressRoute          `json:"items"`
+	Capabilities       AccountEgressCatalogCapabilities `json:"capabilities"`
+	DefaultRouteID     *int64                           `json:"default_route_id,omitempty"`
+	DefaultConcurrency int                              `json:"default_concurrency"`
+	DefaultReasonCode  string                           `json:"default_reason_code,omitempty"`
 }
 
 type AccountEgressPool struct {
@@ -86,7 +89,7 @@ func AssignableEgressRouteFromService(route *service.EgressRoute) *AssignableEgr
 	if route == nil {
 		return nil
 	}
-	eligible, reason := egressRouteEligibility(route, time.Now())
+	eligible, reason := service.EgressRouteEligibility(route, time.Now())
 	displayName := egressRouteDisplayName(route)
 	identityIP := egressRouteIdentityIP(route)
 	return &AssignableEgressRoute{
@@ -176,7 +179,7 @@ func AccountEgressViewsFromService(account *service.Account) (string, *AccountEg
 			degradedCount++
 			continue
 		}
-		eligible, _ := egressRouteEligibility(binding.Route, time.Now())
+		eligible, _ := service.EgressRouteEligibility(binding.Route, time.Now())
 		if !eligible {
 			// Degraded is a route/binding count. Capacity is still deduplicated
 			// below by public identity, so two healthy routes sharing one IP do
@@ -258,7 +261,7 @@ func AccountEgressCapacityBindingsFromService(account *service.Account, identity
 		if !known {
 			continue
 		}
-		eligible, _ := egressRouteEligibility(route, now)
+		eligible, _ := service.EgressRouteEligibility(route, now)
 		eligible = eligible && binding.Status == service.AccountEgressBindingStatusActive
 		item := AccountEgressCapacityBinding{
 			RouteID:            binding.RouteID,
@@ -361,56 +364,6 @@ func nonZeroTimePointer(value time.Time) *time.Time {
 		return nil
 	}
 	return &value
-}
-
-func egressRouteEligibility(route *service.EgressRoute, now time.Time) (bool, string) {
-	if route == nil {
-		return false, "route_unavailable"
-	}
-	switch route.State {
-	case service.EgressRouteStateActive:
-	case service.EgressRouteStatePendingVerification:
-		return false, "pending_verification"
-	case service.EgressRouteStateInactive:
-		return false, "route_inactive"
-	case service.EgressRouteStateExpired:
-		return false, "route_expired"
-	case service.EgressRouteStateIdentityMismatch:
-		return false, "identity_mismatch"
-	case service.EgressRouteStateRetired:
-		return false, "route_retired"
-	default:
-		return false, "route_unavailable"
-	}
-	if route.ExpectedIdentity == nil || route.ExpectedIdentity.ID <= 0 ||
-		route.ExpectedIdentity.Status != service.EgressIdentityStatusActive {
-		return false, "identity_unavailable"
-	}
-	if route.VerifiedAt == nil || route.VerifiedAt.IsZero() {
-		return false, "pending_verification"
-	}
-	if !service.IsEgressIdentityVerificationFresh(route.VerifiedAt, now) {
-		return false, "verification_stale"
-	}
-	switch route.Kind {
-	case service.EgressRouteKindDirect:
-		if route.RuntimeScope == nil || strings.TrimSpace(*route.RuntimeScope) == "" {
-			return false, "direct_route_unavailable"
-		}
-	case service.EgressRouteKindProxy:
-		if route.ProxyID == nil || route.Proxy == nil {
-			return false, "proxy_unavailable"
-		}
-		if !route.Proxy.IsActive() {
-			return false, "proxy_inactive"
-		}
-		if route.Proxy.IsExpired(now) {
-			return false, "proxy_expired"
-		}
-	default:
-		return false, "route_kind_invalid"
-	}
-	return true, ""
 }
 
 func egressRouteExpiresAt(route *service.EgressRoute) *time.Time {

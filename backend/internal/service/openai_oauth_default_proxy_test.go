@@ -101,6 +101,19 @@ func TestSettingServiceResolveOpenAIOAuthDefaultProxy(t *testing.T) {
 		require.Equal(t, "OPENAI_OAUTH_DEFAULT_PROXY_INACTIVE", infraerrors.Reason(err))
 	})
 
+	t.Run("expired proxy is rejected", func(t *testing.T) {
+		expiresAt := time.Now().Add(-time.Minute)
+		settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "18"}}
+		proxies := &mockProxyRepoForOAuth{getByIDFunc: func(context.Context, int64) (*Proxy, error) {
+			return &Proxy{ID: 18, Status: StatusActive, ExpiresAt: &expiresAt}, nil
+		}}
+
+		proxy, err := newOpenAIDefaultProxySettingService(settings, proxies).ResolveOpenAIOAuthDefaultProxy(context.Background())
+
+		require.Nil(t, proxy)
+		require.Equal(t, "OPENAI_OAUTH_DEFAULT_PROXY_EXPIRED", infraerrors.Reason(err))
+	})
+
 	t.Run("active proxy is returned", func(t *testing.T) {
 		settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "19"}}
 		want := activeOpenAIDefaultProxy(19, "2001:db8::19", 3128)
@@ -334,16 +347,24 @@ func TestOpenAIOAuthServiceCodexPATInvalidDefaultDoesNotCallUpstream(t *testing.
 }
 
 func TestAdminServiceCreateAccountOpenAIOAuthDefaultProxy(t *testing.T) {
-	t.Run("OpenAI OAuth inherits default", func(t *testing.T) {
+	t.Run("OpenAI OAuth inherits the eligible pool", func(t *testing.T) {
 		settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "41"}}
-		proxy := activeOpenAIDefaultProxy(41, "2001:db8::41", 3128)
+		proxy := activeOpenAIDefaultProxy(41, "203.0.113.41", 3128)
 		proxies := &mockProxyRepoForOAuth{getByIDFunc: func(context.Context, int64) (*Proxy, error) {
 			return proxy, nil
 		}}
-		repo := &longContextBillingRepoStub{}
+		now := time.Now()
+		otherProxyID := int64(42)
+		routes := []EgressRoute{
+			eligibleProxyRoute(141, proxy.ID, "203.0.113.41", now),
+			eligibleProxyRoute(142, otherProxyID, "203.0.113.42", now),
+		}
+		repo := newDuplicateAccountRepoStub()
 		svc := &adminServiceImpl{
-			accountRepo:    repo,
-			settingService: newOpenAIDefaultProxySettingService(settings, proxies),
+			accountRepo:          repo,
+			accountDuplicateRepo: repo,
+			settingService:       newOpenAIDefaultProxySettingService(settings, proxies),
+			egressService:        NewEgressService(&openAIOAuthEgressRepoStub{routes: routes}, nil),
 		}
 
 		account, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
@@ -355,8 +376,12 @@ func TestAdminServiceCreateAccountOpenAIOAuthDefaultProxy(t *testing.T) {
 		})
 
 		require.NoError(t, err)
-		require.NotNil(t, account.ProxyID)
-		require.Equal(t, int64(41), *account.ProxyID)
+		require.Nil(t, account.ProxyID)
+		require.Equal(t, EgressModePool, account.EgressMode)
+		require.NotNil(t, account.EgressPoolWrite)
+		require.Equal(t, []int64{141, 142}, account.EgressPoolWrite.RouteIDs)
+		require.Equal(t, int64(141), account.EgressPoolWrite.PrimaryRouteID)
+		require.Equal(t, DefaultOpenAIOAuthEgressConcurrency, account.Concurrency)
 	})
 
 	t.Run("explicit proxy skips default", func(t *testing.T) {

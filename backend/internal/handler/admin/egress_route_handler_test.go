@@ -2,16 +2,36 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type egressCatalogSettingRepo struct {
+	service.SettingRepository
+	value string
+}
+
+func (r *egressCatalogSettingRepo) GetValue(context.Context, string) (string, error) {
+	return r.value, nil
+}
+
+type egressCatalogProxyRepo struct {
+	service.ProxyRepository
+	proxy *service.Proxy
+}
+
+func (r *egressCatalogProxyRepo) GetByID(context.Context, int64) (*service.Proxy, error) {
+	return r.proxy, nil
+}
 
 func TestEgressAssignableCatalogAdvertisesMutationCapability(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -33,7 +53,7 @@ func TestEgressAssignableCatalogAdvertisesMutationCapability(t *testing.T) {
 	}
 	handler := NewEgressRouteHandler(service.NewEgressService(&accountDataEgressRepo{
 		routes: []service.EgressRoute{route},
-	}, nil))
+	}, nil), nil)
 	router := gin.New()
 	router.GET("/assignable", handler.ListAssignable)
 
@@ -49,12 +69,44 @@ func TestEgressAssignableCatalogAdvertisesMutationCapability(t *testing.T) {
 	capabilities, ok := data["capabilities"].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, true, capabilities["mutation_enabled"])
+	require.Equal(t, float64(service.DefaultOpenAIOAuthEgressConcurrency), data["default_concurrency"])
+}
+
+func TestEgressAssignableCatalogAdvertisesAuthoritativeOAuthPrimary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := time.Now()
+	proxyID := int64(9)
+	proxy := &service.Proxy{ID: proxyID, Status: service.StatusActive}
+	route := service.EgressRoute{
+		ID: 41, Kind: service.EgressRouteKindProxy, ProxyID: &proxyID,
+		State: service.EgressRouteStateActive, VerifiedAt: &now, Proxy: proxy,
+		ExpectedIdentity: &service.EgressIdentity{
+			ID: 91, PublicIP: "203.0.113.9", Status: service.EgressIdentityStatusActive,
+		},
+	}
+	settings := service.NewSettingService(&egressCatalogSettingRepo{value: "9"}, nil)
+	settings.SetProxyRepository(&egressCatalogProxyRepo{proxy: proxy})
+	handler := NewEgressRouteHandler(service.NewEgressService(&accountDataEgressRepo{
+		routes: []service.EgressRoute{route},
+	}, nil), settings)
+	router := gin.New()
+	router.GET("/assignable", handler.ListAssignable)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/assignable", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var envelope response.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
+	data := envelope.Data.(map[string]any)
+	require.Equal(t, float64(41), data["default_route_id"])
+	require.Equal(t, float64(service.DefaultOpenAIOAuthEgressConcurrency), data["default_concurrency"])
 }
 
 func TestEgressAssignableCatalogFreezesMutationWithoutService(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.GET("/assignable", NewEgressRouteHandler(nil).ListAssignable)
+	router.GET("/assignable", NewEgressRouteHandler(nil, nil).ListAssignable)
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/assignable", nil))

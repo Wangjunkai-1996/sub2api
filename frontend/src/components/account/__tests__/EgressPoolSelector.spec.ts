@@ -73,6 +73,13 @@ describe('EgressPoolSelector', () => {
     expect(wrapper.get('[data-testid="egress-route-2"]').exists()).toBe(true)
   })
 
+  it('masks static egress IPs in the selector', () => {
+    const wrapper = mountSelector([2], 2)
+
+    expect(wrapper.text()).toContain('198.***.***.104')
+    expect(wrapper.text()).not.toContain('198.51.100.104')
+  })
+
   it('selects multiple routes and assigns the first selected route as primary', async () => {
     const wrapper = mountSelector()
 
@@ -105,7 +112,8 @@ describe('EgressPoolSelector', () => {
 
     await wrapper.setProps({ routes: [routes[0], refreshed, routes[2], routes[3]] })
     expect(wrapper.text()).toContain('61ms')
-    expect(wrapper.text()).toContain('198.51.100.105')
+    expect(wrapper.text()).toContain('198.***.***.105')
+    expect(wrapper.text()).not.toContain('198.51.100.105')
   })
 
   it('shows the readable probe reason supplied after a failed verification', async () => {

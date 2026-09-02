@@ -9,7 +9,7 @@ vi.mock('@/api/client', () => ({
   apiClient: { get, post }
 }))
 
-import { confirmIdentity, getAssignable, verify } from '@/api/admin/egressRoutes'
+import { confirmIdentity, getAssignable, getAssignableCatalog, verify } from '@/api/admin/egressRoutes'
 
 describe('admin egress routes API', () => {
   beforeEach(() => {
@@ -23,6 +23,26 @@ describe('admin egress routes API', () => {
 
     await expect(getAssignable()).resolves.toEqual(routes)
     expect(get).toHaveBeenCalledWith('/admin/egress-routes/assignable')
+  })
+
+  it('preserves the authoritative OAuth defaults from the catalog', async () => {
+    const routes = [{ id: 7, kind: 'proxy', name: 'renamed-route', state: 'active', eligible: true }]
+    get.mockResolvedValue({
+      data: {
+        items: routes,
+        default_route_id: 7,
+        default_concurrency: 3,
+        capabilities: { mutation_enabled: true }
+      }
+    })
+
+    await expect(getAssignableCatalog()).resolves.toEqual({
+      items: routes,
+      generation: undefined,
+      default_route_id: 7,
+      default_concurrency: 3,
+      capabilities: { mutation_enabled: true, reason_code: undefined }
+    })
   })
 
   it('verifies a bounded route id list', async () => {

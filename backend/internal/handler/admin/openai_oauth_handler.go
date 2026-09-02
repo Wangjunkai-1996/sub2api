@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -188,23 +189,80 @@ type OpenAIRefreshTokenRequest struct {
 }
 
 type OpenAICodexPATCreateRequest struct {
-	AccessToken             string         `json:"access_token" binding:"required"`
-	Name                    string         `json:"name"`
-	Notes                   *string        `json:"notes"`
-	GroupIDs                []int64        `json:"group_ids"`
-	ProxyID                 *int64         `json:"proxy_id"`
-	EgressRouteID           *int64         `json:"egress_route_id"`
-	Concurrency             *int           `json:"concurrency"`
-	Priority                *int           `json:"priority"`
-	RateMultiplier          *float64       `json:"rate_multiplier"`
-	LoadFactor              *int           `json:"load_factor"`
-	ExpiresAt               *int64         `json:"expires_at"`
-	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
-	CredentialExtras        map[string]any `json:"credential_extras"`
-	Extra                   map[string]any `json:"extra"`
-	SkipDefaultGroupBind    *bool          `json:"skip_default_group_bind"`
-	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"`
-	OpenAICodexWarmupPolicy *string        `json:"openai_codex_warmup_policy"`
+	AccessToken             string                    `json:"access_token" binding:"required"`
+	Name                    string                    `json:"name"`
+	Notes                   *string                   `json:"notes"`
+	GroupIDs                []int64                   `json:"group_ids"`
+	ProxyID                 *int64                    `json:"proxy_id"`
+	EgressRouteID           *int64                    `json:"egress_route_id"`
+	EgressMode              *string                   `json:"egress_mode"`
+	EgressPool              *AccountEgressPoolRequest `json:"egress_pool"`
+	Concurrency             *int                      `json:"concurrency"`
+	Priority                *int                      `json:"priority"`
+	RateMultiplier          *float64                  `json:"rate_multiplier"`
+	LoadFactor              *int                      `json:"load_factor"`
+	ExpiresAt               *int64                    `json:"expires_at"`
+	AutoPauseOnExpired      *bool                     `json:"auto_pause_on_expired"`
+	CredentialExtras        map[string]any            `json:"credential_extras"`
+	Extra                   map[string]any            `json:"extra"`
+	SkipDefaultGroupBind    *bool                     `json:"skip_default_group_bind"`
+	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"`
+	OpenAICodexWarmupPolicy *string                   `json:"openai_codex_warmup_policy"`
+}
+
+type openAICodexPATCreateEgress struct {
+	proxyID     *int64
+	authRouteID *int64
+	pool        *service.ReplaceAccountPoolInput
+	concurrency int
+}
+
+func resolveOpenAICodexPATCreateEgress(req OpenAICodexPATCreateRequest) (openAICodexPATCreateEgress, error) {
+	concurrency := service.DefaultOpenAIOAuthEgressConcurrency
+	if req.Concurrency != nil {
+		concurrency = *req.Concurrency
+	}
+	pool, err := accountEgressPoolInput(req.EgressMode, req.EgressPool, true)
+	if err != nil {
+		return openAICodexPATCreateEgress{}, err
+	}
+	if pool != nil {
+		if req.ProxyID != nil {
+			return openAICodexPATCreateEgress{}, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool")
+		}
+		if req.EgressRouteID != nil {
+			return openAICodexPATCreateEgress{}, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_ROUTE_CONFLICT", "egress_route_id cannot be set together with egress_pool")
+		}
+		if pool.ConcurrencyPerEgress != nil {
+			if req.Concurrency != nil && *req.Concurrency != *pool.ConcurrencyPerEgress {
+				return openAICodexPATCreateEgress{}, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_CONCURRENCY_CONFLICT", "concurrency conflicts with egress_pool.concurrency_per_egress")
+			}
+			concurrency = *pool.ConcurrencyPerEgress
+		}
+		pool = cloneReplaceAccountPoolInput(pool)
+		return openAICodexPATCreateEgress{
+			authRouteID: &pool.PrimaryRouteID,
+			pool:        pool,
+			concurrency: concurrency,
+		}, nil
+	}
+
+	result := openAICodexPATCreateEgress{
+		proxyID:     req.ProxyID,
+		authRouteID: req.EgressRouteID,
+		concurrency: concurrency,
+	}
+	if req.EgressRouteID != nil {
+		routeID := *req.EgressRouteID
+		result.proxyID = nil
+		result.pool = &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{routeID},
+			PrimaryRouteID:       routeID,
+			ConcurrencyPerEgress: &result.concurrency,
+		}
+	}
+	return result, nil
 }
 
 // RefreshToken refreshes an OpenAI OAuth token
@@ -446,8 +504,13 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		response.BadRequest(c, "load_factor must be <= 10000")
 		return
 	}
+	resolvedEgress, err := resolveOpenAICodexPATCreateEgress(req)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 
-	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthEgressURL(c.Request.Context(), req.ProxyID, req.EgressRouteID)
+	proxyURL, err := h.openaiOAuthService.ResolveOpenAIOAuthEgressURL(c.Request.Context(), resolvedEgress.proxyID, resolvedEgress.authRouteID)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -476,10 +539,7 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 	}
 	extra = withOpenAIWindowWarmupPolicy(extra, policy)
 
-	concurrency := 3
-	if req.Concurrency != nil {
-		concurrency = *req.Concurrency
-	}
+	concurrency := resolvedEgress.concurrency
 	priority := 50
 	if req.Priority != nil {
 		priority = *req.Priority
@@ -489,18 +549,6 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		skipDefaultGroupBind = *req.SkipDefaultGroupBind
 	}
 
-	var egressPool *service.ReplaceAccountPoolInput
-	proxyID := req.ProxyID
-	if req.EgressRouteID != nil {
-		routeID := *req.EgressRouteID
-		egressPool = &service.ReplaceAccountPoolInput{
-			Mode:                 service.EgressModePool,
-			RouteIDs:             []int64{routeID},
-			PrimaryRouteID:       routeID,
-			ConcurrencyPerEgress: &concurrency,
-		}
-		proxyID = nil
-	}
 	account, err := h.adminService.CreateAccount(c.Request.Context(), &service.CreateAccountInput{
 		Name:                  buildOpenAICodexPATAccountName(req.Name, tokenInfo),
 		Notes:                 req.Notes,
@@ -508,8 +556,8 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 		Type:                  service.AccountTypeOAuth,
 		Credentials:           credentials,
 		Extra:                 extra,
-		ProxyID:               proxyID,
-		EgressPool:            egressPool,
+		ProxyID:               resolvedEgress.proxyID,
+		EgressPool:            resolvedEgress.pool,
 		Concurrency:           concurrency,
 		Priority:              priority,
 		RateMultiplier:        req.RateMultiplier,

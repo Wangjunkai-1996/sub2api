@@ -51,9 +51,12 @@ describe('AccountCapacityCell egress capacity', () => {
     expect(wrapper.text()).toContain('5/12')
     expect(wrapper.get('[data-testid="egress-capacity-formula"]').text()).toBe('3 IP x 4 = 12')
     const breakdown = wrapper.get('[data-testid="egress-capacity-breakdown"]').text()
-    expect(breakdown).toContain('51.81.109.1541/4')
-    expect(breakdown).toContain('104.223.77.1522/4')
-    expect(breakdown).toContain('67.215.237.472/4')
+    expect(breakdown).toContain('51.***.***.1541/4')
+    expect(breakdown).toContain('104.***.***.1522/4')
+    expect(breakdown).toContain('67.***.***.472/4')
+    expect(breakdown).not.toContain('51.81.109.154')
+    expect(breakdown).not.toContain('104.223.77.152')
+    expect(breakdown).not.toContain('67.215.237.47')
   })
 
   it('falls back to legacy account concurrency when no egress summary is present', () => {

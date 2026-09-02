@@ -530,6 +530,8 @@
       :show="showCreate"
       :proxies="proxyOptions"
       :egress-routes="egressRoutes"
+      :default-egress-route-id="egressDefaultRouteId"
+      :default-egress-concurrency="egressDefaultConcurrency"
       :egress-mutation-enabled="egressMutationEnabled"
       :egress-verifying-route-id="egressVerifyingRouteId"
       :egress-verify-errors="egressVerifyErrors"
@@ -635,7 +637,7 @@ import { formatDateTime, formatRelativeTime } from '@/utils/format'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
-import { formatMultiplier } from '@/utils/formatters'
+import { formatMultiplier, maskIPAddress } from '@/utils/formatters'
 import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, AssignableEgressRoute, AdminGroup, ProxyOption, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
@@ -645,6 +647,8 @@ const authStore = useAuthStore()
 const {
   routes: egressRoutes,
   capabilities: egressCapabilities,
+  defaultRouteId: egressDefaultRouteId,
+  defaultConcurrency: egressDefaultConcurrency,
   loading: egressCatalogLoading,
   verifyingRouteId: egressVerifyingRouteId,
   verifyErrors: egressVerifyErrors,
@@ -2764,7 +2768,11 @@ const isInheritedEgress = (account: Account): boolean =>
   || account.egress_pool?.inherited === true
 
 const egressRouteTitle = (route: AssignableEgressRoute): string => {
-  const parts = [route.name, route.observed_ip || route.ip_address, route.country_code || route.country]
+  const parts = [
+    route.name,
+    maskIPAddress(route.observed_ip || route.public_ip || route.ip_address),
+    route.country_code || route.country
+  ]
   if (route.probe_latency_ms != null) parts.push(`${route.probe_latency_ms}ms`)
   return parts.filter((part): part is string => Boolean(part)).join(' / ')
 }

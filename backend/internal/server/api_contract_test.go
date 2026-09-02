@@ -1478,7 +1478,7 @@ func newContractDeps(t *testing.T) *contractDeps {
 	settingRepo := newStubSettingRepo()
 	settingService := service.NewSettingService(settingRepo, cfg)
 
-	adminService := service.NewAdminService(userRepo, groupRepo, &accountRepo, proxyRepo, apiKeyRepo, redeemRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	adminService := service.NewAdminService(userRepo, groupRepo, &accountRepo, proxyRepo, apiKeyRepo, redeemRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	authHandler := handler.NewAuthHandler(cfg, nil, userService, settingService, nil, redeemService, nil, nil)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
 	usageHandler := handler.NewUsageHandler(usageService, apiKeyService, nil, nil)
@@ -1890,6 +1890,14 @@ func (s *stubAccountRepo) UpdateWithAccountBillingSettings(
 	rateMultiplier *float64,
 ) error {
 	return errors.New("not implemented")
+}
+
+func (s *stubAccountRepo) UpdateAccountConfiguration(_ context.Context, mutation service.AccountConfigurationMutation) (*service.Account, error) {
+	if mutation.Desired == nil {
+		return nil, service.ErrAccountNilInput
+	}
+	account := *mutation.Desired
+	return &account, nil
 }
 
 func (s *stubAccountRepo) Delete(ctx context.Context, id int64) error {

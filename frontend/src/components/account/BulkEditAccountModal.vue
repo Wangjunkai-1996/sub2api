@@ -2343,6 +2343,14 @@ const handleSubmit = async () => {
     return
   }
 
+  if (
+    built.egress_pool != null &&
+    Object.keys(built).some((key) => key !== 'egress_mode' && key !== 'egress_pool')
+  ) {
+    appStore.showError(t('admin.accounts.bulkEdit.egressMixedFields'))
+    return
+  }
+
   const canContinue = await preCheckMixedChannelRisk(built)
   if (!canContinue) return
 

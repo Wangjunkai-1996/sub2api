@@ -50,18 +50,24 @@ describe('useAccountEgressCatalog', () => {
     second.resolve({
       items: [route(2, 'new')],
       generation: 'new-generation',
+      default_route_id: 2,
+      default_concurrency: 3,
       capabilities: { mutation_enabled: true }
     })
     await secondRefresh
     first.resolve({
       items: [route(1, 'stale')],
       generation: 'stale-generation',
+      default_route_id: 1,
+      default_concurrency: 9,
       capabilities: { mutation_enabled: true }
     })
     await firstRefresh
 
     expect(catalog.routes.value.map((item) => item.id)).toEqual([2])
     expect(catalog.generation.value).toBe('new-generation')
+    expect(catalog.defaultRouteId.value).toBe(2)
+    expect(catalog.defaultConcurrency.value).toBe(3)
     expect(catalog.capabilities.value.mutation_enabled).toBe(true)
   })
 
@@ -113,6 +119,23 @@ describe('useAccountEgressCatalog', () => {
       mutation_enabled: false,
       reason_code: 'catalog_unavailable'
     })
+    expect(catalog.defaultRouteId.value).toBeNull()
+    expect(catalog.defaultConcurrency.value).toBeNull()
+  })
+
+  it('rejects invalid default metadata instead of guessing from route order', async () => {
+    getAssignableCatalogMock.mockReset().mockResolvedValue({
+      items: [route(4), route(5)],
+      default_route_id: 0,
+      default_concurrency: -1,
+      capabilities: { mutation_enabled: true }
+    })
+    const catalog = useAccountEgressCatalog()
+
+    await catalog.refresh()
+
+    expect(catalog.defaultRouteId.value).toBeNull()
+    expect(catalog.defaultConcurrency.value).toBeNull()
   })
 
   it('lets fresh catalog entries replace embedded copies without losing embedded-only routes', () => {

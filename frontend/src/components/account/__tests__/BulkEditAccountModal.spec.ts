@@ -783,6 +783,91 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
+  it('多出口替换与统一并发只提交出口池字段', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      egressRoutes: [
+        { id: 11, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+        { id: 12, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true },
+        { id: 13, kind: 'proxy', name: 'rn-67', proxy_id: 67, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-11').setValue(true)
+    await wrapper.get('#egress-route-12').setValue(true)
+    await wrapper.get('#egress-route-13').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(3)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(1)
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      egress_mode: 'pool',
+      egress_pool: {
+        operation: 'replace',
+        route_ids: [11, 12, 13],
+        primary_route_id: 11,
+        concurrency_per_egress: 3
+      }
+    })
+  })
+
+  it('出口池与普通字段混合时在请求前明确拦截', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+        { id: 32, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-31').setValue(true)
+    await wrapper.get('#egress-route-32').setValue(true)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).not.toHaveBeenCalled()
+    expect(showError).toHaveBeenCalledWith('admin.accounts.bulkEdit.egressMixedFields')
+  })
+
+  it('关闭再打开时清空出口池和普通字段的批量编辑状态', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      egressRoutes: [
+        { id: 21, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+        { id: 22, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-21').setValue(true)
+    await wrapper.get('#egress-route-22').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(9)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority').setValue(5)
+
+    await wrapper.setProps({ show: false })
+    await nextTick()
+    await wrapper.setProps({ show: true })
+    await nextTick()
+
+    expect((wrapper.get('#bulk-edit-proxy-enabled').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#bulk-edit-concurrency-enabled').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#bulk-edit-priority-enabled').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-21').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-22').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('1')
+    expect((wrapper.get('#bulk-edit-priority').element as HTMLInputElement).value).toBe('1')
+  })
+
   it('仅调整统一并发时不隐式替换任何账号出口', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],

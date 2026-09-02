@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseCodexSessionImportEntriesSupportsRawTokenJSONAndArray(t *testing.T) {
@@ -646,6 +647,33 @@ func TestImportCodexSessionsAccessTokenOnlySameWorkspaceDifferentUsersCreatesTwo
 	if svc.createdAccounts[0].Credentials["chatgpt_user_id"] == svc.createdAccounts[1].Credentials["chatgpt_user_id"] {
 		t.Fatalf("created accounts share user id: %v", svc.createdAccounts)
 	}
+}
+
+func TestImportCodexSessionsPersistsCompleteEgressPoolForNewAccounts(t *testing.T) {
+	svc := newCodexImportMemoryAdminService(nil)
+	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	concurrency := 3
+	req := CodexSessionImportRequest{
+		SkipDefaultGroupBind: boolPtr(true),
+		parsedEgressPool: &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{11, 12, 13},
+			PrimaryRouteID:       11,
+			ConcurrencyPerEgress: &concurrency,
+		},
+	}
+	entries := []codexImportEntry{{Index: 1, Value: buildCodexAccessOnlyImportValue(t, "workspace-1", "user-1")}}
+
+	result, err := handler.importCodexSessions(context.Background(), req, entries)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Created)
+	require.Len(t, svc.createdAccounts, 1)
+	created := svc.createdAccounts[0]
+	require.Equal(t, 3, created.Concurrency)
+	require.NotNil(t, created.EgressPool)
+	require.Equal(t, []int64{11, 12, 13}, created.EgressPool.RouteIDs)
+	require.Equal(t, int64(11), created.EgressPool.PrimaryRouteID)
 }
 
 func TestImportCodexSessionsAccessTokenOnlySameWorkspaceAndUserDifferentTokensCreatesTwoAccounts(t *testing.T) {

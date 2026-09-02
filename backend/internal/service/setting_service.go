@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -154,6 +155,11 @@ func (s *SettingService) ResolveOpenAIOAuthDefaultProxy(ctx context.Context) (*P
 			fmt.Errorf("proxy %d has status %q", proxy.ID, proxy.Status),
 		)
 	}
+	if proxy.IsExpired(time.Now()) {
+		return nil, ErrOpenAIOAuthDefaultProxyExpired.WithCause(
+			fmt.Errorf("proxy %d is expired", proxy.ID),
+		)
+	}
 	return proxy, nil
 }
 
@@ -171,6 +177,10 @@ var (
 	ErrOpenAIOAuthDefaultProxyInactive = infraerrors.BadRequest(
 		"OPENAI_OAUTH_DEFAULT_PROXY_INACTIVE",
 		"OpenAI OAuth default proxy is not active",
+	)
+	ErrOpenAIOAuthDefaultProxyExpired = infraerrors.BadRequest(
+		"OPENAI_OAUTH_DEFAULT_PROXY_EXPIRED",
+		"OpenAI OAuth default proxy is expired",
 	)
 	ErrDefaultSubGroupInvalid = infraerrors.BadRequest(
 		"DEFAULT_SUBSCRIPTION_GROUP_INVALID",

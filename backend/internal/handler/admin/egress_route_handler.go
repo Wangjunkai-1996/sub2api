@@ -3,8 +3,10 @@ package admin
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -14,11 +16,12 @@ import (
 // EgressRouteHandler exposes only the administrative, redacted view of
 // account egress routes. Credentials remain inside EgressService/repository.
 type EgressRouteHandler struct {
-	egressService *service.EgressService
+	egressService  *service.EgressService
+	settingService *service.SettingService
 }
 
-func NewEgressRouteHandler(egressService *service.EgressService) *EgressRouteHandler {
-	return &EgressRouteHandler{egressService: egressService}
+func NewEgressRouteHandler(egressService *service.EgressService, settingService *service.SettingService) *EgressRouteHandler {
+	return &EgressRouteHandler{egressService: egressService, settingService: settingService}
 }
 
 // ListAssignable returns routes that may be selected by an account. Existing
@@ -28,7 +31,8 @@ func NewEgressRouteHandler(egressService *service.EgressService) *EgressRouteHan
 func (h *EgressRouteHandler) ListAssignable(c *gin.Context) {
 	if h == nil || h.egressService == nil {
 		response.Success(c, dto.AssignableEgressRouteCatalog{
-			Items: []dto.AssignableEgressRoute{},
+			Items:              []dto.AssignableEgressRoute{},
+			DefaultConcurrency: service.DefaultOpenAIOAuthEgressConcurrency,
 			Capabilities: dto.AccountEgressCatalogCapabilities{
 				MutationEnabled: false,
 				ReasonCode:      accountEgressMutationFrozenReason,
@@ -47,12 +51,41 @@ func (h *EgressRouteHandler) ListAssignable(c *gin.Context) {
 			out = append(out, *item)
 		}
 	}
+	var defaultRouteID *int64
+	defaultReasonCode := ""
+	if h.settingService != nil {
+		proxy, resolveErr := h.settingService.ResolveOpenAIOAuthDefaultProxy(c.Request.Context())
+		if resolveErr != nil {
+			defaultReasonCode = serviceErrorReason(resolveErr)
+		} else if proxy != nil {
+			pool, poolErr := service.DefaultOpenAIOAuthEgressPool(routes, proxy.ID, time.Now())
+			if poolErr != nil {
+				defaultReasonCode = serviceErrorReason(poolErr)
+			} else {
+				id := pool.PrimaryRouteID
+				defaultRouteID = &id
+			}
+		}
+	}
 	response.Success(c, dto.AssignableEgressRouteCatalog{
-		Items: out,
+		Items:              out,
+		DefaultRouteID:     defaultRouteID,
+		DefaultConcurrency: service.DefaultOpenAIOAuthEgressConcurrency,
+		DefaultReasonCode:  defaultReasonCode,
 		Capabilities: dto.AccountEgressCatalogCapabilities{
 			MutationEnabled: true,
 		},
 	})
+}
+
+func serviceErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	if reason := infraerrors.Reason(err); reason != "" {
+		return reason
+	}
+	return "default_egress_unavailable"
 }
 
 type verifyEgressRoutesRequest struct {

@@ -11,6 +11,8 @@ type AssignableRoutesResponse =
       items?: AssignableEgressRoute[]
       routes?: AssignableEgressRoute[]
       generation?: string | number | null
+      default_route_id?: number | null
+      default_concurrency?: number | null
       capabilities?: { mutation_enabled?: boolean; reason_code?: string | null }
     }
 
@@ -31,6 +33,8 @@ export async function getAssignableCatalog(): Promise<AssignableEgressRouteCatal
   return {
     items: unwrapRoutes(data),
     generation: data.generation,
+    default_route_id: data.default_route_id,
+    default_concurrency: data.default_concurrency,
     capabilities: {
       mutation_enabled: data.capabilities?.mutation_enabled === true,
       reason_code: data.capabilities?.reason_code

@@ -109,6 +109,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
+import { maskIPAddress } from '@/utils/formatters'
 import type { AssignableEgressRoute, EgressRouteState } from '@/types'
 
 const props = withDefaults(defineProps<{
@@ -171,7 +172,9 @@ const setPrimary = (id: number) => {
 
 const legacyRouteNumberPattern = /^route\s*#?\s*\d+$/i
 
-const routeIp = (route: AssignableEgressRoute) => route.observed_ip || route.public_ip || route.ip_address || ''
+const routeIp = (route: AssignableEgressRoute) => maskIPAddress(
+  route.observed_ip || route.public_ip || route.ip_address
+)
 const routeLabel = (route: AssignableEgressRoute) => {
   if (route.kind === 'direct') return t('admin.accounts.egressPool.direct')
   const names = [route.display_name, route.proxy_name, route.name]

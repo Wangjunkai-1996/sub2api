@@ -14,6 +14,7 @@ import (
 
 type openAIOAuthEgressRepoStub struct {
 	route             *EgressRoute
+	routes            []EgressRoute
 	ensureProxyCalls  int
 	ensureDirectCalls int
 }
@@ -31,7 +32,10 @@ func (r *openAIOAuthEgressRepoStub) ResolveAccountPool(context.Context, int64) (
 }
 
 func (r *openAIOAuthEgressRepoStub) ListAssignableRoutes(context.Context) ([]EgressRoute, error) {
-	return nil, errors.New("not implemented")
+	if r.routes == nil {
+		return nil, errors.New("not implemented")
+	}
+	return append([]EgressRoute(nil), r.routes...), nil
 }
 
 func (r *openAIOAuthEgressRepoStub) GetRoute(_ context.Context, routeID int64) (*EgressRoute, error) {

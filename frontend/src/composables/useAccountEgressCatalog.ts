@@ -11,6 +11,10 @@ const disabledCapabilities = (): AccountEgressCatalogCapabilities => ({
   reason_code: 'catalog_unavailable'
 })
 
+const positiveIntegerOrNull = (value: number | null | undefined): number | null => {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
 export function mergeAccountEgressRoutes(
   catalogRoutes: AssignableEgressRoute[],
   embeddedRoutes: AssignableEgressRoute[] = []
@@ -25,6 +29,8 @@ export function useAccountEgressCatalog() {
   const routes = ref<AssignableEgressRoute[]>([])
   const capabilities = ref<AccountEgressCatalogCapabilities>(disabledCapabilities())
   const generation = ref<string | number | null>(null)
+  const defaultRouteId = ref<number | null>(null)
+  const defaultConcurrency = ref<number | null>(null)
   const loading = ref(false)
   const verifyingRouteId = ref<number | null>(null)
   const verifyErrors = reactive<Record<number, string>>({})
@@ -38,6 +44,8 @@ export function useAccountEgressCatalog() {
     routes.value = catalog.items
     capabilities.value = catalog.capabilities
     generation.value = catalog.generation ?? requestID
+    defaultRouteId.value = positiveIntegerOrNull(catalog.default_route_id)
+    defaultConcurrency.value = positiveIntegerOrNull(catalog.default_concurrency)
     return true
   }
 
@@ -53,6 +61,8 @@ export function useAccountEgressCatalog() {
         routes.value = []
         capabilities.value = disabledCapabilities()
         generation.value = requestID
+        defaultRouteId.value = null
+        defaultConcurrency.value = null
       }
       throw error
     } finally {
@@ -94,6 +104,8 @@ export function useAccountEgressCatalog() {
     routes,
     capabilities,
     generation,
+    defaultRouteId,
+    defaultConcurrency,
     loading,
     verifyingRouteId,
     verifyErrors,

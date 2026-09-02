@@ -11,6 +11,7 @@ const {
   generateAuthUrlMock,
   exchangeCodeMock,
   refreshOpenAITokenMock,
+  showErrorMock,
   authIsSimpleMode,
 } = vi.hoisted(() => ({
   createAccountMock: vi.fn(),
@@ -21,12 +22,13 @@ const {
   generateAuthUrlMock: vi.fn(),
   exchangeCodeMock: vi.fn(),
   refreshOpenAITokenMock: vi.fn(),
+  showErrorMock: vi.fn(),
   authIsSimpleMode: { value: true },
 }))
 
 vi.mock('@/stores/app', () => ({
   useAppStore: () => ({
-    showError: vi.fn(),
+    showError: showErrorMock,
     showSuccess: vi.fn(),
     showWarning: vi.fn(),
   }),
@@ -143,12 +145,20 @@ const ModelWhitelistSelectorStub = defineComponent({
 })
 
 const defaultEgressRoutes = [
-  { id: 1, kind: 'proxy', name: 'sys1-ipv4', state: 'active', eligible: true },
+  { id: 1, kind: 'proxy', name: 'arbitrary-route-label', state: 'active', eligible: true },
 ]
 
 function mountModal(groups: any[] = [], extraProps: Record<string, unknown> = {}) {
   return mount(CreateAccountModal, {
-    props: { show: true, proxies: [], egressRoutes: defaultEgressRoutes, groups, ...extraProps },
+    props: {
+      show: true,
+      proxies: [],
+      egressRoutes: defaultEgressRoutes,
+      defaultEgressRouteId: 1,
+      defaultEgressConcurrency: 3,
+      groups,
+      ...extraProps
+    },
     global: {
       stubs: {
         BaseDialog: BaseDialogStub,
@@ -242,6 +252,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       refresh_token: 'refresh-token',
       expires_at: 123,
     })
+    showErrorMock.mockReset()
   })
 
   it('mounts safely while initially closed', () => {
@@ -394,6 +405,11 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     await flushPromises()
 
     expect(importCodexSessionMock).toHaveBeenCalledTimes(1)
+    expect(importCodexSessionMock.mock.calls[0]?.[0]?.egress_pool).toEqual({
+      route_ids: [1],
+      primary_route_id: 1,
+      concurrency_per_egress: 3
+    })
   })
 
   it('sends true explicitly when OpenAI long-context billing is enabled', async () => {
@@ -450,6 +466,14 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
     expect(importCodexSessionMock).toHaveBeenCalledTimes(1)
     expect(importCodexSessionMock.mock.calls[0]?.[0]?.extra?.openai_long_context_billing_enabled).toBeUndefined()
+    expect(importCodexSessionMock.mock.calls[0]?.[0]).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3
+      }
+    })
   })
 
   it('leaves Codex PAT import billing ownership to the backend', async () => {
@@ -459,6 +483,14 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
     expect(createOpenAICodexPATMock).toHaveBeenCalledTimes(1)
     expect(createOpenAICodexPATMock.mock.calls[0]?.[0]?.extra?.openai_long_context_billing_enabled).toBeUndefined()
+    expect(createOpenAICodexPATMock.mock.calls[0]?.[0]).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3
+      }
+    })
   })
 
   it('sends explicit true for Codex session import after the toggle is enabled', async () => {
@@ -510,7 +542,19 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       platform: 'openai',
       type: 'oauth',
       openai_codex_warmup_policy: 'continuous',
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3
+      }
     })
+    expect(refreshOpenAITokenMock).toHaveBeenCalledWith(
+      'refresh-token',
+      { egress_route_id: 1 },
+      '/admin/openai/refresh-token',
+      undefined
+    )
     expect(createAccountMock.mock.calls[0]?.[0]?.extra).not.toHaveProperty(
       'openai_codex_warmup_policy'
     )
@@ -601,31 +645,45 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
   it('submits a multi-route egress pool with one shared per-egress concurrency', async () => {
     const egressRoutes = [
-      { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
-      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+      { id: 1, kind: 'proxy', name: 'first-route', proxy_id: 1, state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'authoritative-default', proxy_id: 104, state: 'active', eligible: true },
+      { id: 3, kind: 'proxy', name: 'unavailable-route', proxy_id: 67, state: 'inactive', eligible: false }
     ]
-    const wrapper = mountModal([], { egressRoutes })
+    const wrapper = mountModal([], {
+      egressRoutes,
+      defaultEgressRouteId: 2,
+      defaultEgressConcurrency: 3
+    })
     await selectButtonByText(wrapper, 'OpenAI')
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Pooled account')
-    await wrapper.get('#egress-route-1').setValue(true)
-    await wrapper.get('#egress-route-2').setValue(true)
+    expect((wrapper.get('#egress-route-1').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-2').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-3').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('[data-testid="egress-concurrency-per-route"]').element as HTMLInputElement).value).toBe('3')
     await wrapper.get('[data-testid="egress-concurrency-per-route"]').setValue(4)
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
 
     const flow = wrapper.getComponent(OAuthAuthorizationFlowStub)
     await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')
     await flushPromises()
+    expect(generateAuthUrlMock).toHaveBeenCalledWith('/admin/openai/generate-auth-url', {
+      egress_route_id: 2
+    })
     flow.vm.authCode = 'authorization-code'
     flow.vm.oauthState = 'oauth-state'
     await wrapper.vm.$nextTick()
     await selectButtonByText(wrapper, 'admin.accounts.oauth.completeAuth')
     await flushPromises()
 
+    expect(exchangeCodeMock).toHaveBeenCalledWith('/admin/openai/exchange-code', expect.objectContaining({
+      egress_route_id: 2
+    }))
+
     const payload = createAccountMock.mock.calls[0]?.[0]
     expect(payload).toMatchObject({
       egress_mode: 'pool',
       egress_pool: {
-        route_ids: [2, 1],
+        route_ids: [1, 2],
         primary_route_id: 2,
         concurrency_per_egress: 4
       }
@@ -638,11 +696,49 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     const wrapper = mountModal([], {
       egressRoutes: [
         { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
-      ]
+      ],
+      defaultEgressRouteId: 2
     })
     await selectButtonByText(wrapper, 'OpenAI')
     await wrapper.get('form#create-account-form input[type="text"]').setValue('OAuth account')
     await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')
+    await flushPromises()
+
+    expect(generateAuthUrlMock).toHaveBeenCalledWith('/admin/openai/generate-auth-url', {
+      egress_route_id: 2
+    })
+  })
+
+  it('does not guess the authentication egress from catalog order', async () => {
+    const wrapper = mountModal([], {
+      egressRoutes: [
+        { id: 9, kind: 'proxy', name: 'first-route', state: 'active', eligible: true },
+        { id: 4, kind: 'proxy', name: 'second-route', state: 'active', eligible: true }
+      ],
+      defaultEgressRouteId: null
+    })
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Missing primary')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+
+    expect(showErrorMock).toHaveBeenCalledWith('admin.accounts.egressPool.primaryRequired')
+    expect(wrapper.findComponent(OAuthAuthorizationFlowStub).exists()).toBe(false)
+    expect(generateAuthUrlMock).not.toHaveBeenCalled()
+  })
+
+  it('adopts an authoritative primary that arrives after the eligible routes', async () => {
+    const wrapper = mountModal([], {
+      egressRoutes: [
+        { id: 1, kind: 'proxy', name: 'first-route', state: 'active', eligible: true },
+        { id: 2, kind: 'proxy', name: 'default-route', state: 'active', eligible: true }
+      ],
+      defaultEgressRouteId: null
+    })
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.setProps({ defaultEgressRouteId: 2 })
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Late default')
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
     await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')
     await flushPromises()

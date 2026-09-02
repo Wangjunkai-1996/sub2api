@@ -25,9 +25,9 @@
         v-for="binding in egressBreakdown"
         :key="binding.route_id"
         class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 whitespace-nowrap text-[10px] leading-tight text-gray-500 dark:text-gray-400"
-        :title="[binding.name, binding.observed_ip].filter(Boolean).join(' · ') || String(binding.route_id)"
+        :title="[binding.name, maskIPAddress(binding.observed_ip)].filter(Boolean).join(' · ') || String(binding.route_id)"
       >
-        <span class="truncate font-mono">{{ binding.observed_ip || binding.name || `#${binding.route_id}` }}</span>
+        <span class="truncate font-mono">{{ maskIPAddress(binding.observed_ip) || binding.name || `#${binding.route_id}` }}</span>
         <span class="font-mono font-medium">{{ binding.current_concurrency ?? '--' }}/{{ concurrencyPerEgress }}</span>
       </span>
     </div>
@@ -66,6 +66,7 @@ import { useI18n } from 'vue-i18n'
 import type { Account } from '@/types'
 import CapacityBadge from '@/components/account/CapacityBadge.vue'
 import QuotaBadge from '@/components/account/QuotaBadge.vue'
+import { maskIPAddress } from '@/utils/formatters'
 
 const props = defineProps<{
   account: Account
