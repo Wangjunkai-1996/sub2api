@@ -329,6 +329,12 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 				ExpiresAt:          effectiveExpiresAt,
 				AutoPauseOnExpired: autoPauseOnExpired,
 			}
+			if req.parsedEgressPool != nil {
+				egressPool := cloneReplaceAccountPoolInput(req.parsedEgressPool)
+				expectedRevision := existing.EgressRevision
+				egressPool.ExpectedRevision = &expectedRevision
+				updateInput.EgressPool = egressPool
+			}
 			if req.ProxyID != nil {
 				updateInput.ProxyID = req.ProxyID
 			}

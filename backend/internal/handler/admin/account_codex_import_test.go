@@ -676,6 +676,46 @@ func TestImportCodexSessionsPersistsCompleteEgressPoolForNewAccounts(t *testing.
 	require.Equal(t, int64(11), created.EgressPool.PrimaryRouteID)
 }
 
+func TestImportCodexSessionsPersistsCompleteEgressPoolForExistingAccounts(t *testing.T) {
+	existingToken := buildCodexAccessToken(t, "workspace-1", "user-1", time.Now().Add(time.Hour))
+	svc := newCodexImportMemoryAdminService([]service.Account{{
+		ID:             10,
+		Name:           "existing",
+		Platform:       service.PlatformOpenAI,
+		Type:           service.AccountTypeOAuth,
+		EgressRevision: 7,
+		Credentials: map[string]any{
+			"chatgpt_account_id": "workspace-1",
+			"chatgpt_user_id":    "user-1",
+			"access_token":       existingToken,
+		},
+	}})
+	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	concurrency := 3
+	req := CodexSessionImportRequest{
+		SkipDefaultGroupBind: boolPtr(true),
+		parsedEgressPool: &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{11, 12, 13},
+			PrimaryRouteID:       11,
+			ConcurrencyPerEgress: &concurrency,
+		},
+	}
+	entries := []codexImportEntry{{Index: 1, Value: map[string]any{"access_token": existingToken}}}
+
+	result, err := handler.importCodexSessions(context.Background(), req, entries)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Updated)
+	require.Len(t, svc.updatedAccounts, 1)
+	updated := svc.updatedAccounts[0].input
+	require.NotNil(t, updated.EgressPool)
+	require.Equal(t, []int64{11, 12, 13}, updated.EgressPool.RouteIDs)
+	require.Equal(t, int64(11), updated.EgressPool.PrimaryRouteID)
+	require.Equal(t, 3, *updated.EgressPool.ConcurrencyPerEgress)
+	require.Equal(t, int64(7), *updated.EgressPool.ExpectedRevision)
+}
+
 func TestImportCodexSessionsAccessTokenOnlySameWorkspaceAndUserDifferentTokensCreatesTwoAccounts(t *testing.T) {
 	svc := newCodexImportMemoryAdminService(nil)
 	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
