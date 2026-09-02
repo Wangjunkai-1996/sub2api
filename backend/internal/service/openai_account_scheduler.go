@@ -311,10 +311,11 @@ type defaultOpenAIAccountScheduler struct {
 }
 
 type openAISelectionProbeBudget struct {
-	acquires  int
-	rechecks  int
-	attempted map[int64]struct{}
-	limited   bool
+	acquires            int
+	rechecks            int
+	attempted           map[int64]struct{}
+	limited             bool
+	stickyAdmissionFull bool
 }
 
 func newOpenAISelectionProbeBudget() *openAISelectionProbeBudget {
@@ -331,15 +332,15 @@ func (b *openAISelectionProbeBudget) recordAcquire(accountID int64) bool {
 	if b == nil {
 		return false
 	}
-	if !b.limited {
-		return true
-	}
-	if b.acquires >= openAIAccountSelectionProbeLimit {
+	if b.limited && b.acquires >= openAIAccountSelectionProbeLimit {
 		return false
 	}
 	if b.attempted == nil {
 		b.attempted = make(map[int64]struct{})
 	}
+	// Keep the attempted set even before a hard limit is enabled. An admission
+	// failure can promote an initially bounded Top-K plan to an overflow plan;
+	// the second pass must not probe the same account twice.
 	b.acquires++
 	b.attempted[accountID] = struct{}{}
 	return true
@@ -369,6 +370,19 @@ func (b *openAISelectionProbeBudget) wasAttempted(accountID int64) bool {
 	}
 	_, ok := b.attempted[accountID]
 	return ok
+}
+
+func (b *openAISelectionProbeBudget) recordStickyAdmissionFull(req OpenAIAccountScheduleRequest, accountID int64, err error) {
+	if b == nil || !req.StickyWeighted || req.StickyAccountID <= 0 || accountID != req.StickyAccountID {
+		return
+	}
+	if errors.Is(err, ErrAccountEgressCapacityFull) {
+		b.stickyAdmissionFull = true
+	}
+}
+
+func (b *openAISelectionProbeBudget) preserveStickyBinding(req OpenAIAccountScheduleRequest) bool {
+	return req.PreserveStickyBinding || (b != nil && b.stickyAdmissionFull)
 }
 
 type openAIStickyEscapeConfig struct {
@@ -1210,7 +1224,6 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 ) (*AccountSelectionResult, bool, error) {
 	compactBlocked := false
 	var lastEgressAdmissionErr error
-	hasLegacyCandidate := false
 	release := func(result *AcquireResult) {
 		if result != nil && result.ReleaseFunc != nil {
 			result.ReleaseFunc()
@@ -1222,9 +1235,6 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			continue
 		}
 		enforcedPool := accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account)
-		if !enforcedPool {
-			hasLegacyCandidate = true
-		}
 		if !enforcedPool && candidate.loadKnown && candidate.account.Concurrency > 0 &&
 			candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency {
 			continue
@@ -1236,6 +1246,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		}
 		if acquireErr != nil {
 			if isAccountEgressAdmissionError(acquireErr) {
+				budget.recordStickyAdmissionFull(req, candidate.account.ID, acquireErr)
 				lastEgressAdmissionErr = acquireErr
 				continue
 			}
@@ -1286,6 +1297,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			}
 			if acquireErr != nil {
 				if isAccountEgressAdmissionError(acquireErr) {
+					budget.recordStickyAdmissionFull(req, fresh.ID, acquireErr)
 					lastEgressAdmissionErr = acquireErr
 					continue
 				}
@@ -1295,17 +1307,18 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 				continue
 			}
 		}
-		if req.SessionHash != "" && !req.PreserveStickyBinding {
+		if req.SessionHash != "" && !budget.preserveStickyBinding(req) {
 			_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, fresh.ID)
 		}
 		selection, selectErr := s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 		if isAccountEgressAdmissionError(selectErr) {
+			budget.recordStickyAdmissionFull(req, fresh.ID, selectErr)
 			lastEgressAdmissionErr = selectErr
 			continue
 		}
 		return selection, compactBlocked, selectErr
 	}
-	if lastEgressAdmissionErr != nil && !hasLegacyCandidate {
+	if lastEgressAdmissionErr != nil {
 		return nil, compactBlocked, lastEgressAdmissionErr
 	}
 	return nil, compactBlocked, nil
@@ -1336,6 +1349,7 @@ func (s *defaultOpenAIAccountScheduler) consumeOpenAISelectionDBRecheck(budget *
 func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
+	budget *openAISelectionProbeBudget,
 ) (*AccountSelectionResult, error) {
 	if !req.StickyWeighted {
 		return nil, nil
@@ -1354,7 +1368,13 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 		if err != nil || account == nil {
 			continue
 		}
+		if accountUsesEnforcedEgressPool(ctx, s.service.settingService, account) && budget.wasAttempted(account.ID) {
+			continue
+		}
 		if !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
+			continue
+		}
+		if !s.consumeOpenAISelectionDBRecheck(budget) {
 			continue
 		}
 		account, err = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
@@ -1391,16 +1411,23 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 			isGrokModelQuotaBlocked(account.ID, upstreamModel, now) {
 			continue
 		}
-		result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account)
+		if accountUsesEnforcedEgressPool(ctx, s.service.settingService, account) && budget.wasAttempted(account.ID) {
+			continue
+		}
+		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, account, budget)
+		if !attempted {
+			continue
+		}
 		if acquireErr != nil {
 			if isAccountEgressAdmissionError(acquireErr) {
+				budget.recordStickyAdmissionFull(req, account.ID, acquireErr)
 				lastEgressAdmissionErr = acquireErr
 				continue
 			}
 			return nil, acquireErr
 		}
 		if result != nil && result.Acquired {
-			if req.SessionHash != "" && !req.PreserveStickyBinding {
+			if req.SessionHash != "" && !budget.preserveStickyBinding(req) {
 				_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, account.ID)
 			}
 			return s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
@@ -1471,8 +1498,13 @@ func (s openAISelectionFilterStats) summary(extra string) string {
 func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
-) (*AccountSelectionResult, int, int, float64, error) {
+) (selection *AccountSelectionResult, candidateCount int, topK int, loadSkew float64, err error) {
 	budget := newOpenAISelectionProbeBudget()
+	defer func() {
+		if selection != nil && budget.stickyAdmissionFull {
+			selection.preserveStickyBinding = true
+		}
+	}()
 	accounts, err := s.service.listSchedulableAccounts(ctx, req.GroupID, req.Platform)
 	if err != nil {
 		return nil, 0, 0, 0, err
@@ -1563,7 +1595,13 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		subscriptionAccounts, regularAccounts := partitionOpenAIChatGPTSubscriptionAccounts(filtered)
 		if len(subscriptionAccounts) > 0 {
 			attempt := s.trySelectByLoadBalancePool(ctx, req, subscriptionAccounts, loadMap, budget)
-			if attempt.err != nil && (!attempt.noCompactCandidates || len(regularAccounts) <= 0) {
+			// Egress admission is a per-account capacity result, not a pool-wide
+			// fatal error. Give the regular pool a chance when a subscription pool
+			// is saturated; otherwise one full subscription slot can turn a healthy
+			// mixed pool into an avoidable 429.
+			if attempt.err != nil &&
+				(!attempt.noCompactCandidates || len(regularAccounts) <= 0) &&
+				!isAccountEgressAdmissionError(attempt.err) {
 				return nil, attempt.candidateCount, attempt.topK, attempt.loadSkew, attempt.err
 			}
 			if attempt.result != nil {
@@ -1571,7 +1609,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			}
 			if len(regularAccounts) > 0 {
 				regularAttempt := s.trySelectByLoadBalancePool(ctx, req, regularAccounts, loadMap, budget)
-				if regularAttempt.err != nil && !regularAttempt.noCompactCandidates {
+				if regularAttempt.err != nil && !regularAttempt.noCompactCandidates &&
+					!isAccountEgressAdmissionError(regularAttempt.err) {
 					return nil, regularAttempt.candidateCount, regularAttempt.topK, regularAttempt.loadSkew, regularAttempt.err
 				}
 				if regularAttempt.result != nil {
@@ -1633,6 +1672,7 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 	if openAICostOverflowExpanded(req, plan) {
 		budget.enableLimit()
 	}
+	hasAdmissionOverflow := !plan.includeOverflowFallback && openAISelectionHasTopKOverflow(req, plan)
 	attempt := openAIAccountLoadSelectionAttempt{
 		selectionOrder: plan.selectionOrder,
 		candidateCount: plan.candidateCount,
@@ -1656,49 +1696,141 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 
 	result, compactBlocked, acquireErr := s.tryAcquireOpenAISelectionOrderWithBudget(ctx, req, attempt.selectionOrder, budget)
 	attempt.compactBlocked = compactBlocked
+	admissionFailure := isAccountEgressAdmissionError(acquireErr)
+	deferAdmissionError := false
 	if acquireErr != nil {
-		attempt.err = acquireErr
-		return attempt
+		if !admissionFailure {
+			attempt.err = acquireErr
+			return attempt
+		}
+		deferAdmissionError = openAISelectionHasLegacyCandidate(ctx, s.service.settingService, attempt.selectionOrder)
+		if !hasAdmissionOverflow {
+			// Legacy candidates can still be returned as a wait plan. Keep the
+			// admission error deferred in that mixed pool, but do not let it hide
+			// the fact that an enforced candidate exhausted its egress slot.
+			if !deferAdmissionError {
+				attempt.err = acquireErr
+				return attempt
+			}
+		}
 	}
 	if result != nil {
 		attempt.result = result
 		return attempt
 	}
 
-	if s.service.concurrencyService != nil && !budget.acquireExhausted() {
-		if freshLoadMap, loadErr := getAccountLoadsForScheduling(ctx, s.service.concurrencyService, s.service.settingService, filtered, true); loadErr == nil {
-			freshPlan := s.buildOpenAIAccountLoadPlan(ctx, req, filtered, freshLoadMap)
-			if openAICostOverflowExpanded(req, freshPlan) {
+	if !budget.acquireExhausted() {
+		retryPlan := plan
+		// Keep this independent from acquireErr: a mixed pool may defer the
+		// egress error so its legacy candidates can still wait, while the same
+		// admission failure must still trigger an overflow probe.
+		haveRetry := admissionFailure
+		if s.service.concurrencyService != nil {
+			if freshLoadMap, loadErr := getAccountLoadsForScheduling(ctx, s.service.concurrencyService, s.service.settingService, filtered, true); loadErr == nil {
+				retryPlan = s.buildOpenAIAccountLoadPlan(ctx, req, filtered, freshLoadMap)
+				haveRetry = true
+			}
+		}
+		if haveRetry {
+			retrySelectionOrder := retryPlan.selectionOrder
+			fallbackSelectionOrder := retrySelectionOrder
+			if admissionFailure {
+				// A pool admission can race the load snapshot. If every preferred
+				// account is full, spill beyond Top-K instead of returning FULL while
+				// other accounts remain eligible. Fresh loads improve the ordering but
+				// are not required for the failover itself.
+				if !retryPlan.includeOverflowFallback && openAISelectionHasTopKOverflow(req, retryPlan) {
+					budget.enableLimit()
+				}
+				fallbackSelectionOrder = s.buildOpenAIEgressAdmissionOverflowOrder(req, retryPlan)
+				retrySelectionOrder = openAIUnattemptedSelectionOrder(fallbackSelectionOrder, budget)
+			}
+			if openAICostOverflowExpanded(req, retryPlan) {
 				budget.enableLimit()
 			}
-			if len(freshPlan.selectionOrder) > 0 {
-				freshResult, freshCompactBlocked, freshAcquireErr := s.tryAcquireOpenAISelectionOrderWithBudget(ctx, req, freshPlan.selectionOrder, budget)
+			if len(retrySelectionOrder) > 0 {
+				freshResult, freshCompactBlocked, freshAcquireErr := s.tryAcquireOpenAISelectionOrderWithBudget(ctx, req, retrySelectionOrder, budget)
 				if freshAcquireErr != nil {
-					attempt.err = freshAcquireErr
-					return attempt
+					if !isAccountEgressAdmissionError(freshAcquireErr) ||
+						!openAISelectionHasLegacyCandidate(ctx, s.service.settingService, fallbackSelectionOrder) {
+						attempt.err = freshAcquireErr
+						return attempt
+					}
+					// Preserve a legacy wait fallback when all enforced probes in the
+					// expanded order are full.
+					deferAdmissionError = true
 				}
 				if freshResult != nil {
 					attempt.result = freshResult
-					attempt.selectionOrder = freshPlan.selectionOrder
-					attempt.candidateCount = freshPlan.candidateCount
-					attempt.topK = freshPlan.topK
-					attempt.loadSkew = freshPlan.loadSkew
+					attempt.selectionOrder = fallbackSelectionOrder
+					attempt.candidateCount = retryPlan.candidateCount
+					attempt.topK = retryPlan.topK
+					attempt.loadSkew = retryPlan.loadSkew
 					return attempt
 				}
 				attempt.compactBlocked = attempt.compactBlocked || freshCompactBlocked
-				attempt.selectionOrder = freshPlan.selectionOrder
-				attempt.candidateCount = freshPlan.candidateCount
-				attempt.topK = freshPlan.topK
-				attempt.loadSkew = freshPlan.loadSkew
+				attempt.selectionOrder = fallbackSelectionOrder
+				attempt.candidateCount = retryPlan.candidateCount
+				attempt.topK = retryPlan.topK
+				attempt.loadSkew = retryPlan.loadSkew
 			}
 		}
+	}
+	if acquireErr != nil && !deferAdmissionError {
+		attempt.err = acquireErr
 	}
 
 	return attempt
 }
 
+func (s *defaultOpenAIAccountScheduler) buildOpenAIEgressAdmissionOverflowOrder(
+	req OpenAIAccountScheduleRequest,
+	plan openAIAccountLoadPlan,
+) []openAIAccountCandidateScore {
+	if plan.includeOverflowFallback {
+		return plan.selectionOrder
+	}
+	expanded := plan
+	expanded.includeOverflowFallback = true
+	return s.buildOpenAISelectionOrder(req, expanded)
+}
+
+func openAISelectionHasLegacyCandidate(
+	ctx context.Context,
+	settings *SettingService,
+	selectionOrder []openAIAccountCandidateScore,
+) bool {
+	for _, candidate := range selectionOrder {
+		if candidate.account != nil && !accountUsesEnforcedEgressPool(ctx, settings, candidate.account) {
+			return true
+		}
+	}
+	return false
+}
+
+func openAIUnattemptedSelectionOrder(
+	selectionOrder []openAIAccountCandidateScore,
+	budget *openAISelectionProbeBudget,
+) []openAIAccountCandidateScore {
+	if budget == nil || len(selectionOrder) == 0 {
+		return selectionOrder
+	}
+	unattempted := make([]openAIAccountCandidateScore, 0, len(selectionOrder))
+	for _, candidate := range selectionOrder {
+		if candidate.account == nil || budget.wasAttempted(candidate.account.ID) {
+			continue
+		}
+		unattempted = append(unattempted, candidate)
+	}
+	return unattempted
+}
+
 func openAICostOverflowExpanded(req OpenAIAccountScheduleRequest, plan openAIAccountLoadPlan) bool {
-	if !plan.includeOverflowFallback || plan.topK <= 0 {
+	return plan.includeOverflowFallback && openAISelectionHasTopKOverflow(req, plan)
+}
+
+func openAISelectionHasTopKOverflow(req OpenAIAccountScheduleRequest, plan openAIAccountLoadPlan) bool {
+	if plan.topK <= 0 {
 		return false
 	}
 	if !req.RequireCompact {
@@ -1731,15 +1863,18 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 		return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, attempt.compactBlocked, filterStats.summary("selection_order_empty"))
 	}
 
-	if stickyFallback, stickyErr := s.tryFallbackToWeightedSticky(ctx, req); stickyErr != nil {
-		return nil, candidateCount, topK, loadSkew, stickyErr
+	var lastEgressAdmissionErr error
+	if stickyFallback, stickyErr := s.tryFallbackToWeightedSticky(ctx, req, budget); stickyErr != nil {
+		if !isAccountEgressAdmissionError(stickyErr) {
+			return nil, candidateCount, topK, loadSkew, stickyErr
+		}
+		lastEgressAdmissionErr = stickyErr
 	} else if stickyFallback != nil {
 		return stickyFallback, candidateCount, topK, loadSkew, nil
 	}
 
 	cfg := s.service.schedulingConfig()
 	compactBlocked := attempt.compactBlocked
-	var lastEgressAdmissionErr error
 	// WaitPlan.MaxConcurrency 使用 Concurrency（非 EffectiveLoadFactor），因为 WaitPlan 控制的是 Redis 实际并发槽位等待。
 	passes := 1
 	if budget != nil && budget.limited {
@@ -1760,6 +1895,9 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 					continue
 				}
 			}
+			if accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account) && budget.wasAttempted(candidate.account.ID) {
+				continue
+			}
 			fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 				continue
@@ -1779,7 +1917,16 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				continue
 			}
 			if accountUsesEnforcedEgressPool(ctx, s.service.settingService, fresh) {
-				result, acquireErr := s.service.tryAcquireAccountSlot(ctx, fresh)
+				if budget.wasAttempted(fresh.ID) {
+					continue
+				}
+				result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget)
+				if !attempted {
+					// The bounded admission probe budget is shared with the primary
+					// selection pass. Skip further egress probes once it is spent;
+					// legacy candidates later in the order may still produce a wait plan.
+					continue
+				}
 				if acquireErr == nil && result != nil && result.Acquired {
 					selection, selectErr := s.service.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 					return selection, candidateCount, topK, loadSkew, selectErr
@@ -2407,7 +2554,8 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 			// admission check. Persist the route only for ungated selections; the
 			// gated path binds after ProfitControlVetoLatest succeeds.
 			if !selection.ProfitGateActive() && selection.Acquired && selection.Account.SelectedEgress != nil {
-				_ = s.bindOpenAISessionEgressAffinity(ctx, groupID, sessionHash, selection.Account)
+				selectionCtx := ContextWithSelectionProfitGate(ctx, selection)
+				_ = s.bindOpenAISessionEgressAffinity(selectionCtx, groupID, sessionHash, selection.Account)
 			}
 			return selection, decision, nil
 		}

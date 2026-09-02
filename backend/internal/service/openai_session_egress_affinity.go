@@ -205,7 +205,7 @@ func (s *OpenAIGatewayService) bindOpenAISessionEgressAffinity(
 	account *Account,
 ) error {
 	if s == nil || s.cache == nil || account == nil || account.SelectedEgress == nil ||
-		strings.TrimSpace(sessionHash) == "" {
+		strings.TrimSpace(sessionHash) == "" || preserveOpenAISelectionStickyBinding(ctx) {
 		return nil
 	}
 	selected := account.SelectedEgress

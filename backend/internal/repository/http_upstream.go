@@ -227,10 +227,9 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 		return nil, err
 	}
-	s.recordOpenAIHTTP2Success(profile, entry.protocolMode, entry.proxyKey)
-
 	// 如果上游返回了压缩内容，解压后再交给业务层
 	decompressResponseBody(resp)
+	resp.Body = s.observeOpenAIHTTP2ResponseBody(req.Context(), resp.Body, profile, entry.protocolMode, entry.proxyKey)
 
 	// 包装响应体，在关闭时自动减少计数并更新时间戳
 	// 这确保了流式响应（如 SSE）在完全读取前不会被淘汰
@@ -1073,12 +1072,20 @@ func isOpenAIHTTP2CompatibilityError(err error) bool {
 	if isUpstreamTimeoutError(err) {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	if msg == "" {
 		return false
 	}
+	if msg == "unexpected eof" {
+		return true
+	}
 	markers := []string{
 		"alpn",
+		"client connection force closed",
+		"client connection lost",
 		"no application protocol",
 		"protocol error",
 		"stream error",
@@ -1216,6 +1223,65 @@ func (s *openAIHTTP2FallbackState) recordFailure(now time.Time, threshold int, w
 	s.windowStart = time.Time{}
 	s.errorCount = 0
 	return true, s.fallbackUntil
+}
+
+// observeOpenAIHTTP2ResponseBody delays the transport success signal until the
+// response body reaches a clean EOF. Receiving headers is not sufficient for a
+// streaming response: HTTP/2 proxy failures commonly surface only from Body.Read.
+func (s *httpUpstreamService) observeOpenAIHTTP2ResponseBody(
+	requestCtx context.Context,
+	body io.ReadCloser,
+	profile service.HTTPUpstreamProfile,
+	protocolMode string,
+	proxyKey string,
+) io.ReadCloser {
+	if profile != service.HTTPUpstreamProfileOpenAI ||
+		protocolMode != upstreamProtocolModeOpenAIH2 ||
+		!isHTTPProxyKey(proxyKey) {
+		return body
+	}
+	if body == nil {
+		s.recordOpenAIHTTP2Success(profile, protocolMode, proxyKey)
+		return nil
+	}
+	return &openAIHTTP2ObservedBody{
+		ReadCloser: body,
+		requestCtx: requestCtx,
+		onTerminal: func(err error) {
+			if errors.Is(err, io.EOF) {
+				s.recordOpenAIHTTP2Success(profile, protocolMode, proxyKey)
+				return
+			}
+			s.recordOpenAIHTTP2Failure(profile, protocolMode, proxyKey, err)
+		},
+	}
+}
+
+type openAIHTTP2ObservedBody struct {
+	io.ReadCloser
+	requestCtx context.Context
+	once       sync.Once
+	onTerminal func(error)
+}
+
+func (b *openAIHTTP2ObservedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == nil || openAIHTTP2BodyReadWasCanceled(b.requestCtx, err) {
+		return n, err
+	}
+	b.once.Do(func() {
+		if b.onTerminal != nil {
+			b.onTerminal(err)
+		}
+	})
+	return n, err
+}
+
+func openAIHTTP2BodyReadWasCanceled(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
 }
 
 // normalizeProxyURL 标准化代理 URL
