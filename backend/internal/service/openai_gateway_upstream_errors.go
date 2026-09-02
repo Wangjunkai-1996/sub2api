@@ -363,6 +363,10 @@ func (s *OpenAIGatewayService) newOpenAIAccountFailoverErrorWithClassificationHe
 
 const (
 	openAIUpstreamAccessUnavailableClientMessage = "Upstream access is temporarily unavailable, please retry later"
+	// OpenAIConversationSessionExpiredClientMessage is returned when the provider
+	// explicitly requires a new upstream session and the old continuation cannot
+	// be replayed safely.
+	OpenAIConversationSessionExpiredClientMessage = "The upstream conversation session has expired. Start a new conversation and resend the required context."
 	// OpenAIUpstreamAccessStateReason marks a provider credential whose
 	// account, workspace, or organization is unavailable.
 	OpenAIUpstreamAccessStateReason = GatewayFailureReason("openai_upstream_access_state")
@@ -370,6 +374,29 @@ const (
 	// preserve an official Responses HTTP continuation without dropping state.
 	OpenAIHTTPContinuationUnsupportedReason = GatewayFailureReason("openai_http_continuation_unsupported")
 )
+
+func newOpenAISessionBlockedFailoverError(statusCode int, responseHeaders http.Header, responseBody []byte) *UpstreamFailoverError {
+	if statusCode < http.StatusBadRequest {
+		statusCode = http.StatusForbidden
+	}
+	return &UpstreamFailoverError{
+		StatusCode:               statusCode,
+		ResponseBody:             responseBody,
+		ResponseHeaders:          responseHeaders.Clone(),
+		RetryableOnSameAccount:   false,
+		SafeToFailoverAfterWrite: true,
+		Stage:                    GatewayFailureStageInference,
+		Scope:                    GatewayFailureScopeSession,
+		Reason:                   OpenAISessionBlockedReason,
+		NextAccountAction:        NextAccountRetry,
+		ClientStatusCode:         http.StatusConflict,
+		ClientMessage:            OpenAIConversationSessionExpiredClientMessage,
+	}
+}
+
+func (e *UpstreamFailoverError) IsOpenAISessionBlocked() bool {
+	return e != nil && e.Reason == OpenAISessionBlockedReason && e.Scope == GatewayFailureScopeSession
+}
 
 // isOpenAIUpstreamAccessStateError recognizes provider-side credential state
 // failures only from explicit structured codes. Free-form messages may contain
@@ -487,9 +514,8 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 	body := s.readUpstreamErrorBody(resp)
 	body = s.redactAgentIdentitySensitiveBody(ctx, account, body)
 
-	// cyber_policy 硬阻断：透传上游原始错误体给客户端（不重包成通用 502），不冷却账号。
-	// 当前请求恒透传（需求1）；标记供 handler 事后写风控/邮件。400 cyber 不可 failover
-	// （shouldFailoverUpstreamError(400)=false），故走到此处即可安全早返回。
+	// 普通 cyber_policy 仍原样透传。只有明确要求开启新会话的 session-blocked
+	// 事件才在尚未写出客户端响应时返回类型化 failover，由 handler 决定能否安全重建。
 	if hit, code, cyberMsg := detectOpenAICyberPolicy(body); hit {
 		MarkOpsCyberPolicy(c, CyberPolicyMark{
 			Code:           code,
@@ -498,6 +524,19 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 			UpstreamStatus: resp.StatusCode,
 		})
 		setOpsUpstreamError(c, resp.StatusCode, cyberMsg, truncateString(string(body), 2048))
+		if isOpenAISessionBlockedCyberPolicyMessage(cyberMsg) {
+			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				AccountName:        account.Name,
+				UpstreamStatusCode: resp.StatusCode,
+				UpstreamRequestID:  resp.Header.Get("x-request-id"),
+				Kind:               "failover",
+				Message:            cyberMsg,
+				Detail:             truncateString(string(body), 2048),
+			})
+			return nil, newOpenAISessionBlockedFailoverError(resp.StatusCode, resp.Header, body)
+		}
 		writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 		contentType := resp.Header.Get("Content-Type")
 		if contentType == "" {

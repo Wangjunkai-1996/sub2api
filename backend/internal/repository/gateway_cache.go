@@ -70,6 +70,36 @@ func (c *gatewayCache) DeleteSessionAccountID(ctx context.Context, groupID int64
 	return c.rdb.Del(ctx, key).Err()
 }
 
+var compareAndDeleteSessionAccountIDScript = redis.NewScript(`
+local current = redis.call('GET', KEYS[1])
+if current == false or current ~= ARGV[1] then
+  return 0
+end
+redis.call('DEL', KEYS[1])
+return 1
+`)
+
+func (c *gatewayCache) CompareAndDeleteSessionAccountID(
+	ctx context.Context,
+	groupID int64,
+	sessionHash string,
+	expectedAccountID int64,
+) (bool, error) {
+	if c == nil || c.rdb == nil || strings.TrimSpace(sessionHash) == "" || expectedAccountID <= 0 {
+		return false, nil
+	}
+	deleted, err := compareAndDeleteSessionAccountIDScript.Run(
+		ctx,
+		c.rdb,
+		[]string{buildSessionKey(groupID, sessionHash)},
+		strconv.FormatInt(expectedAccountID, 10),
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+	return deleted == 1, nil
+}
+
 var claimOpenAIResponsesSessionWindowScript = redis.NewScript(`
 local previous = redis.call('GET', KEYS[1])
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])

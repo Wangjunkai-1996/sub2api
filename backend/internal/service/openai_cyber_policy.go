@@ -91,3 +91,36 @@ func detectOpenAICyberPolicy(payload []byte) (bool, string, string) {
 	}
 	return true, "cyber_policy", strings.TrimSpace(msg)
 }
+
+// OpenAISessionBlockedReason distinguishes a permanently invalid upstream
+// conversation from an ordinary request-level cyber-policy rejection.
+const OpenAISessionBlockedReason = GatewayFailureReason("openai_session_blocked")
+
+func isOpenAISessionBlockedCyberPolicyMessage(message string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	if normalized == "" {
+		return false
+	}
+
+	englishSessionBlocked := strings.Contains(normalized, "session") &&
+		(strings.Contains(normalized, "blocked") || strings.Contains(normalized, "disabled"))
+	englishCyberPolicy := strings.Contains(normalized, "cyber-security policy") ||
+		strings.Contains(normalized, "cyber security policy") ||
+		strings.Contains(normalized, "cybersecurity policy")
+	englishNewSession := strings.Contains(normalized, "start a new session") ||
+		strings.Contains(normalized, "create a new session") ||
+		strings.Contains(normalized, "begin a new session")
+	if englishSessionBlocked && englishCyberPolicy && englishNewSession {
+		return true
+	}
+
+	chineseSessionBlocked := strings.Contains(normalized, "会话") &&
+		(strings.Contains(normalized, "屏蔽") || strings.Contains(normalized, "封禁") ||
+			strings.Contains(normalized, "阻止") || strings.Contains(normalized, "拦截"))
+	return chineseSessionBlocked && strings.Contains(normalized, "网络安全策略") && strings.Contains(normalized, "新会话")
+}
+
+func isOpenAISessionBlockedCyberPolicy(payload []byte) bool {
+	hit, _, message := detectOpenAICyberPolicy(payload)
+	return hit && isOpenAISessionBlockedCyberPolicyMessage(message)
+}

@@ -502,6 +502,13 @@ type GatewayCache interface {
 	GetReasoningContent(ctx context.Context, itemID string) (string, error)
 }
 
+// GatewaySessionBindingCompareDeleter is an optional GatewayCache capability
+// used when invalidating an upstream continuation. Production Redis implements
+// the comparison atomically so an older request cannot delete a newer binding.
+type GatewaySessionBindingCompareDeleter interface {
+	CompareAndDeleteSessionAccountID(ctx context.Context, groupID int64, sessionHash string, expectedAccountID int64) (bool, error)
+}
+
 // derefGroupID safely dereferences *int64 to int64, returning 0 if nil
 func derefGroupID(groupID *int64) int64 {
 	if groupID == nil {
@@ -658,6 +665,7 @@ const (
 	GatewayFailureScopeAccount  GatewayFailureScope = "account"
 	GatewayFailureScopeProvider GatewayFailureScope = "provider"
 	GatewayFailureScopeRequest  GatewayFailureScope = "request"
+	GatewayFailureScopeSession  GatewayFailureScope = "session"
 )
 
 // NextAccountAction is tri-state for backwards compatibility. The zero value
@@ -714,6 +722,9 @@ func (e *UpstreamFailoverError) IsCredentialFailure() bool {
 // and inference failures retain their existing scheduler-health behavior.
 func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	if e == nil {
+		return false
+	}
+	if e.Scope == GatewayFailureScopeSession {
 		return false
 	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount

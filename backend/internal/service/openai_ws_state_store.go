@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -22,6 +23,8 @@ const (
 	openAIWSSessionEgressRouteCachePrefix   = "openai:session:egress-route:"
 	openAIHTTPResponseOwnerUserPrefix       = "openai:http-response-owner:user:"
 	openAIHTTPResponseOwnerKeyPrefix        = "openai:http-response-owner:key:"
+	openAIHTTPResponseInvalidCachePrefix    = "openai:http-response-invalid:"
+	openAIHTTPResponseInvalidSessionBlocked = int64(1)
 	openAIWSStateStoreCleanupInterval       = time.Minute
 	openAIWSStateStoreCleanupMaxPerMap      = 512
 	openAIWSStateStoreMaxEntriesPerMap      = 65536
@@ -36,6 +39,11 @@ type openAIWSAccountBinding struct {
 type openAIHTTPResponseOwnerBinding struct {
 	userID    int64
 	apiKeyID  int64
+	expiresAt time.Time
+}
+
+type openAIHTTPResponseInvalidBinding struct {
+	reason    GatewayFailureReason
 	expiresAt time.Time
 }
 
@@ -85,6 +93,14 @@ type OpenAIWSStateStore interface {
 	DeleteSessionConn(groupID int64, sessionHash string)
 }
 
+// openAIHTTPResponseInvalidStateStore is additive so custom WS state stores do
+// not need to implement HTTP continuation invalidation unless they participate
+// in session-blocked recovery.
+type openAIHTTPResponseInvalidStateStore interface {
+	MarkHTTPResponseInvalid(ctx context.Context, groupID int64, responseID string, reason GatewayFailureReason, ttl time.Duration) error
+	GetHTTPResponseInvalidReason(ctx context.Context, groupID int64, responseID string) (GatewayFailureReason, bool, error)
+}
+
 type defaultOpenAIWSStateStore struct {
 	cache GatewayCache
 
@@ -92,6 +108,8 @@ type defaultOpenAIWSStateStore struct {
 	responseToAccount    map[string]openAIWSAccountBinding
 	responseOwnerMu      sync.RWMutex
 	responseOwners       map[string]openAIHTTPResponseOwnerBinding
+	responseInvalidMu    sync.RWMutex
+	responseInvalid      map[string]openAIHTTPResponseInvalidBinding
 	responseToConnMu     sync.RWMutex
 	responseToConn       map[string]openAIWSConnBinding
 	responseToEgressMu   sync.RWMutex
@@ -112,6 +130,7 @@ func NewOpenAIWSStateStore(cache GatewayCache) OpenAIWSStateStore {
 		cache:              cache,
 		responseToAccount:  make(map[string]openAIWSAccountBinding, 256),
 		responseOwners:     make(map[string]openAIHTTPResponseOwnerBinding, 256),
+		responseInvalid:    make(map[string]openAIHTTPResponseInvalidBinding, 256),
 		responseToConn:     make(map[string]openAIWSConnBinding, 256),
 		responseToEgress:   make(map[string]openAIWSEgressBinding, 256),
 		sessionToTurnState: make(map[string]openAIWSTurnStateBinding, 256),
@@ -120,6 +139,88 @@ func NewOpenAIWSStateStore(cache GatewayCache) OpenAIWSStateStore {
 	}
 	store.lastCleanupUnixNano.Store(time.Now().UnixNano())
 	return store
+}
+
+func (s *defaultOpenAIWSStateStore) MarkHTTPResponseInvalid(
+	ctx context.Context,
+	groupID int64,
+	responseID string,
+	reason GatewayFailureReason,
+	ttl time.Duration,
+) error {
+	id := normalizeOpenAIWSResponseID(responseID)
+	if id == "" || reason == "" {
+		return nil
+	}
+	if reason != OpenAISessionBlockedReason {
+		return fmt.Errorf("unsupported OpenAI response invalidation reason %q", reason)
+	}
+	ttl = normalizeOpenAIWSTTL(ttl)
+	s.maybeCleanup()
+
+	mapKey := openAIWSResponseAccountMapKey(groupID, id)
+	s.responseInvalidMu.Lock()
+	ensureBindingCapacity(s.responseInvalid, mapKey, openAIWSStateStoreMaxEntriesPerMap)
+	s.responseInvalid[mapKey] = openAIHTTPResponseInvalidBinding{reason: reason, expiresAt: time.Now().Add(ttl)}
+	s.responseInvalidMu.Unlock()
+
+	if s.cache == nil {
+		return nil
+	}
+	cacheCtx, cancel := withOpenAIWSStateStoreDetachedRedisTimeout(ctx)
+	defer cancel()
+	return s.cache.SetSessionAccountID(
+		cacheCtx,
+		groupID,
+		openAIHTTPResponseInvalidCacheKey(id),
+		openAIHTTPResponseInvalidSessionBlocked,
+		ttl,
+	)
+}
+
+func (s *defaultOpenAIWSStateStore) GetHTTPResponseInvalidReason(
+	ctx context.Context,
+	groupID int64,
+	responseID string,
+) (GatewayFailureReason, bool, error) {
+	id := normalizeOpenAIWSResponseID(responseID)
+	if id == "" {
+		return "", false, nil
+	}
+	s.maybeCleanup()
+
+	now := time.Now()
+	mapKey := openAIWSResponseAccountMapKey(groupID, id)
+	s.responseInvalidMu.RLock()
+	binding, ok := s.responseInvalid[mapKey]
+	s.responseInvalidMu.RUnlock()
+	if ok && now.Before(binding.expiresAt) && binding.reason != "" {
+		return binding.reason, true, nil
+	}
+
+	if s.cache == nil {
+		return "", false, nil
+	}
+	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	defer cancel()
+	marker, err := s.cache.GetSessionAccountID(cacheCtx, groupID, openAIHTTPResponseInvalidCacheKey(id))
+	if err != nil {
+		if errors.Is(err, ErrStickySessionNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if marker != openAIHTTPResponseInvalidSessionBlocked {
+		return "", false, fmt.Errorf("unknown OpenAI response invalidation marker %d", marker)
+	}
+
+	s.responseInvalidMu.Lock()
+	ensureBindingCapacity(s.responseInvalid, mapKey, openAIWSStateStoreMaxEntriesPerMap)
+	s.responseInvalid[mapKey] = openAIHTTPResponseInvalidBinding{
+		reason: OpenAISessionBlockedReason, expiresAt: now.Add(time.Minute),
+	}
+	s.responseInvalidMu.Unlock()
+	return OpenAISessionBlockedReason, true, nil
 }
 
 func (s *defaultOpenAIWSStateStore) BindHTTPResponseOwner(ctx context.Context, groupID int64, responseID string, userID, apiKeyID int64, ttl time.Duration) error {
@@ -273,7 +374,7 @@ func (s *defaultOpenAIWSStateStore) DeleteResponseAccount(ctx context.Context, g
 	// The route binding has the same lifetime as the response owner. Clear the
 	// local and Redis route fence together so a later account re-selection cannot
 	// accidentally inherit the old egress.
-	s.deleteResponseEgressLocal(id)
+	s.deleteResponseEgressLocal(groupID, id)
 
 	if s.cache == nil {
 		return nil
@@ -347,9 +448,10 @@ func (s *defaultOpenAIWSStateStore) BindResponseEgress(
 	}
 	ttl = normalizeOpenAIWSTTL(ttl)
 	s.maybeCleanup()
+	mapKey := openAIWSResponseAccountMapKey(groupID, id)
 	s.responseToEgressMu.Lock()
-	ensureBindingCapacity(s.responseToEgress, id, openAIWSStateStoreMaxEntriesPerMap)
-	s.responseToEgress[id] = openAIWSEgressBinding{bindingID: bindingID, expiresAt: time.Now().Add(ttl)}
+	ensureBindingCapacity(s.responseToEgress, mapKey, openAIWSStateStoreMaxEntriesPerMap)
+	s.responseToEgress[mapKey] = openAIWSEgressBinding{bindingID: bindingID, expiresAt: time.Now().Add(ttl)}
 	s.responseToEgressMu.Unlock()
 
 	if s.cache == nil {
@@ -373,8 +475,9 @@ func (s *defaultOpenAIWSStateStore) GetResponseEgress(ctx context.Context, group
 	}
 	s.maybeCleanup()
 	now := time.Now()
+	mapKey := openAIWSResponseAccountMapKey(groupID, id)
 	s.responseToEgressMu.RLock()
-	binding, ok := s.responseToEgress[id]
+	binding, ok := s.responseToEgress[mapKey]
 	s.responseToEgressMu.RUnlock()
 	if ok && now.Before(binding.expiresAt) && strings.TrimSpace(binding.bindingID) != "" {
 		return binding.bindingID, true
@@ -394,19 +497,20 @@ func (s *defaultOpenAIWSStateStore) GetResponseEgress(ctx context.Context, group
 	}
 	bindingID := StableAccountEgressBindingID(accountID, routeID)
 	s.responseToEgressMu.Lock()
-	ensureBindingCapacity(s.responseToEgress, id, openAIWSStateStoreMaxEntriesPerMap)
-	s.responseToEgress[id] = openAIWSEgressBinding{bindingID: bindingID, expiresAt: now.Add(time.Minute)}
+	ensureBindingCapacity(s.responseToEgress, mapKey, openAIWSStateStoreMaxEntriesPerMap)
+	s.responseToEgress[mapKey] = openAIWSEgressBinding{bindingID: bindingID, expiresAt: now.Add(time.Minute)}
 	s.responseToEgressMu.Unlock()
 	return bindingID, true
 }
 
-func (s *defaultOpenAIWSStateStore) deleteResponseEgressLocal(responseID string) {
+func (s *defaultOpenAIWSStateStore) deleteResponseEgressLocal(groupID int64, responseID string) {
 	id := normalizeOpenAIWSResponseID(responseID)
 	if id == "" {
 		return
 	}
+	mapKey := openAIWSResponseAccountMapKey(groupID, id)
 	s.responseToEgressMu.Lock()
-	delete(s.responseToEgress, id)
+	delete(s.responseToEgress, mapKey)
 	s.responseToEgressMu.Unlock()
 }
 
@@ -654,6 +758,10 @@ func (s *defaultOpenAIWSStateStore) maybeCleanup() {
 	cleanupExpiredHTTPResponseOwnerBindings(s.responseOwners, now, openAIWSStateStoreCleanupMaxPerMap)
 	s.responseOwnerMu.Unlock()
 
+	s.responseInvalidMu.Lock()
+	cleanupExpiredHTTPResponseInvalidBindings(s.responseInvalid, now, openAIWSStateStoreCleanupMaxPerMap)
+	s.responseInvalidMu.Unlock()
+
 	s.responseToConnMu.Lock()
 	cleanupExpiredConnBindings(s.responseToConn, now, openAIWSStateStoreCleanupMaxPerMap)
 	s.responseToConnMu.Unlock()
@@ -673,6 +781,22 @@ func (s *defaultOpenAIWSStateStore) maybeCleanup() {
 	s.sessionToEgressMu.Lock()
 	cleanupExpiredEgressBindings(s.sessionToEgress, now, openAIWSStateStoreCleanupMaxPerMap)
 	s.sessionToEgressMu.Unlock()
+}
+
+func cleanupExpiredHTTPResponseInvalidBindings(bindings map[string]openAIHTTPResponseInvalidBinding, now time.Time, maxScan int) {
+	if len(bindings) == 0 || maxScan <= 0 {
+		return
+	}
+	scanned := 0
+	for key, binding := range bindings {
+		if now.After(binding.expiresAt) {
+			delete(bindings, key)
+		}
+		scanned++
+		if scanned >= maxScan {
+			break
+		}
+	}
 }
 
 func cleanupExpiredAccountBindings(bindings map[string]openAIWSAccountBinding, now time.Time, maxScan int) {
@@ -802,6 +926,10 @@ func openAIWSResponseAccountCacheKey(responseID string) string {
 func openAIHTTPResponseOwnerCacheKey(prefix, responseID string) string {
 	sum := sha256.Sum256([]byte(responseID))
 	return prefix + hex.EncodeToString(sum[:])
+}
+
+func openAIHTTPResponseInvalidCacheKey(responseID string) string {
+	return openAIHTTPResponseOwnerCacheKey(openAIHTTPResponseInvalidCachePrefix, responseID)
 }
 
 // openAIWSResponseAccountMapKey 本地热缓存按分组隔离的 key，与 Redis 层保持一致，避免跨组命中。

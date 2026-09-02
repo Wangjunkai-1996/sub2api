@@ -182,8 +182,8 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 ) (*http.Response, error) {
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
-	releaseUpstreamCtx()
 	if err != nil {
+		releaseUpstreamCtx()
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
 	upstreamReq = upstreamReq.WithContext(WithHTTPUpstreamProfile(upstreamReq.Context(), HTTPUpstreamProfileOpenAI))
@@ -224,7 +224,22 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		releaseUpstreamCtx()
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	}
+	if resp == nil || resp.Body == nil {
+		releaseUpstreamCtx()
+		return resp, nil
+	}
+	// The response is consumed by the caller (including streaming fallbacks), so
+	// keep the detached context alive until that body is closed. Releasing it
+	// when this helper returns would cancel the request before the first chunk.
+	resp.Body = &openAIRequestContextReadCloser{
+		ReadCloser: resp.Body,
+		cleanup:    releaseUpstreamCtx,
 	}
 	return resp, nil
 }

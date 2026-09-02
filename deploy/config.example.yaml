@@ -217,15 +217,18 @@ gateway:
   # Grok text Responses first-byte timeout (seconds, 0=disabled; default 120)
   # Grok 文本 Responses 首字节超时时间（秒，0=禁用；默认 120）
   grok_response_header_timeout: 120
-  # Native OpenAI HTTP Responses first semantic output timeout (seconds, 0=disabled)
+  # Native OpenAI HTTP Responses first semantic output timeout (seconds, 0=disabled; default 120)
   # Includes response-header wait; does not apply to passthrough or WebSocket transports.
   # A timed-out request may already have incurred upstream usage; account failover can therefore duplicate upstream billing.
   # 超时请求可能已产生上游用量；切换账号重试可能导致上游重复计费。
   # Pre-output attempt staging is capped at 8 MiB; overflow fails over without exposing partial SSE data.
   # 首次输出前的单次尝试暂存上限为 8 MiB；溢出时切号且不暴露不完整 SSE 数据。
-  openai_first_output_timeout_seconds: 0
-  # Optional high/xhigh/max override (seconds, 0=use the standard timeout)
-  openai_high_effort_first_output_timeout_seconds: 0
+  openai_first_output_timeout_seconds: 120
+  # Optional high/xhigh/max override (seconds, 0=use the standard timeout; default 240)
+  openai_high_effort_first_output_timeout_seconds: 240
+  # End-to-end budget shared by queueing, upstream attempts, and retries (seconds; default 300).
+  # Must remain below the downstream gateway timeout so Sub2API can emit a terminal response.failed.
+  openai_request_budget_seconds: 300
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456

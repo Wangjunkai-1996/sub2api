@@ -947,7 +947,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, reqStream, promptCacheKey, isCodexCLI)
 		if headerGuard == nil {
-			releaseUpstreamCtx()
+			// The request context must remain live until the response body has been
+			// consumed. Header-guard attempts own this release themselves.
+			defer releaseUpstreamCtx()
 		}
 		if err != nil {
 			if headerGuard != nil {

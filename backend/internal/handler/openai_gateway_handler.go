@@ -92,7 +92,14 @@ type grokMediaEligibilityProber interface {
 	ProbeMediaEligibility(ctx context.Context, accountID int64) (bool, string, error)
 }
 
-const maxOpenAIFirstOutputTimeoutSwitches = 1
+const (
+	maxOpenAIFirstOutputTimeoutSwitches = 1
+	maxOpenAISessionBlockedRecoveries   = 1
+	defaultOpenAIRequestBudget          = 300 * time.Second
+	minOpenAIRetryAttemptRemaining      = 30 * time.Second
+	openAIRequestBudgetDeadlineKey      = "openai_request_budget_deadline"
+	openAIRequestBudgetResponseKey      = "openai_request_budget_response_written"
+)
 
 func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bool {
 	return result.SucceededForScheduling()
@@ -306,6 +313,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	setOpenAIClientTransportHTTP(c)
 
 	requestStart := time.Now()
+	releaseRequestBudget := h.beginOpenAIResponsesRequestBudget(c, requestStart)
+	defer releaseRequestBudget()
 
 	// Get apiKey and user from context (set by ApiKeyAuth middleware)
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
@@ -433,6 +442,27 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "previous_response_id is not available for this user")
 			return
 		}
+		invalidReason, invalidErr := h.gatewayService.GetOpenAIHTTPContinuationInvalidReason(
+			c.Request.Context(), groupID, previousResponseID,
+		)
+		if invalidErr != nil {
+			reqLog.Warn("openai.previous_response_invalid_state_lookup_failed", zap.Error(invalidErr))
+			h.errorResponse(c, http.StatusServiceUnavailable, "session_state_unavailable", "Conversation session state is temporarily unavailable")
+			return
+		}
+		if invalidReason != "" {
+			reqLog.Warn("openai.request_validation_failed",
+				zap.String("reason", "previous_response_invalidated"),
+				zap.String("invalidation_reason", string(invalidReason)),
+			)
+			h.errorResponse(
+				c,
+				http.StatusConflict,
+				"conversation_session_expired",
+				service.OpenAIConversationSessionExpiredClientMessage,
+			)
+			return
+		}
 	}
 	service.SetOpenAIHTTPResponseOwner(c, subject.UserID, apiKey.ID)
 
@@ -521,6 +551,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	firstOutputTimeoutSwitchCount := 0
+	sessionBlockedRecoveryCount := 0
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
@@ -544,6 +575,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	c.Request = c.Request.WithContext(pricingCtx)
 
 	for {
+		if openAIRequestBudgetShouldStop(c) {
+			h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+			return
+		}
 		// Streaming Forward intentionally detaches the upstream request so usage can
 		// be drained after a disconnect. Re-check the client context before every
 		// account attempt so a canceled request never starts a failover replay.
@@ -567,6 +602,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
+			if openAIRequestBudgetShouldStop(c) {
+				h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+				return
+			}
 			if failoverClientGone(c) {
 				reqLog.Info("openai.account_select_aborted_client_disconnected", zap.Error(err))
 				return
@@ -686,6 +725,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			)
 			return
 		}
+		if openAIRequestBudgetShouldStop(c) {
+			releaseAccount()
+			h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+			return
+		}
 
 		// Forward request
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
@@ -757,6 +801,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			})
 		}
 		if err != nil {
+			if openAIRequestBudgetExpired(c) {
+				submitResponsesUsage(result)
+				h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
+				return
+			}
 			if result != nil && result.ImageCount > 0 {
 				reqLog.Warn("openai.forward_partial_error_with_image_result",
 					zap.Int64("account_id", account.ID),
@@ -766,6 +815,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			} else {
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
+					if openAIRequestBudgetShouldStop(c) {
+						h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
+						return
+					}
 					if failoverClientGone(c) {
 						reqLog.Info("openai.failover_aborted_client_disconnected",
 							zap.Int64("account_id", account.ID),
@@ -790,6 +843,58 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					if failoverErr.IsOpenAISessionBlocked() {
+						hadPreviousResponseID := previousResponseID != ""
+						groupID := int64(0)
+						if apiKey.GroupID != nil {
+							groupID = *apiKey.GroupID
+						}
+						stateErr := h.gatewayService.InvalidateOpenAIHTTPContinuation(
+							c.Request.Context(), c, groupID, previousResponseID, sessionHash, account.ID,
+						)
+						if stateErr != nil {
+							reqLog.Warn("openai.session_blocked_recovery_state_failed",
+								zap.Int64("account_id", account.ID),
+								zap.Error(stateErr),
+							)
+							h.handleStreamingAwareError(
+								c,
+								http.StatusServiceUnavailable,
+								"session_state_unavailable",
+								"Conversation session state is temporarily unavailable",
+								streamStarted,
+							)
+							return
+						}
+
+						toolCoverage := service.AnalyzeToolCallOutputContextCoverageBytes(forwardBody)
+						recoverable := !toolCoverage.HasFunctionCallOutput || toolCoverage.ContextCoversAllCallIDs
+						if sessionBlockedRecoveryCount >= maxOpenAISessionBlockedRecoveries || !recoverable {
+							h.handleFailoverExhausted(c, failoverErr, streamStarted)
+							return
+						}
+
+						forwardBody = service.RemovePreviousResponseIDFromBody(forwardBody)
+						if gjson.GetBytes(forwardBody, "previous_response_id").Exists() {
+							h.handleStreamingAwareError(
+								c,
+								http.StatusServiceUnavailable,
+								"session_state_unavailable",
+								"Conversation session state could not be reset safely",
+								streamStarted,
+							)
+							return
+						}
+						previousResponseID = ""
+						sessionBlockedRecoveryCount++
+						service.ClearOpsCyberPolicy(c)
+						reqLog.Warn("openai.session_blocked_recovery",
+							zap.Int64("account_id", account.ID),
+							zap.Int("recovery_count", sessionBlockedRecoveryCount),
+							zap.Bool("previous_response_id_removed", hadPreviousResponseID),
+							zap.Bool("tool_context_rebuilt", toolCoverage.HasFunctionCallOutput),
+						)
+					}
 					// 池模式：同账号重试
 					if failoverErr.RetryableOnSameAccount {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
@@ -805,6 +910,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 							)
 							select {
 							case <-c.Request.Context().Done():
+								if openAIRequestBudgetExpired(c) {
+									h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+								}
 								return
 							case <-time.After(retryDelay):
 							}
@@ -2863,6 +2971,18 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		)
 		return
 	}
+	if failoverErr.IsOpenAISessionBlocked() {
+		status := failoverErr.ClientStatusCode
+		if status <= 0 {
+			status = http.StatusConflict
+		}
+		message := strings.TrimSpace(failoverErr.ClientMessage)
+		if message == "" {
+			message = service.OpenAIConversationSessionExpiredClientMessage
+		}
+		h.handleStreamingAwareError(c, status, "conversation_session_expired", message, streamStarted)
+		return
+	}
 	if failoverErr.Reason == service.OpenAIHTTPContinuationUnsupportedReason {
 		message := strings.TrimSpace(failoverErr.ClientMessage)
 		if message == "" {
@@ -3167,6 +3287,53 @@ func openAIForwardMayFailover(c *gin.Context, writerSizeBeforeForward int, failo
 	return failoverErr != nil && failoverErr.SafeToFailoverAfterWrite
 }
 
+func (h *OpenAIGatewayHandler) beginOpenAIResponsesRequestBudget(c *gin.Context, startedAt time.Time) context.CancelFunc {
+	if c == nil || c.Request == nil {
+		return func() {}
+	}
+	budget := defaultOpenAIRequestBudget
+	if h != nil && h.cfg != nil && h.cfg.Gateway.OpenAIRequestBudgetSeconds > 0 {
+		budget = time.Duration(h.cfg.Gateway.OpenAIRequestBudgetSeconds) * time.Second
+	}
+	deadline := startedAt.Add(budget)
+	requestCtx, cancel := context.WithDeadline(c.Request.Context(), deadline)
+	c.Request = c.Request.WithContext(requestCtx)
+	c.Set(openAIRequestBudgetDeadlineKey, deadline)
+	return cancel
+}
+
+func openAIRequestBudgetDeadline(c *gin.Context) (time.Time, bool) {
+	if c == nil {
+		return time.Time{}, false
+	}
+	raw, ok := c.Get(openAIRequestBudgetDeadlineKey)
+	if !ok {
+		return time.Time{}, false
+	}
+	deadline, ok := raw.(time.Time)
+	return deadline, ok && !deadline.IsZero()
+}
+
+func openAIRequestBudgetExpired(c *gin.Context) bool {
+	deadline, ok := openAIRequestBudgetDeadline(c)
+	return ok && time.Until(deadline) <= 0
+}
+
+func openAIRequestBudgetShouldStop(c *gin.Context) bool {
+	deadline, ok := openAIRequestBudgetDeadline(c)
+	return ok && time.Until(deadline) < minOpenAIRetryAttemptRemaining
+}
+
+func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context, streamStarted bool) {
+	if c == nil || c.GetBool(openAIRequestBudgetResponseKey) {
+		return
+	}
+	c.Set(openAIRequestBudgetResponseKey, true)
+	const message = "The request could not complete within the upstream time budget"
+	service.SetOpsUpstreamError(c, http.StatusGatewayTimeout, message, "")
+	h.handleStreamingAwareError(c, http.StatusGatewayTimeout, "request_timeout", message, streamStarted)
+}
+
 func openAIRequestAllowsFailoverReplay(c *gin.Context) bool {
 	if c == nil || c.Request == nil {
 		return false
@@ -3175,7 +3342,7 @@ func openAIRequestAllowsFailoverReplay(c *gin.Context) bool {
 }
 
 func openAIFirstOutputFailoverExhausted(failoverErr *service.UpstreamFailoverError, switchCount *int) bool {
-	if failoverErr == nil || !failoverErr.SafeToFailoverAfterWrite || failoverErr.RequestScopedTransient || switchCount == nil {
+	if failoverErr == nil || failoverErr.IsOpenAISessionBlocked() || !failoverErr.SafeToFailoverAfterWrite || failoverErr.RequestScopedTransient || switchCount == nil {
 		return false
 	}
 	if *switchCount >= maxOpenAIFirstOutputTimeoutSwitches {

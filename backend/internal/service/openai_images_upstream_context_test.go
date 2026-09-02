@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -133,6 +134,20 @@ func TestDetachUpstreamContextSemantics(t *testing.T) {
 		detached, release := detachUpstreamContext(ctx)
 		defer release()
 		require.NoError(t, detached.Err())
+	})
+
+	t.Run("detachUpstreamContext_preserves_deadline_without_parent_cancel", func(t *testing.T) {
+		parent, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		detached, release := detachUpstreamContext(parent)
+		defer release()
+
+		deadline, ok := detached.Deadline()
+		require.True(t, ok)
+		require.WithinDuration(t, time.Now().Add(time.Minute), deadline, 2*time.Second)
+
+		cancel()
+		require.NoError(t, detached.Err(), "client cancellation must not cancel the detached request")
 	})
 
 	t.Run("detachStreamUpstreamContext_keeps_cancel_when_not_streaming", func(t *testing.T) {
