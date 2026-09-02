@@ -27,7 +27,13 @@ func NewEgressRouteHandler(egressService *service.EgressService) *EgressRouteHan
 // GET /api/v1/admin/egress-routes/assignable
 func (h *EgressRouteHandler) ListAssignable(c *gin.Context) {
 	if h == nil || h.egressService == nil {
-		response.ErrorFrom(c, service.ErrEgressRouteInvalid)
+		response.Success(c, dto.AssignableEgressRouteCatalog{
+			Items: []dto.AssignableEgressRoute{},
+			Capabilities: dto.AccountEgressCatalogCapabilities{
+				MutationEnabled: false,
+				ReasonCode:      accountEgressMutationFrozenReason,
+			},
+		})
 		return
 	}
 	routes, err := h.egressService.ListAssignableRoutes(c.Request.Context())
@@ -41,7 +47,12 @@ func (h *EgressRouteHandler) ListAssignable(c *gin.Context) {
 			out = append(out, *item)
 		}
 	}
-	response.Success(c, out)
+	response.Success(c, dto.AssignableEgressRouteCatalog{
+		Items: out,
+		Capabilities: dto.AccountEgressCatalogCapabilities{
+			MutationEnabled: true,
+		},
+	})
 }
 
 type verifyEgressRoutesRequest struct {
@@ -74,7 +85,7 @@ func (h *EgressRouteHandler) Verify(c *gin.Context) {
 		seen[routeID] = struct{}{}
 	}
 	if h == nil || h.egressService == nil {
-		response.ErrorFrom(c, service.ErrEgressRouteInvalid)
+		response.ErrorFrom(c, errAccountEgressMutationFrozen)
 		return
 	}
 
@@ -127,7 +138,7 @@ func (h *EgressRouteHandler) ConfirmIdentity(c *gin.Context) {
 		return
 	}
 	if h == nil || h.egressService == nil {
-		response.ErrorFrom(c, service.ErrEgressRouteInvalid)
+		response.ErrorFrom(c, errAccountEgressMutationFrozen)
 		return
 	}
 	route, err := h.egressService.ConfirmIdentity(c.Request.Context(), service.ConfirmEgressIdentityInput{

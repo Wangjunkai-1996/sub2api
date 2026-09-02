@@ -1061,6 +1061,7 @@ export default {
           persistence_failed: '验证结果保存失败',
           request_canceled: '验证已取消或超时',
           pending_verification: '尚未完成验证',
+          verification_stale: '验证结果已过期，请重新验证出口',
           route_inactive: '出口已停用',
           route_expired: '出口已过期',
           identity_mismatch: '公网 IP 与已确认身份不一致',

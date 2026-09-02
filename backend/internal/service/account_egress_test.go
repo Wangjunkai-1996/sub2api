@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -62,6 +63,7 @@ func TestAccountEgressRuntimeRejectsInactiveOrExpiredProxy(t *testing.T) {
 
 func TestAccountEgressRuntimeAcceptsRedactedSchedulerProxy(t *testing.T) {
 	proxyID := int64(9)
+	verifiedAt := time.Now()
 	account := &Account{
 		ID:          27,
 		Platform:    PlatformOpenAI,
@@ -79,6 +81,7 @@ func TestAccountEgressRuntimeAcceptsRedactedSchedulerProxy(t *testing.T) {
 				Kind:             EgressRouteKindProxy,
 				ProxyID:          &proxyID,
 				State:            EgressRouteStateActive,
+				VerifiedAt:       &verifiedAt,
 				ExpectedIdentity: &EgressIdentity{ID: 5, Status: EgressIdentityStatusActive},
 				// Scheduler cache projections omit Proxy credentials.
 			},
@@ -90,6 +93,87 @@ func TestAccountEgressRuntimeAcceptsRedactedSchedulerProxy(t *testing.T) {
 	require.Len(t, config.Candidates, 1)
 	require.True(t, config.Candidates[0].Healthy)
 	require.Equal(t, 4, config.EffectiveCapacity())
+}
+
+func TestAccountEgressRuntimeRequiresFreshVerifiedRoute(t *testing.T) {
+	now := time.Now()
+	proxyID := int64(9)
+	for _, test := range []struct {
+		name        string
+		verifiedAt  *time.Time
+		wantHealthy bool
+	}{
+		{name: "missing"},
+		{name: "stale", verifiedAt: timePointer(now.Add(-EgressIdentityFreshness - time.Second))},
+		{name: "small future skew", verifiedAt: timePointer(now.Add(30 * time.Second)), wantHealthy: true},
+		{name: "far future", verifiedAt: timePointer(now.Add(accountEgressVerifiedAtFutureSkew + time.Second))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			account := &Account{
+				ID: 28, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+				EgressMode: EgressModePool, EgressRevision: 1, Concurrency: 1,
+				EgressBindings: []AccountEgressBinding{{
+					BindingID: StableAccountEgressBindingID(28, 45), AccountID: 28, RouteID: 45,
+					IsPrimary: true, Status: AccountEgressBindingStatusActive,
+					Route: &EgressRoute{
+						ID: 45, Kind: EgressRouteKindProxy, ProxyID: &proxyID,
+						State: EgressRouteStateActive, VerifiedAt: test.verifiedAt,
+						ExpectedIdentity: &EgressIdentity{ID: 6, Status: EgressIdentityStatusActive},
+					},
+				}},
+			}
+			config, err := AccountEgressPoolConfigForRuntime(account, 0)
+			require.NoError(t, err)
+			require.Equal(t, test.wantHealthy, config.Candidates[0].Healthy)
+		})
+	}
+}
+
+func TestResolvedAccountEgressBindingRejectsSaturatedVersionAuthorityMismatch(t *testing.T) {
+	proxyID := int64(9)
+	verifiedAt := time.Now()
+	account := &Account{
+		ID: 29, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		EgressMode: EgressModePool, EgressRevision: (math.MaxInt64 >> 31) + 2, Concurrency: 1,
+		EgressBindings: []AccountEgressBinding{{
+			BindingID: StableAccountEgressBindingID(29, 46), AccountID: 29, RouteID: 46,
+			IsPrimary: true, Status: AccountEgressBindingStatusActive,
+			Route: &EgressRoute{
+				ID: 46, Kind: EgressRouteKindProxy, ProxyID: &proxyID,
+				State: EgressRouteStateActive, VerifiedAt: &verifiedAt,
+				ExpectedIdentity: &EgressIdentity{ID: 7, Status: EgressIdentityStatusActive},
+			},
+		}},
+	}
+	authorityRevision := accountEgressAuthorityRevision(account)
+	previous := *account
+	previous.EgressRevision--
+	previousAuthorityRevision := accountEgressAuthorityRevision(&previous)
+	resolved := &ResolvedAccountEgress{
+		BindingID: StableAccountEgressBindingID(29, 46), RouteID: 46, IdentityID: "7",
+		ConfigVersion: math.MaxInt64, AuthorityRevision: authorityRevision,
+		Lease: &AccountEgressLease{ID: "saturated-version", AuthorityRevision: authorityRevision},
+	}
+	require.Equal(t, int64(math.MaxInt64), accountEgressRuntimeVersion(account))
+	require.Equal(t, int64(math.MaxInt64), accountEgressRuntimeVersion(&previous))
+	_, err := withResolvedAccountEgressSelection(account, resolved)
+	require.NoError(t, err)
+
+	t.Run("resolved revision", func(t *testing.T) {
+		stale := *resolved
+		stale.AuthorityRevision = previousAuthorityRevision
+		_, err := withResolvedAccountEgressSelection(account, &stale)
+		require.ErrorIs(t, err, ErrAccountEgressConfigStale)
+	})
+
+	t.Run("lease revision", func(t *testing.T) {
+		stale := *resolved
+		staleLease := *resolved.Lease
+		staleLease.AuthorityRevision = previousAuthorityRevision
+		stale.Lease = &staleLease
+		_, err := withResolvedAccountEgressSelection(account, &stale)
+		require.ErrorIs(t, err, ErrAccountEgressConfigStale)
+	})
 }
 
 func TestAccountEgressPoolRuntimeIsRestrictedToOpenAIOAuth(t *testing.T) {

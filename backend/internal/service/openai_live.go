@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -50,11 +51,40 @@ type liveFrameConn interface {
 	Close() error
 }
 
+type liveEgressUseConn struct {
+	liveFrameConn
+	release func()
+	once    sync.Once
+}
+
+func (c *liveEgressUseConn) Close() error {
+	err := c.liveFrameConn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
 func liveSidebandReadError(err error) error {
 	if coderws.CloseStatus(err) == coderws.StatusNormalClosure {
 		return ErrLiveCallNotFound
 	}
 	return err
+}
+
+func liveEgressLeaseDone(record *LiveCallRecord) <-chan struct{} {
+	if record == nil || record.EgressLease == nil {
+		return nil
+	}
+	return record.EgressLease.Context().Done()
+}
+
+func liveEgressLeaseCause(record *LiveCallRecord) error {
+	if record == nil || record.EgressLease == nil {
+		return ErrLiveUnavailable
+	}
+	if cause := context.Cause(record.EgressLease.Context()); cause != nil {
+		return cause
+	}
+	return ErrLiveUnavailable
 }
 
 func hashLiveCallID(callID string) string {
@@ -128,16 +158,18 @@ func liveCallEgressRef(record *LiveCallRecord) (AccountEgressLeaseRef, bool, err
 	hasEgress := strings.TrimSpace(record.EgressBindingID) != "" ||
 		strings.TrimSpace(record.EgressLeaseID) != "" ||
 		record.EgressRouteID > 0 || strings.TrimSpace(record.EgressIdentityID) != "" ||
-		record.EgressConfigVersion > 0
+		record.EgressConfigVersion > 0 || record.EgressAuthorityRevision > 0
 	if !hasEgress {
 		return AccountEgressLeaseRef{}, false, nil
 	}
 	ref := AccountEgressLeaseRef{
-		AccountID:     record.AccountID,
-		ID:            strings.TrimSpace(record.EgressLeaseID),
-		BindingID:     strings.TrimSpace(record.EgressBindingID),
-		IdentityID:    strings.TrimSpace(record.EgressIdentityID),
-		ConfigVersion: record.EgressConfigVersion,
+		AccountID:         record.AccountID,
+		ID:                strings.TrimSpace(record.EgressLeaseID),
+		BindingID:         strings.TrimSpace(record.EgressBindingID),
+		RouteID:           record.EgressRouteID,
+		IdentityID:        strings.TrimSpace(record.EgressIdentityID),
+		ConfigVersion:     record.EgressConfigVersion,
+		AuthorityRevision: record.EgressAuthorityRevision,
 	}
 	accountID, routeID, ok := parseStableAccountEgressBindingID(ref.BindingID)
 	if !ok || accountID != record.AccountID || routeID != record.EgressRouteID {
@@ -155,7 +187,7 @@ func liveCallLegacyEgressAdmission(record *LiveCallRecord) (*LegacyAccountEgress
 	}
 	hasPoolEgress := strings.TrimSpace(record.EgressBindingID) != "" ||
 		strings.TrimSpace(record.EgressLeaseID) != "" || record.EgressRouteID > 0 ||
-		strings.TrimSpace(record.EgressIdentityID) != "" || record.EgressConfigVersion > 0
+		strings.TrimSpace(record.EgressIdentityID) != "" || record.EgressConfigVersion > 0 || record.EgressAuthorityRevision > 0
 	hasLegacyEgress := strings.TrimSpace(record.LegacyEgressBindingID) != "" ||
 		record.LegacyEgressRouteID > 0 || strings.TrimSpace(record.LegacyEgressIdentityID) != "" ||
 		record.LegacyEgressConfigVersion > 0
@@ -502,14 +534,17 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 			provisionalRecord.EgressRouteID = selection.Egress.RouteID
 			provisionalRecord.EgressIdentityID = selection.Egress.IdentityID
 			provisionalRecord.EgressConfigVersion = selection.Egress.ConfigVersion
+			provisionalRecord.EgressAuthorityRevision = selection.Egress.AuthorityRevision
 			provisionalRecord.EgressLease = selection.Egress.Lease
 			if _, _, refErr := liveCallEgressRef(provisionalRecord); refErr != nil ||
 				!accountEgressLeaseMatchesRef(selection.Egress.Lease, AccountEgressLeaseRef{
-					AccountID:     account.ID,
-					ID:            provisionalRecord.EgressLeaseID,
-					BindingID:     provisionalRecord.EgressBindingID,
-					IdentityID:    provisionalRecord.EgressIdentityID,
-					ConfigVersion: provisionalRecord.EgressConfigVersion,
+					AccountID:         account.ID,
+					ID:                provisionalRecord.EgressLeaseID,
+					BindingID:         provisionalRecord.EgressBindingID,
+					RouteID:           provisionalRecord.EgressRouteID,
+					IdentityID:        provisionalRecord.EgressIdentityID,
+					ConfigVersion:     provisionalRecord.EgressConfigVersion,
+					AuthorityRevision: provisionalRecord.EgressAuthorityRevision,
 				}) {
 				selection.ReleaseFunc()
 				return nil, ErrLiveUnavailable
@@ -616,6 +651,7 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 			record.EgressRouteID = provisionalRecord.EgressRouteID
 			record.EgressIdentityID = provisionalRecord.EgressIdentityID
 			record.EgressConfigVersion = provisionalRecord.EgressConfigVersion
+			record.EgressAuthorityRevision = provisionalRecord.EgressAuthorityRevision
 			record.EgressLease = provisionalRecord.EgressLease
 			if rememberErr := s.rememberLiveEgressLease(record, record.EgressLease, liveLeaseConfirmedAt); rememberErr != nil {
 				s.releaseLiveCallLeases(record)
@@ -848,20 +884,27 @@ func (s *OpenAIGatewayService) dialLiveSideband(ctx context.Context, record *Liv
 	if egressErr != nil {
 		return nil, egressErr
 	}
+	var releaseEgressUse func()
 	if poolMode {
 		lease, leaseErr := s.ensureLiveEgressLease(record)
 		if leaseErr != nil {
 			return nil, leaseErr
 		}
+		releaseEgressUse, leaseErr = lease.AcquireUse()
+		if leaseErr != nil {
+			return nil, leaseErr
+		}
 		resolved := &ResolvedAccountEgress{
-			BindingID:     record.EgressBindingID,
-			RouteID:       record.EgressRouteID,
-			IdentityID:    record.EgressIdentityID,
-			Lease:         lease,
-			ConfigVersion: record.EgressConfigVersion,
+			BindingID:         record.EgressBindingID,
+			RouteID:           record.EgressRouteID,
+			IdentityID:        record.EgressIdentityID,
+			Lease:             lease,
+			ConfigVersion:     record.EgressConfigVersion,
+			AuthorityRevision: record.EgressAuthorityRevision,
 		}
 		account, err = WithResolvedAccountEgress(account, resolved)
 		if err != nil {
+			releaseEgressUse()
 			return nil, ErrLiveUnavailable
 		}
 		ctx = ContextWithSelectedAccountEgress(ctx, account)
@@ -877,17 +920,29 @@ func (s *OpenAIGatewayService) dialLiveSideband(ctx context.Context, record *Liv
 	}
 	headers, err := s.liveSidebandHeaders(ctx, account, record)
 	if err != nil {
+		if releaseEgressUse != nil {
+			releaseEgressUse()
+		}
 		return nil, err
 	}
 	target := strings.TrimRight(chatGPTLiveSidebandBaseURL, "/") + "/" + url.PathEscape(record.CallID)
 	conn, status, _, err := s.getOpenAIWSPassthroughDialer().Dial(ctx, target, headers, resolveAccountProxyURL(account))
 	if err != nil {
+		if releaseEgressUse != nil {
+			releaseEgressUse()
+		}
 		return nil, fmt.Errorf("dial live sideband (status %d): %w", status, err)
 	}
 	raw, ok := conn.(liveFrameConn)
 	if !ok {
 		_ = conn.Close()
+		if releaseEgressUse != nil {
+			releaseEgressUse()
+		}
 		return nil, errors.New("live sideband transport does not support raw frames")
+	}
+	if releaseEgressUse != nil {
+		return &liveEgressUseConn{liveFrameConn: raw, release: releaseEgressUse}, nil
 	}
 	return raw, nil
 }
@@ -957,7 +1012,21 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 	}
 
 	// observer 轮询到接管状态后会关闭旧控制连接；同一个 call 可重新加入。
-	time.Sleep(liveObserverPollInterval)
+	pollTimer := time.NewTimer(liveObserverPollInterval)
+	select {
+	case <-ctx.Done():
+		if !pollTimer.Stop() {
+			<-pollTimer.C
+		}
+		return context.Cause(ctx)
+	case <-liveEgressLeaseDone(record):
+		if !pollTimer.Stop() {
+			<-pollTimer.C
+		}
+		s.finalizeLiveCall(record)
+		return liveEgressLeaseCause(record)
+	case <-pollTimer.C:
+	}
 	upstream, err := s.dialLiveSideband(ctx, record)
 	if err != nil {
 		_, _ = store.ReleaseLiveController(context.Background(), record.CallHash, owner)
@@ -1028,6 +1097,8 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 func liveSessionEnded(err error) bool {
 	return errors.Is(err, ErrLiveCallNotFound) ||
 		errors.Is(err, ErrLiveUnavailable) ||
+		errors.Is(err, ErrAccountEgressLeaseFenced) ||
+		errors.Is(err, ErrAccountEgressLeaseLost) ||
 		errors.Is(err, context.DeadlineExceeded)
 }
 
@@ -1045,6 +1116,8 @@ func (s *OpenAIGatewayService) runLiveController(
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
+		case <-liveEgressLeaseDone(record):
+			return liveEgressLeaseCause(record)
 		case err := <-errCh:
 			return err
 		case <-maxTimer.C:
@@ -1112,7 +1185,16 @@ func (s *OpenAIGatewayService) observeLiveCall(record *LiveCallRecord) {
 				s.finalizeLiveCallAfterExpiry(record)
 				return
 			}
-			time.Sleep(liveObserverStoreRetryInterval)
+			retryTimer := time.NewTimer(liveObserverStoreRetryInterval)
+			select {
+			case <-retryTimer.C:
+			case <-liveEgressLeaseDone(record):
+				if !retryTimer.Stop() {
+					<-retryTimer.C
+				}
+				s.finalizeLiveCall(record)
+				return
+			}
 			continue
 		}
 		storeErrStreak = 0
@@ -1190,6 +1272,8 @@ func (s *OpenAIGatewayService) runLiveObserverConnection(record *LiveCallRecord,
 			}
 		case err := <-errCh:
 			return err
+		case <-liveEgressLeaseDone(record):
+			return liveEgressLeaseCause(record)
 		case <-controllerTicker.C:
 			controller, err := store.GetLiveController(context.Background(), record.CallHash)
 			if err != nil {
@@ -1214,7 +1298,12 @@ func (s *OpenAIGatewayService) runLiveObserverConnection(record *LiveCallRecord,
 func (s *OpenAIGatewayService) waitForLiveObserverRetry(record *LiveCallRecord) bool {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
-	<-timer.C
+	select {
+	case <-timer.C:
+	case <-liveEgressLeaseDone(record):
+		s.finalizeLiveCall(record)
+		return false
+	}
 	store, err := s.liveStore()
 	if err != nil {
 		return false
@@ -1239,7 +1328,14 @@ func (s *OpenAIGatewayService) finalizeLiveCallAfterExpiry(record *LiveCallRecor
 		return
 	}
 	if wait := time.Until(record.ExpiresAt); wait > 0 {
-		time.Sleep(wait)
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-liveEgressLeaseDone(record):
+			if !timer.Stop() {
+				<-timer.C
+			}
+		}
 	}
 	s.finalizeLiveCall(record)
 }

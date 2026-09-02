@@ -548,13 +548,19 @@ func ProvideDeferredService(accountRepo AccountRepository, timingWheel *TimingWh
 }
 
 // ProvideConcurrencyService creates ConcurrencyService and starts the expired-slot cleanup worker.
-func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, cfg *config.Config) *ConcurrencyService {
-	svc := NewConcurrencyService(cache)
+func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, egressRepo EgressRepository, cfg *config.Config) *ConcurrencyService {
+	svc := NewConcurrencyService(cache, egressRepo)
 	if cfg != nil {
 		svc.SetAccountLoadBatchCacheTTL(time.Duration(cfg.Gateway.Scheduling.LoadBatchCacheTTLMS) * time.Millisecond)
 		svc.StartSlotCleanupWorker(accountRepo, cfg.Gateway.Scheduling.SlotCleanupInterval)
 	}
 	return svc
+}
+
+func ProvideEgressIdentityVerificationWorker(egressService *EgressService) *EgressIdentityVerificationWorker {
+	worker := NewEgressIdentityVerificationWorker(egressService)
+	worker.Start()
+	return worker
 }
 
 // ProvideUserMessageQueueService 创建用户消息串行队列服务并启动清理 worker
@@ -1045,6 +1051,7 @@ var ProviderSet = wire.NewSet(
 	wire.Bind(new(DefaultSubscriptionAssigner), new(*SubscriptionService)),
 	ProvideConcurrencyService,
 	NewEgressService,
+	ProvideEgressIdentityVerificationWorker,
 	ProvideUserMessageQueueService,
 	NewUsageRecordWorkerPool,
 	ProvideSchedulerSnapshotService,

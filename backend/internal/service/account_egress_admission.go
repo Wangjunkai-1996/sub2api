@@ -156,7 +156,11 @@ func getAccountLoadsForScheduling(
 		}
 		config, err := AccountEgressPoolConfigForRuntime(account, 0)
 		if err != nil {
-			loads[account.ID] = &AccountLoadInfo{AccountID: account.ID, LoadRate: 100}
+			loads[account.ID] = &AccountLoadInfo{
+				AccountID:    account.ID,
+				LoadRate:     100,
+				EgressStatus: AccountEgressStatusConfigStale,
+			}
 			continue
 		}
 		poolConfigs = append(poolConfigs, config)
@@ -179,20 +183,30 @@ func getAccountLoadsForScheduling(
 		poolLoads, err := concurrency.GetAccountEgressLoads(ctx, poolConfigs)
 		if err != nil {
 			for _, config := range poolConfigs {
-				loads[config.AccountID] = &AccountLoadInfo{AccountID: config.AccountID, LoadRate: 100}
+				loads[config.AccountID] = &AccountLoadInfo{
+					AccountID:    config.AccountID,
+					LoadRate:     100,
+					EgressStatus: AccountEgressStatusConfigUnavailable,
+				}
 			}
 		} else {
 			for _, config := range poolConfigs {
-				load := poolLoads[config.AccountID]
-				loadRate := 100
-				if load.EffectiveCapacity > 0 && load.Status != AccountEgressStatusConfigStale && load.Status != AccountEgressStatusConfigUnavailable {
-					loadRate = load.ActiveTotal * 100 / load.EffectiveCapacity
+				load, ok := poolLoads[config.AccountID]
+				if !ok {
+					loads[config.AccountID] = &AccountLoadInfo{
+						AccountID:    config.AccountID,
+						LoadRate:     100,
+						EgressStatus: AccountEgressStatusConfigUnavailable,
+					}
+					continue
 				}
 				loads[config.AccountID] = &AccountLoadInfo{
 					AccountID:          config.AccountID,
 					CurrentConcurrency: load.ActiveTotal,
 					WaitingCount:       load.WaitingCount,
-					LoadRate:           loadRate,
+					LoadRate:           load.LoadRate,
+					EgressStatus:       load.Status,
+					EffectiveCapacity:  load.EffectiveCapacity,
 				}
 			}
 		}

@@ -1,15 +1,5 @@
-import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-
-const { verifyMock } = vi.hoisted(() => ({ verifyMock: vi.fn() }))
-
-vi.mock('@/api/admin', () => ({
-  adminAPI: {
-    egressRoutes: {
-      verify: verifyMock
-    }
-  }
-}))
+import { mount } from '@vue/test-utils'
+import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('vue-i18n', async () => {
   const actual = await vi.importActual<typeof import('vue-i18n')>('vue-i18n')
@@ -75,10 +65,6 @@ function mountSelector(selectedRouteIds: number[] = [], primaryRouteId: number |
 }
 
 describe('EgressPoolSelector', () => {
-  beforeEach(() => {
-    verifyMock.mockReset()
-  })
-
   it('shows only explicit proxy routes and hides direct routes even when previously selected', () => {
     const wrapper = mountSelector([1, 2], 1)
 
@@ -110,32 +96,34 @@ describe('EgressPoolSelector', () => {
     expect(unselected.get('#egress-route-3').attributes('disabled')).toBeDefined()
   })
 
-  it('verifies one route through the redacted egress API and emits the refreshed route', async () => {
+  it('emits a verification request and renders the refreshed route supplied by its owner', async () => {
     const refreshed = { ...routes[1], observed_ip: null, public_ip: '198.51.100.105', probe_success: true, probe_latency_ms: 61 }
-    verifyMock.mockResolvedValue([refreshed])
     const wrapper = mountSelector([2], 2)
 
     await wrapper.get('[data-testid="verify-egress-2"]').trigger('click')
-    await flushPromises()
+    expect(wrapper.emitted('verify')?.[0]).toEqual([routes[1]])
 
-    expect(verifyMock).toHaveBeenCalledWith([2])
-    expect(wrapper.emitted('verified')?.[0]).toEqual([refreshed])
+    await wrapper.setProps({ routes: [routes[0], refreshed, routes[2], routes[3]] })
     expect(wrapper.text()).toContain('61ms')
     expect(wrapper.text()).toContain('198.51.100.105')
   })
 
-  it('shows the readable probe reason returned by a failed verification', async () => {
-    verifyMock.mockResolvedValue([{
+  it('shows the readable probe reason supplied after a failed verification', async () => {
+    const failed = {
       ...routes[1],
       name: 'Route #2',
       proxy_name: 'RackNerd Los Angeles',
       probe_success: false,
       probe_reason_code: 'probe_failed'
-    }])
+    }
     const wrapper = mountSelector([2], 2)
 
     await wrapper.get('[data-testid="verify-egress-2"]').trigger('click')
-    await flushPromises()
+    expect(wrapper.emitted('verify')?.[0]).toEqual([routes[1]])
+    await wrapper.setProps({
+      routes: [routes[0], failed, routes[2], routes[3]],
+      verifyErrors: { 2: 'probe_failed' }
+    })
 
     expect(wrapper.text()).toContain('RackNerd Los Angeles')
     expect(wrapper.text()).toContain('admin.accounts.egressPool.reason.probe_failed')

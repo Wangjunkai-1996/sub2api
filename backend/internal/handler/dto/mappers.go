@@ -2,7 +2,9 @@
 package dto
 
 import (
+	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -516,6 +518,30 @@ func ProxyWithAccountCountFromService(p *service.ProxyWithAccountCount) *ProxyWi
 		QualityGrade:   p.QualityGrade,
 		QualitySummary: p.QualitySummary,
 		QualityChecked: p.QualityChecked,
+	}
+}
+
+func ProxyOptionFromService(p *service.ProxyWithAccountCount, now time.Time) *ProxyOption {
+	if p == nil {
+		return nil
+	}
+	status := p.Status
+	selectable := p.Status == service.StatusActive && !p.IsExpired(now)
+	disabledReason := ""
+	if p.IsExpired(now) {
+		status = "expired"
+		disabledReason = "proxy_expired"
+	} else if p.Status != service.StatusActive {
+		disabledReason = "proxy_inactive"
+	}
+	return &ProxyOption{
+		ID:              p.ID,
+		Name:            p.Name,
+		DisplayEndpoint: strings.ToLower(strings.TrimSpace(p.Protocol)) + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port)),
+		Status:          status,
+		Selectable:      selectable,
+		DisabledReason:  disabledReason,
+		AccountCount:    p.AccountCount,
 	}
 }
 

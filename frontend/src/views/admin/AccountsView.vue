@@ -14,7 +14,7 @@
           <AccountTableActions
             :loading="loading"
             @refresh="handleManualRefresh"
-            @create="showCreate = true"
+            @create="openCreate"
           >
             <template #after>
               <!-- Auto Refresh Dropdown -->
@@ -526,8 +526,31 @@
       </template>
       <template #pagination><Pagination v-if="pagination.total > 0" :page="pagination.page" :total="pagination.total" :page-size="pagination.page_size" @update:page="handlePageChange" @update:pageSize="handlePageSizeChange" /></template>
     </TablePageLayout>
-    <CreateAccountModal :show="showCreate" :egress-routes="egressRoutes" :groups="groups" @close="showCreate = false" @created="reload" />
-    <EditAccountModal :show="showEdit" :account="edAcc" :egress-routes="egressRoutes" :groups="groups" @close="showEdit = false" @updated="handleAccountUpdated" />
+    <CreateAccountModal
+      :show="showCreate"
+      :proxies="proxyOptions"
+      :egress-routes="egressRoutes"
+      :egress-mutation-enabled="egressMutationEnabled"
+      :egress-verifying-route-id="egressVerifyingRouteId"
+      :egress-verify-errors="egressVerifyErrors"
+      :groups="groups"
+      @close="showCreate = false"
+      @created="reload"
+      @verify-egress-route="verifyEgressRoute"
+    />
+    <EditAccountModal
+      :show="showEdit"
+      :account="edAcc"
+      :proxies="proxyOptions"
+      :egress-routes="egressRoutes"
+      :egress-mutation-enabled="egressMutationEnabled"
+      :egress-verifying-route-id="egressVerifyingRouteId"
+      :egress-verify-errors="egressVerifyErrors"
+      :groups="groups"
+      @close="showEdit = false"
+      @updated="handleAccountUpdated"
+      @verify-egress-route="verifyEgressRoute"
+    />
     <ReAuthAccountModal :show="showReAuth" :account="reAuthAcc" @close="closeReAuthModal" @reauthorized="handleAccountUpdated" />
     <AccountTestModal :show="showTest" :account="testingAcc" @close="closeTestModal" />
     <AccountStatsModal :show="showStats" :account="statsAcc" @close="closeStatsModal" />
@@ -541,10 +564,15 @@
       :selected-platforms="selPlatforms"
       :selected-types="selTypes"
       :target="bulkEditTarget ?? undefined"
+      :proxies="proxyOptions"
       :egress-routes="egressRoutes"
+      :egress-mutation-enabled="egressMutationEnabled"
+      :egress-verifying-route-id="egressVerifyingRouteId"
+      :egress-verify-errors="egressVerifyErrors"
       :groups="groups"
       @close="showBulkEdit = false"
       @updated="handleBulkUpdated"
+      @verify-egress-route="verifyEgressRoute"
     />
     <TempUnschedStatusModal :show="showTempUnsched" :account="tempUnschedAcc" @close="showTempUnsched = false" @reset="handleTempUnschedReset" />
     <ConfirmDialog :show="showDeleteDialog" :title="t('admin.accounts.deleteAccount')" :message="t('admin.accounts.deleteConfirm', { name: deletingAcc?.name })" :confirm-text="t('common.delete')" :cancel-text="t('common.cancel')" :danger="true" @confirm="confirmDelete" @cancel="showDeleteDialog = false" />
@@ -571,6 +599,7 @@ import { adminAPI } from '@/api/admin'
 import { useTableLoader } from '@/composables/useTableLoader'
 import { useSwipeSelect, type SwipeSelectVirtualContext } from '@/composables/useSwipeSelect'
 import { useTableSelection } from '@/composables/useTableSelection'
+import { useAccountEgressCatalog } from '@/composables/useAccountEgressCatalog'
 import { useStepUp, isStepUpBlocked, isStepUpCancelled, stepUpBlockReason } from '@/composables/useStepUp'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
 import AppLayout from '@/components/layout/AppLayout.vue'
@@ -607,13 +636,25 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
-import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, AssignableEgressRoute, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
+import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, AssignableEgressRoute, AdminGroup, ProxyOption, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
 const appStore = useAppStore()
 const authStore = useAuthStore()
 
-const egressRoutes = ref<AssignableEgressRoute[]>([])
+const {
+  routes: egressRoutes,
+  capabilities: egressCapabilities,
+  loading: egressCatalogLoading,
+  verifyingRouteId: egressVerifyingRouteId,
+  verifyErrors: egressVerifyErrors,
+  refresh: refreshAssignableEgressRoutes,
+  verify: verifyEgressRoute
+} = useAccountEgressCatalog()
+const egressMutationEnabled = computed(
+  () => !egressCatalogLoading.value && egressCapabilities.value.mutation_enabled
+)
+const proxyOptions = ref<ProxyOption[]>([])
 const groups = ref<AdminGroup[]>([])
 const accountTableRef = ref<HTMLElement | null>(null)
 const dataTableRef = ref<InstanceType<typeof DataTable> | null>(null)
@@ -1915,22 +1956,57 @@ const cols = computed(() =>
   )
 )
 
-const refreshAssignableEgressRoutes = async () => {
-  if (!adminAPI.egressRoutes?.getAssignable) return
+const refreshProxyOptions = async () => {
   try {
-    const routes = await adminAPI.egressRoutes.getAssignable()
-    egressRoutes.value = routes
+    const options = await adminAPI.proxies.getOptions()
+    proxyOptions.value = options
   } catch (error) {
-    // Keep the last known routes so a transient refresh failure never blocks account editing.
-    console.error('Failed to load assignable egress routes:', error)
+    proxyOptions.value = []
+    throw error
   }
 }
 
-const handleEdit = async (a: Account) => {
-  if (a.platform === 'openai' && a.type === 'oauth') {
-    await refreshAssignableEgressRoutes()
+const refreshAccountAssignmentCatalogs = async () => {
+  const [catalogResult, proxyResult] = await Promise.allSettled([
+    refreshAssignableEgressRoutes(),
+    refreshProxyOptions()
+  ])
+  if (catalogResult.status === 'rejected') {
+    console.error('Failed to load assignable egress routes:', catalogResult.reason)
   }
-  edAcc.value = a
+  if (proxyResult.status === 'rejected') {
+    console.error('Failed to load proxy options:', proxyResult.reason)
+  }
+}
+
+const openCreate = async () => {
+  await refreshAccountAssignmentCatalogs()
+  showCreate.value = true
+}
+
+let editRequestGeneration = 0
+const handleEdit = async (a: Account) => {
+  const requestGeneration = ++editRequestGeneration
+  const [catalogResult, proxyResult, accountResult] = await Promise.allSettled([
+    refreshAssignableEgressRoutes(),
+    refreshProxyOptions(),
+    adminAPI.accounts.getById(a.id)
+  ])
+  if (requestGeneration !== editRequestGeneration) return
+
+  if (catalogResult.status === 'rejected') {
+    console.error('Failed to load assignable egress routes:', catalogResult.reason)
+  }
+  if (proxyResult.status === 'rejected') {
+    console.error('Failed to load proxy options:', proxyResult.reason)
+  }
+  if (accountResult.status === 'rejected') {
+    console.error('Failed to load account details:', accountResult.reason)
+    appStore.showError(extractApiErrorMessage(accountResult.reason, t('admin.accounts.failedToLoad')))
+    return
+  }
+
+  edAcc.value = accountResult.value
   showEdit.value = true
 }
 const openMenu = (a: Account, e: MouseEvent) => {
@@ -2224,7 +2300,8 @@ const collectSelectionMetadata = (rows: Account[]) => {
   return { selectedPlatforms, selectedTypes }
 }
 
-const openBulkEditSelected = () => {
+const openBulkEditSelected = async () => {
+  await refreshAccountAssignmentCatalogs()
   bulkEditTarget.value = {
     mode: 'selected',
     accountIds: [...selIds.value],
@@ -2236,7 +2313,10 @@ const openBulkEditSelected = () => {
 
 const openBulkEditFiltered = async () => {
   const filters = buildBulkEditFilterSnapshot()
-  const preview = await adminAPI.accounts.list(1, 100, filters)
+  const [preview] = await Promise.all([
+    adminAPI.accounts.list(1, 100, filters),
+    refreshAccountAssignmentCatalogs()
+  ])
   const { selectedPlatforms, selectedTypes } = collectSelectionMetadata(preview.items)
   bulkEditTarget.value = {
     mode: 'filtered',
@@ -2726,10 +2806,17 @@ onMounted(async () => {
 
   load()
   loadUpstreamBillingProbeGlobalState()
-  const [, groupsResult] = await Promise.allSettled([
+  const [egressResult, proxyResult, groupsResult] = await Promise.allSettled([
     refreshAssignableEgressRoutes(),
+    refreshProxyOptions(),
     adminAPI.groups.getAll()
   ])
+  if (egressResult.status === 'rejected') {
+    console.error('Failed to load assignable egress routes:', egressResult.reason)
+  }
+  if (proxyResult.status === 'rejected') {
+    console.error('Failed to load proxy options:', proxyResult.reason)
+  }
   if (groupsResult.status === 'fulfilled') {
     groups.value = groupsResult.value
   } else {

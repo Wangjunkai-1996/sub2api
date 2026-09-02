@@ -983,6 +983,17 @@ export interface Proxy {
   updated_at: string
 }
 
+/** Credential-free proxy projection used by account assignment controls. */
+export interface ProxyOption {
+  id: number
+  name: string
+  display_endpoint: string
+  status: 'active' | 'inactive' | 'expired'
+  selectable: boolean
+  disabled_reason?: string | null
+  account_count?: number
+}
+
 export type EgressMode = 'legacy' | 'pool' | 'inherited'
 export type EgressKind = 'proxy' | 'direct'
 export type EgressRouteState =
@@ -1021,6 +1032,17 @@ export interface AssignableEgressRoute {
   country?: string | null
   country_code?: string | null
   expires_at?: string | null
+}
+
+export interface AccountEgressCatalogCapabilities {
+  mutation_enabled: boolean
+  reason_code?: string | null
+}
+
+export interface AssignableEgressRouteCatalog {
+  items: AssignableEgressRoute[]
+  generation?: string | number | null
+  capabilities: AccountEgressCatalogCapabilities
 }
 
 export interface AccountEgressPoolWrite {

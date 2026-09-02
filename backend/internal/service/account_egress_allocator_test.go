@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -22,12 +24,31 @@ type accountEgressCacheStub struct {
 	acquireCalls   int
 	lastAcquire    AccountEgressCacheAcquireRequest
 
-	refreshOwned bool
-	refreshErr   error
-	refreshCalls int
+	refreshOwned  bool
+	refreshStatus AccountEgressLeaseRefreshStatus
+	refreshErr    error
+	refreshCalls  int
 
 	releaseCalls int
 	removeCalls  int
+}
+
+type accountEgressAuthorityReaderStub struct {
+	authorities map[int64]AccountEgressAuthority
+	err         error
+}
+
+func (s *accountEgressAuthorityReaderStub) LoadAccountEgressAuthorities(_ context.Context, accountIDs []int64) (map[int64]AccountEgressAuthority, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	result := make(map[int64]AccountEgressAuthority, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if authority, ok := s.authorities[accountID]; ok {
+			result[accountID] = authority
+		}
+	}
+	return result, nil
 }
 
 func (s *accountEgressCacheStub) SyncAccountEgressConfigs(_ context.Context, configs []AccountEgressPoolConfig) (map[int64]AccountEgressConfigSyncStatus, error) {
@@ -79,16 +100,41 @@ func (s *accountEgressCacheStub) RemoveAccountEgressWaiter(context.Context, int6
 	return nil
 }
 
-func (s *accountEgressCacheStub) RefreshAccountEgressLeases(_ context.Context, leases []AccountEgressLeaseRef, _ time.Duration) (map[string]bool, error) {
+func (s *accountEgressCacheStub) RefreshAccountEgressLeases(_ context.Context, leases []AccountEgressLeaseRef, _ time.Duration) (map[string]AccountEgressLeaseRefreshStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refreshCalls++
 	if s.refreshErr != nil {
 		return nil, s.refreshErr
 	}
-	result := make(map[string]bool, len(leases))
+	status := s.refreshStatus
+	if status == "" {
+		status = AccountEgressLeaseRefreshLost
+		if s.refreshOwned {
+			status = AccountEgressLeaseRefreshActive
+		}
+	}
+	result := make(map[string]AccountEgressLeaseRefreshStatus, len(leases))
 	for _, lease := range leases {
-		result[lease.Key()] = s.refreshOwned
+		result[lease.Key()] = status
+	}
+	return result, nil
+}
+
+func (s *accountEgressCacheStub) KeepaliveFencedAccountEgressLeases(_ context.Context, leases []AccountEgressLeaseRef, _ time.Duration) (map[string]AccountEgressLeaseRefreshStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshCalls++
+	if s.refreshErr != nil {
+		return nil, s.refreshErr
+	}
+	status := AccountEgressLeaseRefreshFenced
+	if s.refreshStatus == AccountEgressLeaseRefreshLost || (!s.refreshOwned && s.refreshStatus == "") {
+		status = AccountEgressLeaseRefreshLost
+	}
+	result := make(map[string]AccountEgressLeaseRefreshStatus, len(leases))
+	for _, lease := range leases {
+		result[lease.Key()] = status
 	}
 	return result, nil
 }
@@ -123,6 +169,7 @@ func accountEgressAllocatorTestConfig(maxWaiting int) AccountEgressPoolConfig {
 	return AccountEgressPoolConfig{
 		AccountID:              42,
 		Version:                7,
+		AuthorityRevision:      7,
 		PerIdentityConcurrency: 2,
 		MaxWaiting:             maxWaiting,
 		Candidates: []AccountEgressCandidate{
@@ -142,6 +189,7 @@ func accountEgressAllocatorAcquiredResult() AccountEgressAcquireResult {
 		ActiveTotal:       1,
 		EffectiveCapacity: 4,
 		ConfigVersion:     7,
+		AuthorityRevision: 7,
 	}
 }
 
@@ -214,6 +262,176 @@ func TestAccountEgressAllocatorResolvesAndReleasesIdempotently(t *testing.T) {
 	_, _, releaseCalls, removeCalls := cache.counts()
 	require.Equal(t, 1, releaseCalls)
 	require.Equal(t, 1, removeCalls)
+}
+
+func TestAccountEgressLeaseRequestCancellationWaitsForTransportUse(t *testing.T) {
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
+		refreshOwned:   true,
+	}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
+	defer allocator.Close()
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	resolved, err := allocator.Acquire(requestCtx, AccountEgressAcquireRequest{
+		Config:  accountEgressAllocatorTestConfig(0),
+		LeaseID: "cancel-with-active-transport",
+	})
+	require.NoError(t, err)
+	releaseUse, err := resolved.Lease.AcquireUse()
+	require.NoError(t, err)
+
+	cancelRequest()
+	require.Eventually(t, func() bool {
+		resolved.Lease.mu.Lock()
+		defer resolved.Lease.mu.Unlock()
+		return !resolved.Lease.owner
+	}, time.Second, 5*time.Millisecond)
+	_, _, releaseCalls, _ := cache.counts()
+	require.Zero(t, releaseCalls, "request cancellation must not release Redis while transport is active")
+	require.NoError(t, resolved.Lease.Context().Err())
+
+	releaseUse()
+	releaseUse()
+	require.Eventually(t, func() bool {
+		_, _, releases, _ := cache.counts()
+		return releases == 1
+	}, time.Second, 5*time.Millisecond)
+	require.ErrorIs(t, context.Cause(resolved.Lease.Context()), context.Canceled)
+}
+
+func TestAccountEgressLeaseFenceCancelsTransportAndKeepsCapacityUntilDrain(t *testing.T) {
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
+		refreshOwned:   true,
+		refreshStatus:  AccountEgressLeaseRefreshFenced,
+	}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, 10*time.Millisecond, 20*time.Millisecond, time.Minute, time.Now)
+	defer allocator.Close()
+	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{
+		Config:  accountEgressAllocatorTestConfig(0),
+		LeaseID: "fenced-with-active-transport",
+	})
+	require.NoError(t, err)
+	releaseUse, err := resolved.Lease.AcquireUse()
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return errors.Is(context.Cause(resolved.Lease.Context()), ErrAccountEgressLeaseFenced)
+	}, time.Second, 5*time.Millisecond)
+	_, err = resolved.Lease.AcquireUse()
+	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
+	require.Eventually(t, func() bool {
+		_, refreshCalls, _, _ := cache.counts()
+		return refreshCalls >= 2
+	}, time.Second, 5*time.Millisecond, "fenced reservation must use the keepalive path while draining")
+
+	resolved.Lease.Release()
+	_, _, releaseCalls, _ := cache.counts()
+	require.Zero(t, releaseCalls)
+	releaseUse()
+	require.Eventually(t, func() bool {
+		_, _, releases, _ := cache.counts()
+		return releases == 1
+	}, time.Second, 5*time.Millisecond)
+}
+
+func TestAccountEgressLeaseDetachCancelReleaseRaceIsIdempotent(t *testing.T) {
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
+		refreshOwned:   true,
+	}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
+	defer allocator.Close()
+	for index := 0; index < 50; index++ {
+		requestCtx, cancelRequest := context.WithCancel(context.Background())
+		resolved, err := allocator.Acquire(requestCtx, AccountEgressAcquireRequest{
+			Config:  accountEgressAllocatorTestConfig(0),
+			LeaseID: fmt.Sprintf("detach-cancel-race-%d", index),
+		})
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() { defer wg.Done(); cancelRequest() }()
+		go func() { defer wg.Done(); _ = resolved.Lease.Detach() }()
+		go func() { defer wg.Done(); resolved.Lease.Release() }()
+		wg.Wait()
+		resolved.Lease.Release()
+	}
+	require.Eventually(t, func() bool {
+		_, _, releases, _ := cache.counts()
+		return releases == 50
+	}, time.Second, 5*time.Millisecond)
+}
+
+func TestAccountEgressLeaseDatabaseAuthorityMismatchFences(t *testing.T) {
+	config := accountEgressAllocatorTestConfig(0)
+	config.Version = int64(9)<<31 | 17
+	config.AuthorityRevision = 9
+	result := accountEgressAllocatorAcquiredResult()
+	result.ConfigVersion = config.Version
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{result},
+		refreshOwned:   true,
+	}
+	authority := &accountEgressAuthorityReaderStub{authorities: map[int64]AccountEgressAuthority{
+		config.AccountID: {AccountID: config.AccountID, Mode: EgressModePool, Revision: 10},
+	}}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now, authority)
+	defer allocator.Close()
+	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: config, LeaseID: "db-fence"})
+	require.NoError(t, err)
+
+	err = resolved.Lease.Refresh(context.Background())
+	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
+	require.ErrorIs(t, context.Cause(resolved.Lease.Context()), ErrAccountEgressLeaseFenced)
+	resolved.Lease.Release()
+}
+
+func TestAccountEgressLeaseUsesExplicitAuthorityRevisionAtSaturatedVersion(t *testing.T) {
+	config := accountEgressAllocatorTestConfig(0)
+	config.Version = math.MaxInt64
+	config.AuthorityRevision = 9
+	result := accountEgressAllocatorAcquiredResult()
+	result.ConfigVersion = config.Version
+	result.AuthorityRevision = config.AuthorityRevision
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{result},
+		refreshOwned:   true,
+	}
+	authority := &accountEgressAuthorityReaderStub{authorities: map[int64]AccountEgressAuthority{
+		config.AccountID: {AccountID: config.AccountID, Mode: EgressModePool, Revision: config.AuthorityRevision},
+	}}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now, authority)
+	defer allocator.Close()
+	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: config, LeaseID: "saturated-authority"})
+	require.NoError(t, err)
+	require.NoError(t, resolved.Lease.Refresh(context.Background()))
+
+	authority.authorities[config.AccountID] = AccountEgressAuthority{AccountID: config.AccountID, Mode: EgressModePool, Revision: 10}
+	err = resolved.Lease.Refresh(context.Background())
+	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
+	resolved.Lease.Release()
+}
+
+func TestAccountEgressLeaseChecksDatabaseAuthorityWhenRedisRefreshErrors(t *testing.T) {
+	config := accountEgressAllocatorTestConfig(0)
+	result := accountEgressAllocatorAcquiredResult()
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{result},
+		refreshErr:     errors.New("redis unavailable"),
+	}
+	authority := &accountEgressAuthorityReaderStub{authorities: map[int64]AccountEgressAuthority{
+		config.AccountID: {AccountID: config.AccountID, Mode: EgressModePool, Revision: config.AuthorityRevision + 1},
+	}}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now, authority)
+	defer allocator.Close()
+	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: config, LeaseID: "redis-error-db-fence"})
+	require.NoError(t, err)
+
+	err = resolved.Lease.RefreshWithinSafetyWindow(context.Background())
+	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
+	require.ErrorIs(t, context.Cause(resolved.Lease.Context()), ErrAccountEgressLeaseFenced)
+	resolved.Lease.Release()
 }
 
 func TestAccountEgressAllocatorPollsFIFOAndAlwaysRemovesWaiter(t *testing.T) {
@@ -368,15 +586,15 @@ func TestAccountEgressLeaseManagerToleratesTransientErrorOnlyUntilTTL(t *testing
 	allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, time.Hour, time.Second, time.Minute, func() time.Time { return base })
 	leaseCtx, cancel := context.WithCancelCause(context.Background())
 	lease := &AccountEgressLease{
-		ID: "transient", BindingID: "route:101", IdentityID: "ip:192.0.2.1", ConfigVersion: 7,
-		accountID: 42, ctx: leaseCtx, cancel: cancel, allocator: allocator,
+		ID: "transient", BindingID: "route:101", RouteID: 101, IdentityID: "ip:192.0.2.1", ConfigVersion: 7, AuthorityRevision: 7,
+		accountID: 42, ctx: leaseCtx, cancel: cancel, allocator: allocator, owner: true, phase: accountEgressLeasePhaseActive, remoteOwned: true,
 	}
 	require.True(t, allocator.register(lease))
 	ref := lease.ref()
 
-	allocator.applyRefreshResult([]AccountEgressLeaseRef{ref}, nil, cache.refreshErr, base.Add(99*time.Millisecond))
+	allocator.applyRefreshResult([]AccountEgressLeaseRef{ref}, nil, cache.refreshErr, base.Add(65*time.Millisecond))
 	require.NoError(t, lease.Context().Err())
-	allocator.applyRefreshResult([]AccountEgressLeaseRef{ref}, nil, cache.refreshErr, base.Add(100*time.Millisecond))
+	allocator.applyRefreshResult([]AccountEgressLeaseRef{ref}, nil, cache.refreshErr, base.Add(67*time.Millisecond))
 	require.ErrorIs(t, context.Cause(lease.Context()), ErrAccountEgressLeaseLost)
 	allocator.Close()
 }
@@ -413,10 +631,9 @@ func TestAccountEgressLeaseDetachSurvivesRequestCancellationAndStillFailsOnLease
 	originalLeaseCtx := resolved.Lease.Context()
 	require.True(t, resolved.Lease.Detach())
 	detachedLeaseCtx := resolved.Lease.Context()
-	require.NotEqual(t, originalLeaseCtx, detachedLeaseCtx)
+	require.Equal(t, originalLeaseCtx, detachedLeaseCtx)
 
 	cancelRequest()
-	require.Eventually(t, func() bool { return originalLeaseCtx.Err() != nil }, time.Second, 5*time.Millisecond)
 	require.Eventually(t, func() bool {
 		_, refreshCalls, _, _ := cache.counts()
 		return refreshCalls > 0
@@ -484,11 +701,11 @@ func TestAccountEgressLeaseRefreshWithinSafetyWindow(t *testing.T) {
 	cache.refreshErr = errors.New("redis unavailable")
 	cache.mu.Unlock()
 
-	now = base.Add(99 * time.Millisecond)
+	now = base.Add(allocator.redisFailureWindow - time.Millisecond)
 	require.NoError(t, resolved.Lease.RefreshWithinSafetyWindow(context.Background()))
 	require.NoError(t, resolved.Lease.Context().Err())
 
-	now = base.Add(100 * time.Millisecond)
+	now = base.Add(allocator.redisFailureWindow)
 	require.ErrorIs(t, resolved.Lease.RefreshWithinSafetyWindow(context.Background()), ErrAccountEgressLeaseLost)
 	require.ErrorIs(t, context.Cause(resolved.Lease.Context()), ErrAccountEgressLeaseLost)
 }
@@ -499,11 +716,13 @@ func TestRestoreAccountEgressLeaseValidatesAndProvesExactOwnership(t *testing.T)
 	defer allocator.Close()
 	service := &ConcurrencyService{accountEgressAllocator: allocator}
 	ref := AccountEgressLeaseRef{
-		AccountID:     42,
-		ID:            "persisted-live-egress",
-		BindingID:     StableAccountEgressBindingID(42, 101),
-		IdentityID:    "501",
-		ConfigVersion: 7,
+		AccountID:         42,
+		ID:                "persisted-live-egress",
+		BindingID:         StableAccountEgressBindingID(42, 101),
+		RouteID:           101,
+		IdentityID:        "501",
+		ConfigVersion:     7,
+		AuthorityRevision: 7,
 	}
 
 	restoreCtx, cancelRestore := context.WithCancel(context.Background())
@@ -520,10 +739,10 @@ func TestRestoreAccountEgressLeaseValidatesAndProvesExactOwnership(t *testing.T)
 	require.Same(t, lease, same)
 
 	invalid := []AccountEgressLeaseRef{
-		{AccountID: 42, ID: ref.ID, BindingID: StableAccountEgressBindingID(99, 101), IdentityID: ref.IdentityID, ConfigVersion: ref.ConfigVersion},
-		{AccountID: 42, ID: ref.ID, BindingID: ref.BindingID, IdentityID: "not-an-id", ConfigVersion: ref.ConfigVersion},
-		{AccountID: 42, ID: ref.ID, BindingID: ref.BindingID, IdentityID: ref.IdentityID, ConfigVersion: 0},
-		{AccountID: 42, ID: ref.ID, BindingID: StableAccountEgressBindingID(42, 102), IdentityID: ref.IdentityID, ConfigVersion: ref.ConfigVersion},
+		{AccountID: 42, ID: ref.ID, BindingID: StableAccountEgressBindingID(99, 101), RouteID: 101, IdentityID: ref.IdentityID, ConfigVersion: ref.ConfigVersion},
+		{AccountID: 42, ID: ref.ID, BindingID: ref.BindingID, RouteID: ref.RouteID, IdentityID: "not-an-id", ConfigVersion: ref.ConfigVersion},
+		{AccountID: 42, ID: ref.ID, BindingID: ref.BindingID, RouteID: ref.RouteID, IdentityID: ref.IdentityID, ConfigVersion: 0},
+		{AccountID: 42, ID: ref.ID, BindingID: StableAccountEgressBindingID(42, 102), RouteID: ref.RouteID, IdentityID: ref.IdentityID, ConfigVersion: ref.ConfigVersion},
 	}
 	for _, invalidRef := range invalid {
 		_, restoreErr := service.RestoreAccountEgressLease(context.Background(), invalidRef)
@@ -531,4 +750,62 @@ func TestRestoreAccountEgressLeaseValidatesAndProvesExactOwnership(t *testing.T)
 	}
 
 	lease.Release()
+}
+
+func TestRestoreExistingAccountEgressLeaseRefreshFailureReleasesOwner(t *testing.T) {
+	tests := []struct {
+		name          string
+		refreshStatus AccountEgressLeaseRefreshStatus
+		refreshErr    error
+		wantErr       error
+	}{
+		{
+			name:          "fenced",
+			refreshStatus: AccountEgressLeaseRefreshFenced,
+			wantErr:       ErrAccountEgressLeaseFenced,
+		},
+		{
+			name:       "refresh error",
+			refreshErr: errors.New("redis unavailable"),
+			wantErr:    ErrAccountEgressUnavailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := accountEgressAllocatorTestConfig(0)
+			config.Candidates[0].BindingID = StableAccountEgressBindingID(config.AccountID, config.Candidates[0].RouteID)
+			config.Candidates[0].IdentityID = "501"
+			result := accountEgressAllocatorAcquiredResult()
+			result.BindingID = config.Candidates[0].BindingID
+			result.IdentityID = config.Candidates[0].IdentityID
+			cache := &accountEgressCacheStub{
+				acquireResults: []AccountEgressAcquireResult{result},
+				refreshOwned:   true,
+			}
+			allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
+			defer allocator.Close()
+			service := &ConcurrencyService{accountEgressAllocator: allocator}
+			resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{
+				Config:  config,
+				LeaseID: "existing-restore-" + tt.name,
+			})
+			require.NoError(t, err)
+
+			cache.mu.Lock()
+			cache.refreshStatus = tt.refreshStatus
+			cache.refreshErr = tt.refreshErr
+			cache.mu.Unlock()
+
+			restored, err := service.RestoreAccountEgressLease(context.Background(), resolved.Lease.ref())
+			require.ErrorIs(t, err, tt.wantErr)
+			require.Nil(t, restored)
+			_, refreshCalls, releaseCalls, _ := cache.counts()
+			require.Equal(t, 1, refreshCalls)
+			require.Equal(t, 1, releaseCalls, "failed restore must release the unreachable owner lease")
+			allocator.mu.Lock()
+			require.Empty(t, allocator.leases, "failed restore must stop local lease keepalive")
+			allocator.mu.Unlock()
+		})
+	}
 }

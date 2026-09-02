@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/stretchr/testify/require"
@@ -15,6 +16,14 @@ type openAIOAuthEgressRepoStub struct {
 	route             *EgressRoute
 	ensureProxyCalls  int
 	ensureDirectCalls int
+}
+
+func (r *openAIOAuthEgressRepoStub) LoadAccountEgressAuthorities(_ context.Context, accountIDs []int64) (map[int64]AccountEgressAuthority, error) {
+	result := make(map[int64]AccountEgressAuthority, len(accountIDs))
+	for _, accountID := range accountIDs {
+		result[accountID] = AccountEgressAuthority{AccountID: accountID, Mode: EgressModeLegacy, Revision: 1}
+	}
+	return result, nil
 }
 
 func (r *openAIOAuthEgressRepoStub) ResolveAccountPool(context.Context, int64) (*AccountEgressPoolConfigDomain, error) {
@@ -69,6 +78,7 @@ func (r *openAIOAuthEgressRepoStub) SyncProxyRouteLifecycle(context.Context, int
 func activeDirectOpenAIOAuthRoute(id, revision int64) *EgressRoute {
 	runtimeScope := DefaultDirectEgressRuntimeScope
 	identityID := int64(91)
+	verifiedAt := time.Now()
 	return &EgressRoute{
 		ID:                 id,
 		Kind:               EgressRouteKindDirect,
@@ -79,8 +89,9 @@ func activeDirectOpenAIOAuthRoute(id, revision int64) *EgressRoute {
 			PublicIP: "203.0.113.91",
 			Status:   EgressIdentityStatusActive,
 		},
-		State:    EgressRouteStateActive,
-		Revision: revision,
+		State:      EgressRouteStateActive,
+		VerifiedAt: &verifiedAt,
+		Revision:   revision,
 	}
 }
 
@@ -188,6 +199,32 @@ func TestOpenAIOAuthPoolAccountRefreshKeepsPrimaryDirectRoute(t *testing.T) {
 	require.Equal(t, "at-refresh", info.AccessToken)
 	require.Empty(t, client.refreshProxyURL)
 	require.Equal(t, 1, settings.getValueCalls, "only the rollout gate should be read")
+}
+
+func TestOpenAIOAuthPoolAccountRefreshRejectsStalePrimaryRoute(t *testing.T) {
+	route := activeDirectOpenAIOAuthRoute(84, 6)
+	stale := time.Now().Add(-EgressIdentityFreshness - time.Second)
+	route.VerifiedAt = &stale
+	repo := &openAIOAuthEgressRepoStub{route: route}
+	settings := &settingRepoStub{values: map[string]string{
+		SettingKeyAccountEgressPoolRolloutMode: string(AccountEgressPoolRolloutEnforce),
+	}}
+	svc := NewOpenAIOAuthService(nil, &openAIDefaultProxyOAuthClientStub{})
+	svc.SetEgressService(NewEgressService(repo, nil))
+	svc.SetSettingService(newOpenAIDefaultProxySettingService(settings, nil))
+	defer svc.Stop()
+
+	account := &Account{
+		ID: 103, Platform: PlatformOpenAI, Type: AccountTypeOAuth, EgressMode: EgressModePool,
+		Credentials: map[string]any{"refresh_token": "rt"},
+		EgressBindings: []AccountEgressBinding{{
+			BindingID: StableAccountEgressBindingID(103, route.ID), AccountID: 103,
+			RouteID: route.ID, IsPrimary: true, Status: AccountEgressBindingStatusActive,
+		}},
+	}
+
+	_, err := svc.RefreshAccountToken(context.Background(), account)
+	require.Equal(t, "OPENAI_OAUTH_EGRESS_ROUTE_UNVERIFIED", infraerrors.Reason(err))
 }
 
 func TestOpenAIOAuthPoolAccountUsesLegacyProxyWhileRolloutOff(t *testing.T) {

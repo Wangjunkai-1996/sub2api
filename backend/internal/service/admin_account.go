@@ -593,7 +593,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 		account.ProxyID = nil
 
 		if s.accountDuplicateRepo == nil {
-			return nil, infraerrors.New(http.StatusInternalServerError, "ACCOUNT_EGRESS_ATOMIC_WRITER_UNAVAILABLE", "account egress atomic writer is unavailable")
+			return nil, ErrEgressMutationFrozen
 		}
 		groups := make([]AccountGroup, 0, len(groupIDs))
 		for index, groupID := range groupIDs {
@@ -647,16 +647,15 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if input == nil {
 		return nil, ErrAccountNilInput
 	}
+	credentialsPatch := maps.Clone(input.Credentials)
 	if input.EgressPool != nil && input.ProxyID != nil {
 		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool")
-	}
-	if input.EgressPool != nil && input.GroupIDs != nil {
-		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_GROUPS_CONFLICT", "egress_pool and group_ids must be updated in separate requests")
 	}
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	originalExtra := maps.Clone(account.Extra)
 	effectiveType := account.Type
 	if input.Type != "" {
 		effectiveType = input.Type
@@ -956,6 +955,48 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 	}
 
+	configurationRepo := s.accountConfigRepo
+	if configurationRepo == nil {
+		configurationRepo, _ = s.accountRepo.(AccountConfigurationRepository)
+	}
+	if configurationRepo != nil {
+		fields := AccountConfigurationFieldMask{
+			Name:               input.Name != "",
+			Notes:              input.Notes != nil,
+			Type:               input.Type != "",
+			Credentials:        (account.IsCredentialShadow() && input.Credentials != nil) || len(input.Credentials) > 0,
+			Extra:              input.Extra != nil || !reflect.DeepEqual(originalExtra, account.Extra),
+			ProxyID:            input.ProxyID != nil && !account.IsCredentialShadow(),
+			Concurrency:        input.Concurrency != nil || account.EgressPoolWrite != nil,
+			Priority:           input.Priority != nil,
+			RateMultiplier:     input.RateMultiplier != nil,
+			LoadFactor:         input.LoadFactor != nil,
+			Status:             input.Status != "",
+			ExpiresAt:          input.ExpiresAt != nil,
+			AutoPauseOnExpired: input.AutoPauseOnExpired != nil,
+		}
+		var groupIDs *[]int64
+		if input.GroupIDs != nil {
+			copy := append([]int64(nil), (*input.GroupIDs)...)
+			groupIDs = &copy
+		}
+		return configurationRepo.UpdateAccountConfiguration(ctx, AccountConfigurationMutation{
+			Desired:          account,
+			Fields:           fields,
+			CredentialsPatch: credentialsPatch,
+			ProbeEnabled:     requestedProbeEnabledUpdate,
+			RateSyncEnabled:  requestedRateSyncEnabledUpdate,
+			EgressPool:       account.EgressPoolWrite,
+			GroupIDs:         groupIDs,
+		})
+	}
+	if account.EgressPoolWrite != nil {
+		return nil, ErrEgressMutationFrozen
+	}
+
+	// Compatibility for narrow in-memory service test doubles. Production wiring
+	// requires AccountConfigurationRepository through AdminAccountRepository and
+	// therefore always returns from the atomic path above.
 	billingSettingsAppliedAtomically := false
 	updater := s.accountBillingRepo
 	if updater == nil {

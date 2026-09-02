@@ -455,20 +455,21 @@ func TestFinalizeLiveCallIsIdempotentAndWritesZeroUsage(t *testing.T) {
 
 func liveTestPoolRecord(callID string) *LiveCallRecord {
 	return &LiveCallRecord{
-		CallID:              callID,
-		CallHash:            hashLiveCallID(callID),
-		AccountID:           42,
-		APIKeyID:            22,
-		UserID:              33,
-		LeaseID:             "live-lease-" + callID,
-		EgressBindingID:     StableAccountEgressBindingID(42, 101),
-		EgressLeaseID:       "egress-lease-" + callID,
-		EgressRouteID:       101,
-		EgressIdentityID:    "501",
-		EgressConfigVersion: 7,
-		CreatedAt:           time.Now().Add(-time.Second),
-		ExpiresAt:           time.Now().Add(time.Hour),
-		Controller:          LiveControllerPending,
+		CallID:                  callID,
+		CallHash:                hashLiveCallID(callID),
+		AccountID:               42,
+		APIKeyID:                22,
+		UserID:                  33,
+		LeaseID:                 "live-lease-" + callID,
+		EgressBindingID:         StableAccountEgressBindingID(42, 101),
+		EgressLeaseID:           "egress-lease-" + callID,
+		EgressRouteID:           101,
+		EgressIdentityID:        "501",
+		EgressConfigVersion:     7,
+		EgressAuthorityRevision: 7,
+		CreatedAt:               time.Now().Add(-time.Second),
+		ExpiresAt:               time.Now().Add(time.Hour),
+		Controller:              LiveControllerPending,
 	}
 }
 
@@ -651,11 +652,13 @@ func TestFinalizeLiveCallAlwaysCleansPoolLeases(t *testing.T) {
 			concurrencyService := NewConcurrencyService(poolCache)
 			t.Cleanup(concurrencyService.accountEgressAllocator.Close)
 			lease, err := concurrencyService.RestoreAccountEgressLease(context.Background(), AccountEgressLeaseRef{
-				AccountID:     record.AccountID,
-				ID:            record.EgressLeaseID,
-				BindingID:     record.EgressBindingID,
-				IdentityID:    record.EgressIdentityID,
-				ConfigVersion: record.EgressConfigVersion,
+				AccountID:         record.AccountID,
+				ID:                record.EgressLeaseID,
+				BindingID:         record.EgressBindingID,
+				RouteID:           record.EgressRouteID,
+				IdentityID:        record.EgressIdentityID,
+				ConfigVersion:     record.EgressConfigVersion,
+				AuthorityRevision: record.EgressAuthorityRevision,
 			})
 			require.NoError(t, err)
 			record.EgressLease = lease
@@ -691,11 +694,13 @@ func TestRefreshLiveEgressLeaseToleratesOnlyIndeterminateErrorsInsideSafetyWindo
 	concurrencyService := NewConcurrencyService(poolCache)
 	t.Cleanup(concurrencyService.accountEgressAllocator.Close)
 	lease, err := concurrencyService.RestoreAccountEgressLease(context.Background(), AccountEgressLeaseRef{
-		AccountID:     record.AccountID,
-		ID:            record.EgressLeaseID,
-		BindingID:     record.EgressBindingID,
-		IdentityID:    record.EgressIdentityID,
-		ConfigVersion: record.EgressConfigVersion,
+		AccountID:         record.AccountID,
+		ID:                record.EgressLeaseID,
+		BindingID:         record.EgressBindingID,
+		RouteID:           record.EgressRouteID,
+		IdentityID:        record.EgressIdentityID,
+		ConfigVersion:     record.EgressConfigVersion,
+		AuthorityRevision: record.EgressAuthorityRevision,
 	})
 	require.NoError(t, err)
 	record.EgressLease = lease

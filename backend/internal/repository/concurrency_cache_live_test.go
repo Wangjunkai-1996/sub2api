@@ -110,11 +110,13 @@ func TestTransitionModeFencesLegacyAdmissionsAndKeepsLiveLeasesValid(t *testing.
 	require.Equal(t, "to_legacy", mode)
 
 	egressRef := service.AccountEgressLeaseRef{
-		AccountID:     config.AccountID,
-		ID:            pool.LeaseID,
-		BindingID:     pool.BindingID,
-		IdentityID:    pool.IdentityID,
-		ConfigVersion: pool.ConfigVersion,
+		AccountID:         config.AccountID,
+		ID:                pool.LeaseID,
+		BindingID:         pool.BindingID,
+		RouteID:           pool.RouteID,
+		IdentityID:        pool.IdentityID,
+		ConfigVersion:     pool.ConfigVersion,
+		AuthorityRevision: pool.AuthorityRevision,
 	}
 	poolLive, err := cache.AcquireLiveLeaseForEgress(ctx, egressRef, 22, 3, 32, "pool-live", true)
 	require.NoError(t, err)

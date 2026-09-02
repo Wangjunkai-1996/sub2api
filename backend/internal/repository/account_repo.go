@@ -70,6 +70,32 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"session_window_utilization": {},
 }
 
+// These keys are written by billing, quota and scheduling hot paths. Account
+// edits start from a potentially stale snapshot, so the locked database row is
+// authoritative for them. User-editable configuration keys are intentionally
+// excluded.
+var accountRuntimeManagedExtraKeyPrefixes = []string{
+	"codex_primary_",
+	"codex_secondary_",
+	"codex_5h_",
+	"codex_7d_",
+	"codex_reset_credit_",
+	"passive_usage_",
+}
+
+var accountRuntimeManagedExtraKeys = map[string]struct{}{
+	"quota_used":                               {},
+	"quota_daily_used":                         {},
+	"quota_daily_start":                        {},
+	"quota_weekly_used":                        {},
+	"quota_weekly_start":                       {},
+	"model_rate_limits":                        {},
+	"grok_billing_snapshot":                    {},
+	service.OpenAIAutoResetCreditStateExtraKey: {},
+	"session_window_utilization":               {},
+	"codex_usage_updated_at":                   {},
+}
+
 const postgresParameterBatchSize = 50000
 
 // Eager-loading egress routes adds a second IN query for route IDs. Keep this
@@ -667,7 +693,8 @@ func lockAndMergeAccountProbeExtra(
 			extra -> 'upstream_billing_probe',
 			extra -> 'ollama_cloud_usage_session',
 			extra -> 'ollama_cloud_usage_auto_refresh',
-			extra -> 'ollama_cloud_usage_snapshot'
+			extra -> 'ollama_cloud_usage_snapshot',
+			extra
 		FROM accounts
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -693,6 +720,7 @@ func lockAndMergeAccountProbeExtra(
 		currentOllamaSession         []byte
 		currentOllamaAutoRefresh     []byte
 		currentOllamaSnapshot        []byte
+		currentExtra                 []byte
 	)
 	if err := rows.Scan(
 		&identityUnchanged,
@@ -704,6 +732,7 @@ func lockAndMergeAccountProbeExtra(
 		&currentOllamaSession,
 		&currentOllamaAutoRefresh,
 		&currentOllamaSnapshot,
+		&currentExtra,
 	); err != nil {
 		return nil, err
 	}
@@ -712,6 +741,21 @@ func lockAndMergeAccountProbeExtra(
 	}
 
 	extra := copyJSONMap(normalizeJSONMap(account.Extra))
+	lockedExtraValue, _, err := decodeAccountExtraJSON(currentExtra)
+	if err != nil {
+		return nil, err
+	}
+	lockedExtra, _ := lockedExtraValue.(map[string]any)
+	for key := range extra {
+		if isAccountRuntimeManagedExtraKey(key) {
+			delete(extra, key)
+		}
+	}
+	for key, value := range lockedExtra {
+		if isAccountRuntimeManagedExtraKey(key) {
+			extra[key] = value
+		}
+	}
 	for _, key := range []string{
 		service.UpstreamBillingProbeEnabledExtraKey,
 		service.UpstreamBillingRateSyncEnabledExtraKey,
@@ -797,6 +841,18 @@ func lockAndMergeAccountProbeExtra(
 		}
 	}
 	return extra, nil
+}
+
+func isAccountRuntimeManagedExtraKey(key string) bool {
+	if _, ok := accountRuntimeManagedExtraKeys[key]; ok {
+		return true
+	}
+	for _, prefix := range accountRuntimeManagedExtraKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeAccountExtraJSON(raw []byte) (any, bool, error) {

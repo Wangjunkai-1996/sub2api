@@ -51,6 +51,7 @@ func (r *openAIEgressHydrationAccountRepo) GetByID(context.Context, int64) (*Acc
 func openAIEgressHydrationAccount(accountRevision, routeRevision int64, proxy *Proxy) *Account {
 	proxyID := int64(91)
 	identityID := int64(301)
+	verifiedAt := time.Now()
 	if proxy != nil && proxy.Status == "" {
 		activeProxy := *proxy
 		activeProxy.Status = StatusActive
@@ -81,9 +82,10 @@ func openAIEgressHydrationAccount(accountRevision, routeRevision int64, proxy *P
 					ID:     identityID,
 					Status: EgressIdentityStatusActive,
 				},
-				State:    EgressRouteStateActive,
-				Revision: routeRevision,
-				Proxy:    proxy,
+				State:      EgressRouteStateActive,
+				Revision:   routeRevision,
+				VerifiedAt: &verifiedAt,
+				Proxy:      proxy,
 			},
 		}},
 	}
@@ -91,11 +93,15 @@ func openAIEgressHydrationAccount(accountRevision, routeRevision int64, proxy *P
 
 func openAIEgressHydrationResolved(account *Account) *ResolvedAccountEgress {
 	return &ResolvedAccountEgress{
-		BindingID:     "901:41",
-		RouteID:       41,
-		IdentityID:    "301",
-		ConfigVersion: accountEgressRuntimeVersion(account),
-		Lease:         &AccountEgressLease{ID: "lease-901"},
+		BindingID:         "901:41",
+		RouteID:           41,
+		IdentityID:        "301",
+		ConfigVersion:     accountEgressRuntimeVersion(account),
+		AuthorityRevision: accountEgressAuthorityRevision(account),
+		Lease: &AccountEgressLease{
+			ID:                "lease-901",
+			AuthorityRevision: accountEgressAuthorityRevision(account),
+		},
 	}
 }
 

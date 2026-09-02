@@ -706,10 +706,13 @@
             :selected-route-ids="egressRouteIds"
             :primary-route-id="primaryEgressRouteId"
             :require-primary="egressOperation === 'replace'"
-            :disabled="!enableProxy"
+            :disabled="!enableProxy || !egressMutationEnabled"
+            :verifying-route-id="egressVerifyingRouteId"
+            :verify-errors="egressVerifyErrors"
             aria-labelledby="bulk-edit-proxy-label"
             @update:selected-route-ids="egressRouteIds = $event"
             @update:primary-route-id="primaryEgressRouteId = $event"
+            @verify="emit('verify-egress-route', $event)"
           />
         </div>
         <div v-else id="bulk-edit-proxy-body" :class="!enableProxy && 'pointer-events-none opacity-50'">
@@ -1507,10 +1510,9 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
 import type {
-  Proxy as ProxyConfig,
+  ProxyOption,
   AssignableEgressRoute,
   AccountEgressPoolOperation,
-  BulkAccountEgressPoolWrite,
   AdminGroup,
   AccountPlatform,
   AccountType,
@@ -1541,6 +1543,10 @@ import {
 } from '@/components/account/credentialsBuilder'
 import GrokBaseUrlPresets from '@/components/account/GrokBaseUrlPresets.vue'
 import {
+  AccountEgressPolicyError,
+  buildBulkAccountEgressPatch
+} from '@/components/account/accountEgressPolicy'
+import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
   OPENAI_WS_MODE_PASSTHROUGH,
@@ -1561,18 +1567,25 @@ interface Props {
     selectedPlatforms?: AccountPlatform[]
     selectedTypes?: AccountType[]
   }
-  proxies?: ProxyConfig[]
+  proxies?: ProxyOption[]
   egressRoutes?: AssignableEgressRoute[]
+  egressMutationEnabled?: boolean
+  egressVerifyingRouteId?: number | null
+  egressVerifyErrors?: Record<number, string>
   groups: AdminGroup[]
 }
 
 const props = withDefaults(defineProps<Props>(), {
   proxies: () => [],
-  egressRoutes: () => []
+  egressRoutes: () => [],
+  egressMutationEnabled: true,
+  egressVerifyingRouteId: null,
+  egressVerifyErrors: () => ({})
 })
 const emit = defineEmits<{
   close: []
   updated: []
+  'verify-egress-route': [route: AssignableEgressRoute]
 }>()
 
 const { t } = useI18n()
@@ -1985,18 +1998,14 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
   }
 
   if (allOpenAIOAuthOnly.value && (enableProxy.value || enableConcurrency.value)) {
-    const pool: BulkAccountEgressPoolWrite = {
+    Object.assign(updates, buildBulkAccountEgressPatch({
       operation: enableProxy.value ? egressOperation.value : 'append',
-      route_ids: enableProxy.value ? [...egressRouteIds.value] : []
-    }
-    if (enableProxy.value && egressOperation.value === 'replace') {
-      pool.primary_route_id = primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null
-    }
-    if (enableConcurrency.value) {
-      pool.concurrency_per_egress = Math.max(1, Number(concurrency.value) || 1)
-    }
-    updates.egress_mode = 'pool'
-    updates.egress_pool = pool
+      routeMutation: enableProxy.value,
+      routeIds: egressRouteIds.value,
+      primaryRouteId: primaryEgressRouteId.value,
+      concurrencyPerEgress: enableConcurrency.value ? concurrency.value : undefined,
+      routes: props.egressRoutes
+    }))
   } else {
     if (enableProxy.value) {
       updates.proxy_id = proxyId.value === null ? 0 : proxyId.value
@@ -2244,6 +2253,10 @@ const preCheckMixedChannelRisk = async (built: Record<string, unknown>): Promise
 }
 
 const handleSubmit = async () => {
+  if (allOpenAIOAuthOnly.value && (enableProxy.value || enableConcurrency.value) && !props.egressMutationEnabled) {
+    appStore.showError(t('admin.accounts.egressPool.catalogUnavailable'))
+    return
+  }
   if (allOpenAIOAuthOnly.value && enableProxy.value && egressRouteIds.value.length === 0) {
     appStore.showError(t('admin.accounts.egressPool.noSelection'))
     return
@@ -2311,7 +2324,20 @@ const handleSubmit = async () => {
     }
   }
 
-  const built = buildUpdatePayload()
+  let built: Record<string, unknown> | null
+  try {
+    built = buildUpdatePayload()
+  } catch (error: unknown) {
+    if (error instanceof AccountEgressPolicyError) {
+      appStore.showError(t(error.code === 'no_selection'
+        ? 'admin.accounts.egressPool.noSelection'
+        : 'admin.accounts.egressPool.catalogUnavailable'))
+      return
+    }
+    console.error('Failed to build bulk account update:', error)
+    appStore.showError(error instanceof Error ? error.message : t('admin.accounts.bulkEdit.failed'))
+    return
+  }
   if (!built) {
     appStore.showError(t('admin.accounts.bulkEdit.noFieldsSelected'))
     return

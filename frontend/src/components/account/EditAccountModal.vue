@@ -1519,10 +1519,13 @@
           :selected-route-ids="egressRouteIds"
           :primary-route-id="primaryEgressRouteId"
           :require-primary="true"
-          :disabled="isSparkShadow"
+          :disabled="isSparkShadow || !egressMutationEnabled"
           :inherited="isSparkShadow"
-          @update:selected-route-ids="egressRouteIds = $event"
-          @update:primary-route-id="primaryEgressRouteId = $event"
+          :verifying-route-id="egressVerifyingRouteId"
+          :verify-errors="egressVerifyErrors"
+          @update:selected-route-ids="updateEgressRouteIds"
+          @update:primary-route-id="updatePrimaryEgressRouteId"
+          @verify="emit('verify-egress-route', $event)"
         />
       </div>
       <div v-else>
@@ -1540,7 +1543,7 @@
             :data-testid="usesEgressPool ? 'egress-concurrency-per-route' : undefined"
             :disabled="usesEgressPool && isSparkShadow"
             :class="usesEgressPool && isSparkShadow && 'cursor-not-allowed opacity-60'"
-            @input="form.concurrency = Math.max(1, form.concurrency || 1)" />
+            @input="handleConcurrencyInput" />
           <p v-if="usesEgressPool" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
@@ -2896,9 +2899,8 @@ import { adminAPI } from '@/api/admin'
 import { useQuotaNotifyState } from '@/composables/useQuotaNotifyState'
 import type {
   Account,
-  Proxy,
+  ProxyOption,
   AssignableEgressRoute,
-  AccountEgressPoolWrite,
   AdminGroup,
   CheckMixedChannelResponse,
   OpenAICompactMode,
@@ -2947,6 +2949,11 @@ import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
+  AccountEgressPolicyError,
+  buildEditAccountEgressPatch,
+  initialAccountEgressDraft
+} from '@/components/account/accountEgressPolicy'
+import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
   OPENAI_WS_MODE_PASSTHROUGH,
@@ -2967,18 +2974,25 @@ import {
 interface Props {
   show: boolean
   account: Account | null
-  proxies?: Proxy[]
+  proxies?: ProxyOption[]
   egressRoutes?: AssignableEgressRoute[]
+  egressMutationEnabled?: boolean
+  egressVerifyingRouteId?: number | null
+  egressVerifyErrors?: Record<number, string>
   groups: AdminGroup[]
 }
 
 const props = withDefaults(defineProps<Props>(), {
   proxies: () => [],
-  egressRoutes: () => []
+  egressRoutes: () => [],
+  egressMutationEnabled: true,
+  egressVerifyingRouteId: null,
+  egressVerifyErrors: () => ({})
 })
 const emit = defineEmits<{
   close: []
   updated: [account: Account]
+  'verify-egress-route': [route: AssignableEgressRoute]
 }>()
 
 const { t } = useI18n()
@@ -3629,17 +3643,21 @@ const form = reactive({
 
 const egressRouteIds = ref<number[]>([])
 const primaryEgressRouteId = ref<number | null>(null)
+const egressTouched = ref(false)
+const updateEgressRouteIds = (ids: number[]) => {
+  egressRouteIds.value = ids
+  egressTouched.value = true
+}
 
-const buildEgressPool = (): AccountEgressPoolWrite => ({
-  route_ids: [...egressRouteIds.value],
-  primary_route_id: primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null,
-  concurrency_per_egress: Math.max(1, Number(form.concurrency) || 1),
-  ...(props.account?.egress_revision != null
-    ? { revision: props.account.egress_revision }
-    : props.account?.egress_pool?.revision != null
-      ? { revision: props.account.egress_pool.revision }
-      : {})
-})
+const updatePrimaryEgressRouteId = (id: number | null) => {
+  primaryEgressRouteId.value = id
+  egressTouched.value = true
+}
+
+const handleConcurrencyInput = () => {
+  form.concurrency = Math.max(1, form.concurrency || 1)
+  if (usesEgressPool.value && !isSparkShadow.value) egressTouched.value = true
+}
 
 const usesEgressPool = computed(
   () => props.account?.platform === 'openai' && props.account?.type === 'oauth'
@@ -3744,21 +3762,16 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   form.name = newAccount.name
   form.notes = newAccount.notes || ''
   const accountUsesEgressPool = newAccount.platform === 'openai' && newAccount.type === 'oauth'
-  const pool = accountUsesEgressPool ? newAccount.egress_pool : null
-  const legacyRoute = accountUsesEgressPool
-    ? props.egressRoutes.find((route) => route.proxy_id === newAccount.proxy_id)
-    : undefined
-  egressRouteIds.value = pool?.route_ids?.length
-    ? [...pool.route_ids]
-    : legacyRoute
-      ? [legacyRoute.id]
-      : []
-  primaryEgressRouteId.value = pool?.primary_route_id ?? legacyRoute?.id ?? null
+  const draft = initialAccountEgressDraft(newAccount, [
+    ...(newAccount.egress_pool?.routes ?? newAccount.egress_summary?.routes ?? []),
+    ...props.egressRoutes
+  ])
+  egressRouteIds.value = draft.routeIds
+  primaryEgressRouteId.value = draft.primaryRouteId
+  egressTouched.value = false
   form.proxy_id = newAccount.proxy_id
   form.concurrency = accountUsesEgressPool
-    ? pool?.concurrency_per_egress
-      ?? newAccount.egress_summary?.concurrency_per_egress
-      ?? newAccount.concurrency
+    ? draft.concurrencyPerEgress
     : newAccount.concurrency
   form.load_factor = newAccount.load_factor ?? null
   form.priority = newAccount.priority
@@ -4666,15 +4679,11 @@ const handleClose = () => {
 
 const submitUpdateAccount = async (
   accountID: number,
-  updatePayload: Record<string, unknown>,
-  followUpPayload?: Record<string, unknown>
+  updatePayload: Record<string, unknown>
 ) => {
   submitting.value = true
   try {
-    let updatedAccount = await adminAPI.accounts.update(accountID, withAntigravityConfirmFlag(updatePayload))
-    if (followUpPayload) {
-      updatedAccount = await adminAPI.accounts.update(accountID, followUpPayload)
-    }
+    const updatedAccount = await adminAPI.accounts.update(accountID, withAntigravityConfirmFlag(updatePayload))
     appStore.showSuccess(t('admin.accounts.accountUpdated'))
     emit('updated', updatedAccount)
     handleClose()
@@ -4684,7 +4693,7 @@ const submitUpdateAccount = async (
         message: error.message,
         onConfirm: async () => {
           antigravityMixedChannelConfirmed.value = true
-          await submitUpdateAccount(accountID, updatePayload, followUpPayload)
+          await submitUpdateAccount(accountID, updatePayload)
         }
       })
       return
@@ -4699,7 +4708,12 @@ const handleSubmit = async () => {
   if (!props.account) return
   const accountID = props.account.id
 
-  if (usesEgressPool.value && !isSparkShadow.value && egressRouteIds.value.length === 0) {
+  if (usesEgressPool.value && egressTouched.value && !props.egressMutationEnabled) {
+    appStore.showError(t('admin.accounts.egressPool.catalogUnavailable'))
+    return
+  }
+
+  if (usesEgressPool.value && egressTouched.value && !isSparkShadow.value && egressRouteIds.value.length === 0) {
     appStore.showError(t('admin.accounts.egressPool.noSelection'))
     return
   }
@@ -4717,46 +4731,31 @@ const handleSubmit = async () => {
 	}
 
   const updatePayload: Record<string, unknown> = { ...form }
-  let groupUpdatePayload: Record<string, unknown> | undefined
   try {
     if (usesEgressPool.value) {
       delete updatePayload.proxy_id
       delete updatePayload.concurrency
-      if (!isSparkShadow.value) {
-        const nextPool = buildEgressPool()
-        const currentPool = props.account.egress_pool
-        const currentRouteIDs = currentPool?.route_ids ?? []
-        const egressPoolChanged = !currentPool
-          || currentRouteIDs.length !== nextPool.route_ids.length
-          || currentRouteIDs.some((routeID, index) => routeID !== nextPool.route_ids[index])
-          || currentPool.primary_route_id !== nextPool.primary_route_id
-          || currentPool.concurrency_per_egress !== nextPool.concurrency_per_egress
-          || (props.account.egress_mode != null && props.account.egress_mode !== 'pool')
-        const currentGroupIDs = [...(props.account.group_ids ?? [])].sort((left, right) => left - right)
-        const nextGroupIDs = [...form.group_ids].sort((left, right) => left - right)
-        const groupsChanged = currentGroupIDs.length !== nextGroupIDs.length
-          || currentGroupIDs.some((groupID, index) => groupID !== nextGroupIDs[index])
-
-        if (egressPoolChanged) {
-          updatePayload.egress_mode = 'pool'
-          updatePayload.egress_pool = nextPool
-        } else {
-          delete updatePayload.egress_mode
-          delete updatePayload.egress_pool
-        }
-        if (!groupsChanged) {
-          delete updatePayload.group_ids
-        } else if (egressPoolChanged) {
-          delete updatePayload.group_ids
-          groupUpdatePayload = { group_ids: [...form.group_ids] }
-        }
-      } else {
-        delete updatePayload.egress_mode
-        delete updatePayload.egress_pool
-      }
+      Object.assign(updatePayload, buildEditAccountEgressPatch(props.account, egressTouched.value, {
+        routeIds: egressRouteIds.value,
+        primaryRouteId: primaryEgressRouteId.value,
+        concurrencyPerEgress: form.concurrency
+      }, [
+        ...(props.account.egress_pool?.routes ?? props.account.egress_summary?.routes ?? []),
+        ...props.egressRoutes
+      ]))
     } else {
       delete updatePayload.egress_mode
       delete updatePayload.egress_pool
+      if (form.proxy_id === props.account.proxy_id) delete updatePayload.proxy_id
+      if (form.concurrency === props.account.concurrency) delete updatePayload.concurrency
+    }
+    const currentGroupIDs = [...(props.account.group_ids ?? [])].sort((left, right) => left - right)
+    const nextGroupIDs = [...form.group_ids].sort((left, right) => left - right)
+    if (
+      currentGroupIDs.length === nextGroupIDs.length
+      && currentGroupIDs.every((groupID, index) => groupID === nextGroupIDs[index])
+    ) {
+      delete updatePayload.group_ids
     }
     if (form.expires_at === null) {
       updatePayload.expires_at = 0
@@ -5444,14 +5443,20 @@ const handleSubmit = async () => {
     }
 
     const canContinue = await ensureAntigravityMixedChannelConfirmed(async () => {
-      await submitUpdateAccount(accountID, updatePayload, groupUpdatePayload)
+      await submitUpdateAccount(accountID, updatePayload)
     })
     if (!canContinue) {
       return
     }
 
-    await submitUpdateAccount(accountID, updatePayload, groupUpdatePayload)
+    await submitUpdateAccount(accountID, updatePayload)
   } catch (error: any) {
+    if (error instanceof AccountEgressPolicyError) {
+      appStore.showError(t(error.code === 'no_selection'
+        ? 'admin.accounts.egressPool.noSelection'
+        : 'admin.accounts.egressPool.catalogUnavailable'))
+      return
+    }
     appStore.showError(error.message || t('admin.accounts.failedToUpdate'))
   }
 }

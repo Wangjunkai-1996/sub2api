@@ -12,12 +12,14 @@ import (
 func TestAssignableEgressRouteFromServiceRedactsTransportSecrets(t *testing.T) {
 	proxyID := int64(9)
 	observedIP := "203.0.113.10"
+	verifiedAt := time.Now()
 	expiresAt := time.Now().Add(time.Hour)
 	route := &service.EgressRoute{
 		ID:             17,
 		Kind:           service.EgressRouteKindProxy,
 		ProxyID:        &proxyID,
 		State:          service.EgressRouteStateActive,
+		VerifiedAt:     &verifiedAt,
 		LastObservedIP: &observedIP,
 		Revision:       3,
 		ExpectedIdentity: &service.EgressIdentity{
@@ -102,6 +104,7 @@ func TestAssignableEgressProbeResultIncludesObservedIPOnPersistenceFailure(t *te
 func TestAccountEgressViewsUseDistinctEligibleIdentitiesAndMarkInheritance(t *testing.T) {
 	parentID := int64(21)
 	directScope := service.DefaultDirectEgressRuntimeScope
+	verifiedAt := time.Now()
 	identity := &service.EgressIdentity{ID: 7, PublicIP: "203.0.113.11", Status: service.EgressIdentityStatusActive}
 	account := &service.Account{
 		ID:              22,
@@ -112,11 +115,11 @@ func TestAccountEgressViewsUseDistinctEligibleIdentitiesAndMarkInheritance(t *te
 		EgressBindings: []service.AccountEgressBinding{
 			{
 				RouteID: 2, Position: 1, Status: service.AccountEgressBindingStatusActive,
-				Route: &service.EgressRoute{ID: 2, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: identity},
+				Route: &service.EgressRoute{ID: 2, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, VerifiedAt: &verifiedAt, ExpectedIdentity: identity},
 			},
 			{
 				RouteID: 1, Position: 0, IsPrimary: true, Status: service.AccountEgressBindingStatusActive,
-				Route: &service.EgressRoute{ID: 1, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: identity},
+				Route: &service.EgressRoute{ID: 1, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, VerifiedAt: &verifiedAt, ExpectedIdentity: identity},
 			},
 		},
 	}
@@ -134,6 +137,7 @@ func TestAccountEgressViewsUseDistinctEligibleIdentitiesAndMarkInheritance(t *te
 
 func TestAccountEgressViewsCountOnlyIneligibleBindingsAsDegraded(t *testing.T) {
 	directScope := service.DefaultDirectEgressRuntimeScope
+	verifiedAt := time.Now()
 	identity := &service.EgressIdentity{ID: 1, PublicIP: "203.0.113.12", Status: service.EgressIdentityStatusActive}
 	account := &service.Account{
 		EgressMode:  service.EgressModePool,
@@ -141,7 +145,7 @@ func TestAccountEgressViewsCountOnlyIneligibleBindingsAsDegraded(t *testing.T) {
 		EgressBindings: []service.AccountEgressBinding{
 			{
 				RouteID: 1, Status: service.AccountEgressBindingStatusActive,
-				Route: &service.EgressRoute{ID: 1, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: identity},
+				Route: &service.EgressRoute{ID: 1, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, VerifiedAt: &verifiedAt, ExpectedIdentity: identity},
 			},
 			{
 				RouteID: 2, Status: service.AccountEgressBindingStatusActive,
@@ -160,21 +164,22 @@ func TestAccountEgressViewsCountOnlyIneligibleBindingsAsDegraded(t *testing.T) {
 
 func TestAccountEgressCapacityBindingsUseUniqueIdentitiesAndPrimaryRoute(t *testing.T) {
 	directScope := service.DefaultDirectEgressRuntimeScope
+	verifiedAt := time.Now()
 	firstIdentity := &service.EgressIdentity{ID: 7, PublicIP: "51.81.109.154", Status: service.EgressIdentityStatusActive}
 	secondIdentity := &service.EgressIdentity{ID: 8, PublicIP: "67.215.237.47", Status: service.EgressIdentityStatusActive}
 	account := &service.Account{
 		EgressBindings: []service.AccountEgressBinding{
 			{
 				RouteID: 11, Position: 0, Status: service.AccountEgressBindingStatusActive,
-				Route: &service.EgressRoute{ID: 11, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: firstIdentity},
+				Route: &service.EgressRoute{ID: 11, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, VerifiedAt: &verifiedAt, ExpectedIdentity: firstIdentity},
 			},
 			{
 				RouteID: 12, Position: 1, IsPrimary: true, Status: service.AccountEgressBindingStatusActive,
-				Route: &service.EgressRoute{ID: 12, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: firstIdentity},
+				Route: &service.EgressRoute{ID: 12, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, VerifiedAt: &verifiedAt, ExpectedIdentity: firstIdentity},
 			},
 			{
 				RouteID: 13, Position: 2, Status: service.AccountEgressBindingStatusActive,
-				Route: &service.EgressRoute{ID: 13, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, ExpectedIdentity: secondIdentity},
+				Route: &service.EgressRoute{ID: 13, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope, State: service.EgressRouteStateActive, VerifiedAt: &verifiedAt, ExpectedIdentity: secondIdentity},
 			},
 		},
 	}
@@ -186,4 +191,45 @@ func TestAccountEgressCapacityBindingsUseUniqueIdentitiesAndPrimaryRoute(t *test
 	require.Equal(t, 2, bindings[0].CurrentConcurrency)
 	require.Equal(t, "67.215.237.47", *bindings[1].ObservedIP)
 	require.Equal(t, 1, bindings[1].CurrentConcurrency)
+}
+
+func TestEgressRouteEligibilityRequiresFreshVerification(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	proxyID := int64(9)
+	expiresAt := now.Add(time.Hour)
+	base := service.EgressRoute{
+		ID:      17,
+		Kind:    service.EgressRouteKindProxy,
+		ProxyID: &proxyID,
+		State:   service.EgressRouteStateActive,
+		ExpectedIdentity: &service.EgressIdentity{
+			ID:     5,
+			Status: service.EgressIdentityStatusActive,
+		},
+		Proxy: &service.Proxy{ID: proxyID, Status: service.StatusActive, ExpiresAt: &expiresAt},
+	}
+
+	for _, test := range []struct {
+		name       string
+		verifiedAt *time.Time
+		want       bool
+		reason     string
+	}{
+		{name: "missing", reason: "pending_verification"},
+		{name: "stale", verifiedAt: timePointer(now.Add(-service.EgressIdentityFreshness - time.Second)), reason: "verification_stale"},
+		{name: "far future", verifiedAt: timePointer(now.Add(2 * time.Minute)), reason: "verification_stale"},
+		{name: "fresh", verifiedAt: timePointer(now.Add(-time.Minute)), want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			route := base
+			route.VerifiedAt = test.verifiedAt
+			got, reason := egressRouteEligibility(&route, now)
+			require.Equal(t, test.want, got)
+			require.Equal(t, test.reason, reason)
+		})
+	}
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
 }

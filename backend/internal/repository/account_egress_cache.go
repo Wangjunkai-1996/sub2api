@@ -37,29 +37,37 @@ var (
 		redis.replicate_commands()
 		local key = KEYS[1]
 		local incomingVersion = tonumber(ARGV[1])
-		local incomingDigest = ARGV[2]
+		local incomingAuthorityRevision = tonumber(ARGV[2])
+		local incomingDigest = ARGV[3]
 		local currentVersionRaw = redis.call('HGET', key, 'version')
 		if currentVersionRaw ~= false then
 			local currentVersion = tonumber(currentVersionRaw)
+			local currentAuthorityRevision = tonumber(redis.call('HGET', key, 'authority_revision') or '0')
 			if currentVersion > incomingVersion then
 				return 'CONFIG_STALE'
 			end
 			if currentVersion == incomingVersion then
-				if redis.call('HGET', key, 'digest') ~= incomingDigest then
+				if currentAuthorityRevision > incomingAuthorityRevision then
+					return 'CONFIG_STALE'
+				end
+				if currentAuthorityRevision == incomingAuthorityRevision and redis.call('HGET', key, 'digest') ~= incomingDigest then
 					return 'CONFIG_CONFLICT'
 				end
-				return 'OK'
+				if currentAuthorityRevision == incomingAuthorityRevision then
+					return 'OK'
+				end
 			end
 		end
 
 		redis.call('DEL', key)
 		redis.call('HSET', key,
 			'version', ARGV[1],
+			'authority_revision', ARGV[2],
 			'digest', incomingDigest,
-			'limit', ARGV[3],
-			'max_waiting', ARGV[4])
-		local candidateCount = tonumber(ARGV[5])
-		local offset = 6
+			'limit', ARGV[4],
+			'max_waiting', ARGV[5])
+		local candidateCount = tonumber(ARGV[6])
+		local offset = 7
 		for i = 1, candidateCount do
 			redis.call('HSET', key, 'binding:' .. ARGV[offset], ARGV[offset + 1])
 			offset = offset + 2
@@ -91,32 +99,34 @@ var (
 		local legacyLiveKey = KEYS[9]
 
 		local expectedVersion = tonumber(ARGV[1])
-		local expectedDigest = ARGV[2]
-		local limit = tonumber(ARGV[3])
-		local maxWaiting = tonumber(ARGV[4])
-		local leaseTTL = tonumber(ARGV[5])
-		local waiterTTL = tonumber(ARGV[6])
-		local leaseID = ARGV[7]
-		local leaseMember = ARGV[8]
-		local requiredBindingHash = ARGV[9]
-		local preferredBindingHash = ARGV[10]
-		local candidateCount = tonumber(ARGV[11])
-		local legacyRegularTTL = tonumber(ARGV[12])
-		local legacyLiveTTL = tonumber(ARGV[13])
-		local forcePool = tonumber(ARGV[14]) == 1
-		local legacyPrimaryRegularActive = tonumber(ARGV[15])
-		local legacyPrimaryLiveActive = tonumber(ARGV[16])
+		local expectedAuthorityRevision = ARGV[2]
+		local expectedDigest = ARGV[3]
+		local limit = tonumber(ARGV[4])
+		local maxWaiting = tonumber(ARGV[5])
+		local leaseTTL = tonumber(ARGV[6])
+		local waiterTTL = tonumber(ARGV[7])
+		local leaseID = ARGV[8]
+		local leaseMember = ARGV[9]
+		local requiredBindingHash = ARGV[10]
+		local preferredBindingHash = ARGV[11]
+		local candidateCount = tonumber(ARGV[12])
+		local legacyRegularTTL = tonumber(ARGV[13])
+		local legacyLiveTTL = tonumber(ARGV[14])
+		local forcePool = tonumber(ARGV[15]) == 1
+		local legacyPrimaryRegularActive = tonumber(ARGV[16])
+		local legacyPrimaryLiveActive = tonumber(ARGV[17])
 
 		local storedVersionRaw = redis.call('HGET', configKey, 'version')
 		if storedVersionRaw == false then
-			return {'CONFIG_UNAVAILABLE', '', '0', '', 0, 0, 0, 0, expectedVersion}
+			return {'CONFIG_UNAVAILABLE', '', '0', '', 0, 0, 0, 0, expectedVersion, expectedAuthorityRevision}
 		end
 		local storedVersion = tonumber(storedVersionRaw)
-		if storedVersion ~= expectedVersion or redis.call('HGET', configKey, 'digest') ~= expectedDigest then
-			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, 0, storedVersion}
+		local storedAuthorityRevision = redis.call('HGET', configKey, 'authority_revision') or '0'
+		if storedVersion ~= expectedVersion or storedAuthorityRevision ~= expectedAuthorityRevision or redis.call('HGET', configKey, 'digest') ~= expectedDigest then
+			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, 0, storedVersion, storedAuthorityRevision}
 		end
 		if tonumber(redis.call('HGET', configKey, 'limit')) ~= limit then
-			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, 0, storedVersion}
+			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, 0, storedVersion, storedAuthorityRevision}
 		end
 
 		local timeResult = redis.call('TIME')
@@ -133,7 +143,7 @@ var (
 		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
 		local identityKeyCount = #KEYS - 9
 		if identityKeyCount % 3 ~= 0 then
-			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, nowMillis, storedVersion}
+			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, nowMillis, storedVersion, storedAuthorityRevision}
 		end
 		local identityCount = identityKeyCount / 3
 		local identityLoads = {}
@@ -158,7 +168,7 @@ var (
 		local eligibleIdentities = {}
 		local effectiveCapacity = 0
 		local primaryIdentityIndex = 0
-		local offset = 17
+		local offset = 18
 		for candidateIndex = 1, candidateCount do
 			local candidate = {
 				bindingID = ARGV[offset],
@@ -173,7 +183,7 @@ var (
 			}
 			local expectedMapping = candidate.identityHash .. ':' .. ARGV[offset + 7] .. ':' .. candidate.routeID
 			if redis.call('HGET', configKey, 'binding:' .. candidate.bindingHash) ~= expectedMapping then
-				return {'CONFIG_STALE', '', '0', '', activeTotal, effectiveCapacity, redis.call('ZCARD', waitersKey), nowMillis, storedVersion}
+				return {'CONFIG_STALE', '', '0', '', activeTotal, effectiveCapacity, redis.call('ZCARD', waitersKey), nowMillis, storedVersion, storedAuthorityRevision}
 			end
 			candidates[candidateIndex] = candidate
 			if candidate.primary == 1 then
@@ -195,9 +205,9 @@ var (
 		local function result(status, candidate)
 			local waiting = redis.call('ZCARD', waitersKey)
 			if candidate == nil then
-				return {status, '', '0', '', activeTotal, effectiveCapacity, waiting, nowMillis, storedVersion}
+				return {status, '', '0', '', activeTotal, effectiveCapacity, waiting, nowMillis, storedVersion, storedAuthorityRevision}
 			end
-			return {status, candidate.bindingID, candidate.routeID, candidate.identityID, activeTotal, effectiveCapacity, waiting, nowMillis, storedVersion}
+			return {status, candidate.bindingID, candidate.routeID, candidate.identityID, activeTotal, effectiveCapacity, waiting, nowMillis, storedVersion, storedAuthorityRevision}
 		end
 
 		local function enqueue(status)
@@ -294,6 +304,9 @@ var (
 		local metadataBindingHash = redis.call('HGET', metadataKey, 'binding_hash')
 		if metadataBindingHash ~= false then
 			if tonumber(redis.call('HGET', metadataKey, 'version') or '0') ~= expectedVersion then
+				return result('CONFIG_STALE', nil)
+			end
+			if redis.call('HGET', metadataKey, 'authority_revision') ~= expectedAuthorityRevision then
 				return result('CONFIG_STALE', nil)
 			end
 			local metadataIdentityHash = redis.call('HGET', metadataKey, 'identity_hash')
@@ -426,7 +439,9 @@ var (
 			'route_id', selected.routeID,
 			'identity_id', selected.identityID,
 			'identity_hash', selected.identityHash,
-			'version', storedVersion)
+			'version', storedVersion,
+			'authority_revision', storedAuthorityRevision,
+			'state', 'active')
 		redis.call('PEXPIRE', metadataKey, leaseTTL * 2)
 		redis.call('ZREM', waitersKey, leaseMember)
 		if redis.call('ZCARD', waitersKey) == 0 then
@@ -443,32 +458,107 @@ var (
 		local identityKey = KEYS[2]
 		local poolTotalKey = KEYS[3]
 		local modeKey = KEYS[4]
+		local configKey = KEYS[5]
 		local leaseMember = ARGV[1]
-		local expectedIdentityHash = ARGV[2]
-		local ttl = tonumber(ARGV[3])
+		local expectedBindingHash = ARGV[2]
+		local expectedIdentityHash = ARGV[3]
+		local expectedVersion = ARGV[4]
+		local expectedAuthorityRevision = ARGV[5]
+		local expectedRouteID = ARGV[6]
+		local expectedBindingMapping = ARGV[7]
+		local ttl = tonumber(ARGV[8])
 		local timeResult = redis.call('TIME')
 		local nowMillis = tonumber(timeResult[1]) * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
 		redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowMillis - ttl)
 		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - ttl)
-		local mode = redis.call('GET', modeKey)
-		if mode ~= 'pool' and mode ~= 'transition' and mode ~= 'to_legacy' then
-			return 0
-		end
 		if redis.call('HGET', metadataKey, 'lease_member') ~= leaseMember then
-			return 0
+			return 'LOST'
+		end
+		if redis.call('HGET', metadataKey, 'binding_hash') ~= expectedBindingHash then
+			return 'LOST'
 		end
 		if redis.call('HGET', metadataKey, 'identity_hash') ~= expectedIdentityHash then
-			return 0
+			return 'LOST'
+		end
+		if redis.call('HGET', metadataKey, 'version') ~= expectedVersion then
+			return 'LOST'
+		end
+		if redis.call('HGET', metadataKey, 'authority_revision') ~= expectedAuthorityRevision then
+			return 'LOST'
+		end
+		if redis.call('HGET', metadataKey, 'route_id') ~= expectedRouteID then
+			return 'LOST'
 		end
 		if redis.call('ZSCORE', identityKey, leaseMember) == false or redis.call('ZSCORE', poolTotalKey, leaseMember) == false then
-			return 0
+			return 'LOST'
 		end
+		local function keepalive()
+			redis.call('ZADD', identityKey, 'XX', nowMillis, leaseMember)
+			redis.call('ZADD', poolTotalKey, 'XX', nowMillis, leaseMember)
+			redis.call('PEXPIRE', identityKey, ttl * 2)
+			redis.call('PEXPIRE', poolTotalKey, ttl * 2)
+			redis.call('PEXPIRE', metadataKey, ttl * 2)
+		end
+		local state = redis.call('HGET', metadataKey, 'state') or 'active'
+		if state == 'fenced' then
+			keepalive()
+			return 'FENCED'
+		end
+		if state ~= 'active' then
+			return 'LOST'
+		end
+		local mode = redis.call('GET', modeKey)
+		local configVersion = redis.call('HGET', configKey, 'version')
+		local configAuthorityRevision = redis.call('HGET', configKey, 'authority_revision')
+		local bindingMapping = redis.call('HGET', configKey, 'binding:' .. expectedBindingHash)
+		if (mode ~= 'pool' and mode ~= 'transition') or configVersion ~= expectedVersion or configAuthorityRevision ~= expectedAuthorityRevision or bindingMapping ~= expectedBindingMapping then
+			redis.call('HSET', metadataKey, 'state', 'fenced')
+			keepalive()
+			return 'FENCED'
+		end
+		redis.call('HSET', metadataKey, 'state', 'active')
+		keepalive()
+		return 'ACTIVE'
+	`)
+
+	accountEgressFencedKeepaliveScript = redis.NewScript(`
+		redis.replicate_commands()
+		local metadataKey = KEYS[1]
+		local identityKey = KEYS[2]
+		local poolTotalKey = KEYS[3]
+		local leaseMember = ARGV[1]
+		local expectedBindingHash = ARGV[2]
+		local expectedIdentityHash = ARGV[3]
+		local expectedVersion = ARGV[4]
+		local expectedAuthorityRevision = ARGV[5]
+		local expectedRouteID = ARGV[6]
+		local ttl = tonumber(ARGV[7])
+		local timeResult = redis.call('TIME')
+		local nowMillis = tonumber(timeResult[1]) * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
+		redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowMillis - ttl)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - ttl)
+		if redis.call('HGET', metadataKey, 'lease_member') ~= leaseMember or
+			redis.call('HGET', metadataKey, 'binding_hash') ~= expectedBindingHash or
+			redis.call('HGET', metadataKey, 'identity_hash') ~= expectedIdentityHash or
+			redis.call('HGET', metadataKey, 'version') ~= expectedVersion or
+			redis.call('HGET', metadataKey, 'authority_revision') ~= expectedAuthorityRevision or
+			redis.call('HGET', metadataKey, 'route_id') ~= expectedRouteID then
+			return 'LOST'
+		end
+		if redis.call('ZSCORE', identityKey, leaseMember) == false or redis.call('ZSCORE', poolTotalKey, leaseMember) == false then
+			return 'LOST'
+		end
+		local state = redis.call('HGET', metadataKey, 'state') or 'active'
+		if state ~= 'active' and state ~= 'fenced' then
+			return 'LOST'
+		end
+		redis.call('HSET', metadataKey, 'state', 'fenced')
 		redis.call('ZADD', identityKey, 'XX', nowMillis, leaseMember)
 		redis.call('ZADD', poolTotalKey, 'XX', nowMillis, leaseMember)
 		redis.call('PEXPIRE', identityKey, ttl * 2)
 		redis.call('PEXPIRE', poolTotalKey, ttl * 2)
 		redis.call('PEXPIRE', metadataKey, ttl * 2)
-		return 1
+		return 'FENCED'
 	`)
 
 	accountEgressReleaseScript = redis.NewScript(`
@@ -478,9 +568,18 @@ var (
 		local modeKey = KEYS[4]
 		local leaseMember = ARGV[1]
 		local expectedIdentityHash = ARGV[2]
+		local expectedBindingHash = ARGV[3]
+		local expectedRouteID = ARGV[4]
+		local expectedVersion = ARGV[5]
+		local expectedAuthorityRevision = ARGV[6]
 		local metadataMember = redis.call('HGET', metadataKey, 'lease_member')
 		if metadataMember ~= false then
-			if metadataMember ~= leaseMember or redis.call('HGET', metadataKey, 'identity_hash') ~= expectedIdentityHash then
+			if metadataMember ~= leaseMember or
+				redis.call('HGET', metadataKey, 'identity_hash') ~= expectedIdentityHash or
+				redis.call('HGET', metadataKey, 'binding_hash') ~= expectedBindingHash or
+				redis.call('HGET', metadataKey, 'route_id') ~= expectedRouteID or
+				redis.call('HGET', metadataKey, 'version') ~= expectedVersion or
+				redis.call('HGET', metadataKey, 'authority_revision') ~= expectedAuthorityRevision then
 				return 0
 			end
 		end
@@ -720,8 +819,8 @@ func (c *concurrencyCache) SyncAccountEgressConfigs(
 			return nil, err
 		}
 		candidates := config.SortedCandidates()
-		args := make([]any, 0, 5+len(candidates)*2)
-		args = append(args, config.Version, digest, config.PerIdentityConcurrency, config.MaxWaiting, len(candidates))
+		args := make([]any, 0, 6+len(candidates)*2)
+		args = append(args, config.Version, config.AuthorityRevision, digest, config.PerIdentityConcurrency, config.MaxWaiting, len(candidates))
 		for _, candidate := range candidates {
 			args = append(args, accountEgressIDHash(candidate.BindingID), accountEgressBindingMapping(candidate))
 		}
@@ -795,9 +894,10 @@ func (c *concurrencyCache) AcquireAccountEgress(
 	}
 
 	runAcquire := func(forcePool bool, legacyPrimaryRegularActive, legacyPrimaryLiveActive int64) (service.AccountEgressAcquireResult, error) {
-		args := make([]any, 0, 16+len(candidates)*9)
+		args := make([]any, 0, 17+len(candidates)*9)
 		args = append(args,
 			request.Config.Version,
+			request.Config.AuthorityRevision,
 			digest,
 			request.Config.PerIdentityConcurrency,
 			request.Config.MaxWaiting,
@@ -888,7 +988,7 @@ func accountEgressIDHashOrEmpty(value string) string {
 
 func parseAccountEgressAcquireResult(leaseID string, raw any) (service.AccountEgressAcquireResult, error) {
 	values, ok := raw.([]any)
-	if !ok || len(values) != 9 {
+	if !ok || len(values) != 10 {
 		return service.AccountEgressAcquireResult{}, fmt.Errorf("invalid account egress acquire result: %#v", raw)
 	}
 	intAt := func(index int) (int64, error) {
@@ -918,6 +1018,10 @@ func parseAccountEgressAcquireResult(leaseID string, raw any) (service.AccountEg
 	if err != nil {
 		return service.AccountEgressAcquireResult{}, fmt.Errorf("parse config version: %w", err)
 	}
+	authorityRevision, err := intAt(9)
+	if err != nil {
+		return service.AccountEgressAcquireResult{}, fmt.Errorf("parse authority revision: %w", err)
+	}
 	return service.AccountEgressAcquireResult{
 		Status:            service.AccountEgressStatus(fmt.Sprint(values[0])),
 		LeaseID:           leaseID,
@@ -929,6 +1033,7 @@ func parseAccountEgressAcquireResult(leaseID string, raw any) (service.AccountEg
 		WaitingCount:      int(waitingCount),
 		RedisTime:         time.UnixMilli(redisMillis),
 		ConfigVersion:     version,
+		AuthorityRevision: authorityRevision,
 	}, nil
 }
 
@@ -943,8 +1048,25 @@ func (c *concurrencyCache) RefreshAccountEgressLeases(
 	ctx context.Context,
 	leases []service.AccountEgressLeaseRef,
 	ttl time.Duration,
-) (map[string]bool, error) {
-	results := make(map[string]bool, len(leases))
+) (map[string]service.AccountEgressLeaseRefreshStatus, error) {
+	return c.refreshAccountEgressLeases(ctx, leases, ttl, false)
+}
+
+func (c *concurrencyCache) KeepaliveFencedAccountEgressLeases(
+	ctx context.Context,
+	leases []service.AccountEgressLeaseRef,
+	ttl time.Duration,
+) (map[string]service.AccountEgressLeaseRefreshStatus, error) {
+	return c.refreshAccountEgressLeases(ctx, leases, ttl, true)
+}
+
+func (c *concurrencyCache) refreshAccountEgressLeases(
+	ctx context.Context,
+	leases []service.AccountEgressLeaseRef,
+	ttl time.Duration,
+	fencedOnly bool,
+) (map[string]service.AccountEgressLeaseRefreshStatus, error) {
+	results := make(map[string]service.AccountEgressLeaseRefreshStatus, len(leases))
 	if len(leases) == 0 {
 		return results, nil
 	}
@@ -958,29 +1080,65 @@ func (c *concurrencyCache) RefreshAccountEgressLeases(
 	}
 	commands := make([]refreshCommand, 0, len(leases))
 	for _, lease := range leases {
-		if lease.AccountID <= 0 || lease.ID == "" || lease.IdentityID == "" {
+		if lease.AccountID <= 0 || lease.ID == "" || lease.BindingID == "" || lease.RouteID <= 0 || lease.IdentityID == "" || lease.ConfigVersion <= 0 || lease.AuthorityRevision <= 0 {
 			return nil, errors.New("invalid account egress lease reference")
 		}
 		member := accountEgressIDHash(lease.ID)
+		bindingHash := accountEgressIDHash(lease.BindingID)
+		identityHash := accountEgressIDHash(lease.IdentityID)
+		keys := []string{
+			accountEgressLeaseKey(lease.AccountID, lease.ID),
+			accountEgressIdentityKey(lease.AccountID, lease.IdentityID),
+			accountEgressTotalKey(lease.AccountID),
+		}
+		var cmd *redis.Cmd
+		if fencedOnly {
+			cmd = accountEgressFencedKeepaliveScript.Eval(ctx, pipe, keys,
+				member,
+				bindingHash,
+				identityHash,
+				lease.ConfigVersion,
+				lease.AuthorityRevision,
+				lease.RouteID,
+				accountEgressDurationMilliseconds(ttl),
+			)
+		} else {
+			keys = append(keys,
+				accountEgressModeKey(lease.AccountID),
+				accountEgressConfigKey(lease.AccountID),
+			)
+			expectedMapping := identityHash + ":1:" + strconv.FormatInt(lease.RouteID, 10)
+			cmd = accountEgressRefreshScript.Eval(ctx, pipe, keys,
+				member,
+				bindingHash,
+				identityHash,
+				lease.ConfigVersion,
+				lease.AuthorityRevision,
+				lease.RouteID,
+				expectedMapping,
+				accountEgressDurationMilliseconds(ttl),
+			)
+		}
 		commands = append(commands, refreshCommand{
 			key: lease.Key(),
-			cmd: accountEgressRefreshScript.Eval(ctx, pipe, []string{
-				accountEgressLeaseKey(lease.AccountID, lease.ID),
-				accountEgressIdentityKey(lease.AccountID, lease.IdentityID),
-				accountEgressTotalKey(lease.AccountID),
-				accountEgressModeKey(lease.AccountID),
-			}, member, accountEgressIDHash(lease.IdentityID), accountEgressDurationMilliseconds(ttl)),
+			cmd: cmd,
 		})
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("refresh account egress leases: %w", err)
 	}
 	for _, command := range commands {
-		value, err := command.cmd.Int()
+		value, err := command.cmd.Text()
 		if err != nil {
 			return nil, err
 		}
-		results[command.key] = value == 1
+		status := service.AccountEgressLeaseRefreshStatus(value)
+		switch status {
+		case service.AccountEgressLeaseRefreshActive, service.AccountEgressLeaseRefreshFenced, service.AccountEgressLeaseRefreshLost:
+			results[command.key] = status
+		default:
+			return nil, fmt.Errorf("invalid account egress refresh status %q", value)
+		}
 	}
 	return results, nil
 }
@@ -995,7 +1153,14 @@ func (c *concurrencyCache) ReleaseAccountEgressLease(ctx context.Context, lease 
 		accountEgressIdentityKey(lease.AccountID, lease.IdentityID),
 		accountEgressTotalKey(lease.AccountID),
 		accountEgressModeKey(lease.AccountID),
-	}, member, accountEgressIDHash(lease.IdentityID)).Err()
+	},
+		member,
+		accountEgressIDHash(lease.IdentityID),
+		accountEgressIDHash(lease.BindingID),
+		lease.RouteID,
+		lease.ConfigVersion,
+		lease.AuthorityRevision,
+	).Err()
 }
 
 // BeginAccountEgressPoolTransition fences new legacy admissions before pool

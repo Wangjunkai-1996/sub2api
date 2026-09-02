@@ -335,6 +335,7 @@ func TestAdvancedSchedulerReacquiresOnceWhenDBConcurrencyChanges(t *testing.T) {
 	stale := &Account{ID: 41, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 10}
 	latest := *stale
 	latest.Concurrency = 1
+	latest.UpdatedAt = time.Now()
 	repo := &upstreamCostCountingAccountRepo{accounts: map[int64]*Account{stale.ID: &latest}}
 	snapshot := &openAISnapshotCacheStub{accountsByID: map[int64]*Account{stale.ID: stale}}
 	cache := &upstreamCostTrackingConcurrencyCache{}

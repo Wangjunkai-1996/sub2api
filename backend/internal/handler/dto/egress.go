@@ -40,6 +40,16 @@ type AssignableEgressRoute struct {
 	ProbeObservedAt *time.Time `json:"probe_observed_at,omitempty"`
 }
 
+type AccountEgressCatalogCapabilities struct {
+	MutationEnabled bool   `json:"mutation_enabled"`
+	ReasonCode      string `json:"reason_code,omitempty"`
+}
+
+type AssignableEgressRouteCatalog struct {
+	Items        []AssignableEgressRoute          `json:"items"`
+	Capabilities AccountEgressCatalogCapabilities `json:"capabilities"`
+}
+
 type AccountEgressPool struct {
 	RouteIDs             []int64                 `json:"route_ids"`
 	PrimaryRouteID       *int64                  `json:"primary_route_id"`
@@ -375,6 +385,12 @@ func egressRouteEligibility(route *service.EgressRoute, now time.Time) (bool, st
 	if route.ExpectedIdentity == nil || route.ExpectedIdentity.ID <= 0 ||
 		route.ExpectedIdentity.Status != service.EgressIdentityStatusActive {
 		return false, "identity_unavailable"
+	}
+	if route.VerifiedAt == nil || route.VerifiedAt.IsZero() {
+		return false, "pending_verification"
+	}
+	if !service.IsEgressIdentityVerificationFresh(route.VerifiedAt, now) {
+		return false, "verification_stale"
 	}
 	switch route.Kind {
 	case service.EgressRouteKindDirect:

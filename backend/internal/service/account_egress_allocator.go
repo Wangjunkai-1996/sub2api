@@ -30,7 +30,16 @@ var (
 	ErrAccountEgressUnavailable  = errors.New("account egress allocator unavailable")
 	ErrAccountEgressNoRoute      = errors.New("account egress route unavailable")
 	ErrAccountEgressConfigStale  = errors.New("account egress config stale")
+	ErrAccountEgressLeaseFenced  = errors.New("account egress lease fenced")
 	ErrAccountEgressLeaseLost    = errors.New("account egress lease lost")
+)
+
+type AccountEgressLeaseRefreshStatus string
+
+const (
+	AccountEgressLeaseRefreshActive AccountEgressLeaseRefreshStatus = "ACTIVE"
+	AccountEgressLeaseRefreshFenced AccountEgressLeaseRefreshStatus = "FENCED"
+	AccountEgressLeaseRefreshLost   AccountEgressLeaseRefreshStatus = "LOST"
 )
 
 type AccountEgressStatus string
@@ -70,6 +79,7 @@ type AccountEgressCandidate struct {
 type AccountEgressPoolConfig struct {
 	AccountID              int64
 	Version                int64
+	AuthorityRevision      int64
 	PerIdentityConcurrency int
 	MaxWaiting             int
 	Candidates             []AccountEgressCandidate
@@ -81,6 +91,9 @@ func (c AccountEgressPoolConfig) Validate() error {
 	}
 	if c.Version <= 0 {
 		return errors.New("account egress config version must be positive")
+	}
+	if c.AuthorityRevision <= 0 {
+		return errors.New("account egress authority revision must be positive")
 	}
 	if c.PerIdentityConcurrency <= 0 {
 		return errors.New("account egress per-identity concurrency must be positive")
@@ -212,15 +225,18 @@ type AccountEgressAcquireResult struct {
 	WaitingCount      int
 	EffectiveCapacity int
 	ConfigVersion     int64
+	AuthorityRevision int64
 	RedisTime         time.Time
 }
 
 type AccountEgressLeaseRef struct {
-	AccountID     int64
-	ID            string
-	BindingID     string
-	IdentityID    string
-	ConfigVersion int64
+	AccountID         int64
+	ID                string
+	BindingID         string
+	RouteID           int64
+	IdentityID        string
+	ConfigVersion     int64
+	AuthorityRevision int64
 }
 
 func (r AccountEgressLeaseRef) Key() string {
@@ -242,9 +258,17 @@ type AccountEgressCache interface {
 	SyncAccountEgressConfigs(context.Context, []AccountEgressPoolConfig) (map[int64]AccountEgressConfigSyncStatus, error)
 	AcquireAccountEgress(context.Context, AccountEgressCacheAcquireRequest) (AccountEgressAcquireResult, error)
 	RemoveAccountEgressWaiter(context.Context, int64, string) error
-	RefreshAccountEgressLeases(context.Context, []AccountEgressLeaseRef, time.Duration) (map[string]bool, error)
+	RefreshAccountEgressLeases(context.Context, []AccountEgressLeaseRef, time.Duration) (map[string]AccountEgressLeaseRefreshStatus, error)
+	KeepaliveFencedAccountEgressLeases(context.Context, []AccountEgressLeaseRef, time.Duration) (map[string]AccountEgressLeaseRefreshStatus, error)
 	ReleaseAccountEgressLease(context.Context, AccountEgressLeaseRef) error
 	GetAccountEgressLoadsBatch(context.Context, []AccountEgressPoolConfig, time.Duration, time.Duration) (map[int64]AccountEgressLoadInfo, error)
+}
+
+// AccountEgressAuthorityReader is the PostgreSQL backstop for Redis/outbox
+// authority. Redis remains the hot-path fence; this reader bounds the lifetime
+// of a stale projection when outbox propagation is delayed or interrupted.
+type AccountEgressAuthorityReader interface {
+	LoadAccountEgressAuthorities(context.Context, []int64) (map[int64]AccountEgressAuthority, error)
 }
 
 type ResolvedAccountEgress struct {
@@ -256,21 +280,26 @@ type ResolvedAccountEgress struct {
 	ActiveTotal       int
 	EffectiveCapacity int
 	ConfigVersion     int64
+	AuthorityRevision int64
 }
 
 type accountEgressLeaseState struct {
-	lease         *AccountEgressLease
-	lastConfirmed time.Time
-	nextRefresh   time.Time
+	lease                  *AccountEgressLease
+	lastConfirmed          time.Time
+	lastAuthorityConfirmed time.Time
+	nextRefresh            time.Time
 }
 
 type AccountEgressAllocator struct {
-	cache            AccountEgressCache
-	leaseTTL         time.Duration
-	refreshInterval  time.Duration
-	operationTimeout time.Duration
-	maxWaitDuration  time.Duration
-	now              func() time.Time
+	cache                  AccountEgressCache
+	authorityReader        AccountEgressAuthorityReader
+	leaseTTL               time.Duration
+	refreshInterval        time.Duration
+	operationTimeout       time.Duration
+	maxWaitDuration        time.Duration
+	authorityFailureWindow time.Duration
+	redisFailureWindow     time.Duration
+	now                    func() time.Time
 
 	mu        sync.Mutex
 	leases    map[string]*accountEgressLeaseState
@@ -281,7 +310,11 @@ type AccountEgressAllocator struct {
 	closeOnce sync.Once
 }
 
-func NewAccountEgressAllocator(cache AccountEgressCache) *AccountEgressAllocator {
+func NewAccountEgressAllocator(cache AccountEgressCache, authorityReaders ...AccountEgressAuthorityReader) *AccountEgressAllocator {
+	var authorityReader AccountEgressAuthorityReader
+	if len(authorityReaders) > 0 {
+		authorityReader = authorityReaders[0]
+	}
 	return newAccountEgressAllocatorWithTiming(
 		cache,
 		AccountEgressLeaseTTL,
@@ -289,6 +322,7 @@ func NewAccountEgressAllocator(cache AccountEgressCache) *AccountEgressAllocator
 		accountEgressOperationTimeout,
 		accountEgressMaxWaitDuration,
 		time.Now,
+		authorityReader,
 	)
 }
 
@@ -299,6 +333,7 @@ func newAccountEgressAllocatorWithTiming(
 	operationTimeout time.Duration,
 	maxWaitDuration time.Duration,
 	now func() time.Time,
+	authorityReaders ...AccountEgressAuthorityReader,
 ) *AccountEgressAllocator {
 	if leaseTTL <= 0 {
 		leaseTTL = AccountEgressLeaseTTL
@@ -315,17 +350,36 @@ func newAccountEgressAllocatorWithTiming(
 	if now == nil {
 		now = time.Now
 	}
-	return &AccountEgressAllocator{
-		cache:            cache,
-		leaseTTL:         leaseTTL,
-		refreshInterval:  refreshInterval,
-		operationTimeout: operationTimeout,
-		maxWaitDuration:  maxWaitDuration,
-		now:              now,
-		leases:           make(map[string]*accountEgressLeaseState),
-		closeCh:          make(chan struct{}),
-		doneCh:           make(chan struct{}),
+	var authorityReader AccountEgressAuthorityReader
+	if len(authorityReaders) > 0 {
+		authorityReader = authorityReaders[0]
 	}
+	redisFailureWindow := leaseTTL - minDuration(refreshInterval, leaseTTL/3)
+	if redisFailureWindow <= 0 {
+		redisFailureWindow = leaseTTL / 2
+	}
+	authorityFailureWindow := minDuration(50*time.Second, redisFailureWindow)
+	return &AccountEgressAllocator{
+		cache:                  cache,
+		authorityReader:        authorityReader,
+		leaseTTL:               leaseTTL,
+		refreshInterval:        refreshInterval,
+		operationTimeout:       operationTimeout,
+		maxWaitDuration:        maxWaitDuration,
+		authorityFailureWindow: authorityFailureWindow,
+		redisFailureWindow:     redisFailureWindow,
+		now:                    now,
+		leases:                 make(map[string]*accountEgressLeaseState),
+		closeCh:                make(chan struct{}),
+		doneCh:                 make(chan struct{}),
+	}
+}
+
+func minDuration(left, right time.Duration) time.Duration {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgressAcquireRequest) (*ResolvedAccountEgress, error) {
@@ -401,11 +455,13 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 	candidate, ok := request.Config.Candidate(result.BindingID)
 	if !ok || candidate.RouteID != result.RouteID || candidate.IdentityID != result.IdentityID || !candidate.Healthy {
 		ref := AccountEgressLeaseRef{
-			AccountID:     request.Config.AccountID,
-			ID:            result.LeaseID,
-			BindingID:     result.BindingID,
-			IdentityID:    result.IdentityID,
-			ConfigVersion: result.ConfigVersion,
+			AccountID:         request.Config.AccountID,
+			ID:                result.LeaseID,
+			BindingID:         result.BindingID,
+			RouteID:           result.RouteID,
+			IdentityID:        result.IdentityID,
+			ConfigVersion:     result.ConfigVersion,
+			AuthorityRevision: result.AuthorityRevision,
 		}
 		releaseCtx, cancel := context.WithTimeout(context.Background(), a.operationTimeout)
 		_ = a.cache.ReleaseAccountEgressLease(releaseCtx, ref)
@@ -413,16 +469,21 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 		return nil, ErrAccountEgressConfigStale
 	}
 
-	leaseCtx, cancel := context.WithCancelCause(ctx)
+	leaseCtx, cancel := context.WithCancelCause(context.Background())
 	lease := &AccountEgressLease{
-		ID:            result.LeaseID,
-		BindingID:     result.BindingID,
-		IdentityID:    result.IdentityID,
-		ConfigVersion: result.ConfigVersion,
-		accountID:     request.Config.AccountID,
-		ctx:           leaseCtx,
-		cancel:        cancel,
-		allocator:     a,
+		ID:                result.LeaseID,
+		BindingID:         result.BindingID,
+		RouteID:           result.RouteID,
+		IdentityID:        result.IdentityID,
+		ConfigVersion:     result.ConfigVersion,
+		AuthorityRevision: result.AuthorityRevision,
+		accountID:         request.Config.AccountID,
+		ctx:               leaseCtx,
+		cancel:            cancel,
+		allocator:         a,
+		owner:             true,
+		phase:             accountEgressLeasePhaseActive,
+		remoteOwned:       true,
 	}
 	if !a.register(lease) {
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), a.operationTimeout)
@@ -430,7 +491,9 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 		releaseCancel()
 		return nil, ErrAccountEgressUnavailable
 	}
-	lease.contextStop = context.AfterFunc(ctx, lease.Release)
+	lease.mu.Lock()
+	lease.requestStop = context.AfterFunc(ctx, lease.Release)
+	lease.mu.Unlock()
 	return &ResolvedAccountEgress{
 		BindingID:         result.BindingID,
 		RouteID:           result.RouteID,
@@ -440,6 +503,7 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 		ActiveTotal:       result.ActiveTotal,
 		EffectiveCapacity: result.EffectiveCapacity,
 		ConfigVersion:     result.ConfigVersion,
+		AuthorityRevision: result.AuthorityRevision,
 	}, nil
 }
 
@@ -552,9 +616,10 @@ func (a *AccountEgressAllocator) register(lease *AccountEgressLease) bool {
 		go a.refreshLoop()
 	}
 	a.leases[lease.ref().Key()] = &accountEgressLeaseState{
-		lease:         lease,
-		lastConfirmed: now,
-		nextRefresh:   now.Add(a.refreshInterval),
+		lease:                  lease,
+		lastConfirmed:          now,
+		lastAuthorityConfirmed: now,
+		nextRefresh:            now.Add(a.refreshInterval),
 	}
 	a.mu.Unlock()
 	return true
@@ -583,48 +648,78 @@ func (a *AccountEgressAllocator) refreshLoop() {
 func (a *AccountEgressAllocator) refreshDue() {
 	now := a.now()
 	a.mu.Lock()
-	refs := make([]AccountEgressLeaseRef, 0, len(a.leases))
+	due := make([]*AccountEgressLease, 0, len(a.leases))
 	for _, state := range a.leases {
 		if !state.nextRefresh.After(now) {
-			refs = append(refs, state.lease.ref())
+			due = append(due, state.lease)
 			state.nextRefresh = now.Add(a.refreshInterval)
 		}
 	}
 	a.mu.Unlock()
-	if len(refs) == 0 {
-		return
+	activeRefs := make([]AccountEgressLeaseRef, 0, len(due))
+	fencedRefs := make([]AccountEgressLeaseRef, 0, len(due))
+	for _, lease := range due {
+		switch lease.phaseSnapshot() {
+		case accountEgressLeasePhaseActive:
+			activeRefs = append(activeRefs, lease.ref())
+		case accountEgressLeasePhaseFenced:
+			fencedRefs = append(fencedRefs, lease.ref())
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.operationTimeout)
-	owned, err := a.cache.RefreshAccountEgressLeases(ctx, refs, a.leaseTTL)
-	cancel()
-	a.applyRefreshResult(refs, owned, err, now)
+	if len(activeRefs) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), a.operationTimeout)
+		statuses, err := a.cache.RefreshAccountEgressLeases(ctx, activeRefs, a.leaseTTL)
+		cancel()
+		a.applyRefreshResult(activeRefs, statuses, err, now)
+		a.checkAuthority(activeRefs, now)
+	}
+	if len(fencedRefs) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), a.operationTimeout)
+		statuses, err := a.cache.KeepaliveFencedAccountEgressLeases(ctx, fencedRefs, a.leaseTTL)
+		cancel()
+		a.applyRefreshResult(fencedRefs, statuses, err, now)
+	}
 }
 
 func (a *AccountEgressAllocator) applyRefreshResult(
 	refs []AccountEgressLeaseRef,
-	owned map[string]bool,
+	statuses map[string]AccountEgressLeaseRefreshStatus,
 	err error,
 	now time.Time,
 ) {
 	var lost []*AccountEgressLease
+	var fenced []*AccountEgressLease
 	a.mu.Lock()
 	for _, ref := range refs {
 		state := a.leases[ref.Key()]
 		if state == nil {
 			continue
 		}
-		if err == nil && owned[ref.Key()] {
-			state.lastConfirmed = now
+		if err != nil {
+			if now.Sub(state.lastConfirmed) < a.redisFailureWindow {
+				continue
+			}
+			delete(a.leases, ref.Key())
+			lost = append(lost, state.lease)
 			continue
 		}
-		if err == nil || now.Sub(state.lastConfirmed) >= a.leaseTTL {
+		switch statuses[ref.Key()] {
+		case AccountEgressLeaseRefreshActive:
+			state.lastConfirmed = now
+		case AccountEgressLeaseRefreshFenced:
+			state.lastConfirmed = now
+			fenced = append(fenced, state.lease)
+		default:
 			delete(a.leases, ref.Key())
 			lost = append(lost, state.lease)
 		}
 	}
 	a.mu.Unlock()
 
+	for _, lease := range fenced {
+		lease.markFenced()
+	}
 	for _, lease := range lost {
 		lease.markLost()
 	}
@@ -636,54 +731,182 @@ func (a *AccountEgressAllocator) applyRefreshResult(
 	}
 }
 
+func (a *AccountEgressAllocator) checkAuthority(
+	refs []AccountEgressLeaseRef,
+	now time.Time,
+) {
+	if a == nil || a.authorityReader == nil {
+		return
+	}
+	accountIDs := make([]int64, 0, len(refs))
+	seen := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		a.mu.Lock()
+		state := a.leases[ref.Key()]
+		a.mu.Unlock()
+		if state == nil {
+			continue
+		}
+		if _, ok := seen[ref.AccountID]; ok {
+			continue
+		}
+		seen[ref.AccountID] = struct{}{}
+		accountIDs = append(accountIDs, ref.AccountID)
+	}
+	if len(accountIDs) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.operationTimeout)
+	authorities, err := a.authorityReader.LoadAccountEgressAuthorities(ctx, accountIDs)
+	cancel()
+	a.applyAuthorityResult(refs, authorities, err, now)
+}
+
+func (a *AccountEgressAllocator) applyAuthorityResult(
+	refs []AccountEgressLeaseRef,
+	authorities map[int64]AccountEgressAuthority,
+	err error,
+	now time.Time,
+) {
+	var fenced []*AccountEgressLease
+	a.mu.Lock()
+	for _, ref := range refs {
+		state := a.leases[ref.Key()]
+		if state == nil {
+			continue
+		}
+		if err != nil {
+			if now.Sub(state.lastAuthorityConfirmed) >= a.authorityFailureWindow {
+				fenced = append(fenced, state.lease)
+			}
+			continue
+		}
+		authority, ok := authorities[ref.AccountID]
+		if !ok || authority.Mode != EgressModePool || authority.Revision != ref.AuthorityRevision {
+			fenced = append(fenced, state.lease)
+			continue
+		}
+		state.lastAuthorityConfirmed = now
+	}
+	a.mu.Unlock()
+	for _, lease := range fenced {
+		lease.markFenced()
+	}
+	if err != nil {
+		logger.L().Warn("account_egress_authority_refresh_failed",
+			zap.Int("account_count", len(authorities)),
+			zap.Error(err),
+		)
+	}
+}
+
 func (a *AccountEgressAllocator) refreshOne(ctx context.Context, lease *AccountEgressLease, tolerateTransient bool) error {
 	if a == nil || a.cache == nil || lease == nil {
 		return ErrAccountEgressUnavailable
 	}
+	if cause := lease.terminalError(); cause != nil {
+		return cause
+	}
 	ref := lease.ref()
-	owned, err := a.cache.RefreshAccountEgressLeases(ctx, []AccountEgressLeaseRef{ref}, a.leaseTTL)
-	if err != nil {
-		if tolerateTransient {
-			now := a.now()
+	now := a.now()
+	statuses, redisErr := a.cache.RefreshAccountEgressLeases(ctx, []AccountEgressLeaseRef{ref}, a.leaseTTL)
+	if redisErr == nil {
+		switch statuses[ref.Key()] {
+		case AccountEgressLeaseRefreshFenced:
+			lease.markFenced()
+			return ErrAccountEgressLeaseFenced
+		case AccountEgressLeaseRefreshLost:
 			a.mu.Lock()
-			state := a.leases[ref.Key()]
-			if state != nil && now.Sub(state.lastConfirmed) < a.leaseTTL {
-				a.mu.Unlock()
-				return nil
-			}
-			if state != nil {
-				delete(a.leases, ref.Key())
-			}
+			delete(a.leases, ref.Key())
 			a.mu.Unlock()
 			lease.markLost()
-			return fmt.Errorf("%w: refresh safety window expired: %v", ErrAccountEgressLeaseLost, err)
+			return ErrAccountEgressLeaseLost
+		case AccountEgressLeaseRefreshActive:
+		default:
+			a.mu.Lock()
+			delete(a.leases, ref.Key())
+			a.mu.Unlock()
+			lease.markLost()
+			return ErrAccountEgressLeaseLost
 		}
-		return fmt.Errorf("%w: refresh: %v", ErrAccountEgressUnavailable, err)
-	}
-	if !owned[ref.Key()] {
 		a.mu.Lock()
-		delete(a.leases, ref.Key())
+		if state := a.leases[ref.Key()]; state != nil {
+			state.lastConfirmed = now
+			state.nextRefresh = now.Add(a.refreshInterval)
+		}
 		a.mu.Unlock()
-		lease.markLost()
-		return ErrAccountEgressLeaseLost
 	}
-	now := a.now()
+
+	if authorityErr := a.refreshAuthorityOne(ref, lease, now, tolerateTransient); authorityErr != nil {
+		return authorityErr
+	}
+	if redisErr == nil {
+		return nil
+	}
+	a.mu.Lock()
+	state := a.leases[ref.Key()]
+	insideWindow := state != nil && now.Sub(state.lastConfirmed) < a.redisFailureWindow
+	if tolerateTransient && !insideWindow && state != nil {
+		delete(a.leases, ref.Key())
+	}
+	a.mu.Unlock()
+	if tolerateTransient && insideWindow {
+		return nil
+	}
+	if tolerateTransient {
+		lease.markLost()
+		return fmt.Errorf("%w: refresh safety window expired: %v", ErrAccountEgressLeaseLost, redisErr)
+	}
+	return fmt.Errorf("%w: refresh: %v", ErrAccountEgressUnavailable, redisErr)
+}
+
+func (a *AccountEgressAllocator) refreshAuthorityOne(
+	ref AccountEgressLeaseRef,
+	lease *AccountEgressLease,
+	now time.Time,
+	tolerateTransient bool,
+) error {
+	if a.authorityReader == nil {
+		return nil
+	}
+	authorityCtx, cancel := context.WithTimeout(context.Background(), a.operationTimeout)
+	authorities, authorityErr := a.authorityReader.LoadAccountEgressAuthorities(authorityCtx, []int64{ref.AccountID})
+	cancel()
+	if authorityErr != nil {
+		a.mu.Lock()
+		state := a.leases[ref.Key()]
+		insideWindow := state != nil && now.Sub(state.lastAuthorityConfirmed) < a.authorityFailureWindow
+		a.mu.Unlock()
+		if tolerateTransient && insideWindow {
+			return nil
+		}
+		if insideWindow {
+			return fmt.Errorf("%w: authority refresh: %v", ErrAccountEgressUnavailable, authorityErr)
+		}
+		lease.markFenced()
+		return fmt.Errorf("%w: authority safety window expired: %v", ErrAccountEgressLeaseFenced, authorityErr)
+	}
+	authority, ok := authorities[ref.AccountID]
+	if !ok || authority.Mode != EgressModePool || authority.Revision != ref.AuthorityRevision {
+		lease.markFenced()
+		return ErrAccountEgressLeaseFenced
+	}
 	a.mu.Lock()
 	if state := a.leases[ref.Key()]; state != nil {
-		state.lastConfirmed = now
-		state.nextRefresh = now.Add(a.refreshInterval)
+		state.lastAuthorityConfirmed = now
 	}
 	a.mu.Unlock()
 	return nil
 }
 
 func validateRestoredAccountEgressLeaseRef(ref AccountEgressLeaseRef) error {
-	if ref.AccountID <= 0 || strings.TrimSpace(ref.ID) == "" || strings.TrimSpace(ref.BindingID) == "" ||
-		strings.TrimSpace(ref.IdentityID) == "" || ref.ConfigVersion <= 0 {
+	if ref.AccountID <= 0 || ref.RouteID <= 0 || strings.TrimSpace(ref.ID) == "" || strings.TrimSpace(ref.BindingID) == "" ||
+		strings.TrimSpace(ref.IdentityID) == "" || ref.ConfigVersion <= 0 || ref.AuthorityRevision <= 0 {
 		return ErrAccountEgressConfigStale
 	}
 	accountID, routeID, ok := parseStableAccountEgressBindingID(ref.BindingID)
-	if !ok || accountID != ref.AccountID || routeID <= 0 {
+	if !ok || accountID != ref.AccountID || routeID != ref.RouteID {
 		return ErrAccountEgressConfigStale
 	}
 	identityID, err := strconv.ParseInt(strings.TrimSpace(ref.IdentityID), 10, 64)
@@ -715,6 +938,7 @@ func (a *AccountEgressAllocator) restore(ctx context.Context, ref AccountEgressL
 			return nil, ErrAccountEgressLeaseLost
 		}
 		if err := state.lease.Refresh(ctx); err != nil {
+			state.lease.Release()
 			return nil, err
 		}
 		return state.lease, nil
@@ -722,15 +946,20 @@ func (a *AccountEgressAllocator) restore(ctx context.Context, ref AccountEgressL
 
 	leaseCtx, cancel := context.WithCancelCause(context.Background())
 	lease := &AccountEgressLease{
-		ID:            ref.ID,
-		BindingID:     ref.BindingID,
-		IdentityID:    ref.IdentityID,
-		ConfigVersion: ref.ConfigVersion,
-		accountID:     ref.AccountID,
-		ctx:           leaseCtx,
-		cancel:        cancel,
-		allocator:     a,
-		detached:      true,
+		ID:                ref.ID,
+		BindingID:         ref.BindingID,
+		RouteID:           ref.RouteID,
+		IdentityID:        ref.IdentityID,
+		ConfigVersion:     ref.ConfigVersion,
+		AuthorityRevision: ref.AuthorityRevision,
+		accountID:         ref.AccountID,
+		ctx:               leaseCtx,
+		cancel:            cancel,
+		allocator:         a,
+		detached:          true,
+		owner:             true,
+		phase:             accountEgressLeasePhaseActive,
+		remoteOwned:       true,
 	}
 	if !a.register(lease) {
 		cancel(ErrAccountEgressUnavailable)
@@ -761,37 +990,51 @@ func (a *AccountEgressAllocator) Close() {
 			<-a.doneCh
 		}
 		for _, lease := range leases {
-			lease.Release()
+			lease.shutdown()
 		}
 	})
 }
 
+type accountEgressLeasePhase uint8
+
+const (
+	accountEgressLeasePhaseActive accountEgressLeasePhase = iota
+	accountEgressLeasePhaseFenced
+	accountEgressLeasePhaseLost
+	accountEgressLeasePhaseReleased
+	accountEgressLeasePhaseAbandoned
+)
+
 type AccountEgressLease struct {
-	ID            string
-	BindingID     string
-	IdentityID    string
-	ConfigVersion int64
+	ID                string
+	BindingID         string
+	RouteID           int64
+	IdentityID        string
+	ConfigVersion     int64
+	AuthorityRevision int64
 
 	accountID int64
 	allocator *AccountEgressAllocator
 
-	contextStopMu sync.RWMutex
+	mu            sync.Mutex
 	ctx           context.Context
 	cancel        context.CancelCauseFunc
-	contextStop   func() bool
+	requestStop   func() bool
+	owner         bool
 	detached      bool
+	useCount      int
+	phase         accountEgressLeasePhase
 	terminalCause error
-
-	releaseOnce sync.Once
+	remoteOwned   bool
 }
 
 func (l *AccountEgressLease) Context() context.Context {
 	if l == nil {
 		return context.Background()
 	}
-	l.contextStopMu.RLock()
+	l.mu.Lock()
 	ctx := l.ctx
-	l.contextStopMu.RUnlock()
+	l.mu.Unlock()
 	if ctx == nil {
 		return context.Background()
 	}
@@ -808,6 +1051,32 @@ func (l *AccountEgressLease) Refresh(ctx context.Context) error {
 	return l.allocator.refreshOne(ctx, l, false)
 }
 
+// AcquireUse pins the Redis reservation to one concrete upstream transport.
+// The returned release function is idempotent. New transports are rejected as
+// soon as authority is fenced or lost, while existing transports retain their
+// capacity reservation until their final release.
+func (l *AccountEgressLease) AcquireUse() (func(), error) {
+	if l == nil {
+		return nil, ErrAccountEgressUnavailable
+	}
+	l.mu.Lock()
+	if l.phase != accountEgressLeasePhaseActive || !l.owner {
+		err := l.terminalCause
+		if err == nil {
+			err = context.Canceled
+		}
+		l.mu.Unlock()
+		return nil, err
+	}
+	l.useCount++
+	l.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(l.releaseUse)
+	}, nil
+}
+
 // RefreshWithinSafetyWindow treats an indeterminate cache error as retryable
 // only while the last confirmed ownership is still inside the lease TTL. A
 // definitive ownership miss always fails immediately.
@@ -821,108 +1090,230 @@ func (l *AccountEgressLease) RefreshWithinSafetyWindow(ctx context.Context) erro
 	return l.allocator.refreshOne(ctx, l, true)
 }
 
-// Detach transfers ownership of the lease from a request context to a
-// long-lived operation (for example an OpenAI Live call). It replaces the
-// request-derived context as well as stopping automatic release, so cancellation
-// of the HTTP request cannot poison the long-lived lease context.
+// Detach atomically transfers request ownership to a long-lived operation (for
+// example an OpenAI Live call). The lease context is independent from the
+// request from creation time, so detaching only has to win the cancellation
+// callback race; it never replaces a context visible to transport callers.
 func (l *AccountEgressLease) Detach() bool {
 	if l == nil {
 		return false
 	}
-	l.contextStopMu.Lock()
-	defer l.contextStopMu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.detached {
-		return l.terminalCause == nil
+		return l.phase == accountEgressLeasePhaseActive && l.owner
 	}
-	if l.terminalCause != nil || l.contextStop == nil {
+	if l.phase != accountEgressLeasePhaseActive || !l.owner || l.requestStop == nil {
 		return false
 	}
-	stop := l.contextStop
-	l.contextStop = nil
+	stop := l.requestStop
+	l.requestStop = nil
 	if !stop() {
 		return false
 	}
-	leaseCtx, cancel := context.WithCancelCause(context.Background())
-	l.ctx = leaseCtx
-	l.cancel = cancel
 	l.detached = true
 	return true
 }
 
 func (l *AccountEgressLease) Release() {
-	l.finish(true)
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if !l.owner {
+		l.mu.Unlock()
+		return
+	}
+	l.owner = false
+	if l.requestStop != nil {
+		l.requestStop()
+		l.requestStop = nil
+	}
+	l.mu.Unlock()
+	l.finalizeIfDrained()
 }
 
 // Abandon stops this process from refreshing a transferred lease without
 // deleting the Redis lease. It is used when another controller owns the same
 // long-lived operation and may still be actively using that exact lease.
 func (l *AccountEgressLease) Abandon() {
-	l.finish(false)
-}
-
-func (l *AccountEgressLease) finish(releaseRemote bool) {
 	if l == nil {
 		return
 	}
-	l.releaseOnce.Do(func() {
-		l.contextStopMu.Lock()
-		if l.contextStop != nil {
-			l.contextStop()
-			l.contextStop = nil
-		}
-		if l.terminalCause == nil {
-			l.terminalCause = context.Canceled
-		}
-		leaseCancel := l.cancel
-		l.contextStopMu.Unlock()
-		if leaseCancel != nil {
-			leaseCancel(nil)
-		}
-		if l.allocator == nil {
-			return
-		}
-		ref := l.ref()
-		l.allocator.unregister(ref)
-		if !releaseRemote {
-			return
-		}
-		ctx, releaseCancel := context.WithTimeout(context.Background(), l.allocator.operationTimeout)
-		defer releaseCancel()
-		if err := l.allocator.cache.ReleaseAccountEgressLease(ctx, ref); err != nil {
-			logger.L().Warn("account_egress_lease_release_failed",
-				zap.Int64("account_id", ref.AccountID),
-				zap.String("lease_id", ref.ID),
-				zap.Error(err),
-			)
-		}
-	})
+	l.mu.Lock()
+	if l.phase == accountEgressLeasePhaseReleased || l.phase == accountEgressLeasePhaseAbandoned {
+		l.mu.Unlock()
+		return
+	}
+	l.owner = false
+	l.remoteOwned = false
+	l.phase = accountEgressLeasePhaseAbandoned
+	if l.terminalCause == nil {
+		l.terminalCause = context.Canceled
+	}
+	if l.requestStop != nil {
+		l.requestStop()
+		l.requestStop = nil
+	}
+	cancel := l.cancel
+	cause := l.terminalCause
+	l.mu.Unlock()
+	if cancel != nil {
+		cancel(cause)
+	}
+	if l.allocator != nil {
+		l.allocator.unregister(l.ref())
+	}
+}
+
+func (l *AccountEgressLease) releaseUse() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.useCount > 0 {
+		l.useCount--
+	}
+	l.mu.Unlock()
+	l.finalizeIfDrained()
+}
+
+func (l *AccountEgressLease) finalizeIfDrained() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.owner || l.useCount > 0 || l.phase == accountEgressLeasePhaseReleased || l.phase == accountEgressLeasePhaseAbandoned {
+		l.mu.Unlock()
+		return
+	}
+	releaseRemote := l.remoteOwned
+	l.remoteOwned = false
+	l.phase = accountEgressLeasePhaseReleased
+	if l.terminalCause == nil {
+		l.terminalCause = context.Canceled
+	}
+	if l.requestStop != nil {
+		l.requestStop()
+		l.requestStop = nil
+	}
+	cancel := l.cancel
+	cause := l.terminalCause
+	ref := l.refLocked()
+	l.mu.Unlock()
+
+	if cancel != nil {
+		cancel(cause)
+	}
+	if l.allocator == nil {
+		return
+	}
+	l.allocator.unregister(ref)
+	if !releaseRemote {
+		return
+	}
+	ctx, releaseCancel := context.WithTimeout(context.Background(), l.allocator.operationTimeout)
+	defer releaseCancel()
+	if err := l.allocator.cache.ReleaseAccountEgressLease(ctx, ref); err != nil {
+		logger.L().Warn("account_egress_lease_release_failed",
+			zap.Int64("account_id", ref.AccountID),
+			zap.String("lease_id", ref.ID),
+			zap.Error(err),
+		)
+	}
+}
+
+func (l *AccountEgressLease) markFenced() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.phase != accountEgressLeasePhaseActive {
+		l.mu.Unlock()
+		return
+	}
+	l.phase = accountEgressLeasePhaseFenced
+	l.terminalCause = ErrAccountEgressLeaseFenced
+	cancel := l.cancel
+	l.mu.Unlock()
+	if cancel != nil {
+		cancel(ErrAccountEgressLeaseFenced)
+	}
+	l.finalizeIfDrained()
 }
 
 func (l *AccountEgressLease) markLost() {
 	if l == nil {
 		return
 	}
-	l.contextStopMu.Lock()
-	if l.terminalCause == nil {
-		l.terminalCause = ErrAccountEgressLeaseLost
+	l.mu.Lock()
+	if l.phase == accountEgressLeasePhaseReleased || l.phase == accountEgressLeasePhaseAbandoned || l.phase == accountEgressLeasePhaseLost {
+		l.mu.Unlock()
+		return
 	}
+	l.phase = accountEgressLeasePhaseLost
+	l.terminalCause = ErrAccountEgressLeaseLost
 	cancel := l.cancel
-	l.contextStopMu.Unlock()
+	ref := l.refLocked()
+	l.mu.Unlock()
 	if cancel != nil {
 		cancel(ErrAccountEgressLeaseLost)
 	}
+	if l.allocator != nil {
+		l.allocator.unregister(ref)
+	}
+	l.finalizeIfDrained()
+}
+
+func (l *AccountEgressLease) shutdown() {
+	if l == nil {
+		return
+	}
+	l.markFenced()
+	l.Release()
+}
+
+func (l *AccountEgressLease) phaseSnapshot() accountEgressLeasePhase {
+	if l == nil {
+		return accountEgressLeasePhaseReleased
+	}
+	l.mu.Lock()
+	phase := l.phase
+	l.mu.Unlock()
+	return phase
+}
+
+func (l *AccountEgressLease) terminalError() error {
+	if l == nil {
+		return ErrAccountEgressUnavailable
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.phase == accountEgressLeasePhaseActive && l.owner {
+		return nil
+	}
+	if l.terminalCause != nil {
+		return l.terminalCause
+	}
+	return context.Canceled
 }
 
 func (l *AccountEgressLease) ref() AccountEgressLeaseRef {
 	if l == nil {
 		return AccountEgressLeaseRef{}
 	}
+	return l.refLocked()
+}
+
+func (l *AccountEgressLease) refLocked() AccountEgressLeaseRef {
 	return AccountEgressLeaseRef{
-		AccountID:     l.accountID,
-		ID:            l.ID,
-		BindingID:     l.BindingID,
-		IdentityID:    l.IdentityID,
-		ConfigVersion: l.ConfigVersion,
+		AccountID:         l.accountID,
+		ID:                l.ID,
+		BindingID:         l.BindingID,
+		RouteID:           l.RouteID,
+		IdentityID:        l.IdentityID,
+		ConfigVersion:     l.ConfigVersion,
+		AuthorityRevision: l.AuthorityRevision,
 	}
 }
 

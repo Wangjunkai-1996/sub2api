@@ -602,7 +602,7 @@ func (s *ConcurrencyCacheSuite) TestProvideConcurrencyServiceStartupPreservesMul
 		Member: strconv.FormatInt(userID, 10),
 	}).Err())
 
-	require.NotNil(s.T(), service.ProvideConcurrencyService(s.cache, nil, nil))
+	require.NotNil(s.T(), service.ProvideConcurrencyService(s.cache, nil, nil, nil))
 	// The compatibility entry point must remain harmless if an older caller invokes it.
 	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "proc-a-"))
 

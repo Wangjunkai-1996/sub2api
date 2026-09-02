@@ -52,7 +52,7 @@
               <span v-if="routeIp(route)" class="font-mono">{{ routeIp(route) }}</span>
               <span v-if="route.country_code || route.country">{{ route.country_code || route.country }}</span>
               <span v-if="route.probe_latency_ms != null">{{ route.probe_latency_ms }}ms</span>
-              <span v-if="routeReason(route) && !verifyErrors[route.id]" class="text-amber-700 dark:text-amber-300">{{ routeReason(route) }}</span>
+              <span v-if="routeReason(route) && !verifyError(route.id)" class="text-amber-700 dark:text-amber-300">{{ routeReason(route) }}</span>
             </span>
           </label>
 
@@ -64,7 +64,7 @@
             :aria-label="t('admin.accounts.egressPool.verify')"
             :disabled="verifyingRouteId !== null"
             :data-testid="`verify-egress-${route.id}`"
-            @click="verifyRoute(route)"
+            @click="emit('verify', route)"
           >
             <Icon name="refresh" size="sm" :class="verifyingRouteId === route.id ? 'animate-spin' : ''" />
           </button>
@@ -86,8 +86,8 @@
           {{ t('admin.accounts.egressPool.selectPrimary') }}
         </label>
 
-        <p v-if="verifyErrors[route.id]" class="mt-1 ml-7 text-xs text-red-600 dark:text-red-400">
-          {{ verifyErrors[route.id] }}
+        <p v-if="verifyError(route.id)" class="mt-1 ml-7 text-xs text-red-600 dark:text-red-400">
+          {{ verifyError(route.id) }}
         </p>
       </div>
 
@@ -106,9 +106,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { adminAPI } from '@/api/admin'
 import Icon from '@/components/icons/Icon.vue'
 import type { AssignableEgressRoute, EgressRouteState } from '@/types'
 
@@ -120,31 +119,31 @@ const props = withDefaults(defineProps<{
   requirePrimary?: boolean
   disabled?: boolean
   inherited?: boolean
+  verifyingRouteId?: number | null
+  verifyErrors?: Record<number, string>
 }>(), {
   selectedRoutes: () => [],
   requirePrimary: true,
   disabled: false,
-  inherited: false
+  inherited: false,
+  verifyingRouteId: null,
+  verifyErrors: () => ({})
 })
 
 const emit = defineEmits<{
   'update:selectedRouteIds': [ids: number[]]
   'update:primaryRouteId': [id: number | null]
-  verified: [route: AssignableEgressRoute]
+  verify: [route: AssignableEgressRoute]
 }>()
 
 const { t } = useI18n()
-const verifyingRouteId = ref<number | null>(null)
-const verifiedRoutes = reactive<Record<number, AssignableEgressRoute>>({})
-const verifyErrors = reactive<Record<number, string>>({})
 
 const visibleRoutes = computed(() => {
   const byID = new Map<number, AssignableEgressRoute>()
-  for (const route of [...props.routes, ...props.selectedRoutes]) {
+  // Keep removed selections visible while letting the fresh catalog win for
+  // routes present in both projections.
+  for (const route of [...props.selectedRoutes, ...props.routes]) {
     if (route.kind === 'proxy') byID.set(route.id, route)
-  }
-  for (const [id, route] of Object.entries(verifiedRoutes)) {
-    if (route.kind === 'proxy') byID.set(Number(id), route)
   }
   return Array.from(byID.values()).sort((left, right) => {
     return routeLabel(left).localeCompare(routeLabel(right))
@@ -193,6 +192,7 @@ const knownReasonCodes = new Set([
   'persistence_failed',
   'request_canceled',
   'pending_verification',
+  'verification_stale',
   'route_inactive',
   'route_expired',
   'identity_mismatch',
@@ -213,6 +213,10 @@ const readableReason = (reasonCode?: string | null) => {
 }
 
 const routeReason = (route: AssignableEgressRoute) => readableReason(route.probe_reason_code || route.reason_code)
+const verifyError = (routeID: number) => {
+  const error = props.verifyErrors[routeID]
+  return readableReason(error) || error || ''
+}
 
 const stateLabel = (state: EgressRouteState) => t(`admin.accounts.egressPool.state.${state}`)
 const stateClass = (route: AssignableEgressRoute) => {
@@ -225,37 +229,4 @@ const stateClass = (route: AssignableEgressRoute) => {
   return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
 }
 
-const verifyRoute = async (route: AssignableEgressRoute) => {
-  if (verifyingRouteId.value !== null) return
-  verifyingRouteId.value = route.id
-  delete verifyErrors[route.id]
-  try {
-    const result = await adminAPI.egressRoutes.verify([route.id])
-    const verified = result.find((item) => item.id === route.id)
-    if (verified) {
-      verifiedRoutes[route.id] = verified
-      emit('verified', verified)
-      const probeReason = readableReason(verified.probe_reason_code)
-      if (verified.probe_success === false || probeReason) {
-        verifyErrors[route.id] = probeReason || t('admin.accounts.egressPool.verifyFailed')
-      } else {
-        delete verifyErrors[route.id]
-      }
-    } else {
-      verifyErrors[route.id] = t('admin.accounts.egressPool.verifyFailed')
-    }
-  } catch (error: unknown) {
-    const apiError = error as {
-      response?: { data?: { probe_reason_code?: string; message?: string; detail?: string } }
-      message?: string
-    }
-    verifyErrors[route.id] = readableReason(apiError.response?.data?.probe_reason_code)
-      || apiError.response?.data?.message
-      || apiError.response?.data?.detail
-      || apiError.message
-      || t('admin.accounts.egressPool.verifyFailed')
-  } finally {
-    verifyingRouteId.value = null
-  }
-}
 </script>

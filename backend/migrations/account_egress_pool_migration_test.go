@@ -12,8 +12,9 @@ func TestAccountEgressPoolMigrations(t *testing.T) {
 	backfill := compactMigrationSQL(t, "241_account_egress_pool_backfill.sql")
 	validation := compactMigrationSQL(t, "242_validate_account_egress_pool_constraints.sql")
 	permissions := compactMigrationSQL(t, "243_account_egress_pool_runtime_permissions.sql")
+	proxyOnly := compactMigrationSQL(t, "244_account_egress_proxy_only_contract.sql")
 
-	for _, sql := range []string{foundation, backfill, validation, permissions} {
+	for _, sql := range []string{foundation, backfill, validation, permissions, proxyOnly} {
 		require.Contains(t, sql, "SET LOCAL lock_timeout = '3s'")
 		require.Contains(t, sql, "SET LOCAL statement_timeout = '30s'")
 		require.NotContains(t, strings.ToUpper(sql), "DROP TABLE")
@@ -52,6 +53,27 @@ func TestAccountEgressPoolMigrations(t *testing.T) {
 	require.Contains(t, permissions, "GRANT USAGE, SELECT, UPDATE ON SEQUENCE")
 	require.Contains(t, permissions, "public.egress_identities_id_seq, public.egress_routes_id_seq")
 	require.Contains(t, permissions, "ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public")
+
+	require.Contains(t, proxyOnly, "default_acl_owners <> ARRAY[current_user::name]")
+	require.Contains(t, proxyOnly, "REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES")
+	require.Contains(t, proxyOnly, "REVOKE USAGE, SELECT, UPDATE ON SEQUENCES")
+	tableLock := "LOCK TABLE egress_routes, accounts, account_egress_bindings IN SHARE ROW EXCLUSIVE MODE"
+	require.Contains(t, proxyOnly, tableLock)
+	require.Less(t, strings.Index(proxyOnly, tableLock), strings.Index(proxyOnly, "CREATE TEMP TABLE account_egress_direct_repair"))
+	require.Contains(t, proxyOnly, "repair.repair_kind = 'mixed'")
+	require.Contains(t, proxyOnly, "route.kind = 'direct'")
+	require.Contains(t, proxyOnly, "THEN 'legacy'")
+	require.Contains(t, proxyOnly, "HAVING COUNT(*) > 0")
+	require.Contains(t, proxyOnly, "CREATE TRIGGER account_egress_bindings_proxy_only")
+	require.Contains(t, proxyOnly, "CREATE TRIGGER accounts_egress_pool_proxy_only")
+	require.Contains(t, proxyOnly, "ORDER BY route.id FOR SHARE")
+	require.Contains(t, proxyOnly, "ORDER BY account.id FOR NO KEY UPDATE")
+	require.Contains(t, proxyOnly, "UPDATE OF egress_mode, deleted_at ON accounts")
+	require.Contains(t, proxyOnly, "CREATE TRIGGER egress_routes_proxy_only_for_pool_accounts")
+	require.Contains(t, proxyOnly, "UPDATE OF kind, proxy_id, runtime_scope ON egress_routes")
+	require.Contains(t, proxyOnly, "WHERE binding.route_id = OLD.id ORDER BY account.id FOR NO KEY UPDATE OF account")
+	require.Contains(t, proxyOnly, "route % cannot become direct while referenced by a pool account")
+	require.Contains(t, proxyOnly, "proxy-only egress repair incomplete: pool direct binding remains")
 }
 
 func compactMigrationSQL(t *testing.T, name string) string {

@@ -3,11 +3,16 @@
  */
 
 import { apiClient } from '../client'
-import type { AssignableEgressRoute } from '@/types'
+import type { AssignableEgressRoute, AssignableEgressRouteCatalog } from '@/types'
 
 type AssignableRoutesResponse =
   | AssignableEgressRoute[]
-  | { items?: AssignableEgressRoute[]; routes?: AssignableEgressRoute[] }
+  | {
+      items?: AssignableEgressRoute[]
+      routes?: AssignableEgressRoute[]
+      generation?: string | number | null
+      capabilities?: { mutation_enabled?: boolean; reason_code?: string | null }
+    }
 
 function unwrapRoutes(data: AssignableRoutesResponse): AssignableEgressRoute[] {
   if (Array.isArray(data)) return data
@@ -15,8 +20,22 @@ function unwrapRoutes(data: AssignableRoutesResponse): AssignableEgressRoute[] {
 }
 
 export async function getAssignable(): Promise<AssignableEgressRoute[]> {
+  return (await getAssignableCatalog()).items
+}
+
+export async function getAssignableCatalog(): Promise<AssignableEgressRouteCatalog> {
   const { data } = await apiClient.get<AssignableRoutesResponse>('/admin/egress-routes/assignable')
-  return unwrapRoutes(data)
+  if (Array.isArray(data)) {
+    return { items: data, capabilities: { mutation_enabled: true } }
+  }
+  return {
+    items: unwrapRoutes(data),
+    generation: data.generation,
+    capabilities: {
+      mutation_enabled: data.capabilities?.mutation_enabled === true,
+      reason_code: data.capabilities?.reason_code
+    }
+  }
 }
 
 export async function verify(routeIds: number[]): Promise<AssignableEgressRoute[]> {
@@ -39,6 +58,7 @@ export async function confirmIdentity(
 
 export const egressRoutesAPI = {
   getAssignable,
+  getAssignableCatalog,
   verify,
   confirmIdentity
 }

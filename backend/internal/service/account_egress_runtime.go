@@ -13,6 +13,8 @@ import (
 type requiredAccountEgressBindingContextKey struct{}
 type preferredAccountEgressBindingContextKey struct{}
 
+const accountEgressVerifiedAtFutureSkew = time.Minute
+
 // WithRequiredAccountEgressBinding carries a continuation's route fence into
 // the existing scheduler admission path. It contains only the stable binding
 // identifier; transport credentials remain on the request-local Account.
@@ -59,7 +61,8 @@ func AccountEgressLeaseLost(account *Account) bool {
 		return false
 	}
 	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil &&
-		errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseLost) {
+		(errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseLost) ||
+			errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseFenced)) {
 		return true
 	}
 	return account.LegacyEgressAdmission != nil && account.LegacyEgressAdmission.Lease != nil &&
@@ -162,6 +165,7 @@ func AccountEgressPoolConfigForRuntime(account *Account, maxWaiting int) (Accoun
 	config := AccountEgressPoolConfig{
 		AccountID:              account.ID,
 		Version:                accountEgressRuntimeVersion(account),
+		AuthorityRevision:      accountEgressAuthorityRevision(account),
 		PerIdentityConcurrency: account.Concurrency,
 		MaxWaiting:             maxWaiting,
 		Candidates:             make([]AccountEgressCandidate, 0, len(account.EgressBindings)),
@@ -175,7 +179,8 @@ func AccountEgressPoolConfigForRuntime(account *Account, maxWaiting int) (Accoun
 		}
 		healthy := binding.Status == AccountEgressBindingStatusActive &&
 			route.State == EgressRouteStateActive &&
-			route.ExpectedIdentity.Status == EgressIdentityStatusActive
+			route.ExpectedIdentity.Status == EgressIdentityStatusActive &&
+			IsEgressIdentityVerificationFresh(route.VerifiedAt, now)
 		if healthy {
 			switch route.Kind {
 			case EgressRouteKindDirect:
@@ -209,6 +214,30 @@ func AccountEgressPoolConfigForRuntime(account *Account, maxWaiting int) (Accoun
 	return config, nil
 }
 
+// IsEgressIdentityVerificationFresh is the single freshness contract shared by
+// admission, control traffic, persistence validation, and admin projections.
+func IsEgressIdentityVerificationFresh(verifiedAt *time.Time, now time.Time) bool {
+	if verifiedAt == nil || verifiedAt.IsZero() {
+		return false
+	}
+	verifiedAtUTC := verifiedAt.UTC()
+	now = now.UTC()
+	if verifiedAtUTC.After(now.Add(accountEgressVerifiedAtFutureSkew)) {
+		return false
+	}
+	return !verifiedAtUTC.Before(now.Add(-EgressIdentityFreshness))
+}
+
+func accountEgressAuthorityRevision(account *Account) int64 {
+	if account == nil {
+		return 0
+	}
+	if account.EgressRevision <= 0 {
+		return 1
+	}
+	return account.EgressRevision
+}
+
 func accountEgressRuntimeVersion(account *Account) int64 {
 	if account == nil {
 		return 0
@@ -224,10 +253,7 @@ func accountEgressRuntimeVersion(account *Account) int64 {
 			}
 		}
 	}
-	accountRevision := account.EgressRevision
-	if accountRevision <= 0 {
-		accountRevision = 1
-	}
+	accountRevision := accountEgressAuthorityRevision(account)
 	if accountRevision > math.MaxInt64>>31 {
 		return math.MaxInt64
 	}
@@ -238,8 +264,11 @@ func resolvedAccountEgressBinding(account *Account, resolved *ResolvedAccountEgr
 	if account == nil || resolved == nil || resolved.Lease == nil {
 		return nil, ErrAccountEgressConfigStale
 	}
+	authorityRevision := accountEgressAuthorityRevision(account)
 	if !accountSupportsEgressPoolRuntime(account) || account.EgressMode != EgressModePool ||
-		resolved.ConfigVersion != accountEgressRuntimeVersion(account) {
+		resolved.ConfigVersion != accountEgressRuntimeVersion(account) ||
+		resolved.AuthorityRevision != authorityRevision ||
+		resolved.Lease.AuthorityRevision != authorityRevision {
 		return nil, ErrAccountEgressConfigStale
 	}
 	var selected *AccountEgressBinding
@@ -256,7 +285,8 @@ func resolvedAccountEgressBinding(account *Account, resolved *ResolvedAccountEgr
 	if strconv.FormatInt(selected.Route.ExpectedIdentity.ID, 10) != resolved.IdentityID ||
 		selected.Status != AccountEgressBindingStatusActive ||
 		selected.Route.State != EgressRouteStateActive ||
-		selected.Route.ExpectedIdentity.Status != EgressIdentityStatusActive {
+		selected.Route.ExpectedIdentity.Status != EgressIdentityStatusActive ||
+		!IsEgressIdentityVerificationFresh(selected.Route.VerifiedAt, time.Now()) {
 		return nil, ErrAccountEgressConfigStale
 	}
 	if selected.Route.Kind == EgressRouteKindProxy {
@@ -387,11 +417,12 @@ func OpenAIAccountControlProxyURL(account *Account) (string, error) {
 	if account == nil || account.Platform != PlatformOpenAI {
 		return "", ErrAccountEgressNoRoute
 	}
+	now := time.Now()
 	if account.EgressMode != EgressModePool {
 		if account.Proxy == nil {
 			return "", nil
 		}
-		if !account.Proxy.IsActive() || account.Proxy.IsExpired(time.Now()) {
+		if !account.Proxy.IsActive() || account.Proxy.IsExpired(now) {
 			return "", ErrAccountEgressNoRoute
 		}
 		return account.Proxy.URL(), nil
@@ -410,7 +441,8 @@ func OpenAIAccountControlProxyURL(account *Account) (string, error) {
 	}
 	if primary == nil || primary.Status != AccountEgressBindingStatusActive || primary.Route == nil ||
 		primary.Route.State != EgressRouteStateActive || primary.Route.ExpectedIdentity == nil ||
-		primary.Route.ExpectedIdentity.Status != EgressIdentityStatusActive {
+		primary.Route.ExpectedIdentity.Status != EgressIdentityStatusActive ||
+		!IsEgressIdentityVerificationFresh(primary.Route.VerifiedAt, now) {
 		return "", ErrAccountEgressNoRoute
 	}
 	switch primary.Route.Kind {
@@ -420,7 +452,7 @@ func OpenAIAccountControlProxyURL(account *Account) (string, error) {
 		}
 		return "", nil
 	case EgressRouteKindProxy:
-		if primary.Route.ProxyID == nil || primary.Route.Proxy == nil || !primary.Route.Proxy.IsActive() || primary.Route.Proxy.IsExpired(time.Now()) {
+		if primary.Route.ProxyID == nil || primary.Route.Proxy == nil || !primary.Route.Proxy.IsActive() || primary.Route.Proxy.IsExpired(now) {
 			return "", ErrAccountEgressNoRoute
 		}
 		return primary.Route.Proxy.URL(), nil

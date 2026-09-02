@@ -15,8 +15,10 @@ const {
   listWithEtag,
   getBatchTodayStats,
   getUpstreamBillingProbeSettings,
-  getAllProxies,
-  getAssignableEgress,
+  getProxyOptions,
+  getAssignableEgressCatalog,
+  getAccountById,
+  verifyEgressRoute,
   getAllGroups,
   duplicateAccount,
   createSparkShadow,
@@ -27,8 +29,10 @@ const {
   listWithEtag: vi.fn(),
   getBatchTodayStats: vi.fn(),
   getUpstreamBillingProbeSettings: vi.fn(),
-  getAllProxies: vi.fn(),
-  getAssignableEgress: vi.fn(),
+  getProxyOptions: vi.fn(),
+  getAssignableEgressCatalog: vi.fn(),
+  getAccountById: vi.fn(),
+  verifyEgressRoute: vi.fn(),
   getAllGroups: vi.fn(),
   duplicateAccount: vi.fn(),
   createSparkShadow: vi.fn(),
@@ -42,6 +46,7 @@ vi.mock('@/api/admin', () => ({
       list: listAccounts,
       listWithEtag,
       getBatchTodayStats,
+      getById: getAccountById,
       duplicate: duplicateAccount,
       getUpstreamBillingProbeSettings,
       createSparkShadow,
@@ -50,8 +55,11 @@ vi.mock('@/api/admin', () => ({
       batchRefresh: vi.fn(),
       toggleSchedulable: vi.fn()
     },
-    proxies: { getAll: getAllProxies },
-    egressRoutes: { getAssignable: getAssignableEgress },
+    proxies: { getOptions: getProxyOptions },
+    egressRoutes: {
+      getAssignableCatalog: getAssignableEgressCatalog,
+      verify: verifyEgressRoute
+    },
     groups: { getAll: getAllGroups }
   }
 }))
@@ -83,9 +91,15 @@ const mountView = () =>
         DataTable: true,
         Pagination: true,
         ConfirmDialog: true,
-        AccountTableActions: { template: '<div><slot name="beforeCreate" /><slot name="after" /></div>' },
+        AccountTableActions: {
+          emits: ['create'],
+          template: '<div><button data-test="open-create" @click="$emit(\'create\')">create</button><slot name="beforeCreate" /><slot name="after" /></div>'
+        },
         AccountTableFilters: { template: '<div></div>' },
-        AccountBulkActionsBar: true,
+        AccountBulkActionsBar: {
+          emits: ['edit-selected'],
+          template: '<button data-test="open-bulk-edit" @click="$emit(\'edit-selected\')">bulk</button>'
+        },
         AccountActionMenu: true,
         ImportDataModal: true,
         ReAuthAccountModal: true,
@@ -96,9 +110,15 @@ const mountView = () =>
         TempUnschedStatusModal: true,
         ErrorPassthroughRulesModal: true,
         TLSFingerprintProfilesModal: true,
-        CreateAccountModal: true,
+        CreateAccountModal: {
+          props: ['show', 'proxies', 'egressRoutes'],
+          template: '<div data-test="create-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" />'
+        },
         EditAccountModal: true,
-        BulkEditAccountModal: true,
+        BulkEditAccountModal: {
+          props: ['show', 'proxies', 'egressRoutes'],
+          template: '<div data-test="bulk-edit-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" />'
+        },
         PlatformTypeBadge: true,
         AccountCapacityCell: true,
         AccountStatusIndicator: true,
@@ -113,15 +133,17 @@ const mountView = () =>
 describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getAllProxies, getAssignableEgress, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getProxyOptions, getAssignableEgressCatalog, getAccountById, verifyEgressRoute, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
     listAccounts.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20, pages: 0 })
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
     getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: true, interval_minutes: 30 })
-    getAllProxies.mockResolvedValue([])
-    getAssignableEgress.mockResolvedValue([])
+    getProxyOptions.mockResolvedValue([])
+    getAssignableEgressCatalog.mockResolvedValue({ items: [], capabilities: { mutation_enabled: true } })
+    getAccountById.mockImplementation(async (id: number) => ({ id }))
+    verifyEgressRoute.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     duplicateAccount.mockResolvedValue({ id: 998, name: 'parent-acc (Copy)' })
     createSparkShadow.mockResolvedValue({ id: 999, name: 'parent-acc (Spark)' })
@@ -145,12 +167,50 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     wrapper.unmount()
   })
 
-  it('账号设置只加载脱敏的可分配出口，不再读取完整代理列表', async () => {
+  it('账号设置只加载脱敏的出口与代理选项', async () => {
     const wrapper = mountView()
     await flushPromises()
 
-    expect(getAssignableEgress).toHaveBeenCalledTimes(1)
-    expect(getAllProxies).not.toHaveBeenCalled()
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(1)
+    expect(getProxyOptions).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('打开创建弹窗时刷新目录并清除加载失败的旧代理选项', async () => {
+    getProxyOptions
+      .mockResolvedValueOnce([{ id: 1, name: 'old', display_endpoint: 'old:1', status: 'active', selectable: true }])
+      .mockRejectedValueOnce(new Error('proxy catalog unavailable'))
+    getAssignableEgressCatalog
+      .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
+      .mockResolvedValueOnce({
+        items: [{ id: 2, kind: 'proxy', name: 'fresh-route', state: 'active', eligible: true }],
+        capabilities: { mutation_enabled: true }
+      })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-test="open-create"]').trigger('click')
+    await flushPromises()
+
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
+    expect(getProxyOptions).toHaveBeenCalledTimes(2)
+    const modal = wrapper.get('[data-test="create-account-modal"]')
+    expect(modal.attributes('data-show')).toBe('true')
+    expect(modal.attributes('data-proxy-count')).toBe('0')
+    expect(modal.attributes('data-route-count')).toBe('1')
+    wrapper.unmount()
+  })
+
+  it('打开批量编辑弹窗时刷新出口和代理目录', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-test="open-bulk-edit"]').trigger('click')
+    await flushPromises()
+
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
+    expect(getProxyOptions).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-test="bulk-edit-account-modal"]').attributes('data-show')).toBe('true')
     wrapper.unmount()
   })
 
@@ -264,9 +324,34 @@ const mountViewWithRow = () =>
         TLSFingerprintProfilesModal: true,
         CreateAccountModal: true,
         EditAccountModal: {
-          props: ['show', 'account', 'egressRoutes'],
-          template: `<div data-test="edit-account-modal" :data-show="String(show)">
-            <span v-for="route in egressRoutes" :key="route.id" data-test="edit-egress-route">{{ route.name }}</span>
+          props: [
+            'show',
+            'account',
+            'proxies',
+            'egressRoutes',
+            'egressMutationEnabled',
+            'egressVerifyingRouteId',
+            'egressVerifyErrors'
+          ],
+          emits: ['verify-egress-route'],
+          template: `<div
+            data-test="edit-account-modal"
+            :data-show="String(show)"
+            :data-account-name="account?.name"
+            :data-mutation-enabled="String(egressMutationEnabled)"
+          >
+            <button
+              v-for="route in egressRoutes"
+              :key="route.id"
+              data-test="edit-egress-route"
+              @click="$emit('verify-egress-route', route)"
+            >{{ route.name }} {{ route.probe_latency_ms }}</button>
+            <span v-for="proxy in proxies" :key="proxy.id" data-test="edit-proxy-option">{{ proxy.display_endpoint }}</span>
+            <span
+              v-for="route in (account?.egress_pool?.routes || [])"
+              :key="route.id"
+              data-test="edit-embedded-egress-route"
+            >{{ route.name }}</span>
           </div>`
         },
         BulkEditAccountModal: true,
@@ -284,14 +369,16 @@ const mountViewWithRow = () =>
 describe('admin AccountsView — 账号行展示', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getAllProxies, getAssignableEgress, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getProxyOptions, getAssignableEgressCatalog, getAccountById, verifyEgressRoute, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
     getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: true, interval_minutes: 30 })
-    getAllProxies.mockResolvedValue([])
-    getAssignableEgress.mockResolvedValue([])
+    getProxyOptions.mockResolvedValue([])
+    getAssignableEgressCatalog.mockResolvedValue({ items: [], capabilities: { mutation_enabled: true } })
+    getAccountById.mockImplementation(async (id: number) => ({ id }))
+    verifyEgressRoute.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     vi.stubGlobal('confirm', vi.fn(() => true))
   })
@@ -319,10 +406,22 @@ describe('admin AccountsView — 账号行展示', () => {
       eligible: true,
       observed_ip: '104.223.77.152'
     }]
+    const proxyOptions = [{
+      id: 104,
+      name: 'racknerd-104',
+      display_endpoint: 'socks5://104.223.77.152:1080',
+      status: 'active',
+      selectable: true
+    }]
     listAccounts.mockResolvedValue({ items: [account], total: 1, page: 1, page_size: 20, pages: 1 })
-    getAssignableEgress
+    getAssignableEgressCatalog
+      .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
+      .mockResolvedValueOnce({ items: refreshedRoutes, capabilities: { mutation_enabled: true } })
+    getProxyOptions
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce(refreshedRoutes)
+      .mockResolvedValueOnce(proxyOptions)
+    getAccountById.mockResolvedValue({ ...account, name: 'fresh-openai-oauth' })
+    verifyEgressRoute.mockResolvedValue([{ ...refreshedRoutes[0], probe_latency_ms: 61 }])
 
     const wrapper = mountViewWithRow()
     await flushPromises()
@@ -332,9 +431,64 @@ describe('admin AccountsView — 账号行展示', () => {
     await editButton!.trigger('click')
     await flushPromises()
 
-    expect(getAssignableEgress).toHaveBeenCalledTimes(2)
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
+    expect(getAccountById).toHaveBeenCalledWith(11049)
     expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-show')).toBe('true')
-    expect(wrapper.get('[data-test="edit-egress-route"]').text()).toBe('racknerd-104-ipv4')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-account-name')).toBe('fresh-openai-oauth')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-mutation-enabled')).toBe('true')
+    expect(wrapper.get('[data-test="edit-egress-route"]').text()).toContain('racknerd-104-ipv4')
+    expect(wrapper.get('[data-test="edit-proxy-option"]').text()).toBe('socks5://104.223.77.152:1080')
+
+    await wrapper.get('[data-test="edit-egress-route"]').trigger('click')
+    await flushPromises()
+    expect(verifyEgressRoute).toHaveBeenCalledWith([12])
+    expect(wrapper.get('[data-test="edit-egress-route"]').text()).toContain('61')
+    wrapper.unmount()
+  })
+
+  it('目录刷新失败时使用 fresh 详情展示已绑定出口并禁用修改', async () => {
+    const rowAccount = {
+      id: 11050,
+      name: 'stale-row',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active'
+    }
+    const embeddedRoute = {
+      id: 18,
+      kind: 'proxy',
+      name: 'bound-route',
+      state: 'retired',
+      eligible: false
+    }
+    listAccounts.mockResolvedValue({ items: [rowAccount], total: 1, page: 1, page_size: 20, pages: 1 })
+    getAssignableEgressCatalog
+      .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
+      .mockRejectedValueOnce(new Error('catalog unavailable'))
+    getAccountById.mockResolvedValue({
+      ...rowAccount,
+      name: 'fresh-account',
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [18],
+        primary_route_id: 18,
+        concurrency_per_egress: 2,
+        revision: 4,
+        routes: [embeddedRoute]
+      }
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+    const editButton = wrapper.findAll('button').find(button => button.text() === 'common.edit')
+    await editButton!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-show')).toBe('true')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-account-name')).toBe('fresh-account')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-mutation-enabled')).toBe('false')
+    expect(wrapper.get('[data-test="edit-embedded-egress-route"]').text()).toBe('bound-route')
     wrapper.unmount()
   })
 

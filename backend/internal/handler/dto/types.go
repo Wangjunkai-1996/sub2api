@@ -366,6 +366,17 @@ type ProxyWithAccountCount struct {
 	QualityChecked *int64 `json:"quality_checked,omitempty"`
 }
 
+// ProxyOption is the credential-free projection used by assignment controls.
+type ProxyOption struct {
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	DisplayEndpoint string `json:"display_endpoint"`
+	Status          string `json:"status"`
+	Selectable      bool   `json:"selectable"`
+	DisabledReason  string `json:"disabled_reason,omitempty"`
+	AccountCount    int64  `json:"account_count"`
+}
+
 // AdminProxy 是管理员接口使用的 proxy DTO（包含密码等敏感字段）。
 // 注意：普通接口不得使用此 DTO。
 type AdminProxy struct {

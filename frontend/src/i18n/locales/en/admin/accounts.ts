@@ -981,6 +981,7 @@ export default {
           persistence_failed: 'The verification result could not be saved',
           request_canceled: 'Verification was canceled or timed out',
           pending_verification: 'Verification has not completed',
+          verification_stale: 'Verification has expired; verify this egress again',
           route_inactive: 'The egress is inactive',
           route_expired: 'The egress has expired',
           identity_mismatch: 'The public IP does not match the confirmed identity',

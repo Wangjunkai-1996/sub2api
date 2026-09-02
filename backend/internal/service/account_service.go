@@ -144,12 +144,54 @@ type AccountBillingSettingsRepository interface {
 	) error
 }
 
+// AccountConfigurationFieldMask records which editable account columns were
+// present in one admin PUT. Repository implementations must only mutate these
+// columns so a form loaded before a runtime update cannot write stale runtime
+// state back to the account row.
+type AccountConfigurationFieldMask struct {
+	Name               bool
+	Notes              bool
+	Type               bool
+	Credentials        bool
+	Extra              bool
+	ProxyID            bool
+	Concurrency        bool
+	Priority           bool
+	RateMultiplier     bool
+	LoadFactor         bool
+	Status             bool
+	ExpiresAt          bool
+	AutoPauseOnExpired bool
+}
+
+// AccountConfigurationMutation is the complete durable intent for one admin
+// account edit. Desired contains normalized values, while Fields distinguishes
+// an omitted field from an explicit clear. CredentialsPatch retains the
+// request-level credential update so sensitive values can be merged with the
+// latest locked row instead of a stale service snapshot.
+type AccountConfigurationMutation struct {
+	Desired          *Account
+	Fields           AccountConfigurationFieldMask
+	CredentialsPatch map[string]any
+	ProbeEnabled     *bool
+	RateSyncEnabled  *bool
+	EgressPool       *ReplaceAccountPoolInput
+	GroupIDs         *[]int64
+}
+
+// AccountConfigurationRepository atomically persists every part of one admin
+// edit and returns the committed-shape account hydrated inside that transaction.
+type AccountConfigurationRepository interface {
+	UpdateAccountConfiguration(ctx context.Context, mutation AccountConfigurationMutation) (*Account, error)
+}
+
 // AdminAccountRepository makes the account-duplication write capability an explicit
 // construction dependency without forcing read-only gateway test doubles to implement it.
 type AdminAccountRepository interface {
 	AccountRepository
 	AccountDuplicateRepository
 	AccountBillingSettingsRepository
+	AccountConfigurationRepository
 }
 
 // AccountBulkUpdate describes the fields that can be updated in a bulk operation.

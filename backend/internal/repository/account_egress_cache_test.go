@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +63,7 @@ func accountEgressTestConfig(accountID int64, limit, maxWaiting int, candidates 
 	return service.AccountEgressPoolConfig{
 		AccountID:              accountID,
 		Version:                1,
+		AuthorityRevision:      1,
 		PerIdentityConcurrency: limit,
 		MaxWaiting:             maxWaiting,
 		Candidates:             candidates,
@@ -94,8 +97,8 @@ func syncAccountEgressConfigAtKey(t *testing.T, cache *concurrencyCache, key str
 	digest, err := config.Digest()
 	require.NoError(t, err)
 	candidates := config.SortedCandidates()
-	args := make([]any, 0, 5+len(candidates)*2)
-	args = append(args, config.Version, digest, config.PerIdentityConcurrency, config.MaxWaiting, len(candidates))
+	args := make([]any, 0, 6+len(candidates)*2)
+	args = append(args, config.Version, config.AuthorityRevision, digest, config.PerIdentityConcurrency, config.MaxWaiting, len(candidates))
 	for _, candidate := range candidates {
 		args = append(args, accountEgressIDHash(candidate.BindingID), accountEgressBindingMapping(candidate))
 	}
@@ -130,11 +133,13 @@ func acquireAccountEgressTest(
 func releaseAccountEgressTest(t *testing.T, cache *concurrencyCache, config service.AccountEgressPoolConfig, result service.AccountEgressAcquireResult) {
 	t.Helper()
 	require.NoError(t, cache.ReleaseAccountEgressLease(context.Background(), service.AccountEgressLeaseRef{
-		AccountID:     config.AccountID,
-		ID:            result.LeaseID,
-		BindingID:     result.BindingID,
-		IdentityID:    result.IdentityID,
-		ConfigVersion: result.ConfigVersion,
+		AccountID:         config.AccountID,
+		ID:                result.LeaseID,
+		BindingID:         result.BindingID,
+		RouteID:           result.RouteID,
+		IdentityID:        result.IdentityID,
+		ConfigVersion:     result.ConfigVersion,
+		AuthorityRevision: result.AuthorityRevision,
 	}))
 }
 
@@ -210,6 +215,29 @@ func TestAccountEgressConfigVersionFence(t *testing.T) {
 	result, err = cache.SyncAccountEgressConfigs(context.Background(), []service.AccountEgressPoolConfig{conflict})
 	require.NoError(t, err)
 	require.Equal(t, service.AccountEgressConfigSyncConflict, result[config.AccountID])
+}
+
+func TestAccountEgressAuthorityRevisionAdvancesWhenRuntimeVersionSaturates(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	config := accountEgressTestConfig(1031, 1, 0, accountEgressTestCandidate(0, 91, "ip:a"))
+	config.Version = math.MaxInt64
+	config.AuthorityRevision = 11
+	syncAccountEgressTestConfig(t, cache, config)
+
+	advanced := config
+	advanced.AuthorityRevision = 12
+	result, err := cache.SyncAccountEgressConfigs(context.Background(), []service.AccountEgressPoolConfig{advanced})
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressConfigSyncOK, result[config.AccountID])
+	require.Equal(t, "12", cache.rdb.HGet(context.Background(), accountEgressConfigKey(config.AccountID), "authority_revision").Val())
+
+	acquired := acquireAccountEgressTest(t, cache, advanced, "saturated-version", "", "")
+	require.Equal(t, service.AccountEgressStatusAcquired, acquired.Status)
+	require.Equal(t, int64(12), acquired.AuthorityRevision)
+
+	result, err = cache.SyncAccountEgressConfigs(context.Background(), []service.AccountEgressPoolConfig{config})
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressConfigSyncStale, result[config.AccountID])
 }
 
 func TestAccountEgressDistinctIdentitiesEachRespectLimit(t *testing.T) {
@@ -342,17 +370,153 @@ func TestAccountEgressRefreshCannotRecreateMissingLeaseAndReleaseRestoresCapacit
 	syncAccountEgressTestConfig(t, cache, config)
 
 	result := acquireAccountEgressTest(t, cache, config, "refresh-1", "", "")
-	ref := service.AccountEgressLeaseRef{AccountID: config.AccountID, ID: result.LeaseID, BindingID: result.BindingID, IdentityID: result.IdentityID, ConfigVersion: result.ConfigVersion}
-	owned, err := cache.RefreshAccountEgressLeases(context.Background(), []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
+	ref := service.AccountEgressLeaseRef{AccountID: config.AccountID, ID: result.LeaseID, BindingID: result.BindingID, RouteID: result.RouteID, IdentityID: result.IdentityID, ConfigVersion: result.ConfigVersion, AuthorityRevision: result.AuthorityRevision}
+	statuses, err := cache.RefreshAccountEgressLeases(context.Background(), []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
 	require.NoError(t, err)
-	require.True(t, owned[ref.Key()])
+	require.Equal(t, service.AccountEgressLeaseRefreshActive, statuses[ref.Key()])
 
 	require.NoError(t, cache.rdb.ZRem(context.Background(), accountEgressIdentityKey(config.AccountID, result.IdentityID), accountEgressIDHash(result.LeaseID)).Err())
-	owned, err = cache.RefreshAccountEgressLeases(context.Background(), []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
+	statuses, err = cache.RefreshAccountEgressLeases(context.Background(), []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
 	require.NoError(t, err)
-	require.False(t, owned[ref.Key()])
+	require.Equal(t, service.AccountEgressLeaseRefreshLost, statuses[ref.Key()])
 	require.NoError(t, cache.ReleaseAccountEgressLease(context.Background(), ref))
 	require.Equal(t, service.AccountEgressStatusAcquired, acquireAccountEgressTest(t, cache, config, "refresh-2", "", "").Status)
+}
+
+func TestAccountEgressReleaseDoesNotDeleteReplacementLease(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(service.AccountEgressLeaseRef) (string, string, service.AccountEgressLeaseRef)
+	}{
+		{
+			name: "binding",
+			mutate: func(ref service.AccountEgressLeaseRef) (string, string, service.AccountEgressLeaseRef) {
+				ref.BindingID = "replacement-binding"
+				return "binding_hash", accountEgressIDHash(ref.BindingID), ref
+			},
+		},
+		{
+			name: "route",
+			mutate: func(ref service.AccountEgressLeaseRef) (string, string, service.AccountEgressLeaseRef) {
+				ref.RouteID++
+				return "route_id", strconv.FormatInt(ref.RouteID, 10), ref
+			},
+		},
+		{
+			name: "version",
+			mutate: func(ref service.AccountEgressLeaseRef) (string, string, service.AccountEgressLeaseRef) {
+				ref.ConfigVersion++
+				return "version", strconv.FormatInt(ref.ConfigVersion, 10), ref
+			},
+		},
+		{
+			name: "authority revision",
+			mutate: func(ref service.AccountEgressLeaseRef) (string, string, service.AccountEgressLeaseRef) {
+				ref.AuthorityRevision++
+				return "authority_revision", strconv.FormatInt(ref.AuthorityRevision, 10), ref
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache, _ := newAccountEgressCacheTest(t)
+			config := accountEgressTestConfig(1032, 1, 0, accountEgressTestCandidate(0, 63, "ip:a"))
+			syncAccountEgressTestConfig(t, cache, config)
+			result := acquireAccountEgressTest(t, cache, config, "reused-lease", "", "")
+			oldRef := service.AccountEgressLeaseRef{
+				AccountID: config.AccountID, ID: result.LeaseID, BindingID: result.BindingID,
+				RouteID: result.RouteID, IdentityID: result.IdentityID, ConfigVersion: result.ConfigVersion,
+				AuthorityRevision: result.AuthorityRevision,
+			}
+			field, value, replacementRef := tt.mutate(oldRef)
+			ctx := context.Background()
+			require.NoError(t, cache.rdb.HSet(ctx, accountEgressLeaseKey(config.AccountID, result.LeaseID), field, value).Err())
+
+			require.NoError(t, cache.ReleaseAccountEgressLease(ctx, oldRef))
+			require.Equal(t, int64(1), cache.rdb.Exists(ctx, accountEgressLeaseKey(config.AccountID, result.LeaseID)).Val())
+			require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressIdentityKey(config.AccountID, result.IdentityID)).Val())
+			require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+
+			require.NoError(t, cache.ReleaseAccountEgressLease(ctx, replacementRef))
+			require.Zero(t, cache.rdb.Exists(ctx, accountEgressLeaseKey(config.AccountID, result.LeaseID)).Val())
+			require.Zero(t, cache.rdb.ZCard(ctx, accountEgressIdentityKey(config.AccountID, result.IdentityID)).Val())
+			require.Zero(t, cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+		})
+	}
+
+	t.Run("missing metadata cleans orphaned members", func(t *testing.T) {
+		cache, _ := newAccountEgressCacheTest(t)
+		config := accountEgressTestConfig(1033, 1, 0, accountEgressTestCandidate(0, 64, "ip:a"))
+		syncAccountEgressTestConfig(t, cache, config)
+		result := acquireAccountEgressTest(t, cache, config, "orphaned-lease", "", "")
+		ref := service.AccountEgressLeaseRef{
+			AccountID: config.AccountID, ID: result.LeaseID, BindingID: result.BindingID,
+			RouteID: result.RouteID, IdentityID: result.IdentityID, ConfigVersion: result.ConfigVersion,
+			AuthorityRevision: result.AuthorityRevision,
+		}
+		ctx := context.Background()
+		require.NoError(t, cache.rdb.Del(ctx, accountEgressLeaseKey(config.AccountID, result.LeaseID)).Err())
+
+		require.NoError(t, cache.ReleaseAccountEgressLease(ctx, ref))
+		require.Zero(t, cache.rdb.ZCard(ctx, accountEgressIdentityKey(config.AccountID, result.IdentityID)).Val())
+		require.Zero(t, cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+	})
+}
+
+func TestAccountEgressRefreshFencesChangedAuthorityAndKeepsReservationUntilRelease(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(context.Context, *concurrencyCache, service.AccountEgressPoolConfig, service.AccountEgressAcquireResult)
+	}{
+		{
+			name: "config version",
+			mutate: func(ctx context.Context, cache *concurrencyCache, config service.AccountEgressPoolConfig, _ service.AccountEgressAcquireResult) {
+				require.NoError(t, cache.rdb.HSet(ctx, accountEgressConfigKey(config.AccountID), "version", config.Version+1).Err())
+			},
+		},
+		{
+			name: "binding mapping",
+			mutate: func(ctx context.Context, cache *concurrencyCache, config service.AccountEgressPoolConfig, result service.AccountEgressAcquireResult) {
+				require.NoError(t, cache.rdb.HSet(
+					ctx,
+					accountEgressConfigKey(config.AccountID),
+					"binding:"+accountEgressIDHash(result.BindingID),
+					accountEgressIDHash("different-identity")+":1:"+strconv.FormatInt(result.RouteID, 10),
+				).Err())
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cache, _ := newAccountEgressCacheTest(t)
+			candidate := accountEgressTestCandidate(0, 62, "ip:a")
+			config := accountEgressTestConfig(1026, 1, 0, candidate)
+			syncAccountEgressTestConfig(t, cache, config)
+			result := acquireAccountEgressTest(t, cache, config, "fence-1", "", "")
+			ref := service.AccountEgressLeaseRef{
+				AccountID: config.AccountID, ID: result.LeaseID, BindingID: result.BindingID,
+				RouteID: result.RouteID, IdentityID: result.IdentityID, ConfigVersion: result.ConfigVersion,
+				AuthorityRevision: result.AuthorityRevision,
+			}
+			ctx := context.Background()
+			test.mutate(ctx, cache, config, result)
+
+			statuses, err := cache.RefreshAccountEgressLeases(ctx, []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
+			require.NoError(t, err)
+			require.Equal(t, service.AccountEgressLeaseRefreshFenced, statuses[ref.Key()])
+			require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressIdentityKey(config.AccountID, result.IdentityID)).Val())
+			require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+
+			statuses, err = cache.KeepaliveFencedAccountEgressLeases(ctx, []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
+			require.NoError(t, err)
+			require.Equal(t, service.AccountEgressLeaseRefreshFenced, statuses[ref.Key()])
+			require.Equal(t, "fenced", cache.rdb.HGet(ctx, accountEgressLeaseKey(config.AccountID, result.LeaseID), "state").Val())
+
+			require.NoError(t, cache.ReleaseAccountEgressLease(ctx, ref))
+			require.Zero(t, cache.rdb.ZCard(ctx, accountEgressIdentityKey(config.AccountID, result.IdentityID)).Val())
+			require.Zero(t, cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+		})
+	}
 }
 
 func TestAccountEgressLegacyPoolGateDrainsBothDirections(t *testing.T) {
@@ -419,11 +583,12 @@ func TestAccountEgressTransitionBridgesLegacyByAdmissionIdentity(t *testing.T) {
 	require.Equal(t, "transition", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 	firstPoolRef := service.AccountEgressLeaseRef{
 		AccountID: config.AccountID, ID: poolLeases[0].LeaseID, BindingID: poolLeases[0].BindingID,
-		IdentityID: poolLeases[0].IdentityID, ConfigVersion: poolLeases[0].ConfigVersion,
+		RouteID: poolLeases[0].RouteID, IdentityID: poolLeases[0].IdentityID, ConfigVersion: poolLeases[0].ConfigVersion,
+		AuthorityRevision: poolLeases[0].AuthorityRevision,
 	}
-	owned, err := cache.RefreshAccountEgressLeases(ctx, []service.AccountEgressLeaseRef{firstPoolRef}, service.AccountEgressLeaseTTL)
+	statuses, err := cache.RefreshAccountEgressLeases(ctx, []service.AccountEgressLeaseRef{firstPoolRef}, service.AccountEgressLeaseTTL)
 	require.NoError(t, err)
-	require.True(t, owned[firstPoolRef.Key()])
+	require.Equal(t, service.AccountEgressLeaseRefreshActive, statuses[firstPoolRef.Key()])
 	require.Equal(t, service.AccountEgressStatusFull, acquireAccountEgressTest(t, cache, config, "transition-tenth", "", "").Status)
 
 	legacyBlocked, err := cache.AcquireAccountSlot(ctx, config.AccountID, 3, "transition-new-legacy-blocked")

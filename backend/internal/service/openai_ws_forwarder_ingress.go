@@ -84,6 +84,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return errors.New("account is nil")
 	}
 	ctx = ContextWithSelectedAccountEgress(ctx, account)
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return useErr
+		}
+		defer releaseUse()
+	}
 	// A handler may reuse the same gin context across account failover attempts.
 	// Never let an OAuth attempt's response aliases leak into the next account.
 	setCodexToolNameReverse(c, nil)

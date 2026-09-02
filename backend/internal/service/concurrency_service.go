@@ -284,13 +284,13 @@ type cachedAccountLoadBatch struct {
 }
 
 // NewConcurrencyService 创建并发控制服务。
-func NewConcurrencyService(cache ConcurrencyCache) *ConcurrencyService {
+func NewConcurrencyService(cache ConcurrencyCache, authorityReaders ...AccountEgressAuthorityReader) *ConcurrencyService {
 	svc := &ConcurrencyService{
 		cache:            cache,
 		accountLoadCache: make(map[string]cachedAccountLoadBatch),
 	}
 	if egressCache, ok := cache.(AccountEgressCache); ok {
-		svc.accountEgressAllocator = NewAccountEgressAllocator(egressCache)
+		svc.accountEgressAllocator = NewAccountEgressAllocator(egressCache, authorityReaders...)
 	}
 	svc.SetAccountLoadBatchCacheTTL(defaultAccountLoadBatchCacheTTL)
 	return svc
@@ -430,6 +430,8 @@ type AccountLoadInfo struct {
 	CurrentConcurrency int
 	WaitingCount       int
 	LoadRate           int // 0-100+ (percent)
+	EgressStatus       AccountEgressStatus
+	EffectiveCapacity  int
 }
 
 type UserLoadInfo struct {

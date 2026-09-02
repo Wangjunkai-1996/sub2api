@@ -88,6 +88,7 @@ func (c *legacyEgressConcurrencyCacheStub) ReleaseAccountSlotForEgress(
 func legacyEgressTestAccount() *Account {
 	proxyID := int64(91)
 	identityID := int64(301)
+	verifiedAt := time.Now()
 	proxy := &Proxy{
 		ID:       proxyID,
 		Protocol: "http",
@@ -122,9 +123,10 @@ func legacyEgressTestAccount() *Account {
 					ID:     identityID,
 					Status: EgressIdentityStatusActive,
 				},
-				State:    EgressRouteStateActive,
-				Revision: 13,
-				Proxy:    proxy,
+				State:      EgressRouteStateActive,
+				VerifiedAt: &verifiedAt,
+				Revision:   13,
+				Proxy:      proxy,
 			},
 		}},
 	}

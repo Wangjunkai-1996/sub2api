@@ -63,12 +63,13 @@ type LiveCallRecord struct {
 	LeaseID        string
 	// Egress fields are persisted so an observer in another process can restore
 	// the exact public route instead of selecting the account's current route.
-	EgressBindingID     string
-	EgressLeaseID       string
-	EgressRouteID       int64
-	EgressIdentityID    string
-	EgressConfigVersion int64
-	EgressLease         *AccountEgressLease `json:"-"`
+	EgressBindingID         string
+	EgressLeaseID           string
+	EgressRouteID           int64
+	EgressIdentityID        string
+	EgressConfigVersion     int64
+	EgressAuthorityRevision int64
+	EgressLease             *AccountEgressLease `json:"-"`
 	// Legacy egress fields keep rollout-off/shadow Live calls pinned to the
 	// admission-time identity without persisting proxy URLs or credentials.
 	LegacyEgressBindingID     string

@@ -72,14 +72,14 @@ func (s *AccountEgressCacheSuite) TestFIFOReleaseAndRefreshFencing() {
 	second := acquireAccountEgressTest(s.T(), s.cache, config, "second", "", "")
 	require.Equal(s.T(), service.AccountEgressStatusAcquired, second.Status)
 
-	ref := service.AccountEgressLeaseRef{AccountID: config.AccountID, ID: second.LeaseID, BindingID: second.BindingID, IdentityID: second.IdentityID, ConfigVersion: second.ConfigVersion}
-	owned, err := s.cache.RefreshAccountEgressLeases(s.ctx, []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
+	ref := service.AccountEgressLeaseRef{AccountID: config.AccountID, ID: second.LeaseID, BindingID: second.BindingID, RouteID: second.RouteID, IdentityID: second.IdentityID, ConfigVersion: second.ConfigVersion, AuthorityRevision: second.AuthorityRevision}
+	statuses, err := s.cache.RefreshAccountEgressLeases(s.ctx, []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
 	require.NoError(s.T(), err)
-	require.True(s.T(), owned[ref.Key()])
+	require.Equal(s.T(), service.AccountEgressLeaseRefreshActive, statuses[ref.Key()])
 	require.NoError(s.T(), s.rdb.ZRem(s.ctx, accountEgressTotalKey(config.AccountID), accountEgressIDHash(second.LeaseID)).Err())
-	owned, err = s.cache.RefreshAccountEgressLeases(s.ctx, []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
+	statuses, err = s.cache.RefreshAccountEgressLeases(s.ctx, []service.AccountEgressLeaseRef{ref}, service.AccountEgressLeaseTTL)
 	require.NoError(s.T(), err)
-	require.False(s.T(), owned[ref.Key()], "refresh must not recreate a missing total-fence member")
+	require.Equal(s.T(), service.AccountEgressLeaseRefreshLost, statuses[ref.Key()], "refresh must not recreate a missing total-fence member")
 }
 
 func (s *AccountEgressCacheSuite) TestConfigVersionBatchLoadAndImmediateCapacityRestore() {

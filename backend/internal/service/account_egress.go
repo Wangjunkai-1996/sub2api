@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"strings"
 	"sync"
@@ -59,6 +60,7 @@ var (
 	ErrEgressAccountUnsupported  = infraerrors.BadRequest("ACCOUNT_EGRESS_ACCOUNT_UNSUPPORTED", "egress pools are supported only for OpenAI OAuth accounts")
 	ErrEgressPoolConflict        = infraerrors.Conflict("ACCOUNT_EGRESS_REVISION_CONFLICT", "account egress pool changed; reload it and try again")
 	ErrEgressPoolVersionRequired = infraerrors.Conflict("EGRESS_POOL_VERSION_REQUIRED", "account uses an egress pool; reload it and update the pool contract")
+	ErrEgressMutationFrozen      = infraerrors.New(http.StatusLocked, "ACCOUNT_EGRESS_MUTATION_FROZEN", "account egress mutations are temporarily frozen")
 )
 
 // EgressIdentity is the durable normalized public IP used as one capacity unit.
@@ -120,6 +122,14 @@ type AccountEgressPoolConfigDomain struct {
 	Bindings             []AccountEgressBinding
 }
 
+// AccountEgressAuthority is the writer-database fence consulted by lease
+// refresh batches. Missing accounts are intentionally absent from the result.
+type AccountEgressAuthority struct {
+	AccountID int64
+	Mode      string
+	Revision  int64
+}
+
 type ReplaceAccountPoolInput struct {
 	Mode                 string
 	RouteIDs             []int64
@@ -168,6 +178,7 @@ type EgressProbeResult struct {
 // EgressRepository owns durable egress configuration and the transaction that
 // mirrors the primary route to accounts.proxy_id and publishes scheduler outbox.
 type EgressRepository interface {
+	LoadAccountEgressAuthorities(ctx context.Context, accountIDs []int64) (map[int64]AccountEgressAuthority, error)
 	ResolveAccountPool(ctx context.Context, accountID int64) (*AccountEgressPoolConfigDomain, error)
 	ListAssignableRoutes(ctx context.Context) ([]EgressRoute, error)
 	GetRoute(ctx context.Context, routeID int64) (*EgressRoute, error)

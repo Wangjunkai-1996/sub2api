@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
@@ -12,6 +13,25 @@ import (
 type openAISchedulerEgressTransitionCache struct {
 	schedulerTestConcurrencyCache
 	*accountEgressCacheStub
+}
+
+type openAISchedulerAuthoritativeEgressLoadCache struct {
+	egressAffinityConcurrencyCache
+	loads map[int64]AccountEgressLoadInfo
+}
+
+func (c *openAISchedulerAuthoritativeEgressLoadCache) GetAccountEgressLoadsBatch(
+	_ context.Context,
+	configs []AccountEgressPoolConfig,
+	_, _ time.Duration,
+) (map[int64]AccountEgressLoadInfo, error) {
+	result := make(map[int64]AccountEgressLoadInfo, len(configs))
+	for _, config := range configs {
+		if load, ok := c.loads[config.AccountID]; ok {
+			result[config.AccountID] = load
+		}
+	}
+	return result, nil
 }
 
 func openAISchedulerEgressOverflowAccount(id, groupID int64) Account {
@@ -58,6 +78,213 @@ func newOpenAISchedulerEgressOverflowService(
 	}, egressCache
 }
 
+func newOpenAISchedulerAuthoritativeEgressLoadService(
+	t *testing.T,
+	accounts []Account,
+	topK int,
+	loads map[int64]AccountEgressLoadInfo,
+	acquireFn func(context.Context, AccountEgressCacheAcquireRequest, int) (AccountEgressAcquireResult, error),
+) (*OpenAIGatewayService, *accountEgressCacheStub) {
+	t.Helper()
+	egressCache := &accountEgressCacheStub{acquireFn: acquireFn}
+	cache := &openAISchedulerAuthoritativeEgressLoadCache{
+		egressAffinityConcurrencyCache: egressAffinityConcurrencyCache{accountEgressCacheStub: egressCache},
+		loads:                          loads,
+	}
+	concurrency := NewConcurrencyService(cache)
+	t.Cleanup(func() { concurrency.accountEgressAllocator.Close() })
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.LBTopK = topK
+	return &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cfg:                cfg,
+		concurrencyService: concurrency,
+		settingService:     NewSettingService(accountEgressSettingRepoStub{value: string(AccountEgressPoolRolloutEnforce)}, nil),
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+	}, egressCache
+}
+
+func TestGetAccountLoadsForSchedulingPreservesAuthoritativeEgressLoad(t *testing.T) {
+	const (
+		groupID   = int64(120)
+		accountID = int64(40_001)
+	)
+	account := openAISchedulerEgressOverflowAccount(accountID, groupID)
+	authoritative := AccountEgressLoadInfo{
+		AccountID:         accountID,
+		Status:            AccountEgressStatusExclusive,
+		ActiveTotal:       2,
+		WaitingCount:      4,
+		EffectiveCapacity: 9,
+		LoadRate:          143,
+		ConfigVersion:     account.EgressRevision,
+	}
+	svc, _ := newOpenAISchedulerAuthoritativeEgressLoadService(
+		t, []Account{account}, 1, map[int64]AccountEgressLoadInfo{accountID: authoritative}, nil,
+	)
+
+	loads, err := getAccountLoadsForScheduling(
+		context.Background(), svc.concurrencyService, svc.settingService, []*Account{&account}, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, &AccountLoadInfo{
+		AccountID:          accountID,
+		CurrentConcurrency: authoritative.ActiveTotal,
+		WaitingCount:       authoritative.WaitingCount,
+		LoadRate:           authoritative.LoadRate,
+		EgressStatus:       authoritative.Status,
+		EffectiveCapacity:  authoritative.EffectiveCapacity,
+	}, loads[accountID])
+}
+
+func TestClassifyOpenAIEgressSchedulingAdmission(t *testing.T) {
+	tests := []struct {
+		name string
+		load AccountLoadInfo
+		want openAIEgressSchedulingAdmission
+	}{
+		{name: "acquired with idle capacity", load: AccountLoadInfo{EgressStatus: AccountEgressStatusAcquired, EffectiveCapacity: 2, CurrentConcurrency: 1}, want: openAIEgressSchedulingAdmissionImmediate},
+		{name: "acquired at capacity", load: AccountLoadInfo{EgressStatus: AccountEgressStatusAcquired, EffectiveCapacity: 1, CurrentConcurrency: 1}, want: openAIEgressSchedulingAdmissionWaitable},
+		{name: "acquired behind waiter", load: AccountLoadInfo{EgressStatus: AccountEgressStatusAcquired, EffectiveCapacity: 2, WaitingCount: 1}, want: openAIEgressSchedulingAdmissionWaitable},
+		{name: "full", load: AccountLoadInfo{EgressStatus: AccountEgressStatusFull}, want: openAIEgressSchedulingAdmissionWaitable},
+		{name: "not queue head", load: AccountLoadInfo{EgressStatus: AccountEgressStatusNotQueueHead}, want: openAIEgressSchedulingAdmissionWaitable},
+		{name: "exclusive", load: AccountLoadInfo{EgressStatus: AccountEgressStatusExclusive}, want: openAIEgressSchedulingAdmissionWaitable},
+		{name: "legacy draining", load: AccountLoadInfo{EgressStatus: AccountEgressStatusLegacyDraining}, want: openAIEgressSchedulingAdmissionWaitable},
+		{name: "no eligible", load: AccountLoadInfo{EgressStatus: AccountEgressStatusNoEligibleEgress}, want: openAIEgressSchedulingAdmissionHardBlocked},
+		{name: "required binding unavailable", load: AccountLoadInfo{EgressStatus: AccountEgressStatusRequiredBindingUnavailable}, want: openAIEgressSchedulingAdmissionHardBlocked},
+		{name: "config stale", load: AccountLoadInfo{EgressStatus: AccountEgressStatusConfigStale}, want: openAIEgressSchedulingAdmissionHardBlocked},
+		{name: "config unavailable", load: AccountLoadInfo{EgressStatus: AccountEgressStatusConfigUnavailable}, want: openAIEgressSchedulingAdmissionHardBlocked},
+		{name: "queue full", load: AccountLoadInfo{EgressStatus: AccountEgressStatusQueueFull}, want: openAIEgressSchedulingAdmissionHardBlocked},
+		{name: "unavailable", load: AccountLoadInfo{EgressStatus: AccountEgressStatus("UNAVAILABLE")}, want: openAIEgressSchedulingAdmissionHardBlocked},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, classifyOpenAIEgressSchedulingAdmission(&test.load))
+		})
+	}
+	require.Equal(t, openAIEgressSchedulingAdmissionHardBlocked, classifyOpenAIEgressSchedulingAdmission(nil))
+}
+
+func TestAdvancedSchedulerEgressAdmissionClassifiesBeforeProbeBudget(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+
+	const (
+		groupID        = int64(132)
+		accountBase    = int64(52_000)
+		immediateCount = openAIAccountSelectionProbeLimit
+		waitableID     = accountBase + immediateCount + 1
+		hardBlockedID  = accountBase + immediateCount + 2
+	)
+	accounts := make([]Account, 0, immediateCount+2)
+	loads := make(map[int64]AccountEgressLoadInfo, immediateCount+2)
+	for offset := 1; offset <= immediateCount; offset++ {
+		account := openAISchedulerEgressOverflowAccount(accountBase+int64(offset), groupID)
+		accounts = append(accounts, account)
+		loads[account.ID] = AccountEgressLoadInfo{
+			AccountID:         account.ID,
+			Status:            AccountEgressStatusAcquired,
+			EffectiveCapacity: 2,
+			LoadRate:          offset,
+		}
+	}
+	waitable := openAISchedulerEgressOverflowAccount(waitableID, groupID)
+	waitable.Priority = -100
+	accounts = append(accounts, waitable)
+	loads[waitableID] = AccountEgressLoadInfo{
+		AccountID:         waitableID,
+		Status:            AccountEgressStatusFull,
+		ActiveTotal:       1,
+		EffectiveCapacity: 1,
+		LoadRate:          100,
+	}
+	hardBlocked := openAISchedulerEgressOverflowAccount(hardBlockedID, groupID)
+	hardBlocked.Priority = -200
+	accounts = append(accounts, hardBlocked)
+	loads[hardBlockedID] = AccountEgressLoadInfo{
+		AccountID:    hardBlockedID,
+		Status:       AccountEgressStatusConfigStale,
+		LoadRate:     0,
+		WaitingCount: 0,
+	}
+
+	attempts := make(map[int64]int)
+	svc, egressCache := newOpenAISchedulerAuthoritativeEgressLoadService(t, accounts, 7, loads, func(
+		_ context.Context,
+		request AccountEgressCacheAcquireRequest,
+		_ int,
+	) (AccountEgressAcquireResult, error) {
+		accountID := request.Config.AccountID
+		attempts[accountID]++
+		if accountID != waitableID {
+			return AccountEgressAcquireResult{Status: AccountEgressStatusFull, LeaseID: request.LeaseID}, nil
+		}
+		candidate := request.Config.Candidates[0]
+		return AccountEgressAcquireResult{
+			Status:            AccountEgressStatusAcquired,
+			BindingID:         candidate.BindingID,
+			RouteID:           candidate.RouteID,
+			IdentityID:        candidate.IdentityID,
+			LeaseID:           request.LeaseID,
+			EffectiveCapacity: request.Config.EffectiveCapacity(),
+			ConfigVersion:     request.Config.Version,
+			AuthorityRevision: request.Config.AuthorityRevision,
+		}, nil
+	})
+
+	requestGroupID := groupID
+	selection, _, err := svc.SelectAccountWithScheduler(
+		context.Background(), &requestGroupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, waitableID, selection.Account.ID)
+	require.Zero(t, attempts[hardBlockedID], "hard-blocked candidates must never be probed")
+	require.Equal(t, 1, attempts[waitableID], "waitable fallback must remain reachable after the probe budget is exhausted")
+	for offset := 1; offset <= immediateCount; offset++ {
+		require.Equal(t, 1, attempts[accountBase+int64(offset)])
+	}
+	acquireCalls, _, _, _ := egressCache.counts()
+	require.Equal(t, immediateCount+1, acquireCalls)
+	selection.ReleaseFunc()
+}
+
+func TestAdvancedSchedulerEgressAdmissionHardBlockedSkipsProbe(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+
+	const (
+		groupID   = int64(133)
+		accountID = int64(53_001)
+	)
+	account := openAISchedulerEgressOverflowAccount(accountID, groupID)
+	svc, egressCache := newOpenAISchedulerAuthoritativeEgressLoadService(
+		t,
+		[]Account{account},
+		1,
+		map[int64]AccountEgressLoadInfo{accountID: {
+			AccountID: accountID,
+			Status:    AccountEgressStatusConfigStale,
+			LoadRate:  0,
+		}},
+		func(context.Context, AccountEgressCacheAcquireRequest, int) (AccountEgressAcquireResult, error) {
+			t.Fatal("hard-blocked candidate was probed")
+			return AccountEgressAcquireResult{}, nil
+		},
+	)
+
+	requestGroupID := groupID
+	selection, _, err := svc.SelectAccountWithScheduler(
+		context.Background(), &requestGroupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, false,
+	)
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrAccountEgressConfigStale)
+	acquireCalls, _, _, _ := egressCache.counts()
+	require.Zero(t, acquireCalls)
+}
+
 func TestAdvancedSchedulerEgressAdmissionSpillsBeyondTopK(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
@@ -93,6 +320,7 @@ func TestAdvancedSchedulerEgressAdmissionSpillsBeyondTopK(t *testing.T) {
 			LeaseID:           request.LeaseID,
 			EffectiveCapacity: request.Config.EffectiveCapacity(),
 			ConfigVersion:     request.Config.Version,
+			AuthorityRevision: request.Config.AuthorityRevision,
 		}, nil
 	})
 
@@ -185,6 +413,7 @@ func TestAdvancedSchedulerSubscriptionEgressFullFallsThroughToRegularPool(t *tes
 			LeaseID:           request.LeaseID,
 			EffectiveCapacity: request.Config.EffectiveCapacity(),
 			ConfigVersion:     request.Config.Version,
+			AuthorityRevision: request.Config.AuthorityRevision,
 		}, nil
 	})
 	svc.rateLimitService = newOpenAIAdvancedSchedulerRateLimitService("true", "", "true")
@@ -420,6 +649,7 @@ func TestAdvancedSchedulerFallbackRechecksStaleLegacyAttemptAsFreshEgress(t *tes
 			LeaseID:           request.LeaseID,
 			EffectiveCapacity: request.Config.EffectiveCapacity(),
 			ConfigVersion:     request.Config.Version,
+			AuthorityRevision: request.Config.AuthorityRevision,
 		}, nil
 	}}
 	concurrency := NewConcurrencyService(&openAISchedulerEgressTransitionCache{
@@ -617,6 +847,7 @@ func TestAdvancedSchedulerStickyEgressOverflowKeepsDurableBinding(t *testing.T) 
 			LeaseID:           request.LeaseID,
 			EffectiveCapacity: request.Config.EffectiveCapacity(),
 			ConfigVersion:     request.Config.Version,
+			AuthorityRevision: request.Config.AuthorityRevision,
 		}, nil
 	})
 	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:" + sessionHash: stickyID}}

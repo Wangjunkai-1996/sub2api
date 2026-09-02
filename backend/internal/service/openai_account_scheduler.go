@@ -152,6 +152,8 @@ type openAIAccountSchedulerMetrics struct {
 type openAIAccountLoadPlan struct {
 	allCandidates             []openAIAccountCandidateScore
 	candidates                []openAIAccountCandidateScore
+	waitableCandidates        []openAIAccountCandidateScore
+	hardBlockedCandidates     []openAIAccountCandidateScore
 	staleSnapshotCompactRetry []openAIAccountCandidateScore
 	selectionOrder            []openAIAccountCandidateScore
 	candidateCount            int
@@ -775,14 +777,44 @@ func (s *defaultOpenAIAccountScheduler) shouldEscapeStickyAccount(accountID int6
 }
 
 type openAIAccountCandidateScore struct {
-	account   *Account
-	loadInfo  *AccountLoadInfo
-	loadKnown bool
-	score     float64
-	priority  int
-	errorRate float64
-	ttft      float64
-	hasTTFT   bool
+	account         *Account
+	loadInfo        *AccountLoadInfo
+	loadKnown       bool
+	egressAdmission openAIEgressSchedulingAdmission
+	score           float64
+	priority        int
+	errorRate       float64
+	ttft            float64
+	hasTTFT         bool
+}
+
+type openAIEgressSchedulingAdmission uint8
+
+const (
+	openAIEgressSchedulingAdmissionUnclassified openAIEgressSchedulingAdmission = iota
+	openAIEgressSchedulingAdmissionImmediate
+	openAIEgressSchedulingAdmissionWaitable
+	openAIEgressSchedulingAdmissionHardBlocked
+)
+
+func classifyOpenAIEgressSchedulingAdmission(load *AccountLoadInfo) openAIEgressSchedulingAdmission {
+	if load == nil {
+		return openAIEgressSchedulingAdmissionHardBlocked
+	}
+	switch load.EgressStatus {
+	case AccountEgressStatusAcquired:
+		if load.EffectiveCapacity > load.CurrentConcurrency && load.WaitingCount == 0 {
+			return openAIEgressSchedulingAdmissionImmediate
+		}
+		return openAIEgressSchedulingAdmissionWaitable
+	case AccountEgressStatusFull,
+		AccountEgressStatusNotQueueHead,
+		AccountEgressStatusExclusive,
+		AccountEgressStatusLegacyDraining:
+		return openAIEgressSchedulingAdmissionWaitable
+	default:
+		return openAIEgressSchedulingAdmissionHardBlocked
+	}
 }
 
 type openAIAccountCandidateHeap []openAIAccountCandidateScore
@@ -994,34 +1026,54 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		if s.stats != nil {
 			errorRate, ttft, hasTTFT = s.stats.snapshot(account.ID)
 		}
+		egressAdmission := openAIEgressSchedulingAdmissionUnclassified
+		if accountUsesEnforcedEgressPool(ctx, s.service.settingService, account) {
+			egressAdmission = classifyOpenAIEgressSchedulingAdmission(loadInfo)
+		}
 		allCandidates = append(allCandidates, openAIAccountCandidateScore{
-			account:   account,
-			loadInfo:  loadInfo,
-			loadKnown: loadKnown,
-			errorRate: errorRate,
-			ttft:      ttft,
-			hasTTFT:   hasTTFT,
+			account:         account,
+			loadInfo:        loadInfo,
+			loadKnown:       loadKnown,
+			egressAdmission: egressAdmission,
+			errorRate:       errorRate,
+			ttft:            ttft,
+			hasTTFT:         hasTTFT,
 		})
 	}
 
-	candidates := allCandidates
+	candidates := make([]openAIAccountCandidateScore, 0, len(allCandidates))
+	waitableCandidates := make([]openAIAccountCandidateScore, 0, len(allCandidates))
+	hardBlockedCandidates := make([]openAIAccountCandidateScore, 0, len(allCandidates))
 	staleSnapshotCompactRetry := make([]openAIAccountCandidateScore, 0, len(allCandidates))
-	if req.RequireCompact {
-		candidates = make([]openAIAccountCandidateScore, 0, len(allCandidates))
-		for _, candidate := range allCandidates {
-			if openAICompactSupportTier(candidate.account) == 0 {
+	candidateCount := 0
+	for _, candidate := range allCandidates {
+		if req.RequireCompact && openAICompactSupportTier(candidate.account) == 0 {
+			if candidate.egressAdmission == openAIEgressSchedulingAdmissionHardBlocked {
+				hardBlockedCandidates = append(hardBlockedCandidates, candidate)
+			} else {
 				staleSnapshotCompactRetry = append(staleSnapshotCompactRetry, candidate)
-				continue
 			}
-			candidates = append(candidates, candidate)
+			continue
 		}
+		candidateCount++
+		if candidate.egressAdmission == openAIEgressSchedulingAdmissionHardBlocked {
+			hardBlockedCandidates = append(hardBlockedCandidates, candidate)
+			continue
+		}
+		if candidate.egressAdmission == openAIEgressSchedulingAdmissionWaitable {
+			waitableCandidates = append(waitableCandidates, candidate)
+			continue
+		}
+		candidates = append(candidates, candidate)
 	}
 
 	plan := openAIAccountLoadPlan{
 		allCandidates:             allCandidates,
 		candidates:                candidates,
+		waitableCandidates:        waitableCandidates,
+		hardBlockedCandidates:     hardBlockedCandidates,
 		staleSnapshotCompactRetry: staleSnapshotCompactRetry,
-		candidateCount:            len(candidates),
+		candidateCount:            candidateCount,
 	}
 	if len(candidates) == 0 {
 		plan.selectionOrder = s.buildOpenAISelectionOrder(req, plan)
@@ -1240,13 +1292,33 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		selectionOrder := make([]openAIAccountCandidateScore, 0, len(plan.allCandidates))
 		selectionOrder = append(selectionOrder, buildSelectionOrder(supported)...)
 		selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
+		selectionOrder = append(selectionOrder, sortOpenAIEgressWaitableCandidates(plan.waitableCandidates)...)
 		if len(plan.staleSnapshotCompactRetry) > 0 && s.service.schedulerSnapshot != nil {
 			selectionOrder = append(selectionOrder, sortOpenAICompactRetryCandidates(plan.staleSnapshotCompactRetry)...)
 		}
 		return selectionOrder
 	}
 
-	return buildSelectionOrder(plan.candidates)
+	selectionOrder := buildSelectionOrder(plan.candidates)
+	return append(selectionOrder, sortOpenAIEgressWaitableCandidates(plan.waitableCandidates)...)
+}
+
+func sortOpenAIEgressWaitableCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+	ordered := append([]openAIAccountCandidateScore(nil), pool...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, right := ordered[i], ordered[j]
+		if left.account.Priority != right.account.Priority {
+			return left.account.Priority < right.account.Priority
+		}
+		if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
+			return left.loadInfo.LoadRate < right.loadInfo.LoadRate
+		}
+		if left.loadInfo.WaitingCount != right.loadInfo.WaitingCount {
+			return left.loadInfo.WaitingCount < right.loadInfo.WaitingCount
+		}
+		return left.account.ID < right.account.ID
+	})
+	return ordered
 }
 
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
@@ -1308,6 +1380,10 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			continue
 		}
 		enforcedPool := accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account)
+		if enforcedPool && candidate.egressAdmission != openAIEgressSchedulingAdmissionUnclassified &&
+			candidate.egressAdmission != openAIEgressSchedulingAdmissionImmediate {
+			continue
+		}
 		if !enforcedPool && candidate.loadKnown && candidate.account.Concurrency > 0 &&
 			candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency {
 			continue
@@ -1746,6 +1822,14 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 	budget *openAISelectionProbeBudget,
 ) openAIAccountLoadSelectionAttempt {
 	plan := s.buildOpenAIAccountLoadPlan(ctx, req, filtered, loadMap)
+	for _, candidate := range plan.hardBlockedCandidates {
+		if candidate.account == nil || candidate.loadInfo == nil {
+			continue
+		}
+		err := accountEgressStatusError(candidate.loadInfo.EgressStatus)
+		budget.recordEgressAdmissionFailure(ctx, s.service.settingService, candidate.account, err)
+		budget.recordStickyAdmissionFull(req, candidate.account.ID, err)
+	}
 	if openAICostOverflowExpanded(req, plan) {
 		budget.enableLimit()
 	}
@@ -1780,7 +1864,8 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 			attempt.err = acquireErr
 			return attempt
 		}
-		deferAdmissionError = openAISelectionHasLegacyCandidate(ctx, s.service.settingService, attempt.selectionOrder)
+		deferAdmissionError = openAISelectionHasLegacyCandidate(ctx, s.service.settingService, attempt.selectionOrder) ||
+			openAISelectionHasWaitableEgressCandidate(attempt.selectionOrder)
 		if !hasAdmissionOverflow {
 			// Legacy candidates can still be returned as a wait plan. Keep the
 			// admission error deferred in that mixed pool, but do not let it hide
@@ -1829,7 +1914,8 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 				freshResult, freshCompactBlocked, freshAcquireErr := s.tryAcquireOpenAISelectionOrderWithBudget(ctx, req, retrySelectionOrder, budget)
 				if freshAcquireErr != nil {
 					if !isAccountEgressAdmissionError(freshAcquireErr) ||
-						!openAISelectionHasLegacyCandidate(ctx, s.service.settingService, fallbackSelectionOrder) {
+						(!openAISelectionHasLegacyCandidate(ctx, s.service.settingService, fallbackSelectionOrder) &&
+							!openAISelectionHasWaitableEgressCandidate(fallbackSelectionOrder)) {
 						attempt.err = freshAcquireErr
 						return attempt
 					}
@@ -1879,6 +1965,15 @@ func openAISelectionHasLegacyCandidate(
 ) bool {
 	for _, candidate := range selectionOrder {
 		if candidate.account != nil && !accountUsesEnforcedEgressPool(ctx, settings, candidate.account) {
+			return true
+		}
+	}
+	return false
+}
+
+func openAISelectionHasWaitableEgressCandidate(selectionOrder []openAIAccountCandidateScore) bool {
+	for _, candidate := range selectionOrder {
+		if candidate.egressAdmission == openAIEgressSchedulingAdmissionWaitable {
 			return true
 		}
 	}
@@ -2004,7 +2099,15 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 					lastEgressAdmissionErr = rejectedErr
 					continue
 				}
-				result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget)
+				var result *AcquireResult
+				var attempted bool
+				var acquireErr error
+				if candidate.egressAdmission == openAIEgressSchedulingAdmissionWaitable {
+					result, acquireErr = s.service.tryAcquireAccountSlot(ctx, fresh)
+					attempted = true
+				} else {
+					result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget)
+				}
 				if !attempted {
 					// The bounded admission probe budget is shared with the primary
 					// selection pass. Skip further egress probes once it is spent;

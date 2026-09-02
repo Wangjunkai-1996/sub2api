@@ -38,6 +38,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
 	ctx = ContextWithSelectedAccountEgress(ctx, account)
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return nil, wrapOpenAIWSFallback("egress_lease", useErr)
+		}
+		defer releaseUse()
+	}
 	responseModelObserver := &upstreamResponseModelObserver{}
 
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)

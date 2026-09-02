@@ -869,8 +869,8 @@ describe('EditAccountModal', () => {
     expect(payload).toMatchObject({
       egress_mode: 'pool',
       egress_pool: {
-        route_ids: [1, 2],
-        primary_route_id: 1,
+        route_ids: [2],
+        primary_route_id: 2,
         concurrency_per_egress: 5,
         revision: 7
       }
@@ -880,7 +880,37 @@ describe('EditAccountModal', () => {
     expect(payload).not.toHaveProperty('group_ids')
   })
 
-  it('updates changed egress and groups in separate requests', async () => {
+  it('keeps an embedded selected route visible when the fresh catalog is unavailable', () => {
+    const embeddedRoute = {
+      id: 9,
+      kind: 'proxy',
+      name: 'bound-route',
+      state: 'inactive',
+      eligible: false
+    }
+    const account = {
+      ...buildOpenAIOAuthParentAccount(),
+      egress_mode: 'pool',
+      egress_revision: 3,
+      egress_pool: {
+        route_ids: [9],
+        primary_route_id: 9,
+        concurrency_per_egress: 2,
+        revision: 3,
+        routes: [embeddedRoute]
+      }
+    }
+
+    const wrapper = mountModal(account as any, {
+      egressRoutes: [],
+      egressMutationEnabled: false
+    })
+
+    expect(wrapper.get('[data-testid="egress-route-9"]').text()).toContain('bound-route')
+    expect(wrapper.get('#egress-route-9').attributes()).toHaveProperty('disabled')
+  })
+
+  it('updates changed egress and groups atomically', async () => {
     authIsSimpleMode.value = false
     const account = {
       ...buildOpenAIOAuthParentAccount(),
@@ -898,27 +928,23 @@ describe('EditAccountModal', () => {
       { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
       { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
     ]
-    updateAccountMock
-      .mockReset()
-      .mockResolvedValueOnce(account)
-      .mockResolvedValueOnce({ ...account, group_ids: [7] })
+    updateAccountMock.mockReset().mockResolvedValue({ ...account, group_ids: [7] })
     const wrapper = mountModal(account as any, { egressRoutes: routes })
 
     await wrapper.get('#egress-route-2').setValue(true)
     await wrapper.get('[data-testid="set-shadow-group"]').trigger('click')
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
-    expect(updateAccountMock).toHaveBeenCalledTimes(2)
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
     expect(updateAccountMock.mock.calls[0]?.[1]).toMatchObject({
       egress_mode: 'pool',
-      egress_pool: { route_ids: [1, 2] }
+      egress_pool: { route_ids: [1, 2] },
+      group_ids: [7]
     })
-    expect(updateAccountMock.mock.calls[0]?.[1]).not.toHaveProperty('group_ids')
-    expect(updateAccountMock.mock.calls[1]?.[1]).toEqual({ group_ids: [7] })
     expect(showSuccessMock).toHaveBeenCalledTimes(1)
   })
 
-  it('does not report success when the separate group update fails', async () => {
+  it('does not report success when the atomic egress and group update fails', async () => {
     authIsSimpleMode.value = false
     const account = {
       ...buildOpenAIOAuthParentAccount(),
@@ -935,23 +961,25 @@ describe('EditAccountModal', () => {
       { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
       { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
     ]
-    updateAccountMock
-      .mockReset()
-      .mockResolvedValueOnce(account)
-      .mockRejectedValueOnce(new Error('group update failed'))
+    updateAccountMock.mockReset().mockRejectedValueOnce(new Error('atomic update failed'))
     const wrapper = mountModal(account as any, { egressRoutes: routes })
 
     await wrapper.get('#egress-route-2').setValue(true)
     await wrapper.get('[data-testid="set-shadow-group"]').trigger('click')
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
-    expect(updateAccountMock).toHaveBeenCalledTimes(2)
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: { route_ids: [1, 2] },
+      group_ids: [7]
+    })
     expect(showSuccessMock).not.toHaveBeenCalled()
-    expect(showErrorMock).toHaveBeenCalledWith('group update failed')
+    expect(showErrorMock).toHaveBeenCalledWith('atomic update failed')
     expect(wrapper.emitted('updated')).toBeUndefined()
   })
 
-  it('keeps legacy proxy and concurrency fields for non-OpenAI accounts', async () => {
+  it('omits unchanged legacy proxy and concurrency fields for non-OpenAI accounts', async () => {
     const account = buildGrokAPIKeyAccount()
     updateAccountMock.mockReset().mockResolvedValue(account)
     checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
@@ -961,12 +989,13 @@ describe('EditAccountModal', () => {
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
     const payload = updateAccountMock.mock.calls[0]?.[1]
-    expect(payload).toMatchObject({ proxy_id: null, concurrency: 2 })
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
     expect(payload).not.toHaveProperty('egress_mode')
     expect(payload).not.toHaveProperty('egress_pool')
   })
 
-  it('keeps legacy proxy and concurrency fields for OpenAI API key accounts', async () => {
+  it('omits unchanged legacy proxy and concurrency fields for OpenAI API key accounts', async () => {
     const account = { ...buildAccount(), proxy_id: 9, concurrency: 4 }
     updateAccountMock.mockReset().mockResolvedValue(account)
     checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
@@ -976,7 +1005,8 @@ describe('EditAccountModal', () => {
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
     const payload = updateAccountMock.mock.calls[0]?.[1]
-    expect(payload).toMatchObject({ proxy_id: 9, concurrency: 4 })
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
     expect(payload).not.toHaveProperty('egress_mode')
     expect(payload).not.toHaveProperty('egress_pool')
   })

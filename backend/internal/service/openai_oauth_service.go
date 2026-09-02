@@ -274,10 +274,13 @@ func openAIOAuthRouteProxyURL(route *EgressRoute, requireVerified bool) (string,
 	if route == nil || route.ID <= 0 || route.Revision <= 0 {
 		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route is unavailable")
 	}
+	now := time.Now()
 	if route.State == EgressRouteStateExpired || route.State == EgressRouteStateRetired || route.State == EgressRouteStateInactive || route.State == EgressRouteStateIdentityMismatch {
 		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "egress route is unavailable")
 	}
-	if requireVerified && (route.State != EgressRouteStateActive || route.ExpectedIdentity == nil || route.ExpectedIdentity.Status != EgressIdentityStatusActive) {
+	if requireVerified && (route.State != EgressRouteStateActive || route.ExpectedIdentity == nil ||
+		route.ExpectedIdentity.Status != EgressIdentityStatusActive ||
+		!IsEgressIdentityVerificationFresh(route.VerifiedAt, now)) {
 		return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNVERIFIED", "egress route must be verified before OAuth authorization")
 	}
 	switch route.Kind {
@@ -287,7 +290,7 @@ func openAIOAuthRouteProxyURL(route *EgressRoute, requireVerified bool) (string,
 		}
 		return "", nil
 	case EgressRouteKindProxy:
-		if route.ProxyID == nil || route.Proxy == nil || !route.Proxy.IsActive() || route.Proxy.IsExpired(time.Now()) {
+		if route.ProxyID == nil || route.Proxy == nil || !route.Proxy.IsActive() || route.Proxy.IsExpired(now) {
 			return "", infraerrors.New(http.StatusServiceUnavailable, "OPENAI_OAUTH_EGRESS_ROUTE_UNAVAILABLE", "proxy egress route is unavailable")
 		}
 		return route.Proxy.URL(), nil

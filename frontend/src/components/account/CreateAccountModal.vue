@@ -2881,8 +2881,12 @@
           :selected-route-ids="egressRouteIds"
           :primary-route-id="primaryEgressRouteId"
           :require-primary="true"
+          :disabled="!egressMutationEnabled"
+          :verifying-route-id="egressVerifyingRouteId"
+          :verify-errors="egressVerifyErrors"
           @update:selected-route-ids="egressRouteIds = $event"
           @update:primary-route-id="primaryEgressRouteId = $event"
+          @verify="emit('verify-egress-route', $event)"
         />
       </div>
       <div v-else>
@@ -3787,7 +3791,7 @@ import { useGeminiOAuth } from '@/composables/useGeminiOAuth'
 import { useAntigravityOAuth } from '@/composables/useAntigravityOAuth'
 import { useGrokOAuth } from '@/composables/useGrokOAuth'
 import type {
-  Proxy,
+  ProxyOption,
   AssignableEgressRoute,
   AccountEgressPoolWrite,
   AdminGroup,
@@ -3833,6 +3837,10 @@ import {
 import { formatDateTimeLocalInput, parseDateTimeLocalInput } from '@/utils/format'
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
+import {
+  AccountEgressPolicyError,
+  buildCreateAccountEgressPatch
+} from '@/components/account/accountEgressPolicy'
 import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
@@ -3924,18 +3932,25 @@ const apiKeyValuePlaceholder = computed(() => {
 
 interface Props {
   show: boolean
-  proxies?: Proxy[]
+  proxies?: ProxyOption[]
   egressRoutes?: AssignableEgressRoute[]
+  egressMutationEnabled?: boolean
+  egressVerifyingRouteId?: number | null
+  egressVerifyErrors?: Record<number, string>
   groups: AdminGroup[]
 }
 
 const props = withDefaults(defineProps<Props>(), {
   proxies: () => [],
-  egressRoutes: () => []
+  egressRoutes: () => [],
+  egressMutationEnabled: true,
+  egressVerifyingRouteId: null,
+  egressVerifyErrors: () => ({})
 })
 const emit = defineEmits<{
   close: []
   created: []
+  'verify-egress-route': [route: AssignableEgressRoute]
 }>()
 
 const appStore = useAppStore()
@@ -4564,11 +4579,11 @@ const egressRouteIds = ref<number[]>([])
 const primaryEgressRouteId = ref<number | null>(null)
 const usesEgressPool = computed(() => form.platform === 'openai' && form.type === 'oauth')
 
-const buildEgressPool = (): AccountEgressPoolWrite => ({
-  route_ids: [...egressRouteIds.value],
-  primary_route_id: primaryEgressRouteId.value ?? egressRouteIds.value[0] ?? null,
-  concurrency_per_egress: Math.max(1, Number(form.concurrency) || 1)
-})
+const buildEgressPool = (): AccountEgressPoolWrite => buildCreateAccountEgressPatch({
+  routeIds: egressRouteIds.value,
+  primaryRouteId: primaryEgressRouteId.value,
+  concurrencyPerEgress: form.concurrency
+}, props.egressRoutes).egress_pool
 
 const withEgressPool = <T extends object>(payload: T): T & {
   egress_mode: 'pool'
@@ -5119,6 +5134,12 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
     emit('created')
     handleClose()
   } catch (error: any) {
+    if (error instanceof AccountEgressPolicyError) {
+      appStore.showError(t(error.code === 'no_selection'
+        ? 'admin.accounts.egressPool.noSelection'
+        : 'admin.accounts.egressPool.catalogUnavailable'))
+      return
+    }
     if (error.response?.status === 409 && error.response?.data?.error === 'mixed_channel_warning' && needsMixedChannelCheck(form.platform)) {
       openMixedChannelDialog({
         message: error.response?.data?.message,
@@ -5460,6 +5481,10 @@ const handleVertexServiceAccountDrop = async (event: DragEvent) => {
 }
 
 const handleSubmit = async () => {
+  if (usesEgressPool.value && !props.egressMutationEnabled) {
+    appStore.showError(t('admin.accounts.egressPool.catalogUnavailable'))
+    return
+  }
   if (usesEgressPool.value && egressRouteIds.value.length === 0) {
     appStore.showError(t('admin.accounts.egressPool.noSelection'))
     return

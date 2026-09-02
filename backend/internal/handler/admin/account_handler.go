@@ -70,6 +70,21 @@ type AccountHandler struct {
 	egressService           *service.EgressService
 }
 
+const accountEgressMutationFrozenReason = "ACCOUNT_EGRESS_MUTATION_FROZEN"
+
+var errAccountEgressMutationFrozen = infraerrors.New(
+	http.StatusLocked,
+	accountEgressMutationFrozenReason,
+	"account egress mutation is temporarily unavailable",
+)
+
+func (h *AccountHandler) requireAccountEgressMutation() error {
+	if h == nil || h.egressService == nil {
+		return errAccountEgressMutationFrozen
+	}
+	return nil
+}
+
 // SetUpstreamBillingProbeService attaches the optional remote billing probe service.
 func (h *AccountHandler) SetUpstreamBillingProbeService(probe *service.UpstreamBillingProbeService) {
 	h.upstreamBillingProbe = probe
@@ -934,6 +949,10 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		return
 	}
 	if egressPool != nil {
+		if err := h.requireAccountEgressMutation(); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
 		if err := validateOpenAIEgressWrite(req.Platform, req.Type, false); err != nil {
 			response.ErrorFrom(c, err)
 			return
@@ -1107,6 +1126,10 @@ func (h *AccountHandler) Update(c *gin.Context) {
 		return
 	}
 	if egressPool != nil {
+		if err := h.requireAccountEgressMutation(); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
 		current, currentErr := h.adminService.GetAccount(c.Request.Context(), accountID)
 		if currentErr != nil {
 			response.ErrorFrom(c, currentErr)
@@ -2422,8 +2445,8 @@ func bulkRequestHasNonEgressFields(req *BulkUpdateAccountsRequest) bool {
 }
 
 func (h *AccountHandler) bulkUpdateEgress(c *gin.Context, req *BulkUpdateAccountsRequest) {
-	if h == nil || h.egressService == nil {
-		response.ErrorFrom(c, service.ErrEgressRouteInvalid)
+	if err := h.requireAccountEgressMutation(); err != nil {
+		response.ErrorFrom(c, err)
 		return
 	}
 	input, err := bulkAccountEgressInput(req.EgressMode, req.EgressPool)

@@ -121,6 +121,7 @@ func TestAccountEgressAdmissionForwardsPreferredBinding(t *testing.T) {
 			IdentityID:        candidate.IdentityID,
 			EffectiveCapacity: poolConfig.EffectiveCapacity(),
 			ConfigVersion:     poolConfig.Version,
+			AuthorityRevision: poolConfig.AuthorityRevision,
 		}}},
 	}
 	concurrency := NewConcurrencyService(cache)
@@ -154,6 +155,7 @@ func TestOpenAILegacyNonBatchEgressCapacityFallsBackToAnotherAccount(t *testing.
 				LeaseID:           request.LeaseID,
 				EffectiveCapacity: request.Config.EffectiveCapacity(),
 				ConfigVersion:     request.Config.Version,
+				AuthorityRevision: request.Config.AuthorityRevision,
 			}, nil
 		},
 	}}
@@ -211,6 +213,7 @@ func TestOpenAILegacyNonBatchStickyEgressSpilloverKeepsOriginalBinding(t *testin
 				LeaseID:           request.LeaseID,
 				EffectiveCapacity: request.Config.EffectiveCapacity(),
 				ConfigVersion:     request.Config.Version,
+				AuthorityRevision: request.Config.AuthorityRevision,
 			}, nil
 		},
 	}}
@@ -359,6 +362,7 @@ func TestPreviousResponseRequiredBindingWaitsWithoutSpilling(t *testing.T) {
 				IdentityID:        candidate.IdentityID,
 				EffectiveCapacity: poolConfig.EffectiveCapacity(),
 				ConfigVersion:     poolConfig.Version,
+				AuthorityRevision: poolConfig.AuthorityRevision,
 			},
 		}},
 		waitAllowed: true,
@@ -416,6 +420,7 @@ func TestOpenAIPreviousResponseEgressFenceBypassesWeightedMovableSelection(t *te
 			RouteID:           bound.EgressBindings[0].RouteID,
 			IdentityID:        "301",
 			ConfigVersion:     accountEgressRuntimeVersion(bound),
+			AuthorityRevision: accountEgressAuthorityRevision(bound),
 			EffectiveCapacity: 3,
 		}}},
 	}
@@ -796,11 +801,12 @@ func TestOpenAIPreviousResponseEgressFenceRemainsHardWhenAdvancedSchedulerDisabl
 	gatewayCache := &schedulerTestGatewayCache{sessionBindings: make(map[string]int64)}
 	egressCache := &egressAffinityConcurrencyCache{
 		accountEgressCacheStub: &accountEgressCacheStub{acquireResults: []AccountEgressAcquireResult{{
-			Status:        AccountEgressStatusAcquired,
-			BindingID:     bound.EgressBindings[0].BindingID,
-			RouteID:       bound.EgressBindings[0].RouteID,
-			IdentityID:    "301",
-			ConfigVersion: accountEgressRuntimeVersion(bound),
+			Status:            AccountEgressStatusAcquired,
+			BindingID:         bound.EgressBindings[0].BindingID,
+			RouteID:           bound.EgressBindings[0].RouteID,
+			IdentityID:        "301",
+			ConfigVersion:     accountEgressRuntimeVersion(bound),
+			AuthorityRevision: accountEgressAuthorityRevision(bound),
 		}}},
 	}
 	concurrency := NewConcurrencyService(egressCache)
@@ -1002,6 +1008,7 @@ func openAISessionEgressAffinityTestAccount() *Account {
 	account := legacyEgressTestAccount()
 	secondProxyID := int64(92)
 	secondIdentityID := int64(302)
+	verifiedAt := time.Now()
 	secondProxy := &Proxy{
 		ID:       secondProxyID,
 		Protocol: "http",
@@ -1024,9 +1031,10 @@ func openAISessionEgressAffinityTestAccount() *Account {
 				ID:     secondIdentityID,
 				Status: EgressIdentityStatusActive,
 			},
-			State:    EgressRouteStateActive,
-			Revision: 14,
-			Proxy:    secondProxy,
+			State:      EgressRouteStateActive,
+			VerifiedAt: &verifiedAt,
+			Revision:   14,
+			Proxy:      secondProxy,
 		},
 	})
 	return account
