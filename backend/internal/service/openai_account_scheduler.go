@@ -99,6 +99,11 @@ type OpenAIAccountScheduleRequest struct {
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
 	ExcludedIDs    map[int64]struct{}
+
+	// movableResponseMarkerState is populated by the gateway orchestration
+	// before its best-effort sticky lookup can delete an incomplete marker.
+	// Direct scheduler tests/callers leave it nil and inspect in Select.
+	movableResponseMarkerState *openAIMovableResponseEgressMarkerState
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -397,9 +402,31 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	}()
 
 	previousResponseID := strings.TrimSpace(req.PreviousResponseID)
+	hasResponseEgressBinding := req.movableResponseMarkerState != nil &&
+		req.movableResponseMarkerState.HasEgressBinding
+	if s != nil && s.service != nil && previousResponseID != "" &&
+		NormalizeOpenAICompatiblePlatform(req.Platform) == PlatformOpenAI {
+		var bindingErr error
+		_, observedResponseEgressBinding, bindingErr := s.service.openAIWSResponseEgressBinding(ctx, req.GroupID, previousResponseID)
+		if bindingErr != nil {
+			return nil, decision, bindingErr
+		}
+		hasResponseEgressBinding = hasResponseEgressBinding || observedResponseEgressBinding
+		if !hasResponseEgressBinding && req.StickyWeighted && req.PreviousResponseCanMove &&
+			req.movableResponseMarkerState == nil {
+			markerState, markerErr := s.service.inspectOpenAIMovableResponseEgressMarkers(ctx, req.GroupID, previousResponseID)
+			if markerErr != nil {
+				return nil, decision, markerErr
+			}
+			// A route may be committed between the initial route read and the
+			// account-marker inspection. Promote that observation to the hard
+			// continuation path instead of using the stale miss to load-balance.
+			hasResponseEgressBinding = markerState.HasEgressBinding
+		}
+	}
 	if previousResponseID != "" && NormalizeOpenAICompatiblePlatform(req.Platform) == PlatformOpenAI &&
-		(!req.StickyWeighted || !req.PreviousResponseCanMove) {
-		selection, err := s.service.selectAccountByPreviousResponseIDForCapability(
+		(hasResponseEgressBinding || !req.StickyWeighted || !req.PreviousResponseCanMove) {
+		selection, err := s.service.selectAccountByPreviousResponseIDForCapabilityWithAccountFence(
 			ctx,
 			req.GroupID,
 			previousResponseID,
@@ -407,6 +434,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			req.ExcludedIDs,
 			req.RequiredCapability,
 			req.RequireCompact,
+			!req.PreviousResponseCanMove,
 		)
 		if err != nil {
 			return nil, decision, err
@@ -423,6 +451,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 				if selection.ReleaseFunc != nil {
 					selection.ReleaseFunc()
 				}
+				if hasResponseEgressBinding {
+					return nil, decision, fmt.Errorf("%w: previous response egress is incompatible with this request", ErrAccountEgressConfigStale)
+				}
 				selection = nil
 			}
 		}
@@ -435,6 +466,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 				_ = s.service.bindOpenAIStickySessionDuringSelection(ctx, req.GroupID, req.SessionHash, selection.Account.ID)
 			}
 			return selection, decision, nil
+		}
+		if hasResponseEgressBinding {
+			return nil, decision, fmt.Errorf("%w: previous response egress is unavailable", ErrAccountEgressNoRoute)
 		}
 	}
 
@@ -2345,6 +2379,7 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	previousResponseCanMove bool,
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	ctx = s.withOpenAISessionEgressPreference(ctx, groupID, sessionHash)
 	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 	for {
 		selection, decision, err := s.selectAccountWithSchedulerBeforeCyberCooldown(
@@ -2368,6 +2403,12 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 
 		cooldownErr := s.RecheckOpenAICyberAccountCooldown(ctx, selection.Account)
 		if cooldownErr == nil {
+			// A profit-gated selection is still subject to the handler's final
+			// admission check. Persist the route only for ungated selections; the
+			// gated path binds after ProfitControlVetoLatest succeeds.
+			if !selection.ProfitGateActive() && selection.Acquired && selection.Account.SelectedEgress != nil {
+				_ = s.bindOpenAISessionEgressAffinity(ctx, groupID, sessionHash, selection.Account)
+			}
 			return selection, decision, nil
 		}
 		if selection.ReleaseFunc != nil {
@@ -2431,6 +2472,89 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerBeforeCyberCooldown(
 	return s.selectAccountWithSchedulerOnce(withOpenAIProxyStreamQuarantineBypass(ctx), groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
 }
 
+// selectBoundOpenAIResponseEgress handles continuations that have a durable
+// response->egress fence and rejects incomplete enforced-pool marker pairs.
+// A non-movable response also treats its account marker as a hard fence because
+// the caller cannot reconstruct the upstream conversation on another account.
+// The handled result covers the advanced-scheduler-off path as well.
+func (s *OpenAIGatewayService) selectBoundOpenAIResponseEgress(
+	ctx context.Context,
+	groupID *int64,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requiredImageCapability OpenAIImagesCapability,
+	requireCompact bool,
+	platform string,
+	previousResponseCanMove bool,
+) (*AccountSelectionResult, OpenAIAccountScheduleDecision, bool, error) {
+	decision := OpenAIAccountScheduleDecision{}
+	if s == nil || strings.TrimSpace(previousResponseID) == "" ||
+		NormalizeOpenAICompatiblePlatform(platform) != PlatformOpenAI {
+		return nil, decision, false, nil
+	}
+	_, found, bindingErr := s.openAIWSResponseEgressBinding(ctx, groupID, previousResponseID)
+	if bindingErr != nil {
+		return nil, decision, true, bindingErr
+	}
+	if !found {
+		markerState, markerErr := s.inspectOpenAIMovableResponseEgressMarkers(ctx, groupID, previousResponseID)
+		if markerErr != nil {
+			return nil, decision, true, markerErr
+		}
+		// The strict pair read may observe a route committed after the initial
+		// egress lookup. Promote it to the hard continuation path; portable
+		// account-only markers remain eligible for ordinary scheduling.
+		if !markerState.HasEgressBinding && previousResponseCanMove {
+			return nil, decision, false, nil
+		}
+	}
+	// Keep the same model/channel guard as ordinary scheduling. A hard route
+	// cannot override a group-level pricing restriction.
+	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
+		return nil, decision, true, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
+	}
+	selection, err := s.selectAccountByPreviousResponseIDForCapabilityWithAccountFence(
+		ctx,
+		groupID,
+		previousResponseID,
+		requestedModel,
+		excludedIDs,
+		requiredCapability,
+		requireCompact,
+		!previousResponseCanMove,
+	)
+	if err != nil {
+		return nil, decision, true, err
+	}
+	if selection == nil || selection.Account == nil {
+		return nil, decision, true, fmt.Errorf("%w: previous response egress is unavailable", ErrAccountEgressNoRoute)
+	}
+	hasGroupMetadata := len(selection.Account.GroupIDs) > 0 || len(selection.Account.AccountGroups) > 0
+	groupCompatible := !hasGroupMetadata || openAIStickyAccountMatchesGroup(selection.Account, groupID)
+	if hasGroupMetadata {
+		groupCompatible = s.openAIAccountMatchesSchedulingGroup(selection.Account, groupID)
+	}
+	if !groupCompatible || !s.isOpenAIAccountTransportCompatible(selection.Account, requiredTransport) ||
+		!accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		return nil, decision, true, fmt.Errorf("%w: previous response egress is incompatible with this request", ErrAccountEgressConfigStale)
+	}
+	decision.Layer = openAIAccountScheduleLayerPreviousResponse
+	decision.StickyPreviousHit = true
+	decision.SelectedAccountID = selection.Account.ID
+	decision.SelectedAccountType = selection.Account.Type
+	if sessionHash != "" {
+		_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, selection.Account.ID)
+	}
+	return selection, decision, true, nil
+}
+
 type openAIGroupPrivacyRequirementContextKey struct{}
 
 type openAIGroupPrivacyRequirement struct {
@@ -2491,6 +2615,22 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	ctx = s.withOpenAIAdvancedSchedulerRequestSettings(ctx, groupID, platform)
+	if selection, decision, handled, err := s.selectBoundOpenAIResponseEgress(
+		ctx,
+		groupID,
+		previousResponseID,
+		sessionHash,
+		requestedModel,
+		excludedIDs,
+		requiredTransport,
+		requiredCapability,
+		requiredImageCapability,
+		requireCompact,
+		platform,
+		previousResponseCanMove,
+	); handled {
+		return selection, decision, err
+	}
 	decision := OpenAIAccountScheduleDecision{}
 	preserveGuardianParentBinding := preserveOpenAIGuardianParentBinding(ctx, sessionHash)
 	guardianParentAccountID := int64(0)
@@ -2602,30 +2742,42 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	stickyWeighted := s.isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx)
 	subscriptionPriority := s.isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx)
 	stickyPreviousAccountID := int64(0)
+	var movableResponseMarkerState *openAIMovableResponseEgressMarkerState
 	if stickyWeighted && previousResponseCanMove && strings.TrimSpace(previousResponseID) != "" && platform == PlatformOpenAI {
+		state, markerErr := s.inspectOpenAIMovableResponseEgressMarkers(ctx, groupID, previousResponseID)
+		if markerErr != nil {
+			return nil, decision, markerErr
+		}
+		// A nil value tells direct/default scheduler entry points to inspect for
+		// themselves. Keep no-marker misses nil as well so a marker committed
+		// between this check and Select cannot slip through the race window.
+		if state.HasAccountBinding || state.HasEgressBinding {
+			movableResponseMarkerState = &state
+		}
 		stickyPreviousAccountID = s.ResolveAccountIDByPreviousResponseIDForScheduler(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
 	}
 
 	return scheduler.Select(ctx, OpenAIAccountScheduleRequest{
-		GroupID:                 groupID,
-		Platform:                platform,
-		SessionHash:             sessionHash,
-		StickyAccountID:         stickyAccountID,
-		GuardianParentAccountID: guardianParentAccountID,
-		StickyPreviousAccountID: stickyPreviousAccountID,
-		StickyWeighted:          stickyWeighted,
-		SubscriptionPriority:    subscriptionPriority,
-		PreserveStickyBinding:   preserveGuardianParentBinding,
-		RequirePrivacySet:       s.openAIGroupRequiresPrivacySet(ctx, groupID),
-		PreviousResponseID:      previousResponseID,
-		PreviousResponseCanMove: previousResponseCanMove,
-		UseUpstreamTokenCost:    useUpstreamTokenCost,
-		RequestedModel:          requestedModel,
-		RequiredTransport:       requiredTransport,
-		RequiredCapability:      requiredCapability,
-		RequiredImageCapability: requiredImageCapability,
-		RequireCompact:          requireCompact,
-		ExcludedIDs:             excludedIDs,
+		GroupID:                    groupID,
+		Platform:                   platform,
+		SessionHash:                sessionHash,
+		StickyAccountID:            stickyAccountID,
+		GuardianParentAccountID:    guardianParentAccountID,
+		StickyPreviousAccountID:    stickyPreviousAccountID,
+		StickyWeighted:             stickyWeighted,
+		SubscriptionPriority:       subscriptionPriority,
+		PreserveStickyBinding:      preserveGuardianParentBinding,
+		RequirePrivacySet:          s.openAIGroupRequiresPrivacySet(ctx, groupID),
+		PreviousResponseID:         previousResponseID,
+		PreviousResponseCanMove:    previousResponseCanMove,
+		UseUpstreamTokenCost:       useUpstreamTokenCost,
+		RequestedModel:             requestedModel,
+		RequiredTransport:          requiredTransport,
+		RequiredCapability:         requiredCapability,
+		RequiredImageCapability:    requiredImageCapability,
+		RequireCompact:             requireCompact,
+		ExcludedIDs:                excludedIDs,
+		movableResponseMarkerState: movableResponseMarkerState,
 	})
 }
 

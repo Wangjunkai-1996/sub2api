@@ -67,6 +67,17 @@ var (
 		return 'OK'
 	`)
 
+	// Legacy primary slot keys predate the account hash tag. Keep each lookup in
+	// a single-key script so this compatibility check remains Redis Cluster safe.
+	accountEgressLegacyPrimaryCountScript = redis.NewScript(`
+		redis.replicate_commands()
+		local key = KEYS[1]
+		local ttl = tonumber(ARGV[1])
+		local now = tonumber(redis.call('TIME')[1])
+		redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
+		return redis.call('ZCARD', key)
+	`)
+
 	accountEgressAcquireScript = redis.NewScript(`
 		redis.replicate_commands()
 		local configKey = KEYS[1]
@@ -92,6 +103,9 @@ var (
 		local candidateCount = tonumber(ARGV[11])
 		local legacyRegularTTL = tonumber(ARGV[12])
 		local legacyLiveTTL = tonumber(ARGV[13])
+		local forcePool = tonumber(ARGV[14]) == 1
+		local legacyPrimaryRegularActive = tonumber(ARGV[15])
+		local legacyPrimaryLiveActive = tonumber(ARGV[16])
 
 		local storedVersionRaw = redis.call('HGET', configKey, 'version')
 		if storedVersionRaw == false then
@@ -144,7 +158,7 @@ var (
 		local eligibleIdentities = {}
 		local effectiveCapacity = 0
 		local primaryIdentityIndex = 0
-		local offset = 14
+		local offset = 17
 		for candidateIndex = 1, candidateCount do
 			local candidate = {
 				bindingID = ARGV[offset],
@@ -212,6 +226,10 @@ var (
 			return result('CONFIG_STALE', nil)
 		end
 		local legacyActive = redis.call('ZCARD', legacyRegularKey) + redis.call('ZCARD', legacyLiveKey)
+		local legacyPrimaryActive = legacyPrimaryRegularActive + legacyPrimaryLiveActive
+		if forcePool and legacyPrimaryActive ~= legacyActive then
+			return result('CONFIG_STALE', nil)
+		end
 		local mode = redis.call('GET', modeKey)
 		local blockNewPool = false
 		if mode == false then
@@ -243,7 +261,16 @@ var (
 				mode = 'pool'
 			end
 		elseif mode == 'to_legacy' then
-			blockNewPool = true
+			-- Older pool binaries incorrectly persisted to_legacy when a legacy
+			-- admission merely observed an occupied pool. An enforce-mode caller
+			-- may repair that residue only when no legacy lease is present. Keep a
+			-- genuine transition fenced while legacy work is still draining.
+			if forcePool and legacyActive == 0 and legacyPrimaryActive == 0 then
+				redis.call('SET', modeKey, 'pool')
+				mode = 'pool'
+			else
+				blockNewPool = true
+			end
 		elseif mode == 'pool' then
 			if legacyActive > 0 then
 				return result('CONFIG_STALE', nil)
@@ -767,42 +794,89 @@ func (c *concurrencyCache) AcquireAccountEgress(
 		keys = append(keys, accountEgressLegacyLiveIdentityKey(request.Config.AccountID, identityID))
 	}
 
-	args := make([]any, 0, 13+len(candidates)*9)
-	args = append(args,
-		request.Config.Version,
-		digest,
-		request.Config.PerIdentityConcurrency,
-		request.Config.MaxWaiting,
-		accountEgressDurationMilliseconds(request.LeaseTTL),
-		accountEgressDurationMilliseconds(request.WaiterTTL),
-		request.LeaseID,
-		accountEgressIDHash(request.LeaseID),
-		accountEgressIDHashOrEmpty(request.RequiredBindingID),
-		accountEgressIDHashOrEmpty(request.PreferredBindingID),
-		len(candidates),
-		c.slotTTLSeconds,
-		liveLeaseTTLSeconds,
-	)
-	for _, candidate := range candidates {
-		identityIndex := identityIndexes[candidate.IdentityID]
+	runAcquire := func(forcePool bool, legacyPrimaryRegularActive, legacyPrimaryLiveActive int64) (service.AccountEgressAcquireResult, error) {
+		args := make([]any, 0, 16+len(candidates)*9)
 		args = append(args,
-			candidate.BindingID,
-			accountEgressIDHash(candidate.BindingID),
-			candidate.RouteID,
-			candidate.IdentityID,
-			accountEgressIDHash(candidate.IdentityID),
-			candidate.Position,
-			accountEgressBool(candidate.Primary),
-			accountEgressBool(candidate.Healthy),
-			identityIndex,
+			request.Config.Version,
+			digest,
+			request.Config.PerIdentityConcurrency,
+			request.Config.MaxWaiting,
+			accountEgressDurationMilliseconds(request.LeaseTTL),
+			accountEgressDurationMilliseconds(request.WaiterTTL),
+			request.LeaseID,
+			accountEgressIDHash(request.LeaseID),
+			accountEgressIDHashOrEmpty(request.RequiredBindingID),
+			accountEgressIDHashOrEmpty(request.PreferredBindingID),
+			len(candidates),
+			c.slotTTLSeconds,
+			liveLeaseTTLSeconds,
+			accountEgressBool(forcePool),
+			legacyPrimaryRegularActive,
+			legacyPrimaryLiveActive,
 		)
+		for _, candidate := range candidates {
+			identityIndex := identityIndexes[candidate.IdentityID]
+			args = append(args,
+				candidate.BindingID,
+				accountEgressIDHash(candidate.BindingID),
+				candidate.RouteID,
+				candidate.IdentityID,
+				accountEgressIDHash(candidate.IdentityID),
+				candidate.Position,
+				accountEgressBool(candidate.Primary),
+				accountEgressBool(candidate.Healthy),
+				identityIndex,
+			)
+		}
+
+		raw, runErr := accountEgressAcquireScript.Run(ctx, c.rdb, keys, args...).Result()
+		if runErr != nil {
+			return service.AccountEgressAcquireResult{}, runErr
+		}
+		return parseAccountEgressAcquireResult(request.LeaseID, raw)
 	}
 
-	raw, err := accountEgressAcquireScript.Run(ctx, c.rdb, keys, args...).Result()
+	// Never repair from the mirror alone. A stale to_legacy marker is rare, so
+	// keep the legacy primary-key compatibility reads off the normal hot path.
+	result, err := runAcquire(false, 0, 0)
+	if err != nil || !request.ForcePool || result.Status != service.AccountEgressStatusLegacyDraining {
+		return result, err
+	}
+	legacyPrimaryRegularActive, legacyPrimaryLiveActive, err := c.accountEgressLegacyPrimaryCounts(ctx, request.Config.AccountID)
 	if err != nil {
 		return service.AccountEgressAcquireResult{}, err
 	}
-	return parseAccountEgressAcquireResult(request.LeaseID, raw)
+	return runAcquire(true, legacyPrimaryRegularActive, legacyPrimaryLiveActive)
+}
+
+func (c *concurrencyCache) accountEgressLegacyPrimaryCounts(ctx context.Context, accountID int64) (int64, int64, error) {
+	pipe := c.rdb.Pipeline()
+	// Use EVAL rather than Script.Run: a pipelined EVALSHA cannot perform the
+	// NOSCRIPT fallback until after Exec has already returned.
+	regularCmd := accountEgressLegacyPrimaryCountScript.Eval(
+		ctx,
+		pipe,
+		[]string{accountSlotKey(accountID)},
+		c.slotTTLSeconds,
+	)
+	liveCmd := accountEgressLegacyPrimaryCountScript.Eval(
+		ctx,
+		pipe,
+		[]string{liveAccountSlotKey(accountID)},
+		liveLeaseTTLSeconds,
+	)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, 0, fmt.Errorf("count legacy account egress primary slots: %w", err)
+	}
+	regular, err := regularCmd.Int64()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read legacy account egress regular primary count: %w", err)
+	}
+	live, err := liveCmd.Int64()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read legacy account egress live primary count: %w", err)
+	}
+	return regular, live, nil
 }
 
 func accountEgressIDHashOrEmpty(value string) string {

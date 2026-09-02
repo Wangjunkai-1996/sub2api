@@ -236,7 +236,7 @@ func TestTransitionWithoutPoolLeaseNeverReopensLegacyAdmission(t *testing.T) {
 	require.NoError(t, cache.ReleaseAccountSlotForEgress(ctx, accountID, "regular", identityID))
 }
 
-func TestLegacyLiveAdmissionInitiatesPoolToLegacyTransition(t *testing.T) {
+func TestLegacyLiveAdmissionDoesNotInitiatePoolToLegacyTransition(t *testing.T) {
 	cache, _ := newAccountEgressCacheTest(t)
 	ctx := context.Background()
 	candidate := accountEgressTestCandidate(0, 104, "ip:live-fallback")
@@ -248,11 +248,13 @@ func TestLegacyLiveAdmissionInitiatesPoolToLegacyTransition(t *testing.T) {
 	live, err := cache.AcquireLiveLeaseForLegacyEgress(ctx, config.AccountID, 2, 25, 2, 35, "legacy-live", candidate.IdentityID, false)
 	require.NoError(t, err)
 	require.False(t, live)
-	require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
-	require.Equal(t, service.AccountEgressStatusLegacyDraining, acquireAccountEgressTest(t, cache, config, "new-pool-blocked", "", "").Status)
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	secondPool := acquireAccountEgressTest(t, cache, config, "second-pool", "", "")
+	require.Equal(t, service.AccountEgressStatusAcquired, secondPool.Status)
+	releaseAccountEgressTest(t, cache, config, secondPool)
 
 	releaseAccountEgressTest(t, cache, config, pool)
-	require.Equal(t, "legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 	live, err = cache.AcquireLiveLeaseForLegacyEgress(ctx, config.AccountID, 2, 25, 2, 35, "legacy-live", candidate.IdentityID, false)
 	require.NoError(t, err)
 	require.True(t, live)

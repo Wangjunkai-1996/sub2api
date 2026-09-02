@@ -530,7 +530,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if requiredBindingID == "" || stateStore == nil || payload.previousResponseID == "" {
 			return nil
 		}
-		bindingID, ok := getOpenAIWSResponseEgress(stateStore, ctx, groupID, payload.previousResponseID)
+		bindingID, ok, readErr := getOpenAIWSResponseEgressWithError(stateStore, ctx, groupID, payload.previousResponseID)
+		if readErr != nil {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream continuation egress state is unavailable; please retry later",
+				fmt.Errorf("%w: read response %s egress binding: %v", ErrAccountEgressUnavailable, payload.previousResponseID, readErr),
+			)
+		}
 		if !ok || strings.TrimSpace(bindingID) == "" {
 			return NewOpenAIWSClientCloseError(
 				coderws.StatusPolicyViolation,
@@ -739,10 +746,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			responseID := strings.TrimSpace(result.RequestID)
 			if responseID != "" && stateStore != nil {
 				ttl := s.openAIWSResponseStickyTTL()
-				logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
-				if requiredBindingID != "" {
-					logOpenAIWSBindResponseEgressWarn(groupID, account.ID, responseID, requiredBindingID, bindOpenAIWSResponseEgress(stateStore, ctx, groupID, responseID, requiredBindingID, ttl))
-				}
+				_ = bindOpenAIWSResponseRoutingPair(stateStore, ctx, groupID, responseID, account.ID, requiredBindingID, ttl)
 			}
 			if stateStore != nil && storeDisabled && sessionHash != "" && requiredBindingID != "" {
 				ttl := s.openAIWSSessionStickyTTL()
@@ -1812,11 +1816,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 		if responseID != "" && stateStore != nil {
 			ttl := s.openAIWSResponseStickyTTL()
-			logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 			bindingID := strings.TrimSpace(sessionLease.BindingID())
-			if bindingID != "" {
-				logOpenAIWSBindResponseEgressWarn(groupID, account.ID, responseID, bindingID, bindOpenAIWSResponseEgress(stateStore, ctx, groupID, responseID, bindingID, ttl))
-			}
+			_ = bindOpenAIWSResponseRoutingPair(stateStore, ctx, groupID, responseID, account.ID, bindingID, ttl)
 			stateStore.BindResponseConn(responseID, connID, ttl)
 		}
 		if stateStore != nil && storeDisabled && sessionHash != "" {

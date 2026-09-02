@@ -162,6 +162,17 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	usage := &OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
 	responseID := ""
+	responseRoutingBound := false
+	bindResponseRouting := func() {
+		if responseRoutingBound || strings.TrimSpace(responseID) == "" {
+			return
+		}
+		responseRoutingBound = true
+		// Persist the continuation fence before any event carrying this response ID
+		// can be flushed to the client. In particular, response.completed must not
+		// become observable before its account and egress route are durable.
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	}
 	var firstOutputScanGuard atomic.Bool
 	firstOutputScanGuard.Store(stageBeforeClientOutput)
 	scanner := bufio.NewScanner(resp.Body)
@@ -530,6 +541,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 			if responseID == "" {
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
+				bindResponseRouting()
 			}
 			forceFlushFailedEvent := false
 			if !capacityFailoverSuppressedLogged && account != nil && account.Platform == PlatformOpenAI &&
@@ -1520,7 +1532,16 @@ func (s *OpenAIGatewayService) bindHTTPResponseAccount(ctx context.Context, c *g
 	}
 	groupID := getOpenAIGroupIDFromContext(c)
 	ttl := s.openAIWSResponseStickyTTL()
-	logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, store.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+	// Pool admissions carry the exact route selected for this response. Persist
+	// that fence alongside the account marker so a later previous_response_id
+	// continuation cannot silently move to another public IP. Legacy admission
+	// leases are request-scoped and intentionally are not promoted to a durable
+	// response route marker.
+	bindingID := ""
+	if selected := account.SelectedEgress; selected != nil {
+		bindingID = strings.TrimSpace(selected.BindingID)
+	}
+	_ = bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, account.ID, bindingID, ttl)
 	if rawOwner, ok := c.Get(openAIHTTPResponseOwnerContextKey); ok {
 		if owner, ok := rawOwner.(openAIHTTPResponseOwner); ok && owner.userID > 0 && owner.apiKeyID > 0 {
 			if err := s.BindOpenAIHTTPResponseOwner(ctx, groupID, responseID, owner.userID, owner.apiKeyID); err != nil {

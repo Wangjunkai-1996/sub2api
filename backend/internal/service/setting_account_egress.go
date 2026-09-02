@@ -20,8 +20,9 @@ const (
 )
 
 type cachedAccountEgressRolloutMode struct {
-	mode      AccountEgressPoolRolloutMode
-	expiresAt time.Time
+	mode              AccountEgressPoolRolloutMode
+	expiresAt         time.Time
+	hasSuccessfulRead bool
 }
 
 func NormalizeAccountEgressPoolRolloutMode(value string) AccountEgressPoolRolloutMode {
@@ -35,16 +36,18 @@ func NormalizeAccountEgressPoolRolloutMode(value string) AccountEgressPoolRollou
 	}
 }
 
-// GetAccountEgressPoolRolloutMode is fail closed: a missing, invalid, or
-// unreadable setting disables pool routing. The short cache keeps the setting
-// off the request hot path while preserving a bounded rollback reaction time.
+// GetAccountEgressPoolRolloutMode is fail closed on cold start and for an
+// explicitly missing or invalid value. After a successful read, transient read
+// failures reuse that last value so a database blip cannot flip live traffic
+// between the legacy and pool admission paths.
 func (s *SettingService) GetAccountEgressPoolRolloutMode(ctx context.Context) AccountEgressPoolRolloutMode {
 	if s == nil || s.settingRepo == nil {
 		return AccountEgressPoolRolloutOff
 	}
 	now := time.Now()
+	var cached *cachedAccountEgressRolloutMode
 	if raw := s.accountEgressRolloutCache.Load(); raw != nil {
-		cached, _ := raw.(*cachedAccountEgressRolloutMode)
+		cached, _ = raw.(*cachedAccountEgressRolloutMode)
 		if cached != nil && now.Before(cached.expiresAt) {
 			return cached.mode
 		}
@@ -67,12 +70,18 @@ func (s *SettingService) GetAccountEgressPoolRolloutMode(ctx context.Context) Ac
 		return NormalizeAccountEgressPoolRolloutMode(raw), nil
 	})
 	mode, _ := value.(AccountEgressPoolRolloutMode)
+	hasSuccessfulRead := err == nil
 	if err != nil {
 		mode = AccountEgressPoolRolloutOff
+		if cached != nil && cached.hasSuccessfulRead {
+			mode = cached.mode
+			hasSuccessfulRead = true
+		}
 	}
 	s.accountEgressRolloutCache.Store(&cachedAccountEgressRolloutMode{
-		mode:      mode,
-		expiresAt: now.Add(accountEgressRolloutCacheTTL),
+		mode:              mode,
+		expiresAt:         now.Add(accountEgressRolloutCacheTTL),
+		hasSuccessfulRead: hasSuccessfulRead,
 	})
 	return mode
 }

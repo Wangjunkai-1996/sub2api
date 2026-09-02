@@ -22,6 +22,7 @@ const (
 	AccountEgressLeaseRefreshInterval = 25 * time.Second
 	accountEgressOperationTimeout     = 3 * time.Second
 	accountEgressWaitPollInterval     = 50 * time.Millisecond
+	accountEgressMaxWaitDuration      = 45 * time.Second
 )
 
 var (
@@ -188,6 +189,11 @@ type AccountEgressAcquireRequest struct {
 	LeaseID            string
 	RequiredBindingID  string
 	PreferredBindingID string
+	// ForcePool allows an enforce-mode pool admission to repair a stale
+	// to_legacy marker left by an older binary. It only clears the marker when
+	// neither the legacy primary keys nor their mirrors contain an active lease;
+	// an explicit transition with active legacy work continues to drain normally.
+	ForcePool bool
 }
 
 type AccountEgressCacheAcquireRequest struct {
@@ -263,6 +269,7 @@ type AccountEgressAllocator struct {
 	leaseTTL         time.Duration
 	refreshInterval  time.Duration
 	operationTimeout time.Duration
+	maxWaitDuration  time.Duration
 	now              func() time.Time
 
 	mu        sync.Mutex
@@ -280,6 +287,7 @@ func NewAccountEgressAllocator(cache AccountEgressCache) *AccountEgressAllocator
 		AccountEgressLeaseTTL,
 		AccountEgressLeaseRefreshInterval,
 		accountEgressOperationTimeout,
+		accountEgressMaxWaitDuration,
 		time.Now,
 	)
 }
@@ -289,6 +297,7 @@ func newAccountEgressAllocatorWithTiming(
 	leaseTTL time.Duration,
 	refreshInterval time.Duration,
 	operationTimeout time.Duration,
+	maxWaitDuration time.Duration,
 	now func() time.Time,
 ) *AccountEgressAllocator {
 	if leaseTTL <= 0 {
@@ -300,6 +309,9 @@ func newAccountEgressAllocatorWithTiming(
 	if operationTimeout <= 0 {
 		operationTimeout = accountEgressOperationTimeout
 	}
+	if maxWaitDuration <= 0 {
+		maxWaitDuration = accountEgressMaxWaitDuration
+	}
 	if now == nil {
 		now = time.Now
 	}
@@ -308,6 +320,7 @@ func newAccountEgressAllocatorWithTiming(
 		leaseTTL:         leaseTTL,
 		refreshInterval:  refreshInterval,
 		operationTimeout: operationTimeout,
+		maxWaitDuration:  maxWaitDuration,
 		now:              now,
 		leases:           make(map[string]*accountEgressLeaseState),
 		closeCh:          make(chan struct{}),
@@ -339,13 +352,27 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 
 	defer a.removeWaiter(request.Config.AccountID, request.LeaseID)
 	var result AccountEgressAcquireResult
+	var waitCtx context.Context
+	var cancelWait context.CancelFunc
+	defer func() {
+		if cancelWait != nil {
+			cancelWait()
+		}
+	}()
 	for {
-		result, err = a.cache.AcquireAccountEgress(ctx, AccountEgressCacheAcquireRequest{
+		acquireCtx := ctx
+		if waitCtx != nil {
+			acquireCtx = waitCtx
+		}
+		result, err = a.cache.AcquireAccountEgress(acquireCtx, AccountEgressCacheAcquireRequest{
 			AccountEgressAcquireRequest: request,
 			LeaseTTL:                    a.leaseTTL,
 			WaiterTTL:                   2 * time.Minute,
 		})
 		if err != nil {
+			if waitErr := accountEgressWaitContextError(ctx, waitCtx); waitErr != nil {
+				return nil, waitErr
+			}
 			return nil, fmt.Errorf("%w: acquire: %v", ErrAccountEgressUnavailable, err)
 		}
 		if result.Status == AccountEgressStatusAcquired {
@@ -354,17 +381,20 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 		if request.Config.MaxWaiting <= 0 || !accountEgressStatusCanWait(result.Status) {
 			return nil, accountEgressStatusError(result.Status)
 		}
+		if waitCtx == nil {
+			waitCtx, cancelWait = context.WithTimeout(ctx, a.maxWaitDuration)
+		}
 
 		timer := time.NewTimer(accountEgressWaitPollInterval)
 		select {
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 			if !timer.Stop() {
-				<-timer.C
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return nil, fmt.Errorf("%w: wait deadline exceeded", ErrAccountEgressCapacityFull)
-			}
-			return nil, ctx.Err()
+			return nil, accountEgressWaitContextError(ctx, waitCtx)
 		case <-timer.C:
 		}
 	}
@@ -411,6 +441,26 @@ func (a *AccountEgressAllocator) Acquire(ctx context.Context, request AccountEgr
 		EffectiveCapacity: result.EffectiveCapacity,
 		ConfigVersion:     result.ConfigVersion,
 	}, nil
+}
+
+func accountEgressWaitContextError(ctx, waitCtx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("%w: wait deadline exceeded", ErrAccountEgressCapacityFull)
+			}
+			return err
+		}
+	}
+	if waitCtx != nil {
+		if err := waitCtx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("%w: wait deadline exceeded", ErrAccountEgressCapacityFull)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func accountEgressStatusError(status AccountEgressStatus) error {

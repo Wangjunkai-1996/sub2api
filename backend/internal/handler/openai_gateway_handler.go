@@ -1834,6 +1834,7 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 			if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
 				reqLog.Warn("openai.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 			}
+			h.bindOpenAISessionEgressAffinityAfterAdmission(ctx, groupID, sessionHash, account, reqLog)
 		}
 		return wrapReleaseOnDone(ctx, selection.ReleaseFunc), openAISlotAcquireOK
 	}
@@ -1875,6 +1876,7 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
+		h.bindOpenAISessionEgressAffinityAfterAdmission(ctx, groupID, sessionHash, account, reqLog)
 		return wrapReleaseOnDone(ctx, fastReleaseFunc), openAISlotAcquireOK
 	}
 
@@ -1935,7 +1937,29 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
 		reqLog.Warn("openai.bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 	}
+	h.bindOpenAISessionEgressAffinityAfterAdmission(ctx, groupID, sessionHash, account, reqLog)
 	return wrapReleaseOnDone(ctx, accountReleaseFunc), openAISlotAcquireOK
+}
+
+// bindOpenAISessionEgressAffinityAfterAdmission persists the selected route only
+// after the account sticky fence has been admitted. This matters when a profit
+// gate delays the account binding or when a WaitPlan acquires its slot later.
+func (h *OpenAIGatewayHandler) bindOpenAISessionEgressAffinityAfterAdmission(
+	ctx context.Context,
+	groupID *int64,
+	sessionHash string,
+	account *service.Account,
+	reqLog *zap.Logger,
+) {
+	if h == nil || h.gatewayService == nil || account == nil || account.SelectedEgress == nil {
+		return
+	}
+	if err := h.gatewayService.BindOpenAISessionEgressAffinity(ctx, groupID, sessionHash, account); err != nil && reqLog != nil {
+		reqLog.Warn("openai.bind_session_egress_affinity_failed",
+			zap.Int64("account_id", account.ID),
+			zap.Error(err),
+		)
+	}
 }
 
 // ResponsesWebSocket handles OpenAI Responses API WebSocket ingress endpoint
@@ -2380,6 +2404,13 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		holdPoolLeaseBetweenTurns = shouldHoldOpenAIWSPoolLease(selection, currentAccountRelease)
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.websocket_bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+		}
+		// Ungated selections that already acquired their slot persist account and
+		// route affinity inside scheduling. Deferred admission paths bind here.
+		if account.SelectedEgress != nil && (!selection.Acquired || selection.ProfitGateActive()) {
+			if err := h.gatewayService.BindOpenAISessionEgressAffinity(ctx, apiKey.GroupID, sessionHash, account); err != nil {
+				reqLog.Warn("openai.websocket_bind_session_egress_affinity_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			}
 		}
 
 		token, _, err := h.gatewayService.GetRequestCredential(ctx, c, account)

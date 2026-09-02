@@ -506,7 +506,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 	defer func() { _ = resp.Body.Close() }()
 	serviceTier := extractOpenAIServiceTierFromBody(body)
-	s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	if !reqStream {
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	}
 
 	// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 	if !account.IsShadow() {
@@ -1754,6 +1756,16 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	responseID := ""
+	responseRoutingBound := false
+	bindResponseRouting := func() {
+		if responseRoutingBound || strings.TrimSpace(responseID) == "" {
+			return
+		}
+		responseRoutingBound = true
+		// Bind before response.completed (or any earlier event carrying the ID) is
+		// written, so an immediate continuation cannot race ordinary scheduling.
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	}
 	clientDisconnected := false
 	sawDone := false
 	sawTerminalEvent := false
@@ -1987,6 +1999,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			}
 			if responseID == "" {
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
+				bindResponseRouting()
 			}
 			imageCounter.AddSSEData(dataBytes)
 			if sanitizedData, sanitized := sanitizeOpenAIResponseFailedEventForClient(

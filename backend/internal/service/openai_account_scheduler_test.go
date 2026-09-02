@@ -443,7 +443,7 @@ func TestOpenAIGatewayService_OpenAIAdvancedSchedulerRuntimeSettings_InvalidWeig
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledUsesLegacyLoadAwareness(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledMovablePreviousUsesLegacyLoadAwareness(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 
 	ctx := context.Background()
@@ -482,7 +482,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledUsesLega
 	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_disabled_001", 36001, time.Hour))
 	require.False(t, svc.isOpenAIAdvancedSchedulerEnabled(ctx))
 
-	selection, decision, err := svc.SelectAccountWithScheduler(
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
 		ctx,
 		&groupID,
 		"resp_disabled_001",
@@ -490,7 +490,11 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledUsesLega
 		"gpt-5.1",
 		nil,
 		OpenAIUpstreamTransportAny,
+		"",
 		false,
+		true,
+		true,
+		PlatformOpenAI,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, selection)
@@ -1390,7 +1394,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedPreviousR
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseCompactUnsupportedDeletesBinding(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_MovablePreviousResponseCompactUnsupportedDeletesBinding(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 
 	ctx := context.Background()
@@ -1442,7 +1446,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseCompact
 	store := svc.getOpenAIWSStateStore()
 	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_compact_unsupported", 37121, time.Hour))
 
-	selection, decision, err := svc.SelectAccountWithScheduler(
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
 		ctx,
 		&groupID,
 		"resp_compact_unsupported",
@@ -1450,6 +1454,9 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_PreviousResponseCompact
 		"gpt-5.1",
 		nil,
 		OpenAIUpstreamTransportAny,
+		"",
+		true,
+		true,
 		true,
 	)
 	require.NoError(t, err)
@@ -1593,7 +1600,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_Enabled_EmbeddingsSkips
 		OpenAIUpstreamTransportHTTPSSE,
 		OpenAIEndpointCapabilityEmbeddings,
 		false,
-		false,
+		true,
 		true,
 	)
 	require.NoError(t, err)

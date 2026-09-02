@@ -79,8 +79,10 @@ func acquireAccountSlotForSelectionWithBinding(
 		return nil, err
 	}
 	resolved, err := concurrency.AcquireAccountEgress(ctx, AccountEgressAcquireRequest{
-		Config:            config,
-		RequiredBindingID: strings.TrimSpace(requiredBindingID),
+		Config:             config,
+		RequiredBindingID:  strings.TrimSpace(requiredBindingID),
+		PreferredBindingID: PreferredAccountEgressBindingFromContext(ctx),
+		ForcePool:          true,
 	})
 	if err != nil {
 		return nil, err

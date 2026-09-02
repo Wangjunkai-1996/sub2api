@@ -155,7 +155,6 @@ var (
 		end
 		if mode == 'pool' then
 			if redis.call('ZCARD', poolTotalKey) > 0 then
-				redis.call('SET', modeKey, 'to_legacy')
 				return {0, now}
 			end
 			redis.call('SET', modeKey, 'legacy')
@@ -320,7 +319,6 @@ var (
 		end
 		if mode == 'pool' then
 			if redis.call('ZCARD', poolTotalKey) > 0 then
-				redis.call('SET', modeKey, 'to_legacy')
 				return 0
 			end
 			redis.call('SET', modeKey, 'legacy')

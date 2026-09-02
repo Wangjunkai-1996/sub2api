@@ -259,7 +259,7 @@ func (s *OpenAIGatewayService) SelectAccountForModelWithExclusions(ctx context.C
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
 	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 	for {
-		account, err := s.selectAccountForModelWithExclusions(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, effectiveExcludedIDs, false, 0, "", false)
+		account, err := s.selectAccountForModelWithExclusions(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, effectiveExcludedIDs, false, 0, "", false, true)
 		if err != nil || account == nil {
 			return account, err
 		}
@@ -307,6 +307,7 @@ func (s *OpenAIGatewayService) SelectAccountForTokenCount(
 		0,
 		requiredCapability,
 		false,
+		true,
 	)
 }
 
@@ -903,7 +904,7 @@ func resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel string) strin
 	return strings.TrimSpace(billingModel)
 }
 
-func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, error) {
+func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool, persistStickyBinding bool) (*Account, error) {
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
 		slog.Warn("channel pricing restriction blocked request",
@@ -946,7 +947,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	// 4. 设置粘性会话绑定（利润门下推迟到 handler 终检通过后再绑定，
 	// 终检否决的账号不得成为新的粘性目标；无门保持既有 eager 绑定与 TTL）
 	// Set sticky session binding (deferred until terminal admission under a profit gate)
-	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
+	if persistStickyBinding && sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
 		_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, selected.ID, openaiStickySessionTTL)
 	}
 
@@ -1138,12 +1139,17 @@ func (s *OpenAIGatewayService) isBetterAccount(candidate, current *Account) bool
 
 // SelectAccountWithLoadAwareness selects an account with load-awareness and wait plan.
 func (s *OpenAIGatewayService) SelectAccountWithLoadAwareness(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*AccountSelectionResult, error) {
+	ctx = s.withOpenAISessionEgressPreference(ctx, groupID, sessionHash)
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
 	ctx = s.withOpenAIGroupPrivacyRequirement(ctx, groupID)
 	// 分组利润控制：legacy 公共入口同样装门，保证不经
 	// selectAccountWithScheduler 的调用方也无法绕过利润准入。
 	ctx = s.withOpenAIProfitControlGate(ctx, groupID)
-	return s.selectAccountWithLoadAwareness(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, excludedIDs, false, "", true)
+	selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, excludedIDs, false, "", true)
+	if err == nil && selection != nil && !selection.ProfitGateActive() && selection.Acquired && selection.Account != nil && selection.Account.SelectedEgress != nil {
+		_ = s.bindOpenAISessionEgressAffinity(ctx, groupID, sessionHash, selection.Account)
+	}
+	return selection, err
 }
 
 func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, requiredCapability OpenAIEndpointCapability, useUpstreamTokenCost bool) (*AccountSelectionResult, error) {
@@ -1166,34 +1172,98 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		}
 	}
 	if s.concurrencyService == nil || !cfg.LoadBatchEnabled {
-		account, err := s.selectAccountForModelWithExclusions(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability, preferLowUpstreamRate)
-		if err != nil {
-			return nil, err
-		}
-		result, err := s.tryAcquireAccountSlot(ctx, account)
-		if err == nil && result != nil && result.Acquired {
-			return s.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
-		}
-		if isAccountEgressAdmissionError(err) {
-			return nil, err
-		}
-		if stickyAccountID > 0 && stickyAccountID == account.ID && s.concurrencyService != nil {
-			waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, account.ID)
-			if waitingCount < cfg.StickySessionMaxWaiting {
-				return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
-					AccountID:      account.ID,
-					MaxConcurrency: account.Concurrency,
-					Timeout:        cfg.StickySessionWaitTimeout,
-					MaxWaiting:     cfg.StickySessionMaxWaiting,
-				})
+		effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
+		stickySpillover := false
+		var lastEgressAdmissionErr error
+		persistSelectedSticky := func(account *Account) {
+			if account == nil || sessionHash == "" || stickySpillover || gatewayProfitControlGateActive(ctx) {
+				return
 			}
+			_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, account.ID, openaiStickySessionTTL)
 		}
-		return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
-			AccountID:      account.ID,
-			MaxConcurrency: account.Concurrency,
-			Timeout:        cfg.FallbackWaitTimeout,
-			MaxWaiting:     cfg.FallbackMaxWaiting,
-		})
+
+		for {
+			// Account selection used to persist a fresh sticky binding before egress
+			// admission. Defer that write until this account actually acquires (or is
+			// selected for a legacy wait plan), otherwise a full pool can pin the
+			// conversation to a candidate that never served it.
+			account, err := s.selectAccountForModelWithExclusions(
+				ctx,
+				groupID,
+				platform,
+				sessionHash,
+				requestedModel,
+				effectiveExcludedIDs,
+				requireCompact,
+				stickyAccountID,
+				requiredCapability,
+				preferLowUpstreamRate,
+				false,
+			)
+			if err != nil {
+				if lastEgressAdmissionErr != nil && errors.Is(err, ErrNoAvailableAccounts) {
+					return nil, lastEgressAdmissionErr
+				}
+				return nil, err
+			}
+			if account == nil {
+				if lastEgressAdmissionErr != nil {
+					return nil, lastEgressAdmissionErr
+				}
+				return nil, ErrNoAvailableAccounts
+			}
+
+			result, acquireErr := s.tryAcquireAccountSlot(ctx, account)
+			if acquireErr == nil && result != nil && result.Acquired {
+				selection, selectionErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
+				if selectionErr != nil {
+					return nil, selectionErr
+				}
+				persistSelectedSticky(account)
+				return selection, nil
+			}
+			if isAccountEgressAdmissionError(acquireErr) {
+				lastEgressAdmissionErr = acquireErr
+				if stickyAccountID > 0 && stickyAccountID == account.ID {
+					stickySpillover = true
+				}
+				if effectiveExcludedIDs == nil {
+					effectiveExcludedIDs = make(map[int64]struct{})
+				}
+				if _, alreadyExcluded := effectiveExcludedIDs[account.ID]; alreadyExcluded {
+					return nil, lastEgressAdmissionErr
+				}
+				effectiveExcludedIDs[account.ID] = struct{}{}
+				continue
+			}
+			if stickyAccountID > 0 && stickyAccountID == account.ID && s.concurrencyService != nil {
+				waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, account.ID)
+				if waitingCount < cfg.StickySessionMaxWaiting {
+					selection, selectionErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
+						AccountID:      account.ID,
+						MaxConcurrency: account.Concurrency,
+						Timeout:        cfg.StickySessionWaitTimeout,
+						MaxWaiting:     cfg.StickySessionMaxWaiting,
+					})
+					if selectionErr != nil {
+						return nil, selectionErr
+					}
+					persistSelectedSticky(account)
+					return selection, nil
+				}
+			}
+			selection, selectionErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
+				AccountID:      account.ID,
+				MaxConcurrency: account.Concurrency,
+				Timeout:        cfg.FallbackWaitTimeout,
+				MaxWaiting:     cfg.FallbackMaxWaiting,
+			})
+			if selectionErr != nil {
+				return nil, selectionErr
+			}
+			persistSelectedSticky(account)
+			return selection, nil
+		}
 	}
 
 	accounts, err := s.listSchedulableAccounts(ctx, groupID, platform)

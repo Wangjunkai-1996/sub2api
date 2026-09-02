@@ -18,6 +18,7 @@ type accountEgressCacheStub struct {
 
 	acquireResults []AccountEgressAcquireResult
 	acquireErr     error
+	acquireFn      func(context.Context, AccountEgressCacheAcquireRequest, int) (AccountEgressAcquireResult, error)
 	acquireCalls   int
 	lastAcquire    AccountEgressCacheAcquireRequest
 
@@ -46,12 +47,15 @@ func (s *accountEgressCacheStub) SyncAccountEgressConfigs(_ context.Context, con
 	return result, nil
 }
 
-func (s *accountEgressCacheStub) AcquireAccountEgress(_ context.Context, request AccountEgressCacheAcquireRequest) (AccountEgressAcquireResult, error) {
+func (s *accountEgressCacheStub) AcquireAccountEgress(ctx context.Context, request AccountEgressCacheAcquireRequest) (AccountEgressAcquireResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastAcquire = request
 	index := s.acquireCalls
 	s.acquireCalls++
+	if s.acquireFn != nil {
+		return s.acquireFn(ctx, request, index)
+	}
 	if s.acquireErr != nil {
 		return AccountEgressAcquireResult{}, s.acquireErr
 	}
@@ -189,7 +193,7 @@ func TestAccountEgressAllocatorResolvesAndReleasesIdempotently(t *testing.T) {
 		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
 		refreshOwned:   true,
 	}
-	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Now)
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
 	defer allocator.Close()
 	request := AccountEgressAcquireRequest{
 		Config:             accountEgressAllocatorTestConfig(0),
@@ -221,7 +225,7 @@ func TestAccountEgressAllocatorPollsFIFOAndAlwaysRemovesWaiter(t *testing.T) {
 		},
 		refreshOwned: true,
 	}
-	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Now)
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
 	defer allocator.Close()
 	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{
 		Config:  accountEgressAllocatorTestConfig(3),
@@ -234,7 +238,7 @@ func TestAccountEgressAllocatorPollsFIFOAndAlwaysRemovesWaiter(t *testing.T) {
 	require.Equal(t, 1, removeCalls)
 
 	timeoutCache := &accountEgressCacheStub{acquireResults: []AccountEgressAcquireResult{{Status: AccountEgressStatusFull}}}
-	timeoutAllocator := newAccountEgressAllocatorWithTiming(timeoutCache, time.Second, time.Hour, time.Second, time.Now)
+	timeoutAllocator := newAccountEgressAllocatorWithTiming(timeoutCache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
 	defer timeoutAllocator.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Millisecond)
 	defer cancel()
@@ -244,13 +248,95 @@ func TestAccountEgressAllocatorPollsFIFOAndAlwaysRemovesWaiter(t *testing.T) {
 	require.Equal(t, 1, removeCalls)
 }
 
+func TestAccountEgressAllocatorBoundsWaitWithoutCallerDeadline(t *testing.T) {
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{{Status: AccountEgressStatusLegacyDraining}},
+	}
+	allocator := newAccountEgressAllocatorWithTiming(
+		cache,
+		time.Second,
+		time.Hour,
+		time.Second,
+		30*time.Millisecond,
+		time.Now,
+	)
+	defer allocator.Close()
+
+	startedAt := time.Now()
+	_, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{
+		Config:  accountEgressAllocatorTestConfig(3),
+		LeaseID: "locally-bounded-waiter",
+	})
+	require.ErrorIs(t, err, ErrAccountEgressCapacityFull)
+	require.Less(t, time.Since(startedAt), 500*time.Millisecond)
+	acquireCalls, _, _, removeCalls := cache.counts()
+	require.GreaterOrEqual(t, acquireCalls, 1)
+	require.LessOrEqual(t, acquireCalls, 2)
+	require.Equal(t, 1, removeCalls)
+}
+
+func TestAccountEgressAllocatorPreservesCallerCancellationWhileWaiting(t *testing.T) {
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{{Status: AccountEgressStatusLegacyDraining}},
+	}
+	allocator := newAccountEgressAllocatorWithTiming(
+		cache,
+		time.Second,
+		time.Hour,
+		time.Second,
+		time.Second,
+		time.Now,
+	)
+	defer allocator.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+
+	_, err := allocator.Acquire(ctx, AccountEgressAcquireRequest{
+		Config:  accountEgressAllocatorTestConfig(3),
+		LeaseID: "canceled-waiter",
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	_, _, _, removeCalls := cache.counts()
+	require.Equal(t, 1, removeCalls)
+}
+
+func TestAccountEgressAllocatorMapsLocalDeadlineDuringAcquireToCapacityFull(t *testing.T) {
+	cache := &accountEgressCacheStub{}
+	cache.acquireFn = func(ctx context.Context, request AccountEgressCacheAcquireRequest, call int) (AccountEgressAcquireResult, error) {
+		if call == 0 {
+			return AccountEgressAcquireResult{Status: AccountEgressStatusLegacyDraining, LeaseID: request.LeaseID}, nil
+		}
+		<-ctx.Done()
+		return AccountEgressAcquireResult{}, ctx.Err()
+	}
+	allocator := newAccountEgressAllocatorWithTiming(
+		cache,
+		time.Second,
+		time.Hour,
+		time.Second,
+		80*time.Millisecond,
+		time.Now,
+	)
+	defer allocator.Close()
+
+	_, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{
+		Config:  accountEgressAllocatorTestConfig(3),
+		LeaseID: "deadline-during-acquire",
+	})
+	require.ErrorIs(t, err, ErrAccountEgressCapacityFull)
+	require.NotErrorIs(t, err, ErrAccountEgressUnavailable)
+	acquireCalls, _, _, removeCalls := cache.counts()
+	require.Equal(t, 2, acquireCalls)
+	require.Equal(t, 1, removeCalls)
+}
+
 func TestAccountEgressLeaseManagerRefreshAndLoss(t *testing.T) {
 	t.Run("central manager refreshes", func(t *testing.T) {
 		cache := &accountEgressCacheStub{
 			acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
 			refreshOwned:   true,
 		}
-		allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond, time.Now)
+		allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond, time.Minute, time.Now)
 		resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: accountEgressAllocatorTestConfig(0), LeaseID: "refreshing"})
 		require.NoError(t, err)
 		require.Eventually(t, func() bool {
@@ -266,7 +352,7 @@ func TestAccountEgressLeaseManagerRefreshAndLoss(t *testing.T) {
 			acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
 			refreshOwned:   false,
 		}
-		allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, 10*time.Millisecond, 20*time.Millisecond, time.Now)
+		allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, 10*time.Millisecond, 20*time.Millisecond, time.Minute, time.Now)
 		defer allocator.Close()
 		resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: accountEgressAllocatorTestConfig(0), LeaseID: "missing"})
 		require.NoError(t, err)
@@ -279,7 +365,7 @@ func TestAccountEgressLeaseManagerRefreshAndLoss(t *testing.T) {
 func TestAccountEgressLeaseManagerToleratesTransientErrorOnlyUntilTTL(t *testing.T) {
 	cache := &accountEgressCacheStub{refreshErr: errors.New("redis unavailable")}
 	base := time.Now()
-	allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, time.Hour, time.Second, func() time.Time { return base })
+	allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, time.Hour, time.Second, time.Minute, func() time.Time { return base })
 	leaseCtx, cancel := context.WithCancelCause(context.Background())
 	lease := &AccountEgressLease{
 		ID: "transient", BindingID: "route:101", IdentityID: "ip:192.0.2.1", ConfigVersion: 7,
@@ -300,7 +386,7 @@ func TestAccountEgressAllocatorCloseCancelsAndReleasesLeases(t *testing.T) {
 		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
 		refreshOwned:   true,
 	}
-	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Now)
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
 	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: accountEgressAllocatorTestConfig(0), LeaseID: "close-me"})
 	require.NoError(t, err)
 	allocator.Close()
@@ -316,7 +402,7 @@ func TestAccountEgressLeaseDetachSurvivesRequestCancellationAndStillFailsOnLease
 		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
 		refreshOwned:   true,
 	}
-	allocator := newAccountEgressAllocatorWithTiming(cache, 200*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond, time.Now)
+	allocator := newAccountEgressAllocatorWithTiming(cache, 200*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond, time.Minute, time.Now)
 	defer allocator.Close()
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	resolved, err := allocator.Acquire(requestCtx, AccountEgressAcquireRequest{
@@ -355,7 +441,7 @@ func TestAccountEgressLeaseAbandonStopsLocalRefreshWithoutReleasingRedis(t *test
 		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
 		refreshOwned:   true,
 	}
-	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Now)
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
 	defer allocator.Close()
 	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{
 		Config:  accountEgressAllocatorTestConfig(0),
@@ -385,7 +471,7 @@ func TestAccountEgressLeaseRefreshWithinSafetyWindow(t *testing.T) {
 	}
 	base := time.Now()
 	now := base
-	allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, time.Hour, time.Second, func() time.Time {
+	allocator := newAccountEgressAllocatorWithTiming(cache, 100*time.Millisecond, time.Hour, time.Second, time.Minute, func() time.Time {
 		return now
 	})
 	defer allocator.Close()
@@ -409,7 +495,7 @@ func TestAccountEgressLeaseRefreshWithinSafetyWindow(t *testing.T) {
 
 func TestRestoreAccountEgressLeaseValidatesAndProvesExactOwnership(t *testing.T) {
 	cache := &accountEgressCacheStub{refreshOwned: true}
-	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Now)
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now)
 	defer allocator.Close()
 	service := &ConcurrencyService{accountEgressAllocator: allocator}
 	ref := AccountEgressLeaseRef{

@@ -374,12 +374,13 @@ func TestAccountEgressLegacyPoolGateDrainsBothDirections(t *testing.T) {
 	legacyAcquired, err = cache.AcquireAccountSlot(ctx, config.AccountID, 1, "legacy-blocked")
 	require.NoError(t, err)
 	require.False(t, legacyAcquired)
-	require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 	liveAcquired, err := cache.AcquireLiveLease(ctx, config.AccountID, 1, 9001, 1, 9002, "legacy-live-blocked", false)
 	require.NoError(t, err)
 	require.False(t, liveAcquired)
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 	releaseAccountEgressTest(t, cache, config, pool)
-	require.Equal(t, "legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 
 	liveAcquired, err = cache.AcquireLiveLease(ctx, config.AccountID, 1, 9001, 1, 9002, "legacy-live", false)
 	require.NoError(t, err)
@@ -495,7 +496,7 @@ func TestAccountEgressLegacyLoadKeepsAdmissionIdentityWhenPrimaryChanges(t *test
 	require.NoError(t, cache.ReleaseAccountSlotForEgress(ctx, config.AccountID, "legacy-on-first", first.IdentityID))
 }
 
-func TestLegacyAdmissionInitiatesPoolToLegacyTransition(t *testing.T) {
+func TestLegacyAdmissionDoesNotInitiatePoolToLegacyTransition(t *testing.T) {
 	cache, _ := newAccountEgressCacheTest(t)
 	candidate := accountEgressTestCandidate(0, 77, "ip:only")
 	config := accountEgressTestConfig(1017, 1, 0, candidate)
@@ -507,13 +508,159 @@ func TestLegacyAdmissionInitiatesPoolToLegacyTransition(t *testing.T) {
 	legacy, err := cache.AcquireAccountSlotForEgress(ctx, config.AccountID, 1, "legacy-blocked", candidate.IdentityID)
 	require.NoError(t, err)
 	require.False(t, legacy)
-	require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, service.AccountEgressStatusFull, acquireAccountEgressTest(t, cache, config, "pool-still-open", "", "").Status)
+
+	mode, err := cache.BeginAccountEgressLegacyTransition(ctx, config.AccountID)
+	require.NoError(t, err)
+	require.Equal(t, "to_legacy", mode)
 	require.Equal(t, service.AccountEgressStatusLegacyDraining, acquireAccountEgressTest(t, cache, config, "pool-blocked", "", "").Status)
 	releaseAccountEgressTest(t, cache, config, pool)
 	require.Equal(t, "legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
 	legacy, err = cache.AcquireAccountSlotForEgress(ctx, config.AccountID, 1, "legacy-allowed", candidate.IdentityID)
 	require.NoError(t, err)
 	require.True(t, legacy)
+}
+
+func TestForcePoolRepairsStaleToLegacyMarkerWithoutLegacyLease(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	first := accountEgressTestCandidate(0, 78, "ip:first")
+	second := accountEgressTestCandidate(1, 79, "ip:second")
+	config := accountEgressTestConfig(1018, 1, 0, first, second)
+	syncAccountEgressTestConfig(t, cache, config)
+	ctx := context.Background()
+
+	owner := acquireAccountEgressTest(t, cache, config, "force-pool-owner", "", "")
+	require.Equal(t, service.AccountEgressStatusAcquired, owner.Status)
+	mode, err := cache.BeginAccountEgressLegacyTransition(ctx, config.AccountID)
+	require.NoError(t, err)
+	require.Equal(t, "to_legacy", mode)
+
+	// No legacy mirror lease exists: this is the stale marker produced by the
+	// old admission script when it merely observed an occupied pool.
+	result, err := cache.AcquireAccountEgress(ctx, service.AccountEgressCacheAcquireRequest{
+		AccountEgressAcquireRequest: service.AccountEgressAcquireRequest{
+			Config:    config,
+			LeaseID:   "force-pool-repair",
+			ForcePool: true,
+		},
+		LeaseTTL:  service.AccountEgressLeaseTTL,
+		WaiterTTL: 2 * time.Minute,
+	})
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressStatusAcquired, result.Status)
+	require.Equal(t, second.BindingID, result.BindingID)
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+
+	releaseAccountEgressTest(t, cache, config, result)
+	releaseAccountEgressTest(t, cache, config, owner)
+}
+
+func TestForcePoolDoesNotBypassActiveLegacyLease(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	candidate := accountEgressTestCandidate(0, 80, "ip:legacy")
+	config := accountEgressTestConfig(1019, 1, 0, candidate)
+	syncAccountEgressTestConfig(t, cache, config)
+	ctx := context.Background()
+
+	// Model a genuine transition fence with matching primary and mirror state.
+	// The force flag is intentionally unable to erase this state.
+	require.NoError(t, cache.rdb.Set(ctx, accountEgressModeKey(config.AccountID), "to_legacy", 0).Err())
+	now := float64(time.Now().Unix())
+	require.NoError(t, cache.rdb.ZAdd(ctx, accountSlotKey(config.AccountID), redis.Z{
+		Score: now, Member: "legacy-active",
+	}).Err())
+	require.NoError(t, cache.rdb.ZAdd(ctx, accountEgressLegacyRegularKey(config.AccountID), redis.Z{
+		Score: now, Member: "legacy-active",
+	}).Err())
+	result, err := cache.AcquireAccountEgress(ctx, service.AccountEgressCacheAcquireRequest{
+		AccountEgressAcquireRequest: service.AccountEgressAcquireRequest{
+			Config:    config,
+			LeaseID:   "force-pool-blocked",
+			ForcePool: true,
+		},
+		LeaseTTL:  service.AccountEgressLeaseTTL,
+		WaiterTTL: 2 * time.Minute,
+	})
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressStatusLegacyDraining, result.Status)
+	require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+}
+
+func TestForcePoolFailsClosedWhenLegacyPrimaryAndMirrorDiverge(t *testing.T) {
+	tests := []struct {
+		name        string
+		primaryKey  func(int64) string
+		mirrorKey   func(int64) string
+		seedPrimary bool
+	}{
+		{name: "regular primary without mirror", primaryKey: accountSlotKey, mirrorKey: accountEgressLegacyRegularKey, seedPrimary: true},
+		{name: "live primary without mirror", primaryKey: liveAccountSlotKey, mirrorKey: accountEgressLegacyLiveKey, seedPrimary: true},
+		{name: "regular mirror without primary", primaryKey: accountSlotKey, mirrorKey: accountEgressLegacyRegularKey},
+		{name: "live mirror without primary", primaryKey: liveAccountSlotKey, mirrorKey: accountEgressLegacyLiveKey},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cache, _ := newAccountEgressCacheTest(t)
+			candidate := accountEgressTestCandidate(0, 81, "ip:legacy")
+			config := accountEgressTestConfig(1020, 1, 0, candidate)
+			syncAccountEgressTestConfig(t, cache, config)
+			ctx := context.Background()
+
+			require.NoError(t, cache.rdb.Set(ctx, accountEgressModeKey(config.AccountID), "to_legacy", 0).Err())
+			key := test.mirrorKey(config.AccountID)
+			if test.seedPrimary {
+				key = test.primaryKey(config.AccountID)
+			}
+			require.NoError(t, cache.rdb.ZAdd(ctx, key, redis.Z{
+				Score: float64(time.Now().Unix()), Member: "legacy-divergent",
+			}).Err())
+
+			result, err := cache.AcquireAccountEgress(ctx, service.AccountEgressCacheAcquireRequest{
+				AccountEgressAcquireRequest: service.AccountEgressAcquireRequest{
+					Config:    config,
+					LeaseID:   "force-pool-divergent",
+					ForcePool: true,
+				},
+				LeaseTTL:  service.AccountEgressLeaseTTL,
+				WaiterTTL: 2 * time.Minute,
+			})
+			require.NoError(t, err)
+			require.Equal(t, service.AccountEgressStatusConfigStale, result.Status)
+			require.Equal(t, "to_legacy", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+			require.Equal(t, int64(0), cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+		})
+	}
+}
+
+func TestForcePoolIgnoresExpiredLegacyPrimaryLease(t *testing.T) {
+	cache, _ := newAccountEgressCacheTest(t)
+	candidate := accountEgressTestCandidate(0, 82, "ip:legacy")
+	config := accountEgressTestConfig(1021, 1, 0, candidate)
+	syncAccountEgressTestConfig(t, cache, config)
+	ctx := context.Background()
+
+	require.NoError(t, cache.rdb.Set(ctx, accountEgressModeKey(config.AccountID), "to_legacy", 0).Err())
+	require.NoError(t, cache.rdb.ZAdd(ctx, accountSlotKey(config.AccountID), redis.Z{
+		Score:  float64(time.Now().Unix() - int64(cache.slotTTLSeconds) - 1),
+		Member: "legacy-expired",
+	}).Err())
+
+	result, err := cache.AcquireAccountEgress(ctx, service.AccountEgressCacheAcquireRequest{
+		AccountEgressAcquireRequest: service.AccountEgressAcquireRequest{
+			Config:    config,
+			LeaseID:   "force-pool-after-expiry",
+			ForcePool: true,
+		},
+		LeaseTTL:  service.AccountEgressLeaseTTL,
+		WaiterTTL: 2 * time.Minute,
+	})
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressStatusAcquired, result.Status)
+	require.Equal(t, "pool", cache.rdb.Get(ctx, accountEgressModeKey(config.AccountID)).Val())
+	require.Equal(t, int64(0), cache.rdb.ZCard(ctx, accountSlotKey(config.AccountID)).Val())
+	require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
+	releaseAccountEgressTest(t, cache, config, result)
 }
 
 func TestAccountEgressWarmupGateCoversPoolLeasesAndWaiters(t *testing.T) {

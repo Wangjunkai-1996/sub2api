@@ -11,6 +11,7 @@ import (
 )
 
 type requiredAccountEgressBindingContextKey struct{}
+type preferredAccountEgressBindingContextKey struct{}
 
 // WithRequiredAccountEgressBinding carries a continuation's route fence into
 // the existing scheduler admission path. It contains only the stable binding
@@ -30,6 +31,26 @@ func RequiredAccountEgressBindingFromContext(ctx context.Context) string {
 		return ""
 	}
 	bindingID, _ := ctx.Value(requiredAccountEgressBindingContextKey{}).(string)
+	return strings.TrimSpace(bindingID)
+}
+
+// WithPreferredAccountEgressBinding carries soft conversation affinity into
+// pool admission. Required bindings always take precedence in the allocator.
+func WithPreferredAccountEgressBinding(ctx context.Context, bindingID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if bindingID = strings.TrimSpace(bindingID); bindingID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, preferredAccountEgressBindingContextKey{}, bindingID)
+}
+
+func PreferredAccountEgressBindingFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	bindingID, _ := ctx.Value(preferredAccountEgressBindingContextKey{}).(string)
 	return strings.TrimSpace(bindingID)
 }
 
