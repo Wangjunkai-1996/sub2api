@@ -232,6 +232,40 @@ func TestAdvancedSchedulerSubscriptionOnlyEgressFullPreservesCapacityError(t *te
 	require.Equal(t, 1, acquireCalls, "the rejected subscription admission must not be probed twice")
 }
 
+func TestAdvancedSchedulerSubscriptionCompactAdmissionWinsOverIncompatibleRegularPool(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+
+	const groupID = int64(131)
+	subscription := openAISchedulerEgressOverflowAccount(51_001, groupID)
+	subscription.Credentials = map[string]any{"plan_type": "team"}
+	subscription.Extra = map[string]any{"openai_compact_supported": true}
+	regular := openAISchedulerEgressOverflowAccount(51_002, groupID)
+	regular.Credentials = map[string]any{"plan_type": "free"}
+	regular.Extra = map[string]any{"openai_compact_supported": false}
+
+	svc, egressCache := newOpenAISchedulerEgressOverflowService(t, []Account{subscription, regular}, 1, func(
+		_ context.Context,
+		request AccountEgressCacheAcquireRequest,
+		_ int,
+	) (AccountEgressAcquireResult, error) {
+		require.Equal(t, subscription.ID, request.Config.AccountID)
+		return AccountEgressAcquireResult{Status: AccountEgressStatusFull, LeaseID: request.LeaseID}, nil
+	})
+	svc.rateLimitService = newOpenAIAdvancedSchedulerRateLimitService("true", "", "true")
+
+	requestGroupID := groupID
+	selection, _, err := svc.SelectAccountWithScheduler(
+		context.Background(), &requestGroupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, true,
+	)
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrAccountEgressCapacityFull)
+	require.NotErrorIs(t, err, ErrNoAvailableCompactAccounts)
+	acquireCalls, _, _, _ := egressCache.counts()
+	require.Equal(t, 1, acquireCalls)
+}
+
 func TestAdvancedSchedulerWeightedStickyFullFallsThroughToLegacyWaitPlan(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)

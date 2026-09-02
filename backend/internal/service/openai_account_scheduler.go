@@ -1706,6 +1706,9 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 				if subErr == nil && subResult != nil {
 					return subResult, subCandidateCount, subTopK, subLoadSkew, nil
 				}
+				if regularAttempt.noCompactCandidates && isAccountEgressAdmissionError(subErr) {
+					return nil, subCandidateCount, subTopK, subLoadSkew, subErr
+				}
 				return result, candidateCount, topK, loadSkew, fallbackErr
 			}
 			return s.finishLoadBalanceSelectionFallback(ctx, req, attempt, budget, filterStats)
