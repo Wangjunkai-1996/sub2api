@@ -9,6 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type openAISchedulerEgressTransitionCache struct {
+	schedulerTestConcurrencyCache
+	*accountEgressCacheStub
+}
+
 func openAISchedulerEgressOverflowAccount(id, groupID int64) Account {
 	account := legacyEgressTestAccount()
 	proxyID := id + 100_000
@@ -199,6 +204,34 @@ func TestAdvancedSchedulerSubscriptionEgressFullFallsThroughToRegularPool(t *tes
 	}
 }
 
+func TestAdvancedSchedulerSubscriptionOnlyEgressFullPreservesCapacityError(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+
+	const groupID = int64(129)
+	subscription := openAISchedulerEgressOverflowAccount(49_001, groupID)
+	subscription.Credentials = map[string]any{"plan_type": "team"}
+	svc, egressCache := newOpenAISchedulerEgressOverflowService(t, []Account{subscription}, 1, func(
+		_ context.Context,
+		request AccountEgressCacheAcquireRequest,
+		_ int,
+	) (AccountEgressAcquireResult, error) {
+		return AccountEgressAcquireResult{Status: AccountEgressStatusFull, LeaseID: request.LeaseID}, nil
+	})
+	svc.rateLimitService = newOpenAIAdvancedSchedulerRateLimitService("true", "", "true")
+
+	requestGroupID := groupID
+	selection, _, err := svc.SelectAccountWithScheduler(
+		context.Background(), &requestGroupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, false,
+	)
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrAccountEgressCapacityFull)
+	require.NotContains(t, err.Error(), "selection_order_exhausted")
+	acquireCalls, _, _, _ := egressCache.counts()
+	require.Equal(t, 1, acquireCalls, "the rejected subscription admission must not be probed twice")
+}
+
 func TestAdvancedSchedulerWeightedStickyFullFallsThroughToLegacyWaitPlan(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
@@ -302,6 +335,14 @@ func TestAdvancedSchedulerFallbackDoesNotReprobeAttemptedEgressAccounts(t *testi
 	) (AccountEgressAcquireResult, error) {
 		return AccountEgressAcquireResult{Status: AccountEgressStatusFull, LeaseID: request.LeaseID}, nil
 	})
+	for i := 0; i < accountCount; i++ {
+		budget.recordEgressAdmissionFailure(
+			context.Background(),
+			svc.settingService,
+			&accounts[i],
+			fmt.Errorf("%w: FULL", ErrAccountEgressCapacityFull),
+		)
+	}
 	scheduler := &defaultOpenAIAccountScheduler{service: svc, stats: newOpenAIAccountRuntimeStats()}
 	requestGroupID := groupID
 
@@ -319,6 +360,193 @@ func TestAdvancedSchedulerFallbackDoesNotReprobeAttemptedEgressAccounts(t *testi
 	require.NotNil(t, selection.WaitPlan)
 	acquireCalls, _, _, _ := egressCache.counts()
 	require.Zero(t, acquireCalls, "fallback must not re-acquire enforced accounts rejected by the primary pass")
+}
+
+func TestAdvancedSchedulerFallbackRechecksStaleLegacyAttemptAsFreshEgress(t *testing.T) {
+	const (
+		groupID   = int64(127)
+		accountID = int64(47_001)
+	)
+	fresh := openAISchedulerEgressOverflowAccount(accountID, groupID)
+	stale := fresh.CloneForRequest()
+	stale.EgressMode = EgressModeLegacy
+
+	legacyAcquires := make([]int64, 0, 1)
+	egressCache := &accountEgressCacheStub{acquireFn: func(
+		_ context.Context,
+		request AccountEgressCacheAcquireRequest,
+		_ int,
+	) (AccountEgressAcquireResult, error) {
+		candidate := request.Config.Candidates[0]
+		return AccountEgressAcquireResult{
+			Status:            AccountEgressStatusAcquired,
+			BindingID:         candidate.BindingID,
+			RouteID:           candidate.RouteID,
+			IdentityID:        candidate.IdentityID,
+			LeaseID:           request.LeaseID,
+			EffectiveCapacity: request.Config.EffectiveCapacity(),
+			ConfigVersion:     request.Config.Version,
+		}, nil
+	}}
+	concurrency := NewConcurrencyService(&openAISchedulerEgressTransitionCache{
+		schedulerTestConcurrencyCache: schedulerTestConcurrencyCache{
+			acquireResults: map[int64]bool{accountID: false},
+			acquiredIDs:    &legacyAcquires,
+		},
+		accountEgressCacheStub: egressCache,
+	})
+	t.Cleanup(func() { concurrency.accountEgressAllocator.Close() })
+	settings := NewSettingService(accountEgressSettingRepoStub{value: string(AccountEgressPoolRolloutEnforce)}, nil)
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: []Account{fresh}},
+		cfg:                &config.Config{RunMode: config.RunModeStandard},
+		concurrencyService: concurrency,
+		settingService:     settings,
+		schedulerSnapshot: &SchedulerSnapshotService{cache: &openAISnapshotCacheStub{
+			snapshotAccounts: []*Account{stale},
+			accountsByID:     map[int64]*Account{accountID: stale},
+		}},
+	}
+	scheduler := &defaultOpenAIAccountScheduler{service: svc, stats: newOpenAIAccountRuntimeStats()}
+	requestGroupID := groupID
+	req := OpenAIAccountScheduleRequest{
+		GroupID:        &requestGroupID,
+		Platform:       PlatformOpenAI,
+		RequestedModel: "gpt-5.1",
+	}
+	selectionOrder := []openAIAccountCandidateScore{{account: stale}}
+	budget := newOpenAISelectionProbeBudget()
+	budget.enableLimit()
+
+	selection, _, err := scheduler.tryAcquireOpenAISelectionOrderWithBudget(
+		context.Background(), req, selectionOrder, budget,
+	)
+	require.NoError(t, err)
+	require.Nil(t, selection)
+	require.Equal(t, []int64{accountID}, legacyAcquires)
+	acquireCalls, _, _, _ := egressCache.counts()
+	require.Zero(t, acquireCalls)
+
+	selection, _, _, _, err = scheduler.finishLoadBalanceSelectionFallback(
+		context.Background(),
+		req,
+		openAIAccountLoadSelectionAttempt{
+			selectionOrder: selectionOrder,
+			candidateCount: 1,
+			topK:           1,
+		},
+		budget,
+		openAISelectionFilterStats{},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, accountID, selection.Account.ID)
+	require.NotNil(t, selection.Egress)
+	acquireCalls, _, _, _ = egressCache.counts()
+	require.Equal(t, 1, acquireCalls, "fresh enforced admission must not be hidden by the stale legacy attempt")
+	selection.ReleaseFunc()
+}
+
+func TestAdvancedSchedulerFallbackPreservesDeferredEgressAdmissionError(t *testing.T) {
+	const (
+		groupID   = int64(128)
+		accountID = int64(48_001)
+	)
+	account := openAISchedulerEgressOverflowAccount(accountID, groupID)
+	svc, egressCache := newOpenAISchedulerEgressOverflowService(t, []Account{account}, 1, func(
+		_ context.Context,
+		request AccountEgressCacheAcquireRequest,
+		_ int,
+	) (AccountEgressAcquireResult, error) {
+		return AccountEgressAcquireResult{Status: AccountEgressStatusFull, LeaseID: request.LeaseID}, nil
+	})
+	scheduler := &defaultOpenAIAccountScheduler{service: svc, stats: newOpenAIAccountRuntimeStats()}
+	requestGroupID := groupID
+	req := OpenAIAccountScheduleRequest{
+		GroupID:        &requestGroupID,
+		Platform:       PlatformOpenAI,
+		RequestedModel: "gpt-5.1",
+	}
+	selectionOrder := []openAIAccountCandidateScore{{account: &account}}
+	budget := newOpenAISelectionProbeBudget()
+	budget.enableLimit()
+
+	selection, _, acquireErr := scheduler.tryAcquireOpenAISelectionOrderWithBudget(
+		context.Background(), req, selectionOrder, budget,
+	)
+	require.Nil(t, selection)
+	require.ErrorIs(t, acquireErr, ErrAccountEgressCapacityFull)
+
+	selection, _, _, _, err := scheduler.finishLoadBalanceSelectionFallback(
+		context.Background(),
+		req,
+		openAIAccountLoadSelectionAttempt{
+			selectionOrder: selectionOrder,
+			candidateCount: 1,
+			topK:           1,
+			err:            acquireErr,
+		},
+		budget,
+		openAISelectionFilterStats{},
+	)
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrAccountEgressCapacityFull)
+	require.NotContains(t, err.Error(), "selection_order_exhausted")
+	acquireCalls, _, _, _ := egressCache.counts()
+	require.Equal(t, 1, acquireCalls, "the same rejected egress admission identity must not be probed twice")
+}
+
+func TestAdvancedSchedulerFallbackRecheckLimitPreservesAdmissionError(t *testing.T) {
+	const (
+		groupID           = int64(130)
+		rejectedAccountID = int64(50_001)
+		legacyAccountID   = int64(50_002)
+	)
+	rejected := openAISchedulerEgressOverflowAccount(rejectedAccountID, groupID)
+	legacy := Account{
+		ID:          legacyAccountID,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+	}
+	svc, _ := newOpenAISchedulerEgressOverflowService(t, []Account{rejected, legacy}, 1, nil)
+	svc.schedulerSnapshot = &SchedulerSnapshotService{cache: &openAISnapshotCacheStub{
+		accountsByID: map[int64]*Account{legacyAccountID: &legacy},
+	}}
+	scheduler := &defaultOpenAIAccountScheduler{service: svc, stats: newOpenAIAccountRuntimeStats()}
+	requestGroupID := groupID
+	req := OpenAIAccountScheduleRequest{
+		GroupID:        &requestGroupID,
+		Platform:       PlatformOpenAI,
+		RequestedModel: "gpt-5.1",
+	}
+	budget := newOpenAISelectionProbeBudget()
+	budget.enableLimit()
+	budget.rechecks = openAIAccountSelectionProbeLimit
+	budget.recordEgressAdmissionFailure(
+		context.Background(),
+		svc.settingService,
+		&rejected,
+		fmt.Errorf("%w: FULL", ErrAccountEgressCapacityFull),
+	)
+
+	selection, _, _, _, err := scheduler.finishLoadBalanceSelectionFallback(
+		context.Background(),
+		req,
+		openAIAccountLoadSelectionAttempt{
+			selectionOrder: []openAIAccountCandidateScore{{account: &legacy}},
+			candidateCount: 2,
+			topK:           1,
+		},
+		budget,
+		openAISelectionFilterStats{},
+	)
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrAccountEgressCapacityFull)
+	require.NotContains(t, err.Error(), "selection_order_exhausted")
 }
 
 func TestAdvancedSchedulerStickyEgressOverflowKeepsDurableBinding(t *testing.T) {
