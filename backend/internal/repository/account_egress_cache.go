@@ -18,14 +18,12 @@ const (
 	accountEgressKeyPrefix = "concurrency:egress:"
 
 	// accountEgressConfigNamespace is deliberately part of the config hash key
-	// rather than AccountEgressPoolConfig.Version. The scheduler projection
-	// changed from treating redacted proxy snapshots as unhealthy to treating a
-	// ProxyID-only route as eligible. During a blue-green rollout an old binary
-	// can therefore publish the same semantic version with a different digest.
-	// Keeping the new projection in an additive namespace prevents that old
-	// writer from replacing the corrected config, while preserving the semantic
-	// version stored on request and Live records and sharing lease counters.
-	accountEgressConfigNamespace = "v2"
+	// rather than AccountEgressPoolConfig.Version. The v3 wire contract adds an
+	// authority revision to the v2 config used by the rollback binary. Isolating
+	// the hashes prevents either binary from rejecting or replacing the other's
+	// config during a blue-green rollout, while capacity and lease keys remain
+	// shared.
+	accountEgressConfigNamespace = "v3"
 )
 
 // Every account-egress key uses one {acct:N} hash tag. Legacy account and Live

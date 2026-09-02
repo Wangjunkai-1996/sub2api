@@ -95,17 +95,16 @@ func TestAccountEgressRuntimeAcceptsRedactedSchedulerProxy(t *testing.T) {
 	require.Equal(t, 4, config.EffectiveCapacity())
 }
 
-func TestAccountEgressRuntimeRequiresFreshVerifiedRoute(t *testing.T) {
+func TestAccountEgressRuntimeDefersVerificationFreshnessToAuthoritativeHydration(t *testing.T) {
 	now := time.Now()
 	proxyID := int64(9)
 	for _, test := range []struct {
-		name        string
-		verifiedAt  *time.Time
-		wantHealthy bool
+		name       string
+		verifiedAt *time.Time
 	}{
 		{name: "missing"},
 		{name: "stale", verifiedAt: timePointer(now.Add(-EgressIdentityFreshness - time.Second))},
-		{name: "small future skew", verifiedAt: timePointer(now.Add(30 * time.Second)), wantHealthy: true},
+		{name: "small future skew", verifiedAt: timePointer(now.Add(30 * time.Second))},
 		{name: "far future", verifiedAt: timePointer(now.Add(accountEgressVerifiedAtFutureSkew + time.Second))},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -124,7 +123,7 @@ func TestAccountEgressRuntimeRequiresFreshVerifiedRoute(t *testing.T) {
 			}
 			config, err := AccountEgressPoolConfigForRuntime(account, 0)
 			require.NoError(t, err)
-			require.Equal(t, test.wantHealthy, config.Candidates[0].Healthy)
+			require.True(t, config.Candidates[0].Healthy)
 		})
 	}
 }

@@ -28,11 +28,58 @@ func TestRecordProbeObservationSameStateAndIdentityPreservesRevision(t *testing.
 	require.NoError(t, err)
 	mock.ExpectQuery(`(?s)SELECT er\.revision, er\.state, er\.expected_identity_id, host\(ei\.public_ip\).*FOR UPDATE OF er`).
 		WithArgs(routeID).
-		WillReturnRows(sqlmock.NewRows([]string{"revision", "state", "expected_identity_id", "public_ip"}).
-			AddRow(revision, service.EgressRouteStateActive, identityID, observedIP))
+		WillReturnRows(sqlmock.NewRows([]string{"revision", "state", "expected_identity_id", "public_ip", "verified_at"}).
+			AddRow(revision, service.EgressRouteStateActive, identityID, observedIP, observedAt.Add(-time.Minute)))
 	mock.ExpectExec(`(?s)UPDATE egress_routes.*revision=revision\+CASE WHEN \$5 THEN 1 ELSE 0 END`).
-		WithArgs(service.EgressRouteStateActive, observedIP, observedAt, service.EgressRouteStateActive, false, routeID, revision).
+		WithArgs(service.EgressRouteStateActive, observedIP, observedAt, true, false, routeID, revision).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = recordProbeObservationTx(context.Background(), tx, service.EgressProbeObservation{
+		RouteID:          routeID,
+		ExpectedRevision: revision,
+		ObservedIP:       observedIP,
+	}, observedAt, "")
+	require.NoError(t, err)
+
+	mock.ExpectCommit()
+	require.NoError(t, tx.Commit())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRecordProbeObservationFreshnessRecoveryInvalidatesRootAndShadow(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	const (
+		routeID       = int64(41)
+		revision      = int64(7)
+		identityID    = int64(13)
+		observedIP    = "198.51.100.17"
+		rootAccount   = int64(27)
+		shadowAccount = int64(28)
+	)
+	observedAt := time.Date(2026, time.September, 1, 9, 31, 0, 0, time.UTC)
+	mock.ExpectBegin()
+	tx, err := db.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	mock.ExpectQuery("(?s)SELECT er.*FOR UPDATE OF er").
+		WithArgs(routeID).
+		WillReturnRows(sqlmock.NewRows([]string{"revision", "state", "expected_identity_id", "public_ip", "verified_at"}).
+			AddRow(revision, service.EgressRouteStateActive, identityID, observedIP, observedAt.Add(-service.EgressIdentityFreshness-time.Minute)))
+	mock.ExpectExec("(?s)UPDATE egress_routes.*revision=revision").
+		WithArgs(service.EgressRouteStateActive, observedIP, observedAt, true, false, routeID, revision).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("(?s)WITH roots AS .*JOIN roots r ON r.account_id=a.parent_account_id.*ORDER BY id").
+		WithArgs(routeID, service.PlatformOpenAI, service.EgressModePool).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(rootAccount).AddRow(shadowAccount))
+	expectLockedAccountIDs(mock, rootAccount, shadowAccount)
+	mock.ExpectExec("(?s)UPDATE accounts.*egress_revision=egress_revision.*id=ANY").
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox")).
+		WithArgs(service.SchedulerOutboxEventAccountBulkChanged, nil, nil, accountIDsPayloadMatcher{want: []int64{rootAccount, shadowAccount}}).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	err = recordProbeObservationTx(context.Background(), tx, service.EgressProbeObservation{
 		RouteID:          routeID,
@@ -66,10 +113,10 @@ func TestRecordProbeObservationStateChangeInvalidatesRootAndShadow(t *testing.T)
 	require.NoError(t, err)
 	mock.ExpectQuery(`(?s)SELECT er\.revision, er\.state, er\.expected_identity_id, host\(ei\.public_ip\).*FOR UPDATE OF er`).
 		WithArgs(routeID).
-		WillReturnRows(sqlmock.NewRows([]string{"revision", "state", "expected_identity_id", "public_ip"}).
-			AddRow(revision, service.EgressRouteStateActive, identityID, expectedIP))
+		WillReturnRows(sqlmock.NewRows([]string{"revision", "state", "expected_identity_id", "public_ip", "verified_at"}).
+			AddRow(revision, service.EgressRouteStateActive, identityID, expectedIP, observedAt.Add(-time.Minute)))
 	mock.ExpectExec(`(?s)UPDATE egress_routes.*revision=revision\+CASE WHEN \$5 THEN 1 ELSE 0 END`).
-		WithArgs(service.EgressRouteStateIdentityMismatch, observedIP, observedAt, service.EgressRouteStateActive, true, routeID, revision).
+		WithArgs(service.EgressRouteStateIdentityMismatch, observedIP, observedAt, false, true, routeID, revision).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(`(?s)WITH roots AS .*JOIN roots r ON r\.account_id=a\.parent_account_id.*ORDER BY id`).
 		WithArgs(routeID, service.PlatformOpenAI, service.EgressModePool).

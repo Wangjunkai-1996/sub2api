@@ -115,7 +115,11 @@ func TestOpenAISelectionHydratesSelectedEgressFromAuthoritativeAccount(t *testin
 		Password: "runtime-password",
 	})
 	projected := openAIEgressHydrationAccount(7, 13, nil)
+	projected.EgressBindings[0].Route.VerifiedAt = nil
 	resolved := openAIEgressHydrationResolved(projected)
+	config, err := AccountEgressPoolConfigForRuntime(projected, 0)
+	require.NoError(t, err)
+	require.True(t, config.Candidates[0].Healthy)
 	selectedProjection, err := withResolvedAccountEgressSelection(projected, resolved)
 	require.NoError(t, err)
 
@@ -129,6 +133,28 @@ func TestOpenAISelectionHydratesSelectedEgressFromAuthoritativeAccount(t *testin
 	require.Equal(t, "runtime-user", selection.Account.Proxy.Username)
 	require.Same(t, resolved, selection.Account.SelectedEgress)
 	require.Same(t, resolved, selection.Egress)
+}
+
+func TestOpenAISelectionReleasesLeaseWhenAuthoritativeVerificationIsStale(t *testing.T) {
+	projected := openAIEgressHydrationAccount(7, 13, nil)
+	projected.EgressBindings[0].Route.VerifiedAt = nil
+	resolved := openAIEgressHydrationResolved(projected)
+	selectedProjection, err := withResolvedAccountEgressSelection(projected, resolved)
+	require.NoError(t, err)
+
+	authoritative := openAIEgressHydrationAccount(7, 13, &Proxy{
+		ID: 91, Protocol: "http", Host: "stale.example", Port: 9443,
+	})
+	staleAt := time.Now().Add(-EgressIdentityFreshness - time.Second)
+	authoritative.EgressBindings[0].Route.VerifiedAt = &staleAt
+	service := &OpenAIGatewayService{accountRepo: &openAIEgressHydrationAccountRepo{account: authoritative}}
+	released := 0
+
+	selection, err := service.newAcquiredSelectionResult(context.Background(), selectedProjection, func() { released++ })
+
+	require.ErrorIs(t, err, ErrAccountEgressConfigStale)
+	require.Nil(t, selection)
+	require.Equal(t, 1, released)
 }
 
 func TestOpenAISelectionFailsClosedWhenAuthoritativeEgressVersionChanges(t *testing.T) {

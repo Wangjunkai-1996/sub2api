@@ -156,8 +156,10 @@ func accountSupportsEgressPoolRuntime(account *Account) bool {
 }
 
 // AccountEgressPoolConfigForRuntime projects only non-retired, identity-known
-// bindings. Unhealthy bindings stay in the config as ineligible candidates so
-// their state participates in the digest and cannot be silently reintroduced.
+// bindings. Candidate health contains stable scheduler state only; time-based
+// verification freshness is checked against the authoritative account after a
+// lease is acquired. This keeps cached scheduler projections deterministic
+// without weakening the final fail-closed transport check.
 func AccountEgressPoolConfigForRuntime(account *Account, maxWaiting int) (AccountEgressPoolConfig, error) {
 	if !accountSupportsEgressPoolRuntime(account) || account.ID <= 0 || account.EgressMode != EgressModePool {
 		return AccountEgressPoolConfig{}, ErrAccountEgressConfigStale
@@ -179,8 +181,7 @@ func AccountEgressPoolConfigForRuntime(account *Account, maxWaiting int) (Accoun
 		}
 		healthy := binding.Status == AccountEgressBindingStatusActive &&
 			route.State == EgressRouteStateActive &&
-			route.ExpectedIdentity.Status == EgressIdentityStatusActive &&
-			IsEgressIdentityVerificationFresh(route.VerifiedAt, now)
+			route.ExpectedIdentity.Status == EgressIdentityStatusActive
 		if healthy {
 			switch route.Kind {
 			case EgressRouteKindDirect:
@@ -260,7 +261,11 @@ func accountEgressRuntimeVersion(account *Account) int64 {
 	return accountRevision<<31 | routeFence
 }
 
-func resolvedAccountEgressBinding(account *Account, resolved *ResolvedAccountEgress) (*AccountEgressBinding, error) {
+func resolvedAccountEgressBinding(
+	account *Account,
+	resolved *ResolvedAccountEgress,
+	requireFreshVerification bool,
+) (*AccountEgressBinding, error) {
 	if account == nil || resolved == nil || resolved.Lease == nil {
 		return nil, ErrAccountEgressConfigStale
 	}
@@ -285,8 +290,10 @@ func resolvedAccountEgressBinding(account *Account, resolved *ResolvedAccountEgr
 	if strconv.FormatInt(selected.Route.ExpectedIdentity.ID, 10) != resolved.IdentityID ||
 		selected.Status != AccountEgressBindingStatusActive ||
 		selected.Route.State != EgressRouteStateActive ||
-		selected.Route.ExpectedIdentity.Status != EgressIdentityStatusActive ||
-		!IsEgressIdentityVerificationFresh(selected.Route.VerifiedAt, time.Now()) {
+		selected.Route.ExpectedIdentity.Status != EgressIdentityStatusActive {
+		return nil, ErrAccountEgressConfigStale
+	}
+	if requireFreshVerification && !IsEgressIdentityVerificationFresh(selected.Route.VerifiedAt, time.Now()) {
 		return nil, ErrAccountEgressConfigStale
 	}
 	if selected.Route.Kind == EgressRouteKindProxy {
@@ -309,7 +316,7 @@ func resolvedAccountEgressBinding(account *Account, resolved *ResolvedAccountEgr
 // proxy credentials, so transport resolution is deferred until the final
 // authoritative account read.
 func withResolvedAccountEgressSelection(account *Account, resolved *ResolvedAccountEgress) (*Account, error) {
-	if _, err := resolvedAccountEgressBinding(account, resolved); err != nil {
+	if _, err := resolvedAccountEgressBinding(account, resolved, false); err != nil {
 		return nil, err
 	}
 	cloned := account.CloneForRequest()
@@ -321,7 +328,7 @@ func withResolvedAccountEgressSelection(account *Account, resolved *ResolvedAcco
 // authoritative hydrated account and applies transport state only to a
 // request-local clone.
 func WithResolvedAccountEgress(account *Account, resolved *ResolvedAccountEgress) (*Account, error) {
-	selected, err := resolvedAccountEgressBinding(account, resolved)
+	selected, err := resolvedAccountEgressBinding(account, resolved, true)
 	if err != nil {
 		return nil, err
 	}

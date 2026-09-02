@@ -28,6 +28,27 @@ func (s *AccountEgressCacheSuite) SetupTest() {
 	s.cache = NewConcurrencyCache(s.rdb, 15, 120).(*concurrencyCache)
 }
 
+func (s *AccountEgressCacheSuite) TestV2RollbackWriterIsolatedFromV3Config() {
+	legacy := accountEgressTestConfig(20000, 1, 0, accountEgressTestCandidate(0, 10000, "ip:a"))
+	require.Equal(s.T(), "OK", syncAccountEgressV2Config(s.T(), s.cache, legacy))
+	legacyKey := accountEgressBaseKey(legacy.AccountID) + ":config:v2"
+	legacyBefore, err := s.rdb.HGetAll(s.ctx, legacyKey).Result()
+	require.NoError(s.T(), err)
+
+	current := legacy
+	current.AuthorityRevision = 2
+	current.Candidates = append([]service.AccountEgressCandidate(nil), legacy.Candidates...)
+	current.Candidates[0].Healthy = false
+	syncAccountEgressTestConfig(s.T(), s.cache, current)
+
+	legacyAfter, err := s.rdb.HGetAll(s.ctx, legacyKey).Result()
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), legacyBefore, legacyAfter)
+	require.Equal(s.T(), "OK", syncAccountEgressV2Config(s.T(), s.cache, legacy))
+	require.Equal(s.T(), service.AccountEgressStatusNoEligibleEgress,
+		acquireAccountEgressTest(s.T(), s.cache, current, "mixed-version", "", "").Status)
+}
+
 func (s *AccountEgressCacheSuite) TestPerIdentityCapsSharedIdentityAffinityAndIdempotency() {
 	first := accountEgressTestCandidate(0, 10001, "ip:a")
 	shared := accountEgressTestCandidate(1, 10002, "ip:a")

@@ -296,14 +296,15 @@ func recordProbeObservationTx(
 		currentState     string
 		expectedIdentity sql.NullInt64
 		expectedIP       sql.NullString
+		currentVerified  sql.NullTime
 	)
 	err := queryOneRow(ctx, tx, `
-			SELECT er.revision, er.state, er.expected_identity_id, host(ei.public_ip)
+			SELECT er.revision, er.state, er.expected_identity_id, host(ei.public_ip), er.verified_at
 		FROM egress_routes er
 		LEFT JOIN egress_identities ei ON ei.id=er.expected_identity_id
 		WHERE er.id=$1
 			FOR UPDATE OF er`, []any{observation.RouteID},
-		&currentRevision, &currentState, &expectedIdentity, &expectedIP)
+		&currentRevision, &currentState, &expectedIdentity, &expectedIP, &currentVerified)
 	if errors.Is(err, sql.ErrNoRows) {
 		return service.ErrEgressRouteNotFound
 	}
@@ -343,6 +344,8 @@ func recordProbeObservationTx(
 		newState = service.EgressRouteStateIdentityMismatch
 	}
 	routeChanged := identityChanged || newState != currentState
+	verificationRecovered := probeError == "" && newState == service.EgressRouteStateActive &&
+		(!currentVerified.Valid || !service.IsEgressIdentityVerificationFresh(&currentVerified.Time, observedAt))
 
 	var result sql.Result
 	if probeError != "" {
@@ -364,11 +367,11 @@ func recordProbeObservationTx(
 		result, err = tx.ExecContext(ctx, `
 			UPDATE egress_routes
 			SET state=$1, last_observed_ip=$2::inet, last_probed_at=$3,
-				verified_at=CASE WHEN $1=$4 THEN $3 ELSE verified_at END,
+				verified_at=CASE WHEN $4 THEN $3 ELSE verified_at END,
 				last_error=NULL,
 				revision=revision+CASE WHEN $5 THEN 1 ELSE 0 END, updated_at=NOW()
 			WHERE id=$6 AND revision=$7`, newState, observation.ObservedIP, observedAt,
-			service.EgressRouteStateActive, routeChanged, observation.RouteID, observation.ExpectedRevision)
+			newState == service.EgressRouteStateActive, routeChanged, observation.RouteID, observation.ExpectedRevision)
 	}
 	if err != nil {
 		return err
@@ -380,7 +383,7 @@ func recordProbeObservationTx(
 	if updated != 1 {
 		return service.ErrEgressRouteConflict
 	}
-	if routeChanged {
+	if routeChanged || verificationRecovered {
 		if err := invalidateAccountsForRouteTx(ctx, tx, observation.RouteID); err != nil {
 			return err
 		}
