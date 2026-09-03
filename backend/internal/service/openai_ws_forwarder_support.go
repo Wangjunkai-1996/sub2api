@@ -661,6 +661,12 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapabilityWit
 	result, acquireErr := s.acquirePreviousResponseAccountSlot(ctx, account, poolEnforced)
 	if acquireErr == nil && result != nil && result.Acquired {
 		selectedAccount := selectionAccount(result, account)
+		if !openAIProxyStreamQuarantineBypassed(ctx) && s.isOpenAIProxyStreamQuarantined(ctx, selectedAccount) {
+			if result.ReleaseFunc != nil {
+				result.ReleaseFunc()
+			}
+			return nil, fmt.Errorf("%w: previous response egress proxy is quarantined", ErrAccountEgressNoRoute)
+		}
 		selectedBindingID := ""
 		if selectedAccount != nil && selectedAccount.SelectedEgress != nil {
 			selectedBindingID = strings.TrimSpace(selectedAccount.SelectedEgress.BindingID)
