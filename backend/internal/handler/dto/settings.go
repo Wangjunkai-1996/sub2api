@@ -225,6 +225,18 @@ type SystemSettings struct {
 	CodexCLIOnlyAllowAppServerClients    bool   `json:"codex_cli_only_allow_app_server_clients"`
 	CodexCLIOnlyEngineFingerprintSignals string `json:"codex_cli_only_engine_fingerprint_signals"`
 
+	OpenAIWindowWarmupEnabled               bool    `json:"openai_window_warmup_enabled"`
+	OpenAIWindowWarmupDefaultPolicy         string  `json:"openai_window_warmup_default_policy"`
+	OpenAIWindowWarmupAllowlist             []int64 `json:"openai_window_warmup_allowlist"`
+	OpenAIWindowWarmupProbeModel            string  `json:"openai_window_warmup_probe_model"`
+	OpenAIWindowWarmupWorkerConcurrency     int     `json:"openai_window_warmup_worker_concurrency"`
+	OpenAIWindowWarmupGlobalQPS             float64 `json:"openai_window_warmup_global_qps"`
+	OpenAIWindowWarmupBatchSize             int     `json:"openai_window_warmup_batch_size"`
+	OpenAIWindowWarmupScanSeconds           int     `json:"openai_window_warmup_scan_seconds"`
+	OpenAIWindowWarmupRequestTimeoutSeconds int     `json:"openai_window_warmup_request_timeout_seconds"`
+	OpenAIWindowWarmupLeaseSeconds          int     `json:"openai_window_warmup_lease_seconds"`
+	OpenAIWindowWarmupResetGraceSeconds     int     `json:"openai_window_warmup_reset_grace_seconds"`
+
 	// Web Search Emulation
 	WebSearchEmulationEnabled bool `json:"web_search_emulation_enabled"`
 
@@ -325,9 +337,11 @@ type SystemSettings struct {
 	// 风控中心功能开关
 	RiskControlEnabled bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    bool `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds int  `json:"cyber_session_block_ttl_seconds"`
+	OpenAICyberAccountCooldownEnabled          bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         []int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// Affiliate (邀请返利) feature switch
 	AffiliateEnabled bool `json:"affiliate_enabled"`

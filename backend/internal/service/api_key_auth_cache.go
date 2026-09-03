@@ -4,16 +4,19 @@ import "time"
 
 // APIKeyAuthSnapshot API Key 认证缓存快照（仅包含认证所需字段）
 type APIKeyAuthSnapshot struct {
-	Version     int                      `json:"version"`
-	APIKeyID    int64                    `json:"api_key_id"`
-	UserID      int64                    `json:"user_id"`
-	GroupID     *int64                   `json:"group_id,omitempty"`
-	Name        string                   `json:"name"`
-	Status      string                   `json:"status"`
-	IPWhitelist []string                 `json:"ip_whitelist,omitempty"`
-	IPBlacklist []string                 `json:"ip_blacklist,omitempty"`
-	User        APIKeyAuthUserSnapshot   `json:"user"`
-	Group       *APIKeyAuthGroupSnapshot `json:"group,omitempty"`
+	Version int `json:"version"`
+	// CompletenessVersion distinguishes rollout bridge payloads from incomplete
+	// legacy payloads that use the same wire Version.
+	CompletenessVersion int                      `json:"completeness_version,omitempty"`
+	APIKeyID            int64                    `json:"api_key_id"`
+	UserID              int64                    `json:"user_id"`
+	GroupID             *int64                   `json:"group_id,omitempty"`
+	Name                string                   `json:"name"`
+	Status              string                   `json:"status"`
+	IPWhitelist         []string                 `json:"ip_whitelist,omitempty"`
+	IPBlacklist         []string                 `json:"ip_blacklist,omitempty"`
+	User                APIKeyAuthUserSnapshot   `json:"user"`
+	Group               *APIKeyAuthGroupSnapshot `json:"group,omitempty"`
 
 	// Quota fields for API Key independent quota feature
 	Quota     float64 `json:"quota"`      // Quota limit in USD (0 = unlimited)
@@ -137,6 +140,9 @@ type APIKeyAuthGroupSnapshot struct {
 	ProfitControlEnabled bool    `json:"profit_control_enabled"`
 	ProfitMinMargin      float64 `json:"profit_min_margin"`
 	ProfitSafetyBuffer   float64 `json:"profit_safety_buffer"`
+
+	SchedulerType              string                     `json:"scheduler_type"`
+	AdvancedSchedulerOverrides AdvancedSchedulerOverrides `json:"advanced_scheduler_overrides"`
 }
 
 // APIKeyAuthCacheEntry 缓存条目，支持负缓存

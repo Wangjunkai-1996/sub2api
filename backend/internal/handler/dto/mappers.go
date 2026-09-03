@@ -2,6 +2,7 @@
 package dto
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -153,6 +154,8 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 		ProfitControlEnabled:        g.ProfitControlEnabled,
 		ProfitMinMargin:             g.ProfitMinMargin,
 		ProfitSafetyBuffer:          g.ProfitSafetyBuffer,
+		SchedulerType:               g.SchedulerType,
+		AdvancedSchedulerOverrides:  g.AdvancedSchedulerOverrides.Clone(),
 		ModelPricing:                g.ModelPricing,
 		ModelRouting:                g.ModelRouting,
 		ModelRoutingEnabled:         g.ModelRoutingEnabled,
@@ -240,6 +243,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	if state := service.OllamaCloudUsageStateFromAccount(a); state.Eligible {
 		ollamaCloudUsage = state
 	}
+	egressMode, egressPool, egressSummary := AccountEgressViewsFromService(a)
 	out := &Account{
 		ID:                      a.ID,
 		Name:                    a.Name,
@@ -253,6 +257,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		ProxyID:                 a.ProxyID,
 		ProxyFallbackOriginID:   a.ProxyFallbackOriginID,
 		ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		EgressMode:              egressMode,
+		EgressRevision:          a.EgressRevision,
+		EgressPool:              egressPool,
+		EgressSummary:           egressSummary,
 		Concurrency:             a.Concurrency,
 		LoadFactor:              a.LoadFactor,
 		Priority:                a.Priority,
@@ -276,6 +284,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		GroupIDs:                a.GroupIDs,
 		ParentAccountID:         a.ParentAccountID,
 		QuotaDimension:          a.QuotaDimension,
+	}
+	if a.Platform == service.PlatformOpenAI && a.Type == service.AccountTypeOAuth && !a.IsShadow() &&
+		a.QuotaDimensionOrDefault() == service.QuotaDimensionGlobal {
+		out.OpenAICodexWarmupPolicy = string(service.OpenAIWindowWarmupPolicyForAccount(a))
 	}
 
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
@@ -510,6 +522,30 @@ func ProxyWithAccountCountFromService(p *service.ProxyWithAccountCount) *ProxyWi
 		QualityGrade:   p.QualityGrade,
 		QualitySummary: p.QualitySummary,
 		QualityChecked: p.QualityChecked,
+	}
+}
+
+func ProxyOptionFromService(p *service.ProxyWithAccountCount, now time.Time) *ProxyOption {
+	if p == nil {
+		return nil
+	}
+	status := p.Status
+	selectable := p.Status == service.StatusActive && !p.IsExpired(now)
+	disabledReason := ""
+	if p.IsExpired(now) {
+		status = "expired"
+		disabledReason = "proxy_expired"
+	} else if p.Status != service.StatusActive {
+		disabledReason = "proxy_inactive"
+	}
+	return &ProxyOption{
+		ID:              p.ID,
+		Name:            p.Name,
+		DisplayEndpoint: strings.ToLower(strings.TrimSpace(p.Protocol)) + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port)),
+		Status:          status,
+		Selectable:      selectable,
+		DisabledReason:  disabledReason,
+		AccountCount:    p.AccountCount,
 	}
 }
 

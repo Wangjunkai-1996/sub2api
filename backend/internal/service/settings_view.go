@@ -165,19 +165,22 @@ type SystemSettings struct {
 	CustomMenuItems             string // JSON array of custom menu items
 	CustomEndpoints             string // JSON array of custom endpoints
 
-	DefaultConcurrency           int
-	DefaultBalance               float64
-	RiskControlEnabled           bool
-	CyberSessionBlockEnabled     bool
-	CyberSessionBlockTTLSeconds  int
-	AffiliateEnabled             bool
-	AffiliateRebateRate          float64
-	AffiliateRebateFreezeHours   int
-	AffiliateRebateDurationDays  int
-	AffiliateRebatePerInviteeCap float64
-	AdminRechargeRebateEnabled   bool
-	DefaultUserRPMLimit          int
-	DefaultSubscriptions         []DefaultSubscriptionSetting
+	DefaultConcurrency                         int
+	DefaultBalance                             float64
+	RiskControlEnabled                         bool
+	OpenAICyberAccountCooldownEnabled          bool
+	OpenAICyberAccountCooldownWindowSeconds    int
+	OpenAICyberAccountCooldownFirstSeconds     int
+	OpenAICyberAccountCooldownEscalatedSeconds int
+	OpenAICyberAccountCooldownGroupIDs         []int64
+	AffiliateEnabled                           bool
+	AffiliateRebateRate                        float64
+	AffiliateRebateFreezeHours                 int
+	AffiliateRebateDurationDays                int
+	AffiliateRebatePerInviteeCap               float64
+	AdminRechargeRebateEnabled                 bool
+	DefaultUserRPMLimit                        int
+	DefaultSubscriptions                       []DefaultSubscriptionSetting
 
 	// Model fallback configuration
 	EnableModelFallback      bool   `json:"enable_model_fallback"`
@@ -249,6 +252,20 @@ type SystemSettings struct {
 	CodexCLIOnlyWhitelist                  string // codex_cli_only 全局白名单 JSON（[]AllowedClientEntry，AND allow）
 	CodexCLIOnlyAllowAppServerClients      bool   // codex_cli_only App Server 开关：对未列名客户端开闸（默认 false）
 	CodexCLIOnlyEngineFingerprintSignals   string // codex_cli_only 引擎指纹门信号列表 JSON（[]EngineFingerprintSignal）
+
+	// OpenAI Codex five-hour window warmup. Enabled is the global kill switch;
+	// false prevents workers from claiming or sending new probes.
+	OpenAIWindowWarmupEnabled               bool
+	OpenAIWindowWarmupDefaultPolicy         string
+	OpenAIWindowWarmupAllowlist             []int64
+	OpenAIWindowWarmupProbeModel            string
+	OpenAIWindowWarmupWorkerConcurrency     int
+	OpenAIWindowWarmupGlobalQPS             float64
+	OpenAIWindowWarmupBatchSize             int
+	OpenAIWindowWarmupScanSeconds           int
+	OpenAIWindowWarmupRequestTimeoutSeconds int
+	OpenAIWindowWarmupLeaseSeconds          int
+	OpenAIWindowWarmupResetGraceSeconds     int
 
 	// Web Search Emulation
 	WebSearchEmulationEnabled bool // 是否启用 web search 模拟

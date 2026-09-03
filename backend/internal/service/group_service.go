@@ -11,6 +11,12 @@ import (
 var (
 	ErrGroupNotFound = infraerrors.NotFound("GROUP_NOT_FOUND", "group not found")
 	ErrGroupExists   = infraerrors.Conflict("GROUP_EXISTS", "group name already exists")
+	// ErrGroupUpdateConflict is returned when an ordinary Group update was built
+	// from a stale row snapshot. Callers should reload the Group before retrying.
+	ErrGroupUpdateConflict = infraerrors.Conflict(
+		"GROUP_UPDATE_CONFLICT",
+		"group changed while it was being updated",
+	)
 )
 
 type GroupRepository interface {

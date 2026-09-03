@@ -108,6 +108,7 @@ func (h *OpenAIGatewayHandler) ResponsesInputTokens(c *gin.Context) {
 	if err != nil {
 		reqLog.Warn("openai_input_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)))
 		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, routingModel, reqModel)
+		cls = classifySelectionFailureError(err, cls)
 		if !cls.ModelNotFound {
 			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 		}
@@ -268,26 +269,33 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	if preferredMappedModel != "" {
 		currentRoutingModel = preferredMappedModel
 	}
-	account, err := h.gatewayService.SelectAccountForTokenCount(
+	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
+	selection, _, selectErr := h.gatewayService.SelectAccountWithSchedulerForCapability(
 		c.Request.Context(),
 		apiKey.GroupID,
+		"",
 		sessionHash,
 		currentRoutingModel,
+		nil,
+		service.OpenAIUpstreamTransportAny,
 		service.OpenAIEndpointCapabilityChatCompletions,
-		openAICompatibleRequestPlatform(c.Request.Context(), apiKey),
+		false,
+		false,
+		false,
+		requestPlatform,
 	)
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
-	if err != nil {
-		requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
-		reqLog.Warn("openai_count_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)))
+	if selectErr != nil {
+		reqLog.Warn("openai_count_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(selectErr, requestPlatform)))
 		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+		cls = classifySelectionFailureError(selectErr, cls)
 		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+			markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
 		}
 		h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
 		return
 	}
-	if account == nil {
+	if selection == nil || selection.Account == nil {
 		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
 		if !cls.ModelNotFound {
 			markOpsRoutingCapacityLimited(c)
@@ -296,11 +304,98 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		return
 	}
 
+	account := selection.Account
+	sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 	setOpsSelectedAccount(c, account.ID, account.Platform)
+	accountRelease, acquireErr := h.acquireCountTokensAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqLog)
+	if acquireErr != nil {
+		status, errType, message := concurrencyErrorResponse(acquireErr, "account")
+		h.anthropicErrorResponse(c, status, errType, message)
+		return
+	}
+
+	account = selection.Account
 	forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
 	defaultMappedModel := preferredMappedModel
-
-	if err := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, defaultMappedModel); err != nil {
-		reqLog.Error("openai_count_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+	if accountRelease != nil {
+		defer accountRelease()
 	}
+	if forwardErr := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, defaultMappedModel); forwardErr != nil {
+		reqLog.Error("openai_count_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(forwardErr))
+	}
+}
+
+// acquireCountTokensAccountSlot turns a scheduler WaitPlan into a real account
+// slot while preserving the normal wait, cooldown, and sticky-session semantics.
+func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
+	c *gin.Context,
+	groupID *int64,
+	sessionHash string,
+	selection *service.AccountSelectionResult,
+	reqLog *zap.Logger,
+) (release func(), err error) {
+	if selection == nil || selection.Account == nil {
+		return nil, service.ErrNoAvailableAccounts
+	}
+	ctx := service.ContextWithSelectionProfitGate(c.Request.Context(), selection)
+	c.Request = c.Request.WithContext(ctx)
+	account := selection.Account
+	if selection.Acquired {
+		if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, selection.ReleaseFunc, reqLog); recheckErr != nil {
+			return nil, recheckErr
+		}
+		return wrapReleaseOnDone(ctx, selection.ReleaseFunc), nil
+	}
+	if selection.WaitPlan == nil {
+		return nil, service.ErrNoAvailableAccounts
+	}
+
+	accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(
+		ctx,
+		account.ID,
+		selection.WaitPlan.MaxConcurrency,
+	)
+	if acquireErr != nil {
+		return nil, acquireErr
+	}
+	if !acquired {
+		canWait, waitErr := h.concurrencyHelper.IncrementAccountWaitCount(ctx, account.ID, selection.WaitPlan.MaxWaiting)
+		if waitErr != nil {
+			reqLog.Warn("openai_count_tokens.account_wait_counter_increment_failed", zap.Int64("account_id", account.ID), zap.Error(waitErr))
+		} else if !canWait {
+			return nil, &WaitQueueFullError{SlotType: "account"}
+		}
+
+		waitCounted := waitErr == nil && canWait
+		releaseWait := func() {
+			if waitCounted {
+				h.concurrencyHelper.DecrementAccountWaitCount(ctx, account.ID)
+				waitCounted = false
+			}
+		}
+		defer releaseWait()
+
+		streamStarted := false
+		accountRelease, acquireErr = h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
+			c,
+			account.ID,
+			selection.WaitPlan.MaxConcurrency,
+			selection.WaitPlan.Timeout,
+			false,
+			&streamStarted,
+		)
+		if acquireErr != nil {
+			return nil, acquireErr
+		}
+		releaseWait()
+	}
+
+	if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, accountRelease, reqLog); recheckErr != nil {
+		return nil, recheckErr
+	}
+	selection.ReleaseFunc = accountRelease
+	if bindErr := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); bindErr != nil {
+		reqLog.Warn("openai_count_tokens.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(bindErr))
+	}
+	return wrapReleaseOnDone(ctx, accountRelease), nil
 }

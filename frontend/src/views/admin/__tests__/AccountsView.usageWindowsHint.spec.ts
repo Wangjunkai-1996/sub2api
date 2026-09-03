@@ -75,8 +75,13 @@ const DataTableStub = {
           <slot :name="'header-' + column.key" :column="column" />
         </div>
       </template>
-      <div v-for="row in data" :key="row.id" data-test="account-rate">
-        <slot name="cell-rate_multiplier" :row="row" />
+      <div v-for="row in data" :key="row.id">
+        <div data-test="account-rate">
+          <slot name="cell-rate_multiplier" :row="row" />
+        </div>
+        <div :data-test="'window-warmup-' + row.id">
+          <slot name="cell-openai_window_warmup" :row="row" />
+        </div>
       </div>
     </div>
   `
@@ -204,6 +209,58 @@ describe('admin AccountsView usage windows hint', () => {
     )).toBe(true)
     const columns = wrapper.getComponent(DataTableStub).props('columns') as Array<{ key: string; sortable: boolean }>
     expect(columns.find(column => column.key === 'upstream_billing_rate')?.sortable).toBe(true)
+  })
+
+  it('hides stale next-run timestamps for terminal warmup jobs', async () => {
+    const nextAttemptAt = '2026-08-31T12:00:00Z'
+    const baseAccount = {
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active',
+      schedulable: true,
+      openai_codex_warmup_policy: 'continuous',
+      created_at: '2026-08-31T00:00:00Z',
+      updated_at: '2026-08-31T00:00:00Z'
+    }
+    listAccounts.mockResolvedValueOnce({
+      items: [
+        {
+          ...baseAccount,
+          id: 8,
+          name: 'weekly-only',
+          openai_window_warmup: {
+            policy: 'continuous',
+            state: 'failed',
+            last_error_code: 'five_hour_window_unsupported',
+            next_attempt_at: nextAttemptAt
+          }
+        },
+        {
+          ...baseAccount,
+          id: 9,
+          name: 'retrying',
+          openai_window_warmup: {
+            policy: 'continuous',
+            state: 'retrying',
+            next_attempt_at: nextAttemptAt
+          }
+        }
+      ],
+      total: 2,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const skipped = wrapper.get('[data-test="window-warmup-8"]')
+    expect(skipped.text()).toContain('admin.accounts.openai.windowWarmup.states.five_hour_window_unsupported')
+    expect(skipped.text()).not.toContain('admin.accounts.openai.windowWarmup.nextRun')
+
+    const retrying = wrapper.get('[data-test="window-warmup-9"]')
+    expect(retrying.text()).toContain('admin.accounts.openai.windowWarmup.nextRun')
   })
 
   it('shows account multipliers with enough precision to match declared rates', async () => {

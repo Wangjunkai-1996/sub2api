@@ -83,6 +83,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+	ctx = ContextWithSelectedAccountEgress(ctx, account)
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return useErr
+		}
+		defer releaseUse()
+	}
 	// A handler may reuse the same gin context across account failover attempts.
 	// Never let an OAuth attempt's response aliases leak into the next account.
 	setCodexToolNameReverse(c, nil)
@@ -137,9 +145,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				forceHTTPBridge = true
 				break
 			}
-			// 透传 relay 通过 TurnStarted 记录每个 turn 的开始时刻，但不触发
-			// BeforeTurn；因此仍只有建连时的利润准入门，没有 turn 级复核。
-			// handler 计费在 turn 定价未冻结时回退到对应的 turn 开始时刻。
+			// 首轮已在建连前完成准入；后续 response.create 由 passthrough
+			// relay 触发 BeforeTurn 复核。TurnStarted 仍记录每轮开始时刻，
+			// 供 handler 在未冻结定价时回退。
 			return s.proxyResponsesWebSocketV2Passthrough(
 				ctx,
 				c,
@@ -528,6 +536,38 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	sessionHash := ""
 	preferredConnID := ""
 	storeDisabled := false
+	requiredBindingID := ""
+	if account.SelectedEgress != nil {
+		requiredBindingID = strings.TrimSpace(account.SelectedEgress.BindingID)
+	}
+	validateResponseEgress := func(payload openAIWSClientPayload) error {
+		if requiredBindingID == "" || stateStore == nil || payload.previousResponseID == "" {
+			return nil
+		}
+		bindingID, ok, readErr := getOpenAIWSResponseEgressWithError(stateStore, ctx, groupID, payload.previousResponseID)
+		if readErr != nil {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream continuation egress state is unavailable; please retry later",
+				fmt.Errorf("%w: read response %s egress binding: %v", ErrAccountEgressUnavailable, payload.previousResponseID, readErr),
+			)
+		}
+		if !ok || strings.TrimSpace(bindingID) == "" {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream continuation egress is unavailable; please restart the conversation",
+				fmt.Errorf("%w: response %s has no egress binding", ErrAccountEgressNoRoute, payload.previousResponseID),
+			)
+		}
+		if bindingID != requiredBindingID {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream continuation egress changed; please restart the conversation",
+				fmt.Errorf("%w: response binding %q does not match selected binding %q", ErrAccountEgressConfigStale, bindingID, requiredBindingID),
+			)
+		}
+		return nil
+	}
 	refreshIngressRouteState := func(payload openAIWSClientPayload) {
 		sessionHash = s.GenerateSessionHash(c, payload.rawForHash)
 		if turnState == "" && stateStore != nil && sessionHash != "" {
@@ -551,6 +591,18 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 	}
 	refreshIngressRouteState(firstPayload)
+	if err := validateResponseEgress(firstPayload); err != nil {
+		return err
+	}
+	if requiredBindingID != "" && stateStore != nil && storeDisabled && sessionHash != "" {
+		if bindingID, ok := getOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash); ok && bindingID != requiredBindingID {
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"upstream session egress changed; please restart the conversation",
+				fmt.Errorf("%w: session binding %q does not match selected binding %q", ErrAccountEgressConfigStale, bindingID, requiredBindingID),
+			)
+		}
+	}
 
 	if forceHTTPBridge || s.shouldBridgeOpenAIWSHTTP(account, firstPayload.payloadBytes, firstPayload.previousResponseID) {
 		logOpenAIWSModeInfo(
@@ -656,6 +708,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				turn,
 				writeClientMessage,
 			)
+			if result != nil {
+				// The bridge body carries the policy-adjusted effort. Usage must retain
+				// the canonical value requested by the client before that adjustment.
+				result.RequestedReasoningEffort = currentBridgePayload.requestedReasoningEffort
+			}
 			if bridgeErr != nil && isOpenAIWSSessionPreempted(ctx) {
 				return errOpenAIWSSessionPreempted
 			}
@@ -705,10 +762,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					stateStore.BindSessionTurnState(groupID, sessionHash, bridgeTurnState, s.openAIWSSessionStickyTTL())
 				}
 			}
-			responseID := strings.TrimSpace(result.RequestID)
-			if responseID != "" && stateStore != nil {
-				ttl := s.openAIWSResponseStickyTTL()
-				logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+			if stateStore != nil && storeDisabled && sessionHash != "" && requiredBindingID != "" {
+				ttl := s.openAIWSSessionStickyTTL()
+				logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, requiredBindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, requiredBindingID, ttl))
 			}
 			nextClientMessage, readErr := readClientMessage()
 			if readErr != nil {
@@ -730,6 +786,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 			if parseErr != nil {
 				return parseErr
+			}
+			if validateErr := validateResponseEgress(nextPayload); validateErr != nil {
+				return validateErr
 			}
 			currentBridgePayload = nextPayload
 		}
@@ -753,9 +812,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
 	baseAcquireReq := openAIWSAcquireRequest{
-		Account: account,
-		WSURL:   wsURL,
-		Headers: wsHeaders,
+		Account:           account,
+		WSURL:             wsURL,
+		Headers:           wsHeaders,
+		RequiredBindingID: requiredBindingID,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -941,6 +1001,21 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 
 		responseID := ""
+		responseRoutingBound := false
+		bindResponseRouting := func() {
+			if responseRoutingBound || strings.TrimSpace(responseID) == "" {
+				return
+			}
+			responseRoutingBound = true
+			s.bindOpenAIResponseRouting(
+				ctx,
+				c,
+				account,
+				responseID,
+				lease.BindingID(),
+				lease.ConnID(),
+			)
+		}
 		usage := OpenAIUsage{}
 		imageCounter := newOpenAIImageOutputCounter()
 		var firstTokenMs *int
@@ -958,6 +1033,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		lastEventType := ""
 		needModelReplace := false
 		clientDisconnected := false
+		pendingClientMessages := make([][]byte, 0, 4)
+		pendingClientMessageBytes := int64(0)
 		mappedModel := ""
 		var mappedModelBytes []byte
 		if originalModel != "" {
@@ -1142,28 +1219,82 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 						clientMessage = rewritten
 					}
 				}
-				if err := writeClientMessage(clientMessage); err != nil {
-					if isOpenAIWSClientDisconnectError(err) {
-						clientDisconnected = true
-						closeStatus, closeReason := summarizeOpenAIWSReadCloseError(err)
-						logOpenAIWSModeInfo(
-							"ingress_ws_client_disconnected_drain account_id=%d turn=%d conn_id=%s close_status=%s close_reason=%s",
-							account.ID,
-							turn,
-							truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen),
-							closeStatus,
-							truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
-						)
-					} else {
-						return nil, wrapOpenAIWSIngressTurnError(
-							"write_client",
-							fmt.Errorf("write client websocket event: %w", err),
-							wroteDownstream,
+				stageBeforeSemanticOutput := turn == 1 && account.Platform == PlatformOpenAI && !wroteDownstream
+				if stageBeforeSemanticOutput && (eventType == "error" || eventType == "response.failed") {
+					failureMessage := extractOpenAISSEErrorMessage(upstreamMessage)
+					if failureMessage == "" {
+						failureMessage = "OpenAI websocket response failed before client output"
+					}
+					shouldFailover := openAIStreamFailedEventShouldFailover(upstreamMessage, failureMessage)
+					if eventType == "error" {
+						shouldFailover = openAIStreamErrorEventShouldFailover(upstreamMessage, failureMessage)
+					}
+					if shouldFailover {
+						lease.MarkBroken()
+						return nil, s.newOpenAIStreamFailoverErrorWithModel(
+							c,
+							account,
+							true,
+							lease.HandshakeHeader("x-request-id"),
+							upstreamMessage,
+							failureMessage,
+							mappedModel,
+							lease.HandshakeHeaders(),
 						)
 					}
+				}
+				commitStagedMessages := !stageBeforeSemanticOutput ||
+					openAIStreamDataStartsClientOutput(string(clientMessage), eventType) ||
+					isTerminalEvent
+				if stageBeforeSemanticOutput && !commitStagedMessages {
+					if pendingClientMessageBytes+int64(len(clientMessage)) > openAIFirstOutputStageMaxBytes {
+						lease.MarkBroken()
+						return nil, s.newOpenAIStreamFailoverErrorWithModel(
+							c,
+							account,
+							true,
+							lease.HandshakeHeader("x-request-id"),
+							nil,
+							"OpenAI websocket first-output staging limit exceeded",
+							mappedModel,
+							lease.HandshakeHeaders(),
+						)
+					}
+					pendingClientMessages = append(pendingClientMessages, append([]byte(nil), clientMessage...))
+					pendingClientMessageBytes += int64(len(clientMessage))
 				} else {
-					wroteDownstream = true
-					markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
+					messages := append(pendingClientMessages, clientMessage)
+					pendingClientMessages = nil
+					pendingClientMessageBytes = 0
+					for _, message := range messages {
+						// A continuation can arrive as soon as any event carrying this ID is
+						// visible. Bind account, egress, and connection routing first.
+						bindResponseRouting()
+						if err := writeClientMessage(message); err != nil {
+							if isOpenAIWSClientDisconnectError(err) {
+								clientDisconnected = true
+								closeStatus, closeReason := summarizeOpenAIWSReadCloseError(err)
+								logOpenAIWSModeInfo(
+									"ingress_ws_client_disconnected_drain account_id=%d turn=%d conn_id=%s close_status=%s close_reason=%s",
+									account.ID,
+									turn,
+									truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen),
+									closeStatus,
+									truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
+								)
+								break
+							}
+							return nil, wrapOpenAIWSIngressTurnError(
+								"write_client",
+								fmt.Errorf("write client websocket event: %w", err),
+								wroteDownstream,
+							)
+						}
+						wroteDownstream = true
+					}
+					if !clientDisconnected {
+						markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
+					}
 				}
 			}
 			if isTerminalEvent {
@@ -1208,6 +1339,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					Stream:                        reqStream,
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         terminalEvent,
+					UpstreamTerminalStatusCode:    openAIWSTerminalHealthStatus(upstreamMessage),
 					ResponseHeaders:               lease.HandshakeHeaders(),
 					Duration:                      time.Since(turnStart),
 					FirstTokenMs:                  firstTokenMs,
@@ -1786,13 +1918,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			lastTurnStrictState = nextStrictState
 		}
 
-		if responseID != "" && stateStore != nil {
-			ttl := s.openAIWSResponseStickyTTL()
-			logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
-			stateStore.BindResponseConn(responseID, connID, ttl)
-		}
 		if stateStore != nil && storeDisabled && sessionHash != "" {
-			stateStore.BindSessionConn(groupID, sessionHash, connID, s.openAIWSSessionStickyTTL())
+			ttl := s.openAIWSSessionStickyTTL()
+			stateStore.BindSessionConn(groupID, sessionHash, connID, ttl)
+			bindingID := strings.TrimSpace(sessionLease.BindingID())
+			if bindingID != "" {
+				logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, bindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, bindingID, ttl))
+			}
 		}
 		if connID != "" {
 			preferredConnID = connID
@@ -1820,6 +1952,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 		if parseErr != nil {
 			return parseErr
+		}
+		if validateErr := validateResponseEgress(nextPayload); validateErr != nil {
+			return validateErr
 		}
 		nextRoutingFields := gjson.GetManyBytes(nextPayload.payloadRaw, "model", "service_tier")
 		if nextPayload.promptCacheKey != "" {

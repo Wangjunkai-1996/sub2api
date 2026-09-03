@@ -79,8 +79,13 @@
           <div
             v-for="proxy in filteredProxies"
             :key="proxy.id"
-            @click="selectOption(proxy.id)"
-            :class="['select-option', modelValue === proxy.id && 'select-option-selected']"
+            @click="selectProxy(proxy)"
+            :class="[
+              'select-option',
+              modelValue === proxy.id && 'select-option-selected',
+              !proxy.selectable && 'pointer-events-none opacity-50'
+            ]"
+            :aria-disabled="!proxy.selectable"
           >
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2">
@@ -114,7 +119,8 @@
                 </template>
               </div>
               <div class="truncate text-xs text-gray-500 dark:text-gray-400">
-                {{ proxy.protocol }}://{{ proxy.host }}:{{ proxy.port }}
+                {{ proxy.display_endpoint }}
+                <span v-if="proxy.disabled_reason"> · {{ proxy.disabled_reason }}</span>
               </div>
             </div>
 
@@ -172,7 +178,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
 import Icon from '@/components/icons/Icon.vue'
-import type { Proxy } from '@/types'
+import type { Proxy, ProxyOption } from '@/types'
 
 const { t } = useI18n()
 
@@ -188,7 +194,7 @@ interface ProxyTestResult {
 
 interface Props {
   modelValue: number | null
-  proxies: Proxy[]
+  proxies: Array<ProxyOption | Proxy>
   disabled?: boolean
 }
 
@@ -210,9 +216,22 @@ const testResults = reactive<Record<number, ProxyTestResult>>({})
 const testingProxyIds = reactive(new Set<number>())
 const batchTesting = ref(false)
 
+const normalizedProxies = computed<ProxyOption[]>(() => props.proxies.map((proxy) => {
+  if ('display_endpoint' in proxy) return proxy
+  return {
+    id: proxy.id,
+    name: proxy.name,
+    display_endpoint: `${proxy.protocol}://${proxy.host}:${proxy.port}`,
+    status: proxy.status,
+    selectable: proxy.status === 'active',
+    disabled_reason: proxy.status === 'active' ? null : proxy.status,
+    account_count: proxy.account_count
+  }
+}))
+
 const selectedProxy = computed(() => {
   if (props.modelValue === null) return null
-  return props.proxies.find((p) => p.id === props.modelValue) || null
+  return normalizedProxies.value.find((p) => p.id === props.modelValue) || null
 })
 
 const selectedLabel = computed(() => {
@@ -220,18 +239,18 @@ const selectedLabel = computed(() => {
     return t('admin.accounts.noProxy')
   }
   const proxy = selectedProxy.value
-  return `${proxy.name} (${proxy.protocol}://${proxy.host}:${proxy.port})`
+  return `${proxy.name} (${proxy.display_endpoint})`
 })
 
 const filteredProxies = computed(() => {
   if (!searchQuery.value) {
-    return props.proxies
+    return normalizedProxies.value
   }
   const query = searchQuery.value.toLowerCase()
-  return props.proxies.filter((proxy) => {
+  return normalizedProxies.value.filter((proxy) => {
     const name = proxy.name.toLowerCase()
-    const host = proxy.host.toLowerCase()
-    return name.includes(query) || host.includes(query)
+    const endpoint = proxy.display_endpoint.toLowerCase()
+    return name.includes(query) || endpoint.includes(query)
   })
 })
 
@@ -251,7 +270,11 @@ const selectOption = (value: number | null) => {
   searchQuery.value = ''
 }
 
-const handleTestProxy = async (proxy: Proxy) => {
+const selectProxy = (proxy: ProxyOption) => {
+  if (proxy.selectable) selectOption(proxy.id)
+}
+
+const handleTestProxy = async (proxy: ProxyOption) => {
   if (testingProxyIds.has(proxy.id)) return
 
   testingProxyIds.add(proxy.id)
@@ -274,7 +297,7 @@ const handleBatchTest = async () => {
   batchTesting.value = true
 
   // Test all proxies in parallel
-  const testPromises = props.proxies.map(async (proxy) => {
+  const testPromises = normalizedProxies.value.map(async (proxy) => {
     testingProxyIds.add(proxy.id)
     try {
       const result = await adminAPI.proxies.testProxy(proxy.id)
