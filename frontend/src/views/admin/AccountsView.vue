@@ -568,6 +568,8 @@
       :target="bulkEditTarget ?? undefined"
       :proxies="proxyOptions"
       :egress-routes="egressRoutes"
+      :default-egress-route-id="egressDefaultRouteId"
+      :default-egress-concurrency="egressDefaultConcurrency"
       :egress-mutation-enabled="egressMutationEnabled"
       :egress-verifying-route-id="egressVerifyingRouteId"
       :egress-verify-errors="egressVerifyErrors"

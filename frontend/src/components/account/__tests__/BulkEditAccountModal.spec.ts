@@ -56,7 +56,17 @@ function mountModal(extraProps: Record<string, unknown> = {}) {
     global: {
       stubs: {
         BaseDialog: { template: '<div><slot /><slot name="footer" /></div>' },
-        ConfirmDialog: true,
+        ConfirmDialog: {
+          props: ['show', 'message'],
+          emits: ['confirm', 'cancel'],
+          template: `
+            <div v-if="show" data-testid="mixed-channel-confirm">
+              <span data-testid="mixed-channel-message">{{ message }}</span>
+              <button data-testid="mixed-channel-confirm-button" @click="$emit('confirm')">confirm</button>
+              <button data-testid="mixed-channel-cancel-button" @click="$emit('cancel')">cancel</button>
+            </div>
+          `
+        },
         Select: {
           props: ['modelValue', 'options'],
           emits: ['update:modelValue'],
@@ -755,6 +765,117 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
+  it('OpenAI OAuth 打开时预选可用代理出口并应用默认主出口和并发', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      defaultEgressRouteId: 12,
+      defaultEgressConcurrency: 7,
+      egressRoutes: [
+        { id: 10, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+        { id: 11, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true },
+        { id: 12, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+        { id: 13, kind: 'proxy', name: 'expired', proxy_id: 67, state: 'expired', eligible: false }
+      ]
+    })
+    await nextTick()
+
+    expect((wrapper.get('#bulk-edit-proxy-enabled').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#bulk-edit-concurrency-enabled').element as HTMLInputElement).checked).toBe(false)
+    expect(wrapper.find('#egress-route-10').exists()).toBe(false)
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-13').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('7')
+    expect(wrapper.get('#bulk-edit-concurrency').attributes('disabled')).toBeDefined()
+  })
+
+  it('晚到的出口目录补齐默认值但不覆盖用户已经修改的值', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      egressRoutes: []
+    })
+
+    await wrapper.get('#bulk-edit-concurrency-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-concurrency').setValue(9)
+    await wrapper.setProps({
+      defaultEgressRouteId: 12,
+      defaultEgressConcurrency: 7,
+      egressRoutes: [
+        { id: 11, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true },
+        { id: 12, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true }
+      ]
+    })
+    await nextTick()
+
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('9')
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-11').setValue(false)
+    await wrapper.setProps({
+      defaultEgressRouteId: 13,
+      egressRoutes: [
+        { id: 11, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true },
+        { id: 12, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+        { id: 13, kind: 'proxy', name: 'rn-67', proxy_id: 67, state: 'active', eligible: true }
+      ]
+    })
+    await nextTick()
+
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-13').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('替换出口池缺少有效主出口时阻止提交', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).not.toHaveBeenCalled()
+    expect(showError).toHaveBeenCalledWith('admin.accounts.egressPool.primaryRequired')
+  })
+
+  it('切换到追加或移除时不沿用替换模式的默认全选', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      defaultEgressRouteId: 12,
+      egressRoutes: [
+        { id: 11, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true },
+        { id: 12, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('[data-testid="bulk-egress-operation-append"]').trigger('click')
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(false)
+
+    await wrapper.get('[data-testid="bulk-egress-operation-replace"]').trigger('click')
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
+
+    await wrapper.get('[data-testid="bulk-egress-operation-remove"]').trigger('click')
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(false)
+  })
+
   it('批量追加出口与统一并发可独立开启并合并为一个出口池操作', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
@@ -787,6 +908,7 @@ describe('BulkEditAccountModal', () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
+      defaultEgressRouteId: 11,
       egressRoutes: [
         { id: 11, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
         { id: 12, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true },
@@ -815,10 +937,26 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
-  it('出口池与普通字段混合时在请求前明确拦截', async () => {
+  it('出口池与普通字段混合时按顺序拆分为两次 selected 请求', async () => {
+    vi.mocked(adminAPI.accounts.bulkUpdate)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [1, 2],
+        failed_ids: [],
+        results: []
+      } as any)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [1, 2],
+        failed_ids: [],
+        results: []
+      } as any)
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
+      defaultEgressRouteId: 31,
       egressRoutes: [
         { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
         { id: 32, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true }
@@ -829,14 +967,228 @@ describe('BulkEditAccountModal', () => {
     await wrapper.get('#egress-route-31').setValue(true)
     await wrapper.get('#egress-route-32').setValue(true)
     await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority').setValue(5)
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 
-    expect(adminAPI.accounts.bulkUpdate).not.toHaveBeenCalled()
-    expect(showError).toHaveBeenCalledWith('admin.accounts.bulkEdit.egressMixedFields')
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(2)
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenNthCalledWith(1, [1, 2], {
+      egress_mode: 'pool',
+      egress_pool: {
+        operation: 'replace',
+        route_ids: [31, 32],
+        primary_route_id: 31
+      }
+    })
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenNthCalledWith(2, [1, 2], {
+      priority: 5
+    })
   })
 
-  it('关闭再打开时清空出口池和普通字段的批量编辑状态', async () => {
+  it('筛选目标混合提交时先用 filters 更新出口，再用成功 ID 更新普通字段', async () => {
+    vi.mocked(adminAPI.accounts.bulkUpdate)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [41, 42],
+        failed_ids: [],
+        results: []
+      } as any)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [41, 42],
+        failed_ids: [],
+        results: []
+      } as any)
+    const filters = { platform: 'openai', type: 'oauth', status: 'active' }
+    const wrapper = mountModal({
+      accountIds: [],
+      selectedPlatforms: [],
+      selectedTypes: [],
+      target: {
+        mode: 'filtered',
+        filters,
+        previewCount: 2,
+        selectedPlatforms: ['openai'],
+        selectedTypes: ['oauth']
+      },
+      defaultEgressRouteId: 31,
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+        { id: 32, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-31').setValue(true)
+    await wrapper.get('#egress-route-32').setValue(true)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority').setValue(5)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(2)
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenNthCalledWith(1, {
+      filters,
+      egress_mode: 'pool',
+      egress_pool: {
+        operation: 'replace',
+        route_ids: [31, 32],
+        primary_route_id: 31
+      }
+    })
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenNthCalledWith(2, [41, 42], {
+      priority: 5
+    })
+  })
+
+  it('出口池第一步失败时不提交普通字段', async () => {
+    vi.mocked(adminAPI.accounts.bulkUpdate).mockRejectedValueOnce({ message: 'egress failed' })
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      defaultEgressRouteId: 31,
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-31').setValue(true)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority').setValue(5)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(1)
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      egress_mode: 'pool',
+      egress_pool: {
+        operation: 'replace',
+        route_ids: [31],
+        primary_route_id: 31
+      }
+    })
+    expect(wrapper.emitted('updated')).toBeUndefined()
+  })
+
+  it('出口池成功但普通字段失败时显示部分完成错误', async () => {
+    vi.mocked(adminAPI.accounts.bulkUpdate)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [1, 2],
+        failed_ids: [],
+        results: []
+      } as any)
+      .mockRejectedValueOnce({ message: 'ordinary fields failed' })
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      defaultEgressRouteId: 31,
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#egress-route-31').setValue(true)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority').setValue(5)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(2)
+    expect(showError).toHaveBeenCalledWith('admin.accounts.bulkEdit.egressSavedOtherFieldsFailed')
+    expect(wrapper.emitted('updated')).toHaveLength(1)
+    expect(wrapper.emitted('close')).toHaveLength(1)
+  })
+
+  it('出口池成功后普通字段触发 409，确认时只重试普通字段', async () => {
+    vi.mocked(adminAPI.accounts.bulkUpdate)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [1, 2],
+        failed_ids: [],
+        results: []
+      } as any)
+      .mockRejectedValueOnce({
+        status: 409,
+        error: 'mixed_channel_warning',
+        message: 'mixed channel risk'
+      })
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [1, 2],
+        failed_ids: [],
+        results: []
+      } as any)
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      defaultEgressRouteId: 31,
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="mixed-channel-message"]').text())
+      .toBe('admin.accounts.bulkEdit.egressSavedConfirmOtherFields')
+    await wrapper.get('[data-testid="mixed-channel-confirm-button"]').trigger('click')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(3)
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenNthCalledWith(3, [1, 2], {
+      priority: 1,
+      confirm_mixed_channel_risk: true
+    })
+    expect(wrapper.emitted('updated')).toHaveLength(1)
+  })
+
+  it('出口池成功后取消普通字段的 409 确认时刷新并关闭', async () => {
+    vi.mocked(adminAPI.accounts.bulkUpdate)
+      .mockResolvedValueOnce({
+        success: 2,
+        failed: 0,
+        success_ids: [1, 2],
+        failed_ids: [],
+        results: []
+      } as any)
+      .mockRejectedValueOnce({
+        status: 409,
+        error: 'mixed_channel_warning',
+        message: 'mixed channel risk'
+      })
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      defaultEgressRouteId: 31,
+      egressRoutes: [
+        { id: 31, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true }
+      ]
+    })
+
+    await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-priority-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    await wrapper.get('[data-testid="mixed-channel-cancel-button"]').trigger('click')
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledTimes(2)
+    expect(showError).toHaveBeenCalledWith('admin.accounts.bulkEdit.egressSavedOtherFieldsCancelled')
+    expect(wrapper.emitted('updated')).toHaveLength(1)
+    expect(wrapper.emitted('close')).toHaveLength(1)
+  })
+
+  it('关闭再打开时重置普通字段并重新应用出口池默认值', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
@@ -862,9 +1214,9 @@ describe('BulkEditAccountModal', () => {
     expect((wrapper.get('#bulk-edit-proxy-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#bulk-edit-concurrency-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#bulk-edit-priority-enabled').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('#egress-route-21').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('#egress-route-22').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('1')
+    expect((wrapper.get('#egress-route-21').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-22').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('3')
     expect((wrapper.get('#bulk-edit-priority').element as HTMLInputElement).value).toBe('1')
   })
 

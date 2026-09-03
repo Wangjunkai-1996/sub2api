@@ -116,8 +116,8 @@ const mountView = () =>
         },
         EditAccountModal: true,
         BulkEditAccountModal: {
-          props: ['show', 'proxies', 'egressRoutes'],
-          template: '<div data-test="bulk-edit-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" />'
+          props: ['show', 'proxies', 'egressRoutes', 'defaultEgressRouteId', 'defaultEgressConcurrency'],
+          template: '<div data-test="bulk-edit-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" :data-default-route-id="String(defaultEgressRouteId ?? \'\')" :data-default-concurrency="String(defaultEgressConcurrency ?? \'\')" />'
         },
         PlatformTypeBadge: true,
         AccountCapacityCell: true,
@@ -209,12 +209,22 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
   it('打开批量编辑弹窗时刷新出口和代理目录', async () => {
     const wrapper = mountView()
     await flushPromises()
+    getAssignableEgressCatalog.mockResolvedValueOnce({
+      items: [{ id: 2, kind: 'proxy', name: 'fresh-route', state: 'active', eligible: true }],
+      default_route_id: 2,
+      default_concurrency: 3,
+      capabilities: { mutation_enabled: true }
+    })
     await wrapper.get('[data-test="open-bulk-edit"]').trigger('click')
     await flushPromises()
 
     expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
     expect(getProxyOptions).toHaveBeenCalledTimes(2)
-    expect(wrapper.get('[data-test="bulk-edit-account-modal"]').attributes('data-show')).toBe('true')
+    const modal = wrapper.get('[data-test="bulk-edit-account-modal"]')
+    expect(modal.attributes('data-show')).toBe('true')
+    expect(modal.attributes('data-route-count')).toBe('1')
+    expect(modal.attributes('data-default-route-id')).toBe('2')
+    expect(modal.attributes('data-default-concurrency')).toBe('3')
     wrapper.unmount()
   })
 
