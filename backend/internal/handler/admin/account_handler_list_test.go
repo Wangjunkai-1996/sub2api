@@ -20,14 +20,23 @@ func TestAccountHandlerListLiteUsesCompactDTOAndETag(t *testing.T) {
 	router, adminSvc := setupAccountListRouter()
 	now := time.Now().UTC()
 	groupID := int64(77)
+	egressBindings := []service.AccountEgressBinding{
+		accountHandlerEgressBinding(501, 101, 201, "51.81.109.154", service.DefaultDirectEgressRuntimeScope),
+		accountHandlerEgressBinding(501, 102, 202, "67.215.237.47", service.DefaultDirectEgressRuntimeScope),
+		accountHandlerEgressBinding(501, 103, 203, "104.223.77.152", service.DefaultDirectEgressRuntimeScope),
+	}
+	for i := range egressBindings {
+		egressBindings[i].Route.VerifiedAt = &now
+	}
 	adminSvc.accounts = []service.Account{{
 		ID: 501, Name: "compact-account", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
 		Credentials: map[string]any{"email": "compact@example.com", "access_token": strings.Repeat("x", 4096)},
 		Extra:       map[string]any{"privacy_mode": "training_off"}, Status: service.StatusActive,
-		Schedulable: true, Concurrency: 4, GroupIDs: []int64{groupID},
-		Groups:        []*service.Group{{ID: groupID, Name: "codex", Platform: service.PlatformOpenAI}},
-		AccountGroups: []service.AccountGroup{{AccountID: 501, GroupID: groupID, Priority: 2, Group: &service.Group{ID: groupID, Name: "codex", Platform: service.PlatformOpenAI}}},
-		CreatedAt:     now, UpdatedAt: now,
+		Schedulable: true, Concurrency: 4, EgressMode: service.EgressModePool, EgressRevision: 9, GroupIDs: []int64{groupID},
+		EgressBindings: egressBindings,
+		Groups:         []*service.Group{{ID: groupID, Name: "codex", Platform: service.PlatformOpenAI}},
+		AccountGroups:  []service.AccountGroup{{AccountID: 501, GroupID: groupID, Priority: 2, Group: &service.Group{ID: groupID, Name: "codex", Platform: service.PlatformOpenAI}}},
+		CreatedAt:      now, UpdatedAt: now,
 	}}
 
 	rec := httptest.NewRecorder()
@@ -47,6 +56,23 @@ func TestAccountHandlerListLiteUsesCompactDTOAndETag(t *testing.T) {
 	require.Equal(t, float64(501), liteItem["id"])
 	require.Equal(t, []any{float64(groupID)}, liteItem["group_ids"])
 	require.Equal(t, true, liteItem["schedulable"])
+	require.Equal(t, service.EgressModePool, liteItem["egress_mode"])
+	require.Equal(t, float64(9), liteItem["egress_revision"])
+	egressSummary, ok := liteItem["egress_summary"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, float64(3), egressSummary["configured_route_count"])
+	require.Equal(t, float64(3), egressSummary["eligible_route_count"])
+	require.Equal(t, float64(4), egressSummary["concurrency_per_egress"])
+	require.Equal(t, float64(12), egressSummary["effective_capacity"])
+	routes, ok := egressSummary["routes"].([]any)
+	require.True(t, ok)
+	require.Len(t, routes, 3)
+	egressPool, ok := liteItem["egress_pool"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, float64(4), egressPool["concurrency_per_egress"])
+	routeIDs, ok := egressPool["route_ids"].([]any)
+	require.True(t, ok)
+	require.Len(t, routeIDs, 3)
 	require.NotContains(t, liteItem, "groups")
 	require.NotContains(t, liteItem, "account_groups")
 	credentials, ok := liteItem["credentials"].(map[string]any)
