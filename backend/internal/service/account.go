@@ -21,18 +21,25 @@ import (
 )
 
 type Account struct {
-	ID                      int64
-	Name                    string
-	Notes                   *string
-	Platform                string
-	Type                    string
-	Credentials             map[string]any
-	Extra                   map[string]any
-	ProxyID                 *int64
-	ProxyFallbackOriginID   *int64
-	ProxyFallbackOriginName *string // 仅展示用
-	Concurrency             int
-	Priority                int
+	ID                             int64
+	Name                           string
+	Notes                          *string
+	Platform                       string
+	Type                           string
+	Credentials                    map[string]any
+	OpenAIWarmupIdentityGeneration int64
+	Extra                          map[string]any
+	ProxyID                        *int64
+	ProxyFallbackOriginID          *int64
+	ProxyFallbackOriginName        *string // 仅展示用
+	EgressMode                     string
+	EgressRevision                 int64
+	EgressBindings                 []AccountEgressBinding
+	SelectedEgress                 *ResolvedAccountEgress        `json:"-"` // request-local only; never persisted or cached
+	LegacyEgressAdmission          *LegacyAccountEgressAdmission `json:"-"` // request-local rollout-off identity fence
+	EgressPoolWrite                *ReplaceAccountPoolInput      `json:"-"` // request-local admin write intent
+	Concurrency                    int
+	Priority                       int
 	// RateMultiplier 账号计费倍率（>=0，允许 0 表示该账号计费为 0）。
 	// 使用指针用于兼容旧版本调度缓存（Redis）中缺字段的情况：nil 表示按 1.0 处理。
 	RateMultiplier     *float64
@@ -176,6 +183,36 @@ func (a *Account) EffectiveLoadFactor() int {
 		return a.Concurrency
 	}
 	return 1
+}
+
+func (a *Account) ConcurrencyPerEgress() int {
+	if a == nil {
+		return 0
+	}
+	return a.Concurrency
+}
+
+// EffectiveEgressCapacity is separate from EffectiveLoadFactor so rollout-off
+// schedulers keep their existing behavior. Pool capacity counts only distinct,
+// fully active public IP identities.
+func (a *Account) EffectiveEgressCapacity() int {
+	if a == nil {
+		return 0
+	}
+	if a.EgressMode != EgressModePool {
+		return a.Concurrency
+	}
+	identities := make(map[int64]struct{}, len(a.EgressBindings))
+	for i := range a.EgressBindings {
+		binding := &a.EgressBindings[i]
+		if binding.Status != AccountEgressBindingStatusActive || binding.Route == nil ||
+			binding.Route.State != EgressRouteStateActive || binding.Route.ExpectedIdentity == nil ||
+			binding.Route.ExpectedIdentity.Status != EgressIdentityStatusActive {
+			continue
+		}
+		identities[binding.Route.ExpectedIdentity.ID] = struct{}{}
+	}
+	return len(identities) * a.ConcurrencyPerEgress()
 }
 
 func (a *Account) IsSchedulable() bool {
@@ -1303,6 +1340,14 @@ func (a *Account) IsOpenAIOAuthLike() bool {
 // accounts whose platform is implicit, while adding OpenAI SetupToken.
 func (a *Account) UsesOpenAICodexProtocol() bool {
 	return a != nil && (a.Type == AccountTypeOAuth || a.IsOpenAIOAuthLike())
+}
+
+// IsOpenAIProOAuthAccount reports whether account is an OpenAI OAuth account
+// whose persisted plan type is exactly Pro. A database ID is intentionally not
+// part of this classification so callers can use it before persistence.
+func IsOpenAIProOAuthAccount(account *Account) bool {
+	return account != nil && account.IsOpenAIOAuth() &&
+		strings.EqualFold(strings.TrimSpace(account.GetCredential("plan_type")), "pro")
 }
 
 func (a *Account) IsOpenAIChatGPTSubscription() bool {

@@ -172,6 +172,32 @@ func TestOpsUpstreamProxyFieldAccessors(t *testing.T) {
 	}
 }
 
+func TestOpsUpstreamProxyFieldAccessorsUseSelectedPoolRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	primaryID := int64(9)
+	selectedID := int64(42)
+	account := &Account{
+		ID:       1002,
+		Platform: PlatformOpenAI,
+		ProxyID:  &primaryID,
+		EgressBindings: []AccountEgressBinding{{
+			BindingID: "1002:8",
+			RouteID:   8,
+			Route: &EgressRoute{
+				Kind:    EgressRouteKindProxy,
+				ProxyID: &selectedID,
+				Proxy:   &Proxy{ID: selectedID, Name: "selected-egress"},
+			},
+		}},
+		SelectedEgress: &ResolvedAccountEgress{BindingID: "1002:8", RouteID: 8},
+	}
+
+	id, name := opsUpstreamProxyAttribution(account)
+	require.NotNil(t, id)
+	require.Equal(t, selectedID, *id)
+	require.Equal(t, "selected-egress", name)
+}
+
 func TestOpsUpstreamErrorEventRetryKeepsExplicitAttemptProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())

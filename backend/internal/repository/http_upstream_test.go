@@ -51,6 +51,42 @@ func TestHTTPUpstreamDoCanDisableRedirectsPerRequest(t *testing.T) {
 	require.Zero(t, redirectedCalls.Load())
 }
 
+func TestHTTPUpstreamMarksSetupFailuresAsNotSent(t *testing.T) {
+	client := NewHTTPUpstream(nil)
+	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	require.NoError(t, err)
+
+	_, err = client.Do(req, "http://[invalid-proxy", 1, 1)
+
+	require.Error(t, err)
+	require.True(t, service.IsHTTPUpstreamRequestNotSent(err))
+}
+
+func TestHTTPUpstreamPoolRouteUsesBindingIsolationKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	upstream := NewHTTPUpstream(nil).(*httpUpstreamService)
+	ctx := service.WithHTTPUpstreamEgress(t.Context(), service.HTTPUpstreamEgress{
+		BindingID:    "44:9",
+		RouteID:      9,
+		IdentityID:   "17",
+		PoolRevision: 3,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+	resp, err := upstream.Do(req, "", 44, 4)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	upstream.mu.RLock()
+	_, exists := upstream.clients["account:44|egress:44:9"]
+	upstream.mu.RUnlock()
+	require.True(t, exists)
+}
+
 func TestHTTPUpstreamDoWithTLSPlainHTTPUsesConfiguredHTTPProxy(t *testing.T) {
 	var upstreamCalls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

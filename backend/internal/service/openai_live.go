@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -30,6 +31,10 @@ const (
 	liveObserverPollInterval      = 250 * time.Millisecond
 	liveObserverStoreRetryLimit   = 5
 	liveUpstreamBodyLimit         = 2 << 20
+	// Stop before Redis can expire the 60-second user/API-key Live slots. This
+	// permits one missed 20-second heartbeat while preserving a full heartbeat
+	// interval as the no-overcommit margin.
+	liveLeaseTransientSafetyWindow = LiveConcurrencyLeaseTTL - liveLeaseRefreshInterval
 )
 
 // liveObserverStoreRetryInterval 是 var 以便测试缩短 store 报错的重试等待。
@@ -46,11 +51,40 @@ type liveFrameConn interface {
 	Close() error
 }
 
+type liveEgressUseConn struct {
+	liveFrameConn
+	release func()
+	once    sync.Once
+}
+
+func (c *liveEgressUseConn) Close() error {
+	err := c.liveFrameConn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
 func liveSidebandReadError(err error) error {
 	if coderws.CloseStatus(err) == coderws.StatusNormalClosure {
 		return ErrLiveCallNotFound
 	}
 	return err
+}
+
+func liveEgressLeaseDone(record *LiveCallRecord) <-chan struct{} {
+	if record == nil || record.EgressLease == nil {
+		return nil
+	}
+	return record.EgressLease.Context().Done()
+}
+
+func liveEgressLeaseCause(record *LiveCallRecord) error {
+	if record == nil || record.EgressLease == nil {
+		return ErrLiveUnavailable
+	}
+	if cause := context.Cause(record.EgressLease.Context()); cause != nil {
+		return cause
+	}
+	return ErrLiveUnavailable
 }
 
 func hashLiveCallID(callID string) string {
@@ -93,6 +127,293 @@ func (s *OpenAIGatewayService) liveConcurrencyCache() (LiveConcurrencyCache, err
 		return nil, ErrLiveUnavailable
 	}
 	return cache, nil
+}
+
+func (s *OpenAIGatewayService) liveEgressConcurrencyCache() (LiveEgressConcurrencyCache, error) {
+	if s == nil || s.concurrencyService == nil || s.concurrencyService.cache == nil {
+		return nil, ErrLiveUnavailable
+	}
+	cache, ok := s.concurrencyService.cache.(LiveEgressConcurrencyCache)
+	if !ok {
+		return nil, ErrLiveUnavailable
+	}
+	return cache, nil
+}
+
+func (s *OpenAIGatewayService) liveLegacyEgressConcurrencyCache() (LiveLegacyEgressConcurrencyCache, error) {
+	if s == nil || s.concurrencyService == nil || s.concurrencyService.cache == nil {
+		return nil, ErrLiveUnavailable
+	}
+	cache, ok := s.concurrencyService.cache.(LiveLegacyEgressConcurrencyCache)
+	if !ok {
+		return nil, ErrLiveUnavailable
+	}
+	return cache, nil
+}
+
+func liveCallEgressRef(record *LiveCallRecord) (AccountEgressLeaseRef, bool, error) {
+	if record == nil {
+		return AccountEgressLeaseRef{}, false, ErrLiveUnavailable
+	}
+	hasEgress := strings.TrimSpace(record.EgressBindingID) != "" ||
+		strings.TrimSpace(record.EgressLeaseID) != "" ||
+		record.EgressRouteID > 0 || strings.TrimSpace(record.EgressIdentityID) != "" ||
+		record.EgressConfigVersion > 0 || record.EgressAuthorityRevision > 0
+	if !hasEgress {
+		return AccountEgressLeaseRef{}, false, nil
+	}
+	ref := AccountEgressLeaseRef{
+		AccountID:         record.AccountID,
+		ID:                strings.TrimSpace(record.EgressLeaseID),
+		BindingID:         strings.TrimSpace(record.EgressBindingID),
+		RouteID:           record.EgressRouteID,
+		IdentityID:        strings.TrimSpace(record.EgressIdentityID),
+		ConfigVersion:     record.EgressConfigVersion,
+		AuthorityRevision: record.EgressAuthorityRevision,
+	}
+	accountID, routeID, ok := parseStableAccountEgressBindingID(ref.BindingID)
+	if !ok || accountID != record.AccountID || routeID != record.EgressRouteID {
+		return AccountEgressLeaseRef{}, true, ErrLiveUnavailable
+	}
+	if err := validateRestoredAccountEgressLeaseRef(ref); err != nil {
+		return AccountEgressLeaseRef{}, true, ErrLiveUnavailable
+	}
+	return ref, true, nil
+}
+
+func liveCallLegacyEgressAdmission(record *LiveCallRecord) (*LegacyAccountEgressAdmission, bool, error) {
+	if record == nil {
+		return nil, false, ErrLiveUnavailable
+	}
+	hasPoolEgress := strings.TrimSpace(record.EgressBindingID) != "" ||
+		strings.TrimSpace(record.EgressLeaseID) != "" || record.EgressRouteID > 0 ||
+		strings.TrimSpace(record.EgressIdentityID) != "" || record.EgressConfigVersion > 0 || record.EgressAuthorityRevision > 0
+	hasLegacyEgress := strings.TrimSpace(record.LegacyEgressBindingID) != "" ||
+		record.LegacyEgressRouteID > 0 || strings.TrimSpace(record.LegacyEgressIdentityID) != "" ||
+		record.LegacyEgressConfigVersion > 0
+	if !hasLegacyEgress {
+		return nil, false, nil
+	}
+	if hasPoolEgress || record.AccountID <= 0 || strings.TrimSpace(record.LegacyEgressBindingID) == "" ||
+		record.LegacyEgressRouteID <= 0 || strings.TrimSpace(record.LegacyEgressIdentityID) == "" ||
+		record.LegacyEgressConfigVersion <= 0 {
+		return nil, true, ErrLiveUnavailable
+	}
+	accountID, routeID, ok := parseStableAccountEgressBindingID(record.LegacyEgressBindingID)
+	if !ok || accountID != record.AccountID || routeID != record.LegacyEgressRouteID {
+		return nil, true, ErrLiveUnavailable
+	}
+	return &LegacyAccountEgressAdmission{
+		AccountID:     record.AccountID,
+		BindingID:     strings.TrimSpace(record.LegacyEgressBindingID),
+		RouteID:       record.LegacyEgressRouteID,
+		IdentityID:    strings.TrimSpace(record.LegacyEgressIdentityID),
+		ConfigVersion: record.LegacyEgressConfigVersion,
+	}, true, nil
+}
+
+func withLiveLegacyEgressAdmission(account *Account, record *LiveCallRecord) (*Account, bool, error) {
+	persisted, legacyMode, err := liveCallLegacyEgressAdmission(record)
+	if err != nil || !legacyMode {
+		return account, legacyMode, err
+	}
+	current, err := resolveLegacyAccountEgressAdmission(account)
+	if err != nil || current.AccountID != persisted.AccountID || current.BindingID != persisted.BindingID ||
+		current.RouteID != persisted.RouteID || current.IdentityID != persisted.IdentityID ||
+		current.ConfigVersion != persisted.ConfigVersion {
+		return nil, true, ErrLiveUnavailable
+	}
+	hydrated, err := WithLegacyAccountEgressAdmission(account, current)
+	if err != nil {
+		return nil, true, ErrLiveUnavailable
+	}
+	return hydrated, true, nil
+}
+
+func accountEgressLeaseMatchesRef(lease *AccountEgressLease, ref AccountEgressLeaseRef) bool {
+	return lease != nil && lease.ref() == ref
+}
+
+type liveEgressLeaseState struct {
+	lease             *AccountEgressLease
+	owners            map[string]struct{}
+	liveLastConfirmed time.Time
+}
+
+// rememberLiveEgressLease records a lease acquired while creating a Live call.
+// At that point both the egress slot and the user/API-key Live slots were
+// confirmed by one Redis script, so the transient-error safety window can begin.
+func (s *OpenAIGatewayService) rememberLiveEgressLease(
+	record *LiveCallRecord,
+	lease *AccountEgressLease,
+	confirmedAt time.Time,
+) error {
+	ref, poolMode, err := liveCallEgressRef(record)
+	if err != nil || !poolMode || !accountEgressLeaseMatchesRef(lease, ref) || context.Cause(lease.Context()) != nil {
+		return ErrLiveUnavailable
+	}
+	s.liveEgressLeaseMu.Lock()
+	defer s.liveEgressLeaseMu.Unlock()
+	if s.liveEgressLeases == nil {
+		s.liveEgressLeases = make(map[string]*liveEgressLeaseState)
+	}
+	if state := s.liveEgressLeases[record.CallHash]; state != nil {
+		if !accountEgressLeaseMatchesRef(state.lease, ref) || context.Cause(state.lease.Context()) != nil {
+			return ErrLiveUnavailable
+		}
+		if state.liveLastConfirmed.Before(confirmedAt) {
+			state.liveLastConfirmed = confirmedAt
+		}
+		record.EgressLease = state.lease
+		return nil
+	}
+	s.liveEgressLeases[record.CallHash] = &liveEgressLeaseState{
+		lease:             lease,
+		owners:            make(map[string]struct{}),
+		liveLastConfirmed: confirmedAt,
+	}
+	record.EgressLease = lease
+	return nil
+}
+
+// ensureLiveEgressLease returns the one process-local lease for the persisted
+// binding. A different process restores it only after its controller claim and
+// only when Redis confirms the exact lease metadata and identity membership.
+func (s *OpenAIGatewayService) ensureLiveEgressLease(record *LiveCallRecord) (*AccountEgressLease, error) {
+	ref, poolMode, err := liveCallEgressRef(record)
+	if err != nil || !poolMode {
+		return nil, err
+	}
+	if s == nil || s.concurrencyService == nil {
+		return nil, ErrLiveUnavailable
+	}
+
+	s.liveEgressLeaseMu.Lock()
+	defer s.liveEgressLeaseMu.Unlock()
+	if s.liveEgressLeases == nil {
+		s.liveEgressLeases = make(map[string]*liveEgressLeaseState)
+	}
+	if state := s.liveEgressLeases[record.CallHash]; state != nil {
+		if !accountEgressLeaseMatchesRef(state.lease, ref) || context.Cause(state.lease.Context()) != nil {
+			return nil, ErrLiveUnavailable
+		}
+		record.EgressLease = state.lease
+		return state.lease, nil
+	}
+	if record.EgressLease != nil {
+		if !accountEgressLeaseMatchesRef(record.EgressLease, ref) || context.Cause(record.EgressLease.Context()) != nil {
+			return nil, ErrLiveUnavailable
+		}
+		s.liveEgressLeases[record.CallHash] = &liveEgressLeaseState{
+			lease:  record.EgressLease,
+			owners: make(map[string]struct{}),
+		}
+		return record.EgressLease, nil
+	}
+
+	restoreCtx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+	lease, restoreErr := s.concurrencyService.RestoreAccountEgressLease(restoreCtx, ref)
+	cancel()
+	if restoreErr != nil || lease == nil {
+		logger.L().Warn("openai_live_egress_restore_failed",
+			zap.Int64("account_id", record.AccountID),
+			zap.String("call_hash", record.CallHash),
+			zap.String("egress_binding_id", record.EgressBindingID),
+			zap.Error(restoreErr),
+		)
+		return nil, ErrLiveUnavailable
+	}
+	record.EgressLease = lease
+	s.liveEgressLeases[record.CallHash] = &liveEgressLeaseState{
+		lease:  lease,
+		owners: make(map[string]struct{}),
+	}
+	return lease, nil
+}
+
+func (s *OpenAIGatewayService) activateLiveEgressOwner(record *LiveCallRecord, owner string) error {
+	if strings.TrimSpace(owner) == "" {
+		return ErrLiveUnavailable
+	}
+	lease, err := s.ensureLiveEgressLease(record)
+	if err != nil {
+		return err
+	}
+	s.liveEgressLeaseMu.Lock()
+	state := s.liveEgressLeases[record.CallHash]
+	if state == nil || state.lease != lease {
+		s.liveEgressLeaseMu.Unlock()
+		return ErrLiveUnavailable
+	}
+	state.owners[owner] = struct{}{}
+	s.liveEgressLeaseMu.Unlock()
+	if !s.refreshLiveLease(record) {
+		s.releaseLiveEgressOwner(record, owner)
+		return ErrLiveUnavailable
+	}
+	return nil
+}
+
+// releaseLiveEgressOwner relinquishes only this process-local controller's
+// ownership. The last local owner abandons its refresher without deleting the
+// Redis lease, which may already belong to a controller in another process.
+func (s *OpenAIGatewayService) releaseLiveEgressOwner(record *LiveCallRecord, owner string) {
+	if s == nil || record == nil || strings.TrimSpace(owner) == "" {
+		return
+	}
+	s.liveEgressLeaseMu.Lock()
+	if state := s.liveEgressLeases[record.CallHash]; state != nil {
+		if _, owned := state.owners[owner]; owned {
+			delete(state.owners, owner)
+			if len(state.owners) == 0 {
+				delete(s.liveEgressLeases, record.CallHash)
+				if record.EgressLease == state.lease {
+					record.EgressLease = nil
+				}
+				// Keep the registry lock until the allocator unregister completes;
+				// otherwise a new local owner could restore this doomed object.
+				state.lease.Abandon()
+			}
+		}
+	}
+	s.liveEgressLeaseMu.Unlock()
+}
+
+// abandonUnownedLiveEgressLease cleans up the creation-process lease when that
+// process loses or cannot confirm the controller claim. Existing local owners
+// are left untouched, and Redis is never modified by this operation.
+func (s *OpenAIGatewayService) abandonUnownedLiveEgressLease(record *LiveCallRecord) {
+	if s == nil || record == nil {
+		return
+	}
+	s.liveEgressLeaseMu.Lock()
+	if state := s.liveEgressLeases[record.CallHash]; state != nil && len(state.owners) == 0 {
+		delete(s.liveEgressLeases, record.CallHash)
+		if record.EgressLease == state.lease {
+			record.EgressLease = nil
+		}
+		state.lease.Abandon()
+	} else if state == nil && record.EgressLease != nil {
+		record.EgressLease.Abandon()
+		record.EgressLease = nil
+	}
+	s.liveEgressLeaseMu.Unlock()
+}
+
+func (s *OpenAIGatewayService) markLiveEgressLeaseConfirmed(record *LiveCallRecord, lease *AccountEgressLease) {
+	s.liveEgressLeaseMu.Lock()
+	if state := s.liveEgressLeases[record.CallHash]; state != nil && state.lease == lease {
+		state.liveLastConfirmed = time.Now()
+	}
+	s.liveEgressLeaseMu.Unlock()
+}
+
+func (s *OpenAIGatewayService) liveEgressLeaseInsideSafetyWindow(record *LiveCallRecord, lease *AccountEgressLease) bool {
+	s.liveEgressLeaseMu.Lock()
+	defer s.liveEgressLeaseMu.Unlock()
+	state := s.liveEgressLeases[record.CallHash]
+	return state != nil && state.lease == lease && !state.liveLastConfirmed.IsZero() &&
+		time.Now().Before(state.liveLastConfirmed.Add(liveLeaseTransientSafetyWindow))
 }
 
 func (s *OpenAIGatewayService) liveMaxSessionDuration() time.Duration {
@@ -177,16 +498,100 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 
 		account := selection.Account
 		leaseID := generateRequestID()
-		acquired, acquireErr := liveCache.AcquireLiveLease(
-			ctx,
-			account.ID,
-			account.Concurrency,
-			identity.UserID,
-			userMaxConcurrency,
-			identity.APIKeyID,
-			leaseID,
-			true,
-		)
+		provisionalRecord := &LiveCallRecord{
+			AccountID: account.ID,
+			APIKeyID:  identity.APIKeyID,
+			UserID:    identity.UserID,
+			LeaseID:   leaseID,
+		}
+		poolMode := selection.Egress != nil
+		legacyEgressMode := !poolMode && account.LegacyEgressAdmission != nil
+		if legacyEgressMode {
+			admission := account.LegacyEgressAdmission
+			if admission.Lease == nil || context.Cause(admission.Lease.Context()) != nil {
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+			provisionalRecord.LegacyEgressBindingID = admission.BindingID
+			provisionalRecord.LegacyEgressRouteID = admission.RouteID
+			provisionalRecord.LegacyEgressIdentityID = admission.IdentityID
+			provisionalRecord.LegacyEgressConfigVersion = admission.ConfigVersion
+			if _, _, legacyErr := liveCallLegacyEgressAdmission(provisionalRecord); legacyErr != nil {
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+		}
+		var acquired bool
+		var acquireErr error
+		if poolMode {
+			if selection.Egress.Lease == nil {
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+			egressRef := selection.Egress.Lease.ref()
+			provisionalRecord.EgressBindingID = selection.Egress.BindingID
+			provisionalRecord.EgressLeaseID = egressRef.ID
+			provisionalRecord.EgressRouteID = selection.Egress.RouteID
+			provisionalRecord.EgressIdentityID = selection.Egress.IdentityID
+			provisionalRecord.EgressConfigVersion = selection.Egress.ConfigVersion
+			provisionalRecord.EgressAuthorityRevision = selection.Egress.AuthorityRevision
+			provisionalRecord.EgressLease = selection.Egress.Lease
+			if _, _, refErr := liveCallEgressRef(provisionalRecord); refErr != nil ||
+				!accountEgressLeaseMatchesRef(selection.Egress.Lease, AccountEgressLeaseRef{
+					AccountID:         account.ID,
+					ID:                provisionalRecord.EgressLeaseID,
+					BindingID:         provisionalRecord.EgressBindingID,
+					RouteID:           provisionalRecord.EgressRouteID,
+					IdentityID:        provisionalRecord.EgressIdentityID,
+					ConfigVersion:     provisionalRecord.EgressConfigVersion,
+					AuthorityRevision: provisionalRecord.EgressAuthorityRevision,
+				}) {
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+			egressCache, cacheErr := s.liveEgressConcurrencyCache()
+			if cacheErr != nil {
+				selection.ReleaseFunc()
+				return nil, cacheErr
+			}
+			acquired, acquireErr = egressCache.AcquireLiveLeaseForEgress(
+				ctx,
+				egressRef,
+				identity.UserID,
+				userMaxConcurrency,
+				identity.APIKeyID,
+				leaseID,
+				true,
+			)
+		} else if legacyEgressMode {
+			legacyCache, cacheErr := s.liveLegacyEgressConcurrencyCache()
+			if cacheErr != nil {
+				selection.ReleaseFunc()
+				return nil, cacheErr
+			}
+			acquired, acquireErr = legacyCache.AcquireLiveLeaseForLegacyEgress(
+				ctx,
+				account.ID,
+				account.Concurrency,
+				identity.UserID,
+				userMaxConcurrency,
+				identity.APIKeyID,
+				leaseID,
+				provisionalRecord.LegacyEgressIdentityID,
+				true,
+			)
+		} else {
+			acquired, acquireErr = liveCache.AcquireLiveLease(
+				ctx,
+				account.ID,
+				account.Concurrency,
+				identity.UserID,
+				userMaxConcurrency,
+				identity.APIKeyID,
+				leaseID,
+				true,
+			)
+		}
 		if acquireErr != nil || !acquired {
 			selection.ReleaseFunc()
 			if acquireErr != nil {
@@ -194,17 +599,27 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 			}
 			return nil, ErrLiveConcurrencyFull
 		}
+		liveLeaseConfirmedAt := time.Now()
 
 		created, createErr := s.createUpstreamLiveCall(ctx, account, request, attestation)
-		selection.ReleaseFunc()
 		if createErr != nil {
-			s.releaseLiveLease(account.ID, identity.UserID, identity.APIKeyID, leaseID)
+			s.releaseLiveConcurrencyLease(provisionalRecord)
+			selection.ReleaseFunc()
 			if !s.shouldFailoverLiveCreateError(createErr) {
 				return nil, createErr
 			}
 			excluded[account.ID] = struct{}{}
 			lastErr = createErr
 			continue
+		}
+		if poolMode {
+			if !selection.Egress.Lease.Detach() {
+				s.releaseLiveConcurrencyLease(provisionalRecord)
+				selection.ReleaseFunc()
+				return nil, ErrLiveUnavailable
+			}
+		} else {
+			selection.ReleaseFunc()
 		}
 
 		now := time.Now()
@@ -230,9 +645,27 @@ func (s *OpenAIGatewayService) CreateLiveCall(
 			InboundEndpoint:       identity.InboundEndpoint,
 			AttestationCiphertext: attestationCiphertext,
 		}
+		if poolMode {
+			record.EgressBindingID = provisionalRecord.EgressBindingID
+			record.EgressLeaseID = provisionalRecord.EgressLeaseID
+			record.EgressRouteID = provisionalRecord.EgressRouteID
+			record.EgressIdentityID = provisionalRecord.EgressIdentityID
+			record.EgressConfigVersion = provisionalRecord.EgressConfigVersion
+			record.EgressAuthorityRevision = provisionalRecord.EgressAuthorityRevision
+			record.EgressLease = provisionalRecord.EgressLease
+			if rememberErr := s.rememberLiveEgressLease(record, record.EgressLease, liveLeaseConfirmedAt); rememberErr != nil {
+				s.releaseLiveCallLeases(record)
+				return nil, rememberErr
+			}
+		} else if legacyEgressMode {
+			record.LegacyEgressBindingID = provisionalRecord.LegacyEgressBindingID
+			record.LegacyEgressRouteID = provisionalRecord.LegacyEgressRouteID
+			record.LegacyEgressIdentityID = provisionalRecord.LegacyEgressIdentityID
+			record.LegacyEgressConfigVersion = provisionalRecord.LegacyEgressConfigVersion
+		}
 		mappingTTL := s.liveMaxSessionDuration() + 5*time.Minute
 		if saveErr := store.SaveLiveCall(ctx, record, mappingTTL); saveErr != nil {
-			s.releaseLiveLease(account.ID, identity.UserID, identity.APIKeyID, leaseID)
+			s.releaseLiveCallLeases(record)
 			return nil, fmt.Errorf("save live call mapping: %w", saveErr)
 		}
 		created.Account = account
@@ -280,6 +713,7 @@ func (s *OpenAIGatewayService) createUpstreamLiveCall(
 		return nil, err
 	}
 	reqCtx := WithHTTPUpstreamRedirectsDisabled(WithHTTPUpstreamProfile(ctx, HTTPUpstreamProfileOpenAI))
+	reqCtx = ContextWithSelectedAccountEgress(reqCtx, account)
 	upstreamReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, chatGPTLiveCallsURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -446,19 +880,69 @@ func (s *OpenAIGatewayService) dialLiveSideband(ctx context.Context, record *Liv
 	if account == nil || !account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityLive) {
 		return nil, ErrLiveUnavailable
 	}
+	_, poolMode, egressErr := liveCallEgressRef(record)
+	if egressErr != nil {
+		return nil, egressErr
+	}
+	var releaseEgressUse func()
+	if poolMode {
+		lease, leaseErr := s.ensureLiveEgressLease(record)
+		if leaseErr != nil {
+			return nil, leaseErr
+		}
+		releaseEgressUse, leaseErr = lease.AcquireUse()
+		if leaseErr != nil {
+			return nil, leaseErr
+		}
+		resolved := &ResolvedAccountEgress{
+			BindingID:         record.EgressBindingID,
+			RouteID:           record.EgressRouteID,
+			IdentityID:        record.EgressIdentityID,
+			Lease:             lease,
+			ConfigVersion:     record.EgressConfigVersion,
+			AuthorityRevision: record.EgressAuthorityRevision,
+		}
+		account, err = WithResolvedAccountEgress(account, resolved)
+		if err != nil {
+			releaseEgressUse()
+			return nil, ErrLiveUnavailable
+		}
+		ctx = ContextWithSelectedAccountEgress(ctx, account)
+	} else {
+		var legacyMode bool
+		account, legacyMode, err = withLiveLegacyEgressAdmission(account, record)
+		if err != nil {
+			return nil, err
+		}
+		if legacyMode {
+			ctx = ContextWithSelectedAccountEgress(ctx, account)
+		}
+	}
 	headers, err := s.liveSidebandHeaders(ctx, account, record)
 	if err != nil {
+		if releaseEgressUse != nil {
+			releaseEgressUse()
+		}
 		return nil, err
 	}
 	target := strings.TrimRight(chatGPTLiveSidebandBaseURL, "/") + "/" + url.PathEscape(record.CallID)
 	conn, status, _, err := s.getOpenAIWSPassthroughDialer().Dial(ctx, target, headers, resolveAccountProxyURL(account))
 	if err != nil {
+		if releaseEgressUse != nil {
+			releaseEgressUse()
+		}
 		return nil, fmt.Errorf("dial live sideband (status %d): %w", status, err)
 	}
 	raw, ok := conn.(liveFrameConn)
 	if !ok {
 		_ = conn.Close()
+		if releaseEgressUse != nil {
+			releaseEgressUse()
+		}
 		return nil, errors.New("live sideband transport does not support raw frames")
+	}
+	if releaseEgressUse != nil {
+		return &liveEgressUseConn{liveFrameConn: raw, release: releaseEgressUse}, nil
 	}
 	return raw, nil
 }
@@ -499,22 +983,57 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 	}
 	store, err := s.liveStore()
 	if err != nil {
+		s.abandonUnownedLiveEgressLease(record)
 		return err
 	}
 	owner := uuid.NewString()
 	claimed, err := store.ClaimLiveController(ctx, record.CallHash, LiveControllerProxy, owner)
 	if err != nil {
+		s.abandonUnownedLiveEgressLease(record)
 		return err
 	}
 	if !claimed {
+		s.abandonUnownedLiveEgressLease(record)
 		return ErrLiveControllerChanged
+	}
+	_, poolMode, egressErr := liveCallEgressRef(record)
+	if egressErr != nil {
+		_, _ = store.ReleaseLiveController(context.Background(), record.CallHash, owner)
+		s.finalizeLiveCall(record)
+		return egressErr
+	}
+	if poolMode {
+		if ownerErr := s.activateLiveEgressOwner(record, owner); ownerErr != nil {
+			_, _ = store.ReleaseLiveController(context.Background(), record.CallHash, owner)
+			s.finalizeLiveCall(record)
+			return ownerErr
+		}
+		defer s.releaseLiveEgressOwner(record, owner)
 	}
 
 	// observer 轮询到接管状态后会关闭旧控制连接；同一个 call 可重新加入。
-	time.Sleep(liveObserverPollInterval)
+	pollTimer := time.NewTimer(liveObserverPollInterval)
+	select {
+	case <-ctx.Done():
+		if !pollTimer.Stop() {
+			<-pollTimer.C
+		}
+		return context.Cause(ctx)
+	case <-liveEgressLeaseDone(record):
+		if !pollTimer.Stop() {
+			<-pollTimer.C
+		}
+		s.finalizeLiveCall(record)
+		return liveEgressLeaseCause(record)
+	case <-pollTimer.C:
+	}
 	upstream, err := s.dialLiveSideband(ctx, record)
 	if err != nil {
 		_, _ = store.ReleaseLiveController(context.Background(), record.CallHash, owner)
+		if liveSessionEnded(err) {
+			s.finalizeLiveCall(record)
+			return err
+		}
 		go s.observeLiveCall(record)
 		return err
 	}
@@ -578,6 +1097,8 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 func liveSessionEnded(err error) bool {
 	return errors.Is(err, ErrLiveCallNotFound) ||
 		errors.Is(err, ErrLiveUnavailable) ||
+		errors.Is(err, ErrAccountEgressLeaseFenced) ||
+		errors.Is(err, ErrAccountEgressLeaseLost) ||
 		errors.Is(err, context.DeadlineExceeded)
 }
 
@@ -595,6 +1116,8 @@ func (s *OpenAIGatewayService) runLiveController(
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
+		case <-liveEgressLeaseDone(record):
+			return liveEgressLeaseCause(record)
 		case err := <-errCh:
 			return err
 		case <-maxTimer.C:
@@ -616,11 +1139,13 @@ func (s *OpenAIGatewayService) observeLiveCall(record *LiveCallRecord) {
 	}
 	store, err := s.liveStore()
 	if err != nil {
+		s.abandonUnownedLiveEgressLease(record)
 		return
 	}
 	owner := uuid.NewString()
 	claimed, claimErr := store.ClaimLiveController(context.Background(), record.CallHash, LiveControllerObserver, owner)
 	if claimErr != nil {
+		s.abandonUnownedLiveEgressLease(record)
 		// store 报错时无法确认控制权归属，不能静默退出：若 claim 实际已生效而
 		// observer 消失，租约与 usage log 都会丢。兜底 finalize 是幂等的，即使
 		// 控制权在他人手上也只会在到期后落一次库。
@@ -628,7 +1153,22 @@ func (s *OpenAIGatewayService) observeLiveCall(record *LiveCallRecord) {
 		return
 	}
 	if !claimed {
+		s.abandonUnownedLiveEgressLease(record)
 		return
+	}
+	_, poolMode, egressErr := liveCallEgressRef(record)
+	if egressErr != nil {
+		_, _ = store.ReleaseLiveController(context.Background(), record.CallHash, owner)
+		s.finalizeLiveCall(record)
+		return
+	}
+	if poolMode {
+		if ownerErr := s.activateLiveEgressOwner(record, owner); ownerErr != nil {
+			_, _ = store.ReleaseLiveController(context.Background(), record.CallHash, owner)
+			s.finalizeLiveCall(record)
+			return
+		}
+		defer s.releaseLiveEgressOwner(record, owner)
 	}
 	storeErrStreak := 0
 	for {
@@ -645,7 +1185,16 @@ func (s *OpenAIGatewayService) observeLiveCall(record *LiveCallRecord) {
 				s.finalizeLiveCallAfterExpiry(record)
 				return
 			}
-			time.Sleep(liveObserverStoreRetryInterval)
+			retryTimer := time.NewTimer(liveObserverStoreRetryInterval)
+			select {
+			case <-retryTimer.C:
+			case <-liveEgressLeaseDone(record):
+				if !retryTimer.Stop() {
+					<-retryTimer.C
+				}
+				s.finalizeLiveCall(record)
+				return
+			}
 			continue
 		}
 		storeErrStreak = 0
@@ -659,6 +1208,10 @@ func (s *OpenAIGatewayService) observeLiveCall(record *LiveCallRecord) {
 		}
 		upstream, dialErr := s.dialLiveSideband(context.Background(), record)
 		if dialErr != nil {
+			if liveSessionEnded(dialErr) {
+				s.finalizeLiveCall(record)
+				return
+			}
 			if !s.waitForLiveObserverRetry(record) {
 				return
 			}
@@ -719,6 +1272,8 @@ func (s *OpenAIGatewayService) runLiveObserverConnection(record *LiveCallRecord,
 			}
 		case err := <-errCh:
 			return err
+		case <-liveEgressLeaseDone(record):
+			return liveEgressLeaseCause(record)
 		case <-controllerTicker.C:
 			controller, err := store.GetLiveController(context.Background(), record.CallHash)
 			if err != nil {
@@ -743,7 +1298,12 @@ func (s *OpenAIGatewayService) runLiveObserverConnection(record *LiveCallRecord,
 func (s *OpenAIGatewayService) waitForLiveObserverRetry(record *LiveCallRecord) bool {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
-	<-timer.C
+	select {
+	case <-timer.C:
+	case <-liveEgressLeaseDone(record):
+		s.finalizeLiveCall(record)
+		return false
+	}
 	store, err := s.liveStore()
 	if err != nil {
 		return false
@@ -768,36 +1328,177 @@ func (s *OpenAIGatewayService) finalizeLiveCallAfterExpiry(record *LiveCallRecor
 		return
 	}
 	if wait := time.Until(record.ExpiresAt); wait > 0 {
-		time.Sleep(wait)
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-liveEgressLeaseDone(record):
+			if !timer.Stop() {
+				<-timer.C
+			}
+		}
 	}
 	s.finalizeLiveCall(record)
 }
 
 func (s *OpenAIGatewayService) refreshLiveLease(record *LiveCallRecord) bool {
-	cache, err := s.liveConcurrencyCache()
+	legacyAdmission, legacyMode, legacyErr := liveCallLegacyEgressAdmission(record)
+	if legacyErr != nil {
+		return false
+	}
+	if legacyMode {
+		cache, cacheErr := s.liveLegacyEgressConcurrencyCache()
+		if cacheErr != nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+		refreshed, refreshErr := cache.RefreshLiveLeaseForLegacyEgress(
+			ctx,
+			record.AccountID,
+			record.UserID,
+			record.APIKeyID,
+			record.LeaseID,
+			legacyAdmission.IdentityID,
+		)
+		cancel()
+		return refreshErr == nil && refreshed
+	}
+
+	ref, poolMode, err := liveCallEgressRef(record)
 	if err != nil {
 		return false
 	}
+	if poolMode {
+		lease, leaseErr := s.ensureLiveEgressLease(record)
+		if leaseErr != nil || !accountEgressLeaseMatchesRef(lease, ref) {
+			return false
+		}
+		egressCtx, egressCancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+		egressErr := lease.RefreshWithinSafetyWindow(egressCtx)
+		egressCancel()
+		if egressErr != nil {
+			return false
+		}
+		cache, cacheErr := s.liveEgressConcurrencyCache()
+		if cacheErr != nil {
+			return false
+		}
+		liveCtx, liveCancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+		refreshed, refreshErr := cache.RefreshLiveLeaseForEgress(
+			liveCtx,
+			ref,
+			record.UserID,
+			record.APIKeyID,
+			record.LeaseID,
+		)
+		liveCancel()
+		if refreshErr == nil && refreshed {
+			s.markLiveEgressLeaseConfirmed(record, lease)
+			return true
+		}
+		if refreshErr != nil {
+			return s.liveEgressLeaseInsideSafetyWindow(record, lease)
+		}
+		return false
+	}
+
+	cache, cacheErr := s.liveConcurrencyCache()
+	if cacheErr != nil {
+		return false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
-	defer cancel()
-	refreshed, err := cache.RefreshLiveLease(ctx, record.AccountID, record.UserID, record.APIKeyID, record.LeaseID)
-	return err == nil && refreshed
+	refreshed, refreshErr := cache.RefreshLiveLease(ctx, record.AccountID, record.UserID, record.APIKeyID, record.LeaseID)
+	cancel()
+	return refreshErr == nil && refreshed
 }
 
-func (s *OpenAIGatewayService) releaseLiveLease(accountID, userID, apiKeyID int64, leaseID string) {
+func (s *OpenAIGatewayService) releaseLiveConcurrencyLease(record *LiveCallRecord) {
+	if record == nil {
+		return
+	}
+	legacyAdmission, legacyMode, legacyErr := liveCallLegacyEgressAdmission(record)
+	if legacyErr != nil {
+		return
+	}
+	if legacyMode {
+		if cache, err := s.liveLegacyEgressConcurrencyCache(); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+			_ = cache.ReleaseLiveLeaseForLegacyEgress(
+				ctx,
+				record.AccountID,
+				record.UserID,
+				record.APIKeyID,
+				record.LeaseID,
+				legacyAdmission.IdentityID,
+			)
+			cancel()
+		}
+		return
+	}
+	ref, poolMode, refErr := liveCallEgressRef(record)
+	if refErr == nil && poolMode {
+		if cache, err := s.liveEgressConcurrencyCache(); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+			_ = cache.ReleaseLiveLeaseForEgress(ctx, ref, record.UserID, record.APIKeyID, record.LeaseID)
+			cancel()
+			return
+		}
+	}
 	cache, err := s.liveConcurrencyCache()
 	if err != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
-	defer cancel()
-	_ = cache.ReleaseLiveLease(ctx, accountID, userID, apiKeyID, leaseID)
+	_ = cache.ReleaseLiveLease(ctx, record.AccountID, record.UserID, record.APIKeyID, record.LeaseID)
+	cancel()
+}
+
+func (s *OpenAIGatewayService) releaseLiveEgressLease(record *LiveCallRecord) {
+	if record == nil || s == nil {
+		return
+	}
+	var lease *AccountEgressLease
+	s.liveEgressLeaseMu.Lock()
+	if state := s.liveEgressLeases[record.CallHash]; state != nil {
+		lease = state.lease
+		delete(s.liveEgressLeases, record.CallHash)
+	}
+	if lease == nil {
+		lease = record.EgressLease
+	}
+	record.EgressLease = nil
+	s.liveEgressLeaseMu.Unlock()
+	if lease != nil {
+		lease.Release()
+		return
+	}
+
+	ref, poolMode, err := liveCallEgressRef(record)
+	if err != nil || !poolMode {
+		return
+	}
+	if s.concurrencyService == nil || s.concurrencyService.accountEgressAllocator == nil ||
+		s.concurrencyService.accountEgressAllocator.cache == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), liveRedisOperationTimeout)
+	_ = s.concurrencyService.accountEgressAllocator.cache.ReleaseAccountEgressLease(ctx, ref)
+	cancel()
+}
+
+func (s *OpenAIGatewayService) releaseLiveCallLeases(record *LiveCallRecord) {
+	s.releaseLiveConcurrencyLease(record)
+	s.releaseLiveEgressLease(record)
 }
 
 func (s *OpenAIGatewayService) finalizeLiveCall(record *LiveCallRecord) {
 	if record == nil {
 		return
 	}
+	// Resource cleanup is independent from the closed-record idempotency gate.
+	// Even when Redis applied MarkLiveCallClosed but its response was lost, this
+	// process must stop renewing and make both releases; all Redis removals are
+	// exact-ID and idempotent.
+	s.releaseLiveCallLeases(record)
 	store, err := s.liveStore()
 	if err != nil {
 		return
@@ -808,7 +1509,6 @@ func (s *OpenAIGatewayService) finalizeLiveCall(record *LiveCallRecord) {
 	if err != nil || !first {
 		return
 	}
-	s.releaseLiveLease(record.AccountID, record.UserID, record.APIKeyID, record.LeaseID)
 	if s.usageLogRepo == nil {
 		return
 	}

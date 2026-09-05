@@ -396,6 +396,10 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		if cause == nil {
 			cause = ErrOpenAIUpstreamStreamTruncated
 		}
+		// A raw CC stream can fail before the Responses passthrough handler
+		// sees it. Feed the same request-local egress into the proxy circuit so
+		// repeated failures on one pool route are quarantined consistently.
+		s.recordOpenAIProxyStreamDisconnect(account, cause, requestID)
 		logger.L().Warn("openai chat_completions raw: upstream stream truncated before terminal chunk",
 			zap.Error(cause),
 			zap.String("request_id", requestID),

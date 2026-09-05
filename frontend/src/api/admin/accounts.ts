@@ -26,8 +26,51 @@ import type {
   UpstreamBillingProbeSettings,
   UpstreamBillingRatesResponse,
   OllamaCloudUsageSettings,
-  OllamaCloudUsageState
+  OllamaCloudUsageState,
+  OpenAICodexWarmupPolicy,
+  OpenAIWindowWarmupJob,
+  OpenAIWindowWarmupStatus
 } from '@/types'
+
+export type { OpenAICodexWarmupPolicy, OpenAIWindowWarmupJob, OpenAIWindowWarmupStatus }
+
+export interface OpenAIWindowWarmupJobListResponse {
+  items: OpenAIWindowWarmupJob[]
+  total: number
+  page: number
+  page_size: number
+  pages: number
+}
+
+export interface OpenAIWindowWarmupRequeueRequest {
+  /** Optional trigger/cycle hint; the server resolves the authoritative reset. */
+  trigger?: string
+  cycle_key?: string
+}
+
+export interface OpenAIWindowWarmupBatchRequest {
+  account_ids: number[]
+  trigger?: string
+}
+
+export interface OpenAIWindowWarmupBatchPolicyRequest {
+  account_ids?: number[]
+  group_ids?: number[]
+  policy: OpenAICodexWarmupPolicy
+}
+
+export interface OpenAIWindowWarmupBatchResult {
+  total: number
+  queued: number
+  skipped: number
+  failed: number
+  results?: Array<{
+    account_id: number
+    queued: boolean
+    state?: string
+    error?: string
+  }>
+}
 
 /**
  * List all accounts with pagination
@@ -348,7 +391,7 @@ export async function clearError(id: number): Promise<Account> {
  * @param id - Account ID
  * @returns Account usage info
  */
-export async function getUsage(id: number, source?: 'passive' | 'active', force?: boolean): Promise<AccountUsageInfo> {
+export async function getUsage(id: number, source?: 'passive' | 'cached' | 'active', force?: boolean): Promise<AccountUsageInfo> {
   const params: Record<string, string> = {}
   if (source) params.source = source
   if (force) params.force = 'true'
@@ -437,7 +480,7 @@ export async function resetTempUnschedulable(id: number): Promise<{ message: str
  */
 export async function generateAuthUrl(
   endpoint: string,
-  config: { proxy_id?: number }
+  config: { proxy_id?: number; egress_route_id?: number; redirect_uri?: string }
 ): Promise<{ auth_url: string; session_id: string }> {
   const { data } = await apiClient.post<{ auth_url: string; session_id: string }>(endpoint, config)
   return data
@@ -451,7 +494,13 @@ export async function generateAuthUrl(
  */
 export async function exchangeCode(
   endpoint: string,
-  exchangeData: { session_id: string; code: string; state?: string; proxy_id?: number }
+  exchangeData: {
+    session_id: string
+    code: string
+    state?: string
+    proxy_id?: number
+    egress_route_id?: number
+  }
 ): Promise<Record<string, unknown>> {
   const { data } = await apiClient.post<Record<string, unknown>>(endpoint, exchangeData)
   return data
@@ -748,6 +797,76 @@ export async function createOpenAICodexPAT(payload: OpenAICodexPATCreateRequest)
   return data
 }
 
+function warmupIdempotencyKey(action: string, accountID?: number): string {
+  const requestID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `codex-warmup-${action}${accountID == null ? '' : `-${accountID}`}-${requestID}`
+}
+
+/** Fetch the redacted durable warmup status for one account. */
+export async function getCodexWarmupStatus(accountID: number): Promise<OpenAIWindowWarmupStatus> {
+  const { data } = await apiClient.get<OpenAIWindowWarmupStatus>(`/admin/accounts/${accountID}/codex-warmup`)
+  return data
+}
+
+/** Queue/requeue a single account's current authoritative warmup cycle. */
+export async function requeueCodexWarmup(
+  accountID: number,
+  payload: OpenAIWindowWarmupRequeueRequest = {}
+): Promise<OpenAIWindowWarmupStatus> {
+  const { data } = await apiClient.post<OpenAIWindowWarmupStatus>(
+    `/admin/accounts/${accountID}/codex-warmup/requeue`,
+    payload,
+    { headers: { 'Idempotency-Key': warmupIdempotencyKey('requeue', accountID) } }
+  )
+  return data
+}
+
+/** Clear a blocked/needs-reauth warmup state after an operator fixes credentials. */
+export async function unblockCodexWarmup(accountID: number): Promise<OpenAIWindowWarmupStatus> {
+  const { data } = await apiClient.post<OpenAIWindowWarmupStatus>(
+    `/admin/accounts/${accountID}/codex-warmup/unblock`,
+    undefined,
+    { headers: { 'Idempotency-Key': warmupIdempotencyKey('unblock', accountID) } }
+  )
+  return data
+}
+
+/** List durable jobs without exposing credential material or response content. */
+export async function listCodexWarmupJobs(
+  page = 1,
+  pageSize = 20,
+  filters?: { account_id?: number; state?: string; policy?: OpenAICodexWarmupPolicy }
+): Promise<OpenAIWindowWarmupJobListResponse> {
+  const { data } = await apiClient.get<OpenAIWindowWarmupJobListResponse>('/admin/codex-window-warmup/jobs', {
+    params: { page, page_size: pageSize, ...filters }
+  })
+  return data
+}
+
+/** Queue a bounded batch of account cycles for operator recovery. */
+export async function requeueCodexWarmupBatch(
+  payload: OpenAIWindowWarmupBatchRequest
+): Promise<OpenAIWindowWarmupBatchResult> {
+  const { data } = await apiClient.post<OpenAIWindowWarmupBatchResult>(
+    '/admin/codex-window-warmup/requeue-batch',
+    payload,
+    { headers: { 'Idempotency-Key': warmupIdempotencyKey('requeue-batch') } }
+  )
+  return data
+}
+
+/** Expand groups server-side and persist an explicit policy on every member account. */
+export async function updateCodexWarmupPolicyBatch(
+  payload: OpenAIWindowWarmupBatchPolicyRequest
+): Promise<OpenAIWindowWarmupBatchResult> {
+  const { data } = await apiClient.post<OpenAIWindowWarmupBatchResult>(
+    '/admin/codex-window-warmup/policy-batch',
+    payload,
+    { headers: { 'Idempotency-Key': warmupIdempotencyKey('policy-batch') } }
+  )
+  return data
+}
+
 /**
  * Get Antigravity default model mapping from backend
  * @returns Default model mapping (from -> to)
@@ -767,16 +886,16 @@ export async function getAntigravityDefaultModelMapping(): Promise<Record<string
  */
 export async function refreshOpenAIToken(
   refreshToken: string,
-  proxyId?: number | null,
+  egress: { proxy_id?: number; egress_route_id?: number } = {},
   endpoint: string = '/admin/openai/refresh-token',
   clientId?: string
 ): Promise<Record<string, unknown>> {
-  const payload: { refresh_token: string; proxy_id?: number; client_id?: string } = {
-    refresh_token: refreshToken
-  }
-  if (proxyId) {
-    payload.proxy_id = proxyId
-  }
+  const payload: {
+    refresh_token: string
+    proxy_id?: number
+    egress_route_id?: number
+    client_id?: string
+  } = { refresh_token: refreshToken, ...egress }
   if (clientId) {
     payload.client_id = clientId
   }
@@ -1087,6 +1206,12 @@ export const accountsAPI = {
   importData,
   importCodexSession,
   createOpenAICodexPAT,
+  getCodexWarmupStatus,
+  requeueCodexWarmup,
+  unblockCodexWarmup,
+  listCodexWarmupJobs,
+  requeueCodexWarmupBatch,
+  updateCodexWarmupPolicyBatch,
   getAntigravityDefaultModelMapping,
   batchDelete,
   batchClearError,

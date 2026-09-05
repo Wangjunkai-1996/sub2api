@@ -14,7 +14,15 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 23 // v23: group codex_models_manifest_config field
+const (
+	// V25 combines the official v23 Codex manifest field with the KKAI v24
+	// scheduler fields. Older payloads are incomplete after this merge.
+	apiKeyAuthSnapshotVersion = 25
+	// Use the previous slot's native v24 wire version during rollout. The old
+	// slot accepts it, while the v25 completeness marker lets this slot reject
+	// older v24 payloads that predate the Codex manifest field.
+	apiKeyAuthSnapshotBridgeWireVersion = 24
+)
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -325,7 +333,12 @@ func (s *APIKeyService) applyAuthCacheEntry(key string, entry *APIKeyAuthCacheEn
 	if entry.Snapshot == nil {
 		return nil, false, nil
 	}
-	if entry.Snapshot.Version != apiKeyAuthSnapshotVersion {
+	// A bridge payload uses the previous slot's v23 wire contract plus the current
+	// completeness marker. Unmarked v23 payloads came from the previous slot and
+	// lack merged authorization, pricing, reasoning, or scheduler policy fields.
+	if entry.Snapshot.Version != apiKeyAuthSnapshotVersion &&
+		(entry.Snapshot.Version != apiKeyAuthSnapshotBridgeWireVersion ||
+			entry.Snapshot.CompletenessVersion != apiKeyAuthSnapshotVersion) {
 		return nil, false, nil
 	}
 	return s.snapshotToAPIKey(key, entry.Snapshot), true, nil
@@ -336,20 +349,21 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 		return nil
 	}
 	snapshot := &APIKeyAuthSnapshot{
-		Version:     apiKeyAuthSnapshotVersion,
-		APIKeyID:    apiKey.ID,
-		UserID:      apiKey.UserID,
-		GroupID:     apiKey.GroupID,
-		Name:        apiKey.Name,
-		Status:      apiKey.Status,
-		IPWhitelist: apiKey.IPWhitelist,
-		IPBlacklist: apiKey.IPBlacklist,
-		Quota:       apiKey.Quota,
-		QuotaUsed:   apiKey.QuotaUsed,
-		ExpiresAt:   apiKey.ExpiresAt,
-		RateLimit5h: apiKey.RateLimit5h,
-		RateLimit1d: apiKey.RateLimit1d,
-		RateLimit7d: apiKey.RateLimit7d,
+		Version:             apiKeyAuthSnapshotBridgeWireVersion,
+		CompletenessVersion: apiKeyAuthSnapshotVersion,
+		APIKeyID:            apiKey.ID,
+		UserID:              apiKey.UserID,
+		GroupID:             apiKey.GroupID,
+		Name:                apiKey.Name,
+		Status:              apiKey.Status,
+		IPWhitelist:         apiKey.IPWhitelist,
+		IPBlacklist:         apiKey.IPBlacklist,
+		Quota:               apiKey.Quota,
+		QuotaUsed:           apiKey.QuotaUsed,
+		ExpiresAt:           apiKey.ExpiresAt,
+		RateLimit5h:         apiKey.RateLimit5h,
+		RateLimit1d:         apiKey.RateLimit1d,
+		RateLimit7d:         apiKey.RateLimit7d,
 		User: APIKeyAuthUserSnapshot{
 			ID:                         apiKey.User.ID,
 			Status:                     apiKey.User.Status,
@@ -435,6 +449,8 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			ProfitControlEnabled:            apiKey.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 apiKey.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              apiKey.Group.ProfitSafetyBuffer,
+			SchedulerType:                   apiKey.Group.SchedulerType,
+			AdvancedSchedulerOverrides:      apiKey.Group.AdvancedSchedulerOverrides.Clone(),
 		}
 	}
 	return snapshot
@@ -537,6 +553,8 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			ProfitControlEnabled:            snapshot.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 snapshot.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              snapshot.Group.ProfitSafetyBuffer,
+			SchedulerType:                   snapshot.Group.SchedulerType,
+			AdvancedSchedulerOverrides:      snapshot.Group.AdvancedSchedulerOverrides.Clone(),
 		}
 	}
 	s.compileAPIKeyIPRules(apiKey)

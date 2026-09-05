@@ -454,9 +454,9 @@ func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
 }
 
 // opsUpstreamProxyAttribution derives both attribution fields from one
-// decision so they can never disagree. The event is assembled at the failure
-// site; forwarding code builds managed proxy routes from Proxy only when the
-// binding ID is also set, so the same rule decides the label here:
+// decision so they can never disagree. Pool requests use the request-local
+// SelectedEgress route, which may differ from the account's durable primary
+// ProxyID; attribution must follow that admitted route.
 //
 //   - nil account                     -> (nil, unknown)
 //   - no binding or no hydrated Proxy -> (nil, direct/no_proxy)
@@ -469,14 +469,30 @@ func opsUpstreamProxyAttribution(account *Account) (*int64, string) {
 	if account == nil {
 		return nil, opsProxyNameUnknown
 	}
-	if account.ProxyID == nil || account.Proxy == nil {
-		return nil, opsProxyNameDirect
-	}
-	if account.Proxy.ID <= 0 {
+	proxyID, proxy, ok := openAIEffectiveProxyAttribution(account)
+	if !ok {
+		if account.SelectedEgress != nil {
+			if binding := findAccountEgressBinding(account, account.SelectedEgress); binding != nil &&
+				binding.Route != nil && binding.Route.Kind == EgressRouteKindDirect {
+				return nil, opsProxyNameDirect
+			}
+			return nil, opsProxyNameUnknown
+		}
+		if admission := account.LegacyEgressAdmission; admission != nil {
+			if admission.RouteKind == EgressRouteKindDirect {
+				return nil, opsProxyNameDirect
+			}
+			return nil, opsProxyNameUnknown
+		}
+		if account.ProxyID == nil || account.Proxy == nil {
+			return nil, opsProxyNameDirect
+		}
 		return nil, opsProxyNameUnknown
 	}
-	proxyID := account.Proxy.ID
-	name := strings.TrimSpace(account.Proxy.Name)
+	name := ""
+	if proxy != nil {
+		name = strings.TrimSpace(proxy.Name)
+	}
 	if name == "" {
 		name = opsProxyNameUnnamed
 	}

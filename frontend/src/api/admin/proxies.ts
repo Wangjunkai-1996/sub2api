@@ -12,7 +12,8 @@ import type {
   UpdateProxyRequest,
   PaginatedResponse,
   AdminDataPayload,
-  AdminDataImportResult
+  AdminDataImportResult,
+  ProxyOption
 } from '@/types'
 
 /**
@@ -53,6 +54,12 @@ export async function list(
  */
 export async function getAll(): Promise<Proxy[]> {
   const { data } = await apiClient.get<Proxy[]>('/admin/proxies/all')
+  return data
+}
+
+/** Credential-free proxy options for assignment controls. */
+export async function getOptions(): Promise<ProxyOption[]> {
+  const { data } = await apiClient.get<ProxyOption[]>('/admin/proxies/options')
   return data
 }
 
@@ -258,6 +265,7 @@ export async function importData(payload: {
 export const proxiesAPI = {
   list,
   getAll,
+  getOptions,
   getAllWithCount,
   getById,
   create,

@@ -539,6 +539,34 @@ func logOpenAIWSBindResponseAccountWarn(groupID, accountID int64, responseID str
 	)
 }
 
+func logOpenAIWSBindResponseEgressWarn(groupID, accountID int64, responseID, bindingID string, err error) {
+	if err == nil {
+		return
+	}
+	logger.L().Warn(
+		"openai.ws_bind_response_egress_failed",
+		zap.Int64("group_id", groupID),
+		zap.Int64("account_id", accountID),
+		zap.String("response_id", truncateOpenAIWSLogValue(responseID, openAIWSIDValueMaxLen)),
+		zap.String("binding_id", bindingID),
+		zap.Error(err),
+	)
+}
+
+func logOpenAIWSBindSessionEgressWarn(groupID, accountID int64, sessionHash, bindingID string, err error) {
+	if err == nil {
+		return
+	}
+	logger.L().Warn(
+		"openai.ws_bind_session_egress_failed",
+		zap.Int64("group_id", groupID),
+		zap.Int64("account_id", accountID),
+		zap.String("session_hash", truncateOpenAIWSLogValue(sessionHash, 12)),
+		zap.String("binding_id", bindingID),
+		zap.Error(err),
+	)
+}
+
 func summarizeOpenAIWSReadCloseError(err error) (status string, reason string) {
 	if err == nil {
 		return "-", "-"

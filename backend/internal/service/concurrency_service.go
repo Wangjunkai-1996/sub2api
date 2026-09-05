@@ -51,8 +51,48 @@ type ConcurrencyCache interface {
 	CleanupExpiredAccountSlots(ctx context.Context, accountID int64) error
 	CleanupExpiredAccountSlotKeys(ctx context.Context) error
 
-	// 启动时清理旧进程遗留槽位与等待计数
+	// 保留用于兼容旧调用方；实现不得清理其他进程槽位或共享等待计数
 	CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error
+}
+
+// AccountExclusiveSlotCache is an optional cache capability used by low-priority
+// maintenance traffic. Ordinary requests must fail fast while the exclusive
+// lease exists; they never wait on the lease itself.
+type AccountExclusiveSlotCache interface {
+	AcquireAccountExclusive(context.Context, int64, string, time.Duration) (bool, error)
+	RefreshAccountExclusive(context.Context, int64, string, time.Duration) (bool, error)
+	ReleaseAccountExclusive(context.Context, int64, string) (bool, error)
+}
+
+// AccountUnboundedSlotCache keeps an otherwise-unlimited account aware of the
+// warmup maintenance gate without imposing a numerical concurrency limit.
+type AccountUnboundedSlotCache interface {
+	AcquireUnboundedAccountSlot(context.Context, int64, string) (bool, error)
+}
+
+// AccountEgressLegacySlotCache mirrors a rollout-off regular admission into
+// the exact public identity selected at admission time. It is optional so
+// caches used by tests and non-OpenAI paths preserve their legacy contract.
+type AccountEgressLegacySlotCache interface {
+	AcquireAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		maxConcurrency int,
+		requestID string,
+		identityID string,
+	) (bool, error)
+	RefreshAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		requestID string,
+		identityID string,
+	) (bool, error)
+	ReleaseAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		requestID string,
+		identityID string,
+	) error
 }
 
 type APIKeyConcurrencyCache interface {
@@ -229,7 +269,8 @@ const (
 
 // ConcurrencyService 管理账号和用户的并发限制。
 type ConcurrencyService struct {
-	cache ConcurrencyCache
+	cache                  ConcurrencyCache
+	accountEgressAllocator *AccountEgressAllocator
 
 	accountLoadCacheTTL atomic.Int64
 	accountLoadCacheMu  sync.RWMutex
@@ -243,10 +284,13 @@ type cachedAccountLoadBatch struct {
 }
 
 // NewConcurrencyService 创建并发控制服务。
-func NewConcurrencyService(cache ConcurrencyCache) *ConcurrencyService {
+func NewConcurrencyService(cache ConcurrencyCache, authorityReaders ...AccountEgressAuthorityReader) *ConcurrencyService {
 	svc := &ConcurrencyService{
 		cache:            cache,
 		accountLoadCache: make(map[string]cachedAccountLoadBatch),
+	}
+	if egressCache, ok := cache.(AccountEgressCache); ok {
+		svc.accountEgressAllocator = NewAccountEgressAllocator(egressCache, authorityReaders...)
 	}
 	svc.SetAccountLoadBatchCacheTTL(defaultAccountLoadBatchCacheTTL)
 	return svc
@@ -308,8 +352,67 @@ func (s *ConcurrencyService) SetAccountLoadBatchCacheTTL(ttl time.Duration) {
 
 // AcquireResult represents the result of acquiring a concurrency slot
 type AcquireResult struct {
-	Acquired    bool
-	ReleaseFunc func() // Must be called when done (typically via defer)
+	Acquired              bool
+	ReleaseFunc           func() // Must be called when done (typically via defer)
+	Account               *Account
+	Egress                *ResolvedAccountEgress
+	LegacyEgressAdmission *LegacyAccountEgressAdmission
+}
+
+// AccountExclusiveLease reserves an idle account for a short maintenance
+// request. Release is idempotent and uses a fencing token in the cache.
+type AccountExclusiveLease struct {
+	cache     AccountExclusiveSlotCache
+	accountID int64
+	token     string
+	ttl       time.Duration
+	release   sync.Once
+}
+
+func (l *AccountExclusiveLease) Refresh(ctx context.Context) (bool, error) {
+	if l == nil || l.cache == nil || l.accountID <= 0 || l.token == "" {
+		return false, errors.New("account exclusive lease is unavailable")
+	}
+	// The cache also fences refresh against newly arrived business demand, so a
+	// maintenance owner cannot extend its lease ahead of a real request.
+	return l.cache.RefreshAccountExclusive(ctx, l.accountID, l.token, l.ttl)
+}
+
+func (l *AccountExclusiveLease) Release() {
+	if l == nil {
+		return
+	}
+	l.release.Do(func() {
+		if l.cache == nil || l.accountID <= 0 || l.token == "" {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := l.cache.ReleaseAccountExclusive(ctx, l.accountID, l.token); err != nil {
+			logger.LegacyPrintf("service.concurrency", "Warning: failed to release exclusive account lease for %d: %v", l.accountID, err)
+		}
+	})
+}
+
+// TryAcquireAccountExclusive atomically succeeds only when the account has no
+// ordinary/live request and no queued waiter. Unsupported caches fail closed.
+func (s *ConcurrencyService) TryAcquireAccountExclusive(ctx context.Context, accountID int64, ttl time.Duration) (*AccountExclusiveLease, bool, error) {
+	if s == nil || s.cache == nil || accountID <= 0 {
+		return nil, false, errors.New("account exclusive concurrency cache is unavailable")
+	}
+	cache, ok := s.cache.(AccountExclusiveSlotCache)
+	if !ok {
+		return nil, false, errors.New("account exclusive concurrency cache is unsupported")
+	}
+	if ttl <= 0 {
+		ttl = 2 * time.Minute
+	}
+	token := generateRequestID()
+	acquired, err := cache.AcquireAccountExclusive(ctx, accountID, token, ttl)
+	if err != nil || !acquired {
+		return nil, acquired, err
+	}
+	return &AccountExclusiveLease{cache: cache, accountID: accountID, token: token, ttl: ttl}, true, nil
 }
 
 type AccountWithConcurrency struct {
@@ -327,6 +430,8 @@ type AccountLoadInfo struct {
 	CurrentConcurrency int
 	WaitingCount       int
 	LoadRate           int // 0-100+ (percent)
+	EgressStatus       AccountEgressStatus
+	EffectiveCapacity  int
 }
 
 type UserLoadInfo struct {
@@ -342,6 +447,32 @@ type UserLoadInfo struct {
 func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int) (*AcquireResult, error) {
 	// If maxConcurrency is 0 or negative, no limit
 	if maxConcurrency <= 0 {
+		if s != nil && s.cache != nil {
+			if cache, ok := s.cache.(AccountUnboundedSlotCache); ok {
+				requestID := generateRequestID()
+				acquired, err := cache.AcquireUnboundedAccountSlot(ctx, accountID, requestID)
+				if err != nil {
+					// Preserve the historical fail-open contract for unlimited
+					// accounts. A Redis outage also prevents a warmup worker from
+					// acquiring the exclusive lease in the first place.
+					logger.LegacyPrintf("service.concurrency", "Warning: failed to check warmup gate for unlimited account %d: %v", accountID, err)
+					return &AcquireResult{Acquired: true, ReleaseFunc: func() {}}, nil
+				}
+				if !acquired {
+					return &AcquireResult{Acquired: false}, nil
+				}
+				return &AcquireResult{
+					Acquired: true,
+					ReleaseFunc: func() {
+						bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						if err := s.cache.ReleaseAccountSlot(bgCtx, accountID, requestID); err != nil {
+							logger.LegacyPrintf("service.concurrency", "Warning: failed to release unlimited account slot for %d (req=%s): %v", accountID, requestID, err)
+						}
+					},
+				}, nil
+			}
+		}
 		return &AcquireResult{
 			Acquired:    true,
 			ReleaseFunc: func() {}, // no-op
@@ -350,6 +481,41 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 
 	// Generate unique request ID for this slot
 	requestID := generateRequestID()
+	legacyEgressAdmission := legacyAccountEgressAdmissionFromContext(ctx, accountID)
+	if legacyEgressAdmission != nil && s != nil && s.cache != nil {
+		if cache, ok := s.cache.(AccountEgressLegacySlotCache); ok {
+			acquired, err := cache.AcquireAccountSlotForEgress(
+				ctx,
+				accountID,
+				maxConcurrency,
+				requestID,
+				legacyEgressAdmission.IdentityID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !acquired {
+				return &AcquireResult{
+					Acquired:              false,
+					LegacyEgressAdmission: legacyEgressAdmission,
+				}, nil
+			}
+
+			lease := newLegacyAccountEgressLease(
+				legacyEgressAdmission.leaseContext(ctx),
+				cache,
+				accountID,
+				requestID,
+				legacyEgressAdmission.IdentityID,
+			)
+			legacyEgressAdmission.Lease = lease
+			return &AcquireResult{
+				Acquired:              true,
+				ReleaseFunc:           lease.Release,
+				LegacyEgressAdmission: legacyEgressAdmission,
+			}, nil
+		}
+	}
 
 	acquired, err := s.cache.AcquireAccountSlot(ctx, accountID, maxConcurrency, requestID)
 	if err != nil {

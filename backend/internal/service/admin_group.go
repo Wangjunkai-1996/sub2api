@@ -415,6 +415,13 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	if err := ValidateProfitControlConfig(platform, profitControlEnabled, profitMinMargin, profitSafetyBuffer); err != nil {
 		return nil, err
 	}
+	schedulerType, err := NormalizeGroupSchedulerType(input.SchedulerType)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateAdvancedSchedulerOverrides(input.AdvancedSchedulerOverrides); err != nil {
+		return nil, err
+	}
 
 	// 校验降级分组
 	if input.FallbackGroupID != nil {
@@ -502,6 +509,8 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		ProfitControlEnabled:            profitControlEnabled,
 		ProfitMinMargin:                 profitMinMargin,
 		ProfitSafetyBuffer:              profitSafetyBuffer,
+		SchedulerType:                   schedulerType,
+		AdvancedSchedulerOverrides:      input.AdvancedSchedulerOverrides.Clone(),
 		ImagePrice1K:                    imagePrice1K,
 		ImagePrice2K:                    imagePrice2K,
 		ImagePrice4K:                    imagePrice4K,
@@ -693,6 +702,19 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	}
 	if input.Status != "" {
 		group.Status = input.Status
+	}
+	if input.SchedulerType != nil {
+		schedulerType, normalizeErr := NormalizeGroupSchedulerType(*input.SchedulerType)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		group.SchedulerType = schedulerType
+	}
+	if input.AdvancedSchedulerOverrides != nil {
+		if err := ValidateAdvancedSchedulerOverrides(*input.AdvancedSchedulerOverrides); err != nil {
+			return nil, err
+		}
+		group.AdvancedSchedulerOverrides = input.AdvancedSchedulerOverrides.Clone()
 	}
 	if input.LongContextPricingEnabled != nil {
 		group.LongContextPricingEnabled = *input.LongContextPricingEnabled

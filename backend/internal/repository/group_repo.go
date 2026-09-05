@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/group"
@@ -27,6 +28,28 @@ type sqlExecutor interface {
 type groupRepository struct {
 	client *dbent.Client
 	sql    sqlExecutor
+}
+
+func (r *groupRepository) beginGroupLifecycleTransaction(ctx context.Context) (context.Context, *dbent.Client, sqlExecutor, *dbent.Tx, bool, error) {
+	client := clientFromContext(ctx, r.client)
+	if client == nil {
+		return nil, nil, nil, nil, false, errors.New("group lifecycle client is unavailable")
+	}
+	if dbent.TxFromContext(ctx) != nil {
+		return ctx, client, client, nil, false, nil
+	}
+
+	tx, err := client.Tx(ctx)
+	if errors.Is(err, dbent.ErrTxStarted) {
+		// The repository itself was constructed with a transaction-bound client.
+		return ctx, client, client, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, nil, nil, false, err
+	}
+	txCtx := dbent.NewTxContext(ctx, tx)
+	txClient := tx.Client()
+	return txCtx, txClient, txClient, tx, true, nil
 }
 
 func NewGroupRepository(client *dbent.Client, sqlDB *sql.DB) service.GroupRepository {
@@ -57,6 +80,14 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 	if groupIn == nil {
 		return errors.New("group is nil")
 	}
+	schedulerType, err := service.NormalizeGroupSchedulerType(groupIn.SchedulerType)
+	if err != nil {
+		return err
+	}
+	if err := service.ValidateAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides); err != nil {
+		return err
+	}
+	groupIn.SchedulerType = schedulerType
 	modelPricing, err := json.Marshal(groupIn.ModelPricing)
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
@@ -121,7 +152,9 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 		SetPeakRateMultiplier(groupIn.PeakRateMultiplier).
 		SetProfitControlEnabled(groupIn.ProfitControlEnabled).
 		SetProfitMinMargin(groupIn.ProfitMinMargin).
-		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer)
+		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer).
+		SetSchedulerType(groupIn.SchedulerType).
+		SetAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides.Clone())
 	if groupIn.DuplicateOperationID != "" {
 		builder = builder.SetDuplicateOperationID(groupIn.DuplicateOperationID)
 	}
@@ -245,11 +278,33 @@ func (r *groupRepository) GetByIDLite(ctx context.Context, id int64) (*service.G
 }
 
 func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) error {
+	client := clientFromContext(ctx, r.client)
+	if client == nil {
+		return errors.New("group update client is unavailable")
+	}
+	schedulerType, err := service.NormalizeGroupSchedulerType(groupIn.SchedulerType)
+	if err != nil {
+		return err
+	}
+	if err := service.ValidateAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides); err != nil {
+		return err
+	}
+	groupIn.SchedulerType = schedulerType
 	modelPricing, err := json.Marshal(groupIn.ModelPricing)
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
 	}
-	builder := r.client.Group.UpdateOneID(groupIn.ID).
+	updatedAt := time.Now()
+	if minimum := groupIn.UpdatedAt.Add(time.Microsecond); updatedAt.Before(minimum) {
+		// PostgreSQL timestamps have microsecond precision. Ensure every successful
+		// compare-and-set advances the token even under a fast update or clock skew.
+		updatedAt = minimum
+	}
+	builder := client.Group.UpdateOneID(groupIn.ID).
+		// Keep the whole-row write conditional on the snapshot it was built from.
+		// updated_at rejects concurrent ordinary Group updates.
+		Where(group.UpdatedAtEQ(groupIn.UpdatedAt)).
+		SetUpdatedAt(updatedAt).
 		SetName(groupIn.Name).
 		SetDescription(groupIn.Description).
 		SetPlatform(groupIn.Platform).
@@ -301,7 +356,9 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		SetPeakRateMultiplier(groupIn.PeakRateMultiplier).
 		SetProfitControlEnabled(groupIn.ProfitControlEnabled).
 		SetProfitMinMargin(groupIn.ProfitMinMargin).
-		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer)
+		SetProfitSafetyBuffer(groupIn.ProfitSafetyBuffer).
+		SetSchedulerType(groupIn.SchedulerType).
+		SetAdvancedSchedulerOverrides(groupIn.AdvancedSchedulerOverrides.Clone())
 
 	// 显式处理可空字段：nil 需要 clear，非 nil 需要 set。
 	if groupIn.DailyLimitUSD != nil {
@@ -400,22 +457,51 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 
 	updated, err := builder.Save(ctx)
 	if err != nil {
+		if dbent.IsNotFound(err) {
+			// Ent reports a conditional UPDATE with zero affected rows as
+			// NotFoundError. Distinguish deletion from a stale ordinary Group
+			// snapshot for callers and HTTP clients.
+			current, lookupErr := client.Group.Query().
+				Where(group.IDEQ(groupIn.ID)).
+				Select(group.FieldUpdatedAt).
+				Only(ctx)
+			if lookupErr != nil {
+				return translatePersistenceError(lookupErr, service.ErrGroupNotFound, service.ErrGroupExists)
+			}
+			return service.ErrGroupUpdateConflict.WithMetadata(map[string]string{
+				"expected_updated_at": groupIn.UpdatedAt.UTC().Format(time.RFC3339Nano),
+				"actual_updated_at":   current.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			})
+		}
 		return translatePersistenceError(err, service.ErrGroupNotFound, service.ErrGroupExists)
 	}
 	groupIn.UpdatedAt = updated.UpdatedAt
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &groupIn.ID, nil); err != nil {
+	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventGroupChanged, nil, &groupIn.ID, nil); err != nil {
 		logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group update failed: group=%d err=%v", groupIn.ID, err)
 	}
 	return nil
 }
 
 func (r *groupRepository) Delete(ctx context.Context, id int64) error {
-	_, err := r.client.Group.Delete().Where(group.IDEQ(id)).Exec(ctx)
+	txCtx, txClient, exec, tx, ownsTx, err := r.beginGroupLifecycleTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	if ownsTx {
+		defer func() { _ = tx.Rollback() }()
+	}
+
+	_, err = txClient.Group.Delete().Where(group.IDEQ(id)).Exec(txCtx)
 	if err != nil {
 		return translatePersistenceError(err, service.ErrGroupNotFound, nil)
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {
-		logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group delete failed: group=%d err=%v", id, err)
+	if err := enqueueSchedulerOutbox(txCtx, exec, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {
+		return fmt.Errorf("enqueue group delete scheduler event: %w", err)
+	}
+	if ownsTx {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit group delete: %w", err)
+		}
 	}
 	return nil
 }
@@ -807,36 +893,25 @@ func (r *groupRepository) DeleteAccountGroupsByGroupID(ctx context.Context, grou
 }
 
 func (r *groupRepository) DeleteCascade(ctx context.Context, id int64) ([]int64, error) {
-	g, err := r.client.Group.Query().Where(group.IDEQ(id)).Only(ctx)
+	txCtx, txClient, exec, tx, ownsTx, err := r.beginGroupLifecycleTransaction(ctx)
 	if err != nil {
-		return nil, translatePersistenceError(err, service.ErrGroupNotFound, nil)
-	}
-	groupSvc := groupEntityToService(g)
-
-	// 使用 ent 事务统一包裹：避免手工基于 *sql.Tx 构造 ent client 带来的驱动断言问题，
-	// 同时保证级联删除的原子性。
-	tx, err := r.client.Tx(ctx)
-	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
 		return nil, err
 	}
-	exec := r.client
-	txClient := r.client
-	if err == nil {
+	if ownsTx {
 		defer func() { _ = tx.Rollback() }()
-		exec = tx.Client()
-		txClient = exec
 	}
-	// err 为 dbent.ErrTxStarted 时，复用当前 client 参与同一事务。
 
 	// Lock the group row to avoid concurrent writes while we cascade.
-	// 这里使用 exec.QueryContext 手动扫描，确保同一事务内加锁并能区分"未找到"与其他错误。
-	rows, err := exec.QueryContext(ctx, "SELECT id FROM groups WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", id)
+	// Read subscription_type from the locked row so subscription cleanup cannot
+	// use a stale value observed before a concurrent group update committed.
+	rows, err := exec.QueryContext(txCtx, "SELECT id, subscription_type FROM groups WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", id)
 	if err != nil {
 		return nil, err
 	}
 	var lockedID int64
+	var subscriptionType string
 	if rows.Next() {
-		if err := rows.Scan(&lockedID); err != nil {
+		if err := rows.Scan(&lockedID, &subscriptionType); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -852,9 +927,9 @@ func (r *groupRepository) DeleteCascade(ctx context.Context, id int64) ([]int64,
 	}
 
 	var affectedUserIDs []int64
-	if groupSvc.IsSubscriptionType() {
+	if subscriptionType == service.SubscriptionTypeSubscription {
 		// 只查询未软删除的订阅，避免通知已取消订阅的用户
-		rows, err := exec.QueryContext(ctx, "SELECT user_id FROM user_subscriptions WHERE group_id = $1 AND deleted_at IS NULL", id)
+		rows, err := exec.QueryContext(txCtx, "SELECT user_id FROM user_subscriptions WHERE group_id = $1 AND deleted_at IS NULL", id)
 		if err != nil {
 			return nil, err
 		}
@@ -874,41 +949,40 @@ func (r *groupRepository) DeleteCascade(ctx context.Context, id int64) ([]int64,
 		}
 
 		// 软删除订阅：设置 deleted_at 而非硬删除
-		if _, err := exec.ExecContext(ctx, "UPDATE user_subscriptions SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL", id); err != nil {
+		if _, err := exec.ExecContext(txCtx, "UPDATE user_subscriptions SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL", id); err != nil {
 			return nil, err
 		}
 	}
 
 	// 2. Remove the group id from user_allowed_groups join table.
 	// Legacy users.allowed_groups 列已弃用，不再同步。
-	if _, err := exec.ExecContext(ctx, "DELETE FROM user_allowed_groups WHERE group_id = $1", id); err != nil {
+	if _, err := exec.ExecContext(txCtx, "DELETE FROM user_allowed_groups WHERE group_id = $1", id); err != nil {
 		return nil, err
 	}
 
 	// 3. Delete account_groups join rows.
-	if _, err := exec.ExecContext(ctx, "DELETE FROM account_groups WHERE group_id = $1", id); err != nil {
+	if _, err := exec.ExecContext(txCtx, "DELETE FROM account_groups WHERE group_id = $1", id); err != nil {
 		return nil, err
 	}
 
 	// 4. Soft-delete composite model routes owned by this group.
-	if _, err := exec.ExecContext(ctx, "UPDATE composite_model_routes SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL", id); err != nil {
+	if _, err := exec.ExecContext(txCtx, "UPDATE composite_model_routes SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL", id); err != nil {
 		return nil, err
 	}
 
 	// 5. Soft-delete group itself.
-	if _, err := txClient.Group.Delete().Where(group.IDEQ(id)).Exec(ctx); err != nil {
+	if _, err := txClient.Group.Delete().Where(group.IDEQ(id)).Exec(txCtx); err != nil {
 		return nil, err
 	}
+	if err := enqueueSchedulerOutbox(txCtx, exec, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {
+		return nil, fmt.Errorf("enqueue group cascade delete scheduler event: %w", err)
+	}
 
-	if tx != nil {
+	if ownsTx {
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {
-		logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group cascade delete failed: group=%d err=%v", id, err)
-	}
-
 	return affectedUserIDs, nil
 }
 

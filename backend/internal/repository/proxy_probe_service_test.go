@@ -23,6 +23,16 @@ func (s *ProxyProbeServiceSuite) SetupTest() {
 	s.ctx = context.Background()
 	s.prober = &proxyProbeService{
 		allowPrivateHosts: true,
+		configuredProbeURLs: []configuredProbeTarget{
+			{url: "http://ip-api.com/json/?lang=zh-CN", parser: "ip-api"},
+			{url: "http://api64.ipify.org?format=json", parser: "ipify"},
+		},
+	}
+}
+
+func (s *ProxyProbeServiceSuite) TestDefaultProbeURLsUseHTTPS() {
+	for _, probe := range probeURLs {
+		require.True(s.T(), strings.HasPrefix(probe.url, "https://"), probe.url)
 	}
 }
 

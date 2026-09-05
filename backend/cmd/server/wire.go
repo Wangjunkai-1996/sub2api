@@ -25,10 +25,11 @@ import (
 )
 
 type Application struct {
-	Server        *http.Server
-	PromptAudit   *securityaudit.PromptService
-	PluginManager *service.PluginManager
-	Cleanup       func()
+	Server             *http.Server
+	PromptAudit        *securityaudit.PromptService
+	PluginManager      *service.PluginManager
+	OpenAIWindowWarmup *service.OpenAIWindowWarmupService
+	Cleanup            func()
 }
 
 func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
@@ -58,7 +59,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		provideCleanup,
 
 		// Application struct
-		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "Cleanup"),
+		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "OpenAIWindowWarmup", "Cleanup"),
 	)
 	return nil, nil
 }
@@ -94,6 +95,7 @@ func provideCleanup(
 	opsIngressReject *service.OpsIngressRejectAggregator,
 	apiKeyService *service.APIKeyService,
 	authCacheInvalidationWorker *service.AuthCacheInvalidationWorker,
+	egressIdentityVerificationWorker *service.EgressIdentityVerificationWorker,
 	schedulerSnapshot *service.SchedulerSnapshotService,
 	tokenRefresh *service.TokenRefreshService,
 	accountExpiry *service.AccountExpiryService,
@@ -126,6 +128,7 @@ func provideCleanup(
 	ollamaCloudUsage *service.OllamaCloudUsageService,
 	auditLog *service.AuditLogService,
 	openAIAutoReset *service.OpenAIQuotaAutoResetService,
+	openAIWindowWarmup *service.OpenAIWindowWarmupService,
 	promptAudit *securityaudit.PromptService,
 	pluginManager *service.PluginManager,
 ) func() {
@@ -138,8 +141,25 @@ func provideCleanup(
 			fn   func() error
 		}
 
+		// Stop warmup before plugin teardown so an in-flight probe cannot race the
+		// optional OpenAI OAuth transport shutting down.
+		preSteps := []cleanupStep{
+			{"OpenAIWindowWarmupService", func() error {
+				if openAIWindowWarmup != nil {
+					openAIWindowWarmup.Stop()
+				}
+				return nil
+			}},
+		}
+
 		// 应用层清理步骤可并行执行，基础设施资源（Redis/Ent）最后按顺序关闭。
 		parallelSteps := []cleanupStep{
+			{"EgressIdentityVerificationWorker", func() error {
+				if egressIdentityVerificationWorker != nil {
+					egressIdentityVerificationWorker.Stop()
+				}
+				return nil
+			}},
 			{"PluginManager", func() error {
 				if pluginManager != nil {
 					pluginManager.Stop()
@@ -425,6 +445,7 @@ func provideCleanup(
 			}
 		}
 
+		runSequential(preSteps)
 		runParallel(parallelSteps)
 		runSequential(infraSteps)
 

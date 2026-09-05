@@ -60,19 +60,24 @@ func startPassthroughHookRecordingServer(
 	return server, serverErr
 }
 
-// TestPassthroughIngressReportsTurnStartedBeforeAfterTurnWithoutBeforeTurn 钉死
-// ws_v2 透传 ingress 与 handler 侧 turn 定价的耦合：透传 relay 不触发
-// BeforeTurn，但会在每个 AfterTurn 前通过 TurnStarted 报告同一 turn 的开始时刻。
-//
-// handler 的 recordTurnStart 保存该时刻，AfterTurn 再用 currentOr(turnStart)
-// 作为计费 PricingAt；不触发 BeforeTurn 也意味着透传仍没有 turn 级利润复核。
-func TestPassthroughIngressReportsTurnStartedBeforeAfterTurnWithoutBeforeTurn(t *testing.T) {
+// The first passthrough turn is admitted before the proxy starts. It still
+// reports TurnStarted before AfterTurn so handler-side billing can use the
+// exact accepted timestamp when no per-turn pricing snapshot exists yet.
+func TestPassthroughIngressReportsInitialTurnLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 
 	upstream := newStagedPassthroughConn()
 	upstream.Send(`{"type":"response.completed","response":{"id":"resp_pricing","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
+	store := newStreamingResponseBindingOrderStore()
+	svc := newPassthroughLifecycleService(passthroughLifecycleConfig(), upstream)
+	svc.openaiWSStateStore = store
+	account := passthroughLifecycleAccount()
+	account.SelectedEgress = &ResolvedAccountEgress{
+		BindingID: StableAccountEgressBindingID(account.ID, 92),
+		RouteID:   92,
+	}
 
 	var hooksMu sync.Mutex
 	beforeTurnCalls := 0
@@ -106,8 +111,8 @@ func TestPassthroughIngressReportsTurnStartedBeforeAfterTurnWithoutBeforeTurn(t 
 	server, serverErr := startPassthroughHookRecordingServer(
 		t,
 		controlCtx,
-		newPassthroughLifecycleService(passthroughLifecycleConfig(), upstream),
-		passthroughLifecycleAccount(),
+		svc,
+		account,
 		hooks,
 	)
 	defer server.Close()
@@ -131,12 +136,18 @@ func TestPassthroughIngressReportsTurnStartedBeforeAfterTurnWithoutBeforeTurn(t 
 	gotEvents := append([]hookEvent(nil), hookEvents...)
 	hooksMu.Unlock()
 
-	require.Zero(t, gotBefore, "透传 ingress 不应调用 BeforeTurn")
+	require.Zero(t, gotBefore, "首轮已在建连前完成准入，不应重复调用 BeforeTurn")
 	require.GreaterOrEqual(t, len(gotEvents), 2, "透传 ingress 应报告 TurnStarted 和 AfterTurn")
 	require.Equal(t, "TurnStarted", gotEvents[0].name)
 	require.Equal(t, expectedTurnStartedAt, gotEvents[0].startedAt, "TurnStarted 必须携带入口冻结的首轮开始时刻")
 	require.Equal(t, "AfterTurn", gotEvents[1].name)
 	require.Equal(t, gotEvents[0].turn, gotEvents[1].turn, "TurnStarted 后应提交同一 turn 的 AfterTurn")
+	boundAccountID, bindErr := store.GetResponseAccount(context.Background(), 0, "resp_pricing")
+	require.NoError(t, bindErr)
+	require.Equal(t, account.ID, boundAccountID)
+	boundEgress, ok := getOpenAIWSResponseEgress(store, context.Background(), 0, "resp_pricing")
+	require.True(t, ok)
+	require.Equal(t, account.SelectedEgress.BindingID, boundEgress)
 }
 
 func TestPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T) {
@@ -162,6 +173,7 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 	}
 	turnStarts := make(chan turnStart, 2)
 	beforeRequestEntered := make(chan time.Time, 1)
+	beforeTurnEntered := make(chan int, 1)
 	releaseBeforeRequest := make(chan struct{})
 	hooks := &OpenAIWSIngressHooks{
 		InitialTurnStartedAt: time.Now(),
@@ -173,6 +185,10 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 				beforeRequestEntered <- time.Now()
 				<-releaseBeforeRequest
 			}
+			return nil
+		},
+		BeforeTurn: func(turn int) error {
+			beforeTurnEntered <- turn
 			return nil
 		},
 	}
@@ -211,6 +227,12 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 		t.Fatal("second turn did not enter BeforeRequest")
 	}
 	close(releaseBeforeRequest)
+	select {
+	case turn := <-beforeTurnEntered:
+		require.Equal(t, 2, turn, "后续 passthrough turn 必须在写上游前重新准入")
+	case <-time.After(time.Second):
+		t.Fatal("second turn did not enter BeforeTurn")
+	}
 	require.Equal(t, "response.create", gjson.GetBytes(requirePassthroughUpstreamWrite(t, upstream, 3*time.Second), "type").String())
 	upstream.Send(`{"type":"response.completed","response":{"id":"resp_second","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
 	secondCompleted, err := readPassthroughLifecycleFrame(t, clientConn, 3*time.Second)

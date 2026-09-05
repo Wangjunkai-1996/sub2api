@@ -16,6 +16,7 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/Wei-Shaw/sub2api/ent/account"
+	"github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	"github.com/Wei-Shaw/sub2api/ent/announcement"
 	"github.com/Wei-Shaw/sub2api/ent/announcementread"
@@ -30,6 +31,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/egressidentity"
+	"github.com/Wei-Shaw/sub2api/ent/egressroute"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
@@ -67,6 +70,8 @@ type Client struct {
 	APIKey *APIKeyClient
 	// Account is the client for interacting with the Account builders.
 	Account *AccountClient
+	// AccountEgressBinding is the client for interacting with the AccountEgressBinding builders.
+	AccountEgressBinding *AccountEgressBindingClient
 	// AccountGroup is the client for interacting with the AccountGroup builders.
 	AccountGroup *AccountGroupClient
 	// Announcement is the client for interacting with the Announcement builders.
@@ -93,6 +98,10 @@ type Client struct {
 	ChannelMonitorRequestTemplate *ChannelMonitorRequestTemplateClient
 	// CompositeModelRoute is the client for interacting with the CompositeModelRoute builders.
 	CompositeModelRoute *CompositeModelRouteClient
+	// EgressIdentity is the client for interacting with the EgressIdentity builders.
+	EgressIdentity *EgressIdentityClient
+	// EgressRoute is the client for interacting with the EgressRoute builders.
+	EgressRoute *EgressRouteClient
 	// ErrorPassthroughRule is the client for interacting with the ErrorPassthroughRule builders.
 	ErrorPassthroughRule *ErrorPassthroughRuleClient
 	// Group is the client for interacting with the Group builders.
@@ -154,6 +163,7 @@ func (c *Client) init() {
 	c.Schema = migrate.NewSchema(c.driver)
 	c.APIKey = NewAPIKeyClient(c.config)
 	c.Account = NewAccountClient(c.config)
+	c.AccountEgressBinding = NewAccountEgressBindingClient(c.config)
 	c.AccountGroup = NewAccountGroupClient(c.config)
 	c.Announcement = NewAnnouncementClient(c.config)
 	c.AnnouncementRead = NewAnnouncementReadClient(c.config)
@@ -167,6 +177,8 @@ func (c *Client) init() {
 	c.ChannelMonitorHistory = NewChannelMonitorHistoryClient(c.config)
 	c.ChannelMonitorRequestTemplate = NewChannelMonitorRequestTemplateClient(c.config)
 	c.CompositeModelRoute = NewCompositeModelRouteClient(c.config)
+	c.EgressIdentity = NewEgressIdentityClient(c.config)
+	c.EgressRoute = NewEgressRouteClient(c.config)
 	c.ErrorPassthroughRule = NewErrorPassthroughRuleClient(c.config)
 	c.Group = NewGroupClient(c.config)
 	c.IdempotencyRecord = NewIdempotencyRecordClient(c.config)
@@ -285,6 +297,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		config:                        cfg,
 		APIKey:                        NewAPIKeyClient(cfg),
 		Account:                       NewAccountClient(cfg),
+		AccountEgressBinding:          NewAccountEgressBindingClient(cfg),
 		AccountGroup:                  NewAccountGroupClient(cfg),
 		Announcement:                  NewAnnouncementClient(cfg),
 		AnnouncementRead:              NewAnnouncementReadClient(cfg),
@@ -298,6 +311,8 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		ChannelMonitorHistory:         NewChannelMonitorHistoryClient(cfg),
 		ChannelMonitorRequestTemplate: NewChannelMonitorRequestTemplateClient(cfg),
 		CompositeModelRoute:           NewCompositeModelRouteClient(cfg),
+		EgressIdentity:                NewEgressIdentityClient(cfg),
+		EgressRoute:                   NewEgressRouteClient(cfg),
 		ErrorPassthroughRule:          NewErrorPassthroughRuleClient(cfg),
 		Group:                         NewGroupClient(cfg),
 		IdempotencyRecord:             NewIdempotencyRecordClient(cfg),
@@ -343,6 +358,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		config:                        cfg,
 		APIKey:                        NewAPIKeyClient(cfg),
 		Account:                       NewAccountClient(cfg),
+		AccountEgressBinding:          NewAccountEgressBindingClient(cfg),
 		AccountGroup:                  NewAccountGroupClient(cfg),
 		Announcement:                  NewAnnouncementClient(cfg),
 		AnnouncementRead:              NewAnnouncementReadClient(cfg),
@@ -356,6 +372,8 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		ChannelMonitorHistory:         NewChannelMonitorHistoryClient(cfg),
 		ChannelMonitorRequestTemplate: NewChannelMonitorRequestTemplateClient(cfg),
 		CompositeModelRoute:           NewCompositeModelRouteClient(cfg),
+		EgressIdentity:                NewEgressIdentityClient(cfg),
+		EgressRoute:                   NewEgressRouteClient(cfg),
 		ErrorPassthroughRule:          NewErrorPassthroughRuleClient(cfg),
 		Group:                         NewGroupClient(cfg),
 		IdempotencyRecord:             NewIdempotencyRecordClient(cfg),
@@ -409,11 +427,12 @@ func (c *Client) Close() error {
 // In order to add hooks to a specific client, call: `client.Node.Use(...)`.
 func (c *Client) Use(hooks ...Hook) {
 	for _, n := range []interface{ Use(...Hook) }{
-		c.APIKey, c.Account, c.AccountGroup, c.Announcement, c.AnnouncementRead,
-		c.AuthIdentity, c.AuthIdentityChannel, c.BatchImageEvent, c.BatchImageItem,
-		c.BatchImageJob, c.ChannelMonitor, c.ChannelMonitorDailyRollup,
-		c.ChannelMonitorHistory, c.ChannelMonitorRequestTemplate,
-		c.CompositeModelRoute, c.ErrorPassthroughRule, c.Group, c.IdempotencyRecord,
+		c.APIKey, c.Account, c.AccountEgressBinding, c.AccountGroup, c.Announcement,
+		c.AnnouncementRead, c.AuthIdentity, c.AuthIdentityChannel, c.BatchImageEvent,
+		c.BatchImageItem, c.BatchImageJob, c.ChannelMonitor,
+		c.ChannelMonitorDailyRollup, c.ChannelMonitorHistory,
+		c.ChannelMonitorRequestTemplate, c.CompositeModelRoute, c.EgressIdentity,
+		c.EgressRoute, c.ErrorPassthroughRule, c.Group, c.IdempotencyRecord,
 		c.IdentityAdoptionDecision, c.PaymentAuditLog, c.PaymentOrder,
 		c.PaymentProviderInstance, c.PendingAuthSession, c.PromoCode, c.PromoCodeUsage,
 		c.Proxy, c.RedeemCode, c.SecuritySecret, c.Setting, c.SubscriptionPlan,
@@ -429,11 +448,12 @@ func (c *Client) Use(hooks ...Hook) {
 // In order to add interceptors to a specific client, call: `client.Node.Intercept(...)`.
 func (c *Client) Intercept(interceptors ...Interceptor) {
 	for _, n := range []interface{ Intercept(...Interceptor) }{
-		c.APIKey, c.Account, c.AccountGroup, c.Announcement, c.AnnouncementRead,
-		c.AuthIdentity, c.AuthIdentityChannel, c.BatchImageEvent, c.BatchImageItem,
-		c.BatchImageJob, c.ChannelMonitor, c.ChannelMonitorDailyRollup,
-		c.ChannelMonitorHistory, c.ChannelMonitorRequestTemplate,
-		c.CompositeModelRoute, c.ErrorPassthroughRule, c.Group, c.IdempotencyRecord,
+		c.APIKey, c.Account, c.AccountEgressBinding, c.AccountGroup, c.Announcement,
+		c.AnnouncementRead, c.AuthIdentity, c.AuthIdentityChannel, c.BatchImageEvent,
+		c.BatchImageItem, c.BatchImageJob, c.ChannelMonitor,
+		c.ChannelMonitorDailyRollup, c.ChannelMonitorHistory,
+		c.ChannelMonitorRequestTemplate, c.CompositeModelRoute, c.EgressIdentity,
+		c.EgressRoute, c.ErrorPassthroughRule, c.Group, c.IdempotencyRecord,
 		c.IdentityAdoptionDecision, c.PaymentAuditLog, c.PaymentOrder,
 		c.PaymentProviderInstance, c.PendingAuthSession, c.PromoCode, c.PromoCodeUsage,
 		c.Proxy, c.RedeemCode, c.SecuritySecret, c.Setting, c.SubscriptionPlan,
@@ -452,6 +472,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.APIKey.mutate(ctx, m)
 	case *AccountMutation:
 		return c.Account.mutate(ctx, m)
+	case *AccountEgressBindingMutation:
+		return c.AccountEgressBinding.mutate(ctx, m)
 	case *AccountGroupMutation:
 		return c.AccountGroup.mutate(ctx, m)
 	case *AnnouncementMutation:
@@ -478,6 +500,10 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.ChannelMonitorRequestTemplate.mutate(ctx, m)
 	case *CompositeModelRouteMutation:
 		return c.CompositeModelRoute.mutate(ctx, m)
+	case *EgressIdentityMutation:
+		return c.EgressIdentity.mutate(ctx, m)
+	case *EgressRouteMutation:
+		return c.EgressRoute.mutate(ctx, m)
 	case *ErrorPassthroughRuleMutation:
 		return c.ErrorPassthroughRule.mutate(ctx, m)
 	case *GroupMutation:
@@ -854,6 +880,22 @@ func (c *AccountClient) QueryProxy(_m *Account) *ProxyQuery {
 	return query
 }
 
+// QueryEgressRoutes queries the egress_routes edge of a Account.
+func (c *AccountClient) QueryEgressRoutes(_m *Account) *EgressRouteQuery {
+	query := (&EgressRouteClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(account.Table, account.FieldID, id),
+			sqlgraph.To(egressroute.Table, egressroute.FieldID),
+			sqlgraph.Edge(sqlgraph.M2M, false, account.EgressRoutesTable, account.EgressRoutesPrimaryKey...),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // QueryParent queries the parent edge of a Account.
 func (c *AccountClient) QueryParent(_m *Account) *AccountQuery {
 	query := (&AccountClient{config: c.config}).Query()
@@ -918,6 +960,22 @@ func (c *AccountClient) QueryAccountGroups(_m *Account) *AccountGroupQuery {
 	return query
 }
 
+// QueryEgressBindings queries the egress_bindings edge of a Account.
+func (c *AccountClient) QueryEgressBindings(_m *Account) *AccountEgressBindingQuery {
+	query := (&AccountEgressBindingClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(account.Table, account.FieldID, id),
+			sqlgraph.To(accountegressbinding.Table, accountegressbinding.AccountColumn),
+			sqlgraph.Edge(sqlgraph.O2M, true, account.EgressBindingsTable, account.EgressBindingsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // Hooks returns the client hooks.
 func (c *AccountClient) Hooks() []Hook {
 	hooks := c.hooks.Account
@@ -942,6 +1000,122 @@ func (c *AccountClient) mutate(ctx context.Context, m *AccountMutation) (Value, 
 		return (&AccountDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown Account mutation op: %q", m.Op())
+	}
+}
+
+// AccountEgressBindingClient is a client for the AccountEgressBinding schema.
+type AccountEgressBindingClient struct {
+	config
+}
+
+// NewAccountEgressBindingClient returns a client for the AccountEgressBinding from the given config.
+func NewAccountEgressBindingClient(c config) *AccountEgressBindingClient {
+	return &AccountEgressBindingClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `accountegressbinding.Hooks(f(g(h())))`.
+func (c *AccountEgressBindingClient) Use(hooks ...Hook) {
+	c.hooks.AccountEgressBinding = append(c.hooks.AccountEgressBinding, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `accountegressbinding.Intercept(f(g(h())))`.
+func (c *AccountEgressBindingClient) Intercept(interceptors ...Interceptor) {
+	c.inters.AccountEgressBinding = append(c.inters.AccountEgressBinding, interceptors...)
+}
+
+// Create returns a builder for creating a AccountEgressBinding entity.
+func (c *AccountEgressBindingClient) Create() *AccountEgressBindingCreate {
+	mutation := newAccountEgressBindingMutation(c.config, OpCreate)
+	return &AccountEgressBindingCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of AccountEgressBinding entities.
+func (c *AccountEgressBindingClient) CreateBulk(builders ...*AccountEgressBindingCreate) *AccountEgressBindingCreateBulk {
+	return &AccountEgressBindingCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *AccountEgressBindingClient) MapCreateBulk(slice any, setFunc func(*AccountEgressBindingCreate, int)) *AccountEgressBindingCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &AccountEgressBindingCreateBulk{err: fmt.Errorf("calling to AccountEgressBindingClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*AccountEgressBindingCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &AccountEgressBindingCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for AccountEgressBinding.
+func (c *AccountEgressBindingClient) Update() *AccountEgressBindingUpdate {
+	mutation := newAccountEgressBindingMutation(c.config, OpUpdate)
+	return &AccountEgressBindingUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *AccountEgressBindingClient) UpdateOne(_m *AccountEgressBinding) *AccountEgressBindingUpdateOne {
+	mutation := newAccountEgressBindingMutation(c.config, OpUpdateOne)
+	mutation.account = &_m.AccountID
+	mutation.route = &_m.RouteID
+	return &AccountEgressBindingUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for AccountEgressBinding.
+func (c *AccountEgressBindingClient) Delete() *AccountEgressBindingDelete {
+	mutation := newAccountEgressBindingMutation(c.config, OpDelete)
+	return &AccountEgressBindingDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Query returns a query builder for AccountEgressBinding.
+func (c *AccountEgressBindingClient) Query() *AccountEgressBindingQuery {
+	return &AccountEgressBindingQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeAccountEgressBinding},
+		inters: c.Interceptors(),
+	}
+}
+
+// QueryAccount queries the account edge of a AccountEgressBinding.
+func (c *AccountEgressBindingClient) QueryAccount(_m *AccountEgressBinding) *AccountQuery {
+	return c.Query().
+		Where(accountegressbinding.AccountID(_m.AccountID), accountegressbinding.RouteID(_m.RouteID)).
+		QueryAccount()
+}
+
+// QueryRoute queries the route edge of a AccountEgressBinding.
+func (c *AccountEgressBindingClient) QueryRoute(_m *AccountEgressBinding) *EgressRouteQuery {
+	return c.Query().
+		Where(accountegressbinding.AccountID(_m.AccountID), accountegressbinding.RouteID(_m.RouteID)).
+		QueryRoute()
+}
+
+// Hooks returns the client hooks.
+func (c *AccountEgressBindingClient) Hooks() []Hook {
+	return c.hooks.AccountEgressBinding
+}
+
+// Interceptors returns the client interceptors.
+func (c *AccountEgressBindingClient) Interceptors() []Interceptor {
+	return c.inters.AccountEgressBinding
+}
+
+func (c *AccountEgressBindingClient) mutate(ctx context.Context, m *AccountEgressBindingMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&AccountEgressBindingCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&AccountEgressBindingUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&AccountEgressBindingUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&AccountEgressBindingDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown AccountEgressBinding mutation op: %q", m.Op())
 	}
 }
 
@@ -2880,6 +3054,352 @@ func (c *CompositeModelRouteClient) mutate(ctx context.Context, m *CompositeMode
 		return (&CompositeModelRouteDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown CompositeModelRoute mutation op: %q", m.Op())
+	}
+}
+
+// EgressIdentityClient is a client for the EgressIdentity schema.
+type EgressIdentityClient struct {
+	config
+}
+
+// NewEgressIdentityClient returns a client for the EgressIdentity from the given config.
+func NewEgressIdentityClient(c config) *EgressIdentityClient {
+	return &EgressIdentityClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `egressidentity.Hooks(f(g(h())))`.
+func (c *EgressIdentityClient) Use(hooks ...Hook) {
+	c.hooks.EgressIdentity = append(c.hooks.EgressIdentity, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `egressidentity.Intercept(f(g(h())))`.
+func (c *EgressIdentityClient) Intercept(interceptors ...Interceptor) {
+	c.inters.EgressIdentity = append(c.inters.EgressIdentity, interceptors...)
+}
+
+// Create returns a builder for creating a EgressIdentity entity.
+func (c *EgressIdentityClient) Create() *EgressIdentityCreate {
+	mutation := newEgressIdentityMutation(c.config, OpCreate)
+	return &EgressIdentityCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of EgressIdentity entities.
+func (c *EgressIdentityClient) CreateBulk(builders ...*EgressIdentityCreate) *EgressIdentityCreateBulk {
+	return &EgressIdentityCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *EgressIdentityClient) MapCreateBulk(slice any, setFunc func(*EgressIdentityCreate, int)) *EgressIdentityCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &EgressIdentityCreateBulk{err: fmt.Errorf("calling to EgressIdentityClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*EgressIdentityCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &EgressIdentityCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for EgressIdentity.
+func (c *EgressIdentityClient) Update() *EgressIdentityUpdate {
+	mutation := newEgressIdentityMutation(c.config, OpUpdate)
+	return &EgressIdentityUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *EgressIdentityClient) UpdateOne(_m *EgressIdentity) *EgressIdentityUpdateOne {
+	mutation := newEgressIdentityMutation(c.config, OpUpdateOne, withEgressIdentity(_m))
+	return &EgressIdentityUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *EgressIdentityClient) UpdateOneID(id int64) *EgressIdentityUpdateOne {
+	mutation := newEgressIdentityMutation(c.config, OpUpdateOne, withEgressIdentityID(id))
+	return &EgressIdentityUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for EgressIdentity.
+func (c *EgressIdentityClient) Delete() *EgressIdentityDelete {
+	mutation := newEgressIdentityMutation(c.config, OpDelete)
+	return &EgressIdentityDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *EgressIdentityClient) DeleteOne(_m *EgressIdentity) *EgressIdentityDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *EgressIdentityClient) DeleteOneID(id int64) *EgressIdentityDeleteOne {
+	builder := c.Delete().Where(egressidentity.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &EgressIdentityDeleteOne{builder}
+}
+
+// Query returns a query builder for EgressIdentity.
+func (c *EgressIdentityClient) Query() *EgressIdentityQuery {
+	return &EgressIdentityQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeEgressIdentity},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a EgressIdentity entity by its id.
+func (c *EgressIdentityClient) Get(ctx context.Context, id int64) (*EgressIdentity, error) {
+	return c.Query().Where(egressidentity.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *EgressIdentityClient) GetX(ctx context.Context, id int64) *EgressIdentity {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryRoutes queries the routes edge of a EgressIdentity.
+func (c *EgressIdentityClient) QueryRoutes(_m *EgressIdentity) *EgressRouteQuery {
+	query := (&EgressRouteClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(egressidentity.Table, egressidentity.FieldID, id),
+			sqlgraph.To(egressroute.Table, egressroute.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, true, egressidentity.RoutesTable, egressidentity.RoutesColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *EgressIdentityClient) Hooks() []Hook {
+	return c.hooks.EgressIdentity
+}
+
+// Interceptors returns the client interceptors.
+func (c *EgressIdentityClient) Interceptors() []Interceptor {
+	return c.inters.EgressIdentity
+}
+
+func (c *EgressIdentityClient) mutate(ctx context.Context, m *EgressIdentityMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&EgressIdentityCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&EgressIdentityUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&EgressIdentityUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&EgressIdentityDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown EgressIdentity mutation op: %q", m.Op())
+	}
+}
+
+// EgressRouteClient is a client for the EgressRoute schema.
+type EgressRouteClient struct {
+	config
+}
+
+// NewEgressRouteClient returns a client for the EgressRoute from the given config.
+func NewEgressRouteClient(c config) *EgressRouteClient {
+	return &EgressRouteClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `egressroute.Hooks(f(g(h())))`.
+func (c *EgressRouteClient) Use(hooks ...Hook) {
+	c.hooks.EgressRoute = append(c.hooks.EgressRoute, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `egressroute.Intercept(f(g(h())))`.
+func (c *EgressRouteClient) Intercept(interceptors ...Interceptor) {
+	c.inters.EgressRoute = append(c.inters.EgressRoute, interceptors...)
+}
+
+// Create returns a builder for creating a EgressRoute entity.
+func (c *EgressRouteClient) Create() *EgressRouteCreate {
+	mutation := newEgressRouteMutation(c.config, OpCreate)
+	return &EgressRouteCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of EgressRoute entities.
+func (c *EgressRouteClient) CreateBulk(builders ...*EgressRouteCreate) *EgressRouteCreateBulk {
+	return &EgressRouteCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *EgressRouteClient) MapCreateBulk(slice any, setFunc func(*EgressRouteCreate, int)) *EgressRouteCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &EgressRouteCreateBulk{err: fmt.Errorf("calling to EgressRouteClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*EgressRouteCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &EgressRouteCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for EgressRoute.
+func (c *EgressRouteClient) Update() *EgressRouteUpdate {
+	mutation := newEgressRouteMutation(c.config, OpUpdate)
+	return &EgressRouteUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *EgressRouteClient) UpdateOne(_m *EgressRoute) *EgressRouteUpdateOne {
+	mutation := newEgressRouteMutation(c.config, OpUpdateOne, withEgressRoute(_m))
+	return &EgressRouteUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *EgressRouteClient) UpdateOneID(id int64) *EgressRouteUpdateOne {
+	mutation := newEgressRouteMutation(c.config, OpUpdateOne, withEgressRouteID(id))
+	return &EgressRouteUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for EgressRoute.
+func (c *EgressRouteClient) Delete() *EgressRouteDelete {
+	mutation := newEgressRouteMutation(c.config, OpDelete)
+	return &EgressRouteDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *EgressRouteClient) DeleteOne(_m *EgressRoute) *EgressRouteDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *EgressRouteClient) DeleteOneID(id int64) *EgressRouteDeleteOne {
+	builder := c.Delete().Where(egressroute.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &EgressRouteDeleteOne{builder}
+}
+
+// Query returns a query builder for EgressRoute.
+func (c *EgressRouteClient) Query() *EgressRouteQuery {
+	return &EgressRouteQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeEgressRoute},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a EgressRoute entity by its id.
+func (c *EgressRouteClient) Get(ctx context.Context, id int64) (*EgressRoute, error) {
+	return c.Query().Where(egressroute.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *EgressRouteClient) GetX(ctx context.Context, id int64) *EgressRoute {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProxy queries the proxy edge of a EgressRoute.
+func (c *EgressRouteClient) QueryProxy(_m *EgressRoute) *ProxyQuery {
+	query := (&ProxyClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(egressroute.Table, egressroute.FieldID, id),
+			sqlgraph.To(proxy.Table, proxy.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, false, egressroute.ProxyTable, egressroute.ProxyColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryExpectedIdentity queries the expected_identity edge of a EgressRoute.
+func (c *EgressRouteClient) QueryExpectedIdentity(_m *EgressRoute) *EgressIdentityQuery {
+	query := (&EgressIdentityClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(egressroute.Table, egressroute.FieldID, id),
+			sqlgraph.To(egressidentity.Table, egressidentity.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, false, egressroute.ExpectedIdentityTable, egressroute.ExpectedIdentityColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryAccounts queries the accounts edge of a EgressRoute.
+func (c *EgressRouteClient) QueryAccounts(_m *EgressRoute) *AccountQuery {
+	query := (&AccountClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(egressroute.Table, egressroute.FieldID, id),
+			sqlgraph.To(account.Table, account.FieldID),
+			sqlgraph.Edge(sqlgraph.M2M, true, egressroute.AccountsTable, egressroute.AccountsPrimaryKey...),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryBindings queries the bindings edge of a EgressRoute.
+func (c *EgressRouteClient) QueryBindings(_m *EgressRoute) *AccountEgressBindingQuery {
+	query := (&AccountEgressBindingClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(egressroute.Table, egressroute.FieldID, id),
+			sqlgraph.To(accountegressbinding.Table, accountegressbinding.RouteColumn),
+			sqlgraph.Edge(sqlgraph.O2M, true, egressroute.BindingsTable, egressroute.BindingsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *EgressRouteClient) Hooks() []Hook {
+	return c.hooks.EgressRoute
+}
+
+// Interceptors returns the client interceptors.
+func (c *EgressRouteClient) Interceptors() []Interceptor {
+	return c.inters.EgressRoute
+}
+
+func (c *EgressRouteClient) mutate(ctx context.Context, m *EgressRouteMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&EgressRouteCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&EgressRouteUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&EgressRouteUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&EgressRouteDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown EgressRoute mutation op: %q", m.Op())
 	}
 }
 
@@ -6825,28 +7345,28 @@ func (c *UserSubscriptionClient) mutate(ctx context.Context, m *UserSubscription
 // hooks and interceptors per client, for fast access.
 type (
 	hooks struct {
-		APIKey, Account, AccountGroup, Announcement, AnnouncementRead, AuthIdentity,
-		AuthIdentityChannel, BatchImageEvent, BatchImageItem, BatchImageJob,
-		ChannelMonitor, ChannelMonitorDailyRollup, ChannelMonitorHistory,
-		ChannelMonitorRequestTemplate, CompositeModelRoute, ErrorPassthroughRule,
-		Group, IdempotencyRecord, IdentityAdoptionDecision, PaymentAuditLog,
-		PaymentOrder, PaymentProviderInstance, PendingAuthSession, PromoCode,
-		PromoCodeUsage, Proxy, RedeemCode, SecuritySecret, Setting, SubscriptionPlan,
-		TLSFingerprintProfile, UsageCleanupTask, UsageLog, User, UserAllowedGroup,
-		UserAttributeDefinition, UserAttributeValue, UserPlatformQuota,
-		UserSubscription []ent.Hook
+		APIKey, Account, AccountEgressBinding, AccountGroup, Announcement,
+		AnnouncementRead, AuthIdentity, AuthIdentityChannel, BatchImageEvent,
+		BatchImageItem, BatchImageJob, ChannelMonitor, ChannelMonitorDailyRollup,
+		ChannelMonitorHistory, ChannelMonitorRequestTemplate, CompositeModelRoute,
+		EgressIdentity, EgressRoute, ErrorPassthroughRule, Group, IdempotencyRecord,
+		IdentityAdoptionDecision, PaymentAuditLog, PaymentOrder,
+		PaymentProviderInstance, PendingAuthSession, PromoCode, PromoCodeUsage, Proxy,
+		RedeemCode, SecuritySecret, Setting, SubscriptionPlan, TLSFingerprintProfile,
+		UsageCleanupTask, UsageLog, User, UserAllowedGroup, UserAttributeDefinition,
+		UserAttributeValue, UserPlatformQuota, UserSubscription []ent.Hook
 	}
 	inters struct {
-		APIKey, Account, AccountGroup, Announcement, AnnouncementRead, AuthIdentity,
-		AuthIdentityChannel, BatchImageEvent, BatchImageItem, BatchImageJob,
-		ChannelMonitor, ChannelMonitorDailyRollup, ChannelMonitorHistory,
-		ChannelMonitorRequestTemplate, CompositeModelRoute, ErrorPassthroughRule,
-		Group, IdempotencyRecord, IdentityAdoptionDecision, PaymentAuditLog,
-		PaymentOrder, PaymentProviderInstance, PendingAuthSession, PromoCode,
-		PromoCodeUsage, Proxy, RedeemCode, SecuritySecret, Setting, SubscriptionPlan,
-		TLSFingerprintProfile, UsageCleanupTask, UsageLog, User, UserAllowedGroup,
-		UserAttributeDefinition, UserAttributeValue, UserPlatformQuota,
-		UserSubscription []ent.Interceptor
+		APIKey, Account, AccountEgressBinding, AccountGroup, Announcement,
+		AnnouncementRead, AuthIdentity, AuthIdentityChannel, BatchImageEvent,
+		BatchImageItem, BatchImageJob, ChannelMonitor, ChannelMonitorDailyRollup,
+		ChannelMonitorHistory, ChannelMonitorRequestTemplate, CompositeModelRoute,
+		EgressIdentity, EgressRoute, ErrorPassthroughRule, Group, IdempotencyRecord,
+		IdentityAdoptionDecision, PaymentAuditLog, PaymentOrder,
+		PaymentProviderInstance, PendingAuthSession, PromoCode, PromoCodeUsage, Proxy,
+		RedeemCode, SecuritySecret, Setting, SubscriptionPlan, TLSFingerprintProfile,
+		UsageCleanupTask, UsageLog, User, UserAllowedGroup, UserAttributeDefinition,
+		UserAttributeValue, UserPlatformQuota, UserSubscription []ent.Interceptor
 	}
 )
 
