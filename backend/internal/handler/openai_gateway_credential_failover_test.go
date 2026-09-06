@@ -102,30 +102,121 @@ func TestOpenAICapacityFailoverExhaustionPreservesMessageAsServerError(t *testin
 	t.Run("native_openai", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(recorder)
+		c.Set(service.OpsUpstreamErrorsKey, []*service.OpsUpstreamErrorEvent{{
+			UpstreamStatusCode: http.StatusBadRequest,
+			Message:            message,
+		}})
 		(&OpenAIGatewayHandler{}).handleFailoverExhausted(c, failoverErr, false)
 		require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 		require.Equal(t, "server_error", gjson.Get(recorder.Body.String(), "error.type").String())
 		require.Equal(t, message, gjson.Get(recorder.Body.String(), "error.message").String())
 		require.NotContains(t, recorder.Body.String(), "server_is_overloaded")
+		events, ok := c.MustGet(service.OpsUpstreamErrorsKey).([]*service.OpsUpstreamErrorEvent)
+		require.True(t, ok)
+		require.Len(t, events, 1)
+		require.Equal(t, http.StatusServiceUnavailable, events[0].FinalClientStatusCode)
+		require.Equal(t, "capacity_shed", events[0].FinalOutcome)
+		require.True(t, events[0].RetryableOnSameAccount)
+		require.True(t, events[0].RequestScopedTransient)
 	})
 
 	t.Run("responses_compat", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(recorder)
+		c.Set(service.OpsUpstreamErrorsKey, []*service.OpsUpstreamErrorEvent{{
+			UpstreamStatusCode: http.StatusBadRequest,
+			Message:            message,
+		}})
 		(&GatewayHandler{}).handleResponsesFailoverExhausted(c, failoverErr, false)
 		require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 		require.Equal(t, "server_error", gjson.Get(recorder.Body.String(), "error.code").String())
 		require.Equal(t, message, gjson.Get(recorder.Body.String(), "error.message").String())
+		events := c.MustGet(service.OpsUpstreamErrorsKey).([]*service.OpsUpstreamErrorEvent)
+		require.Equal(t, "capacity_shed", events[0].FinalOutcome)
 	})
 
 	t.Run("anthropic_compat", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(recorder)
+		c.Set(service.OpsUpstreamErrorsKey, []*service.OpsUpstreamErrorEvent{{
+			UpstreamStatusCode: http.StatusBadRequest,
+			Message:            message,
+		}})
 		(&OpenAIGatewayHandler{}).handleAnthropicFailoverExhausted(c, failoverErr, false)
 		require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 		require.Equal(t, "api_error", gjson.Get(recorder.Body.String(), "error.type").String())
 		require.Equal(t, message, gjson.Get(recorder.Body.String(), "error.message").String())
+		events := c.MustGet(service.OpsUpstreamErrorsKey).([]*service.OpsUpstreamErrorEvent)
+		require.Equal(t, "capacity_shed", events[0].FinalOutcome)
 	})
+}
+
+func TestOpenAICompatibilityFailoverExhaustionMarksFinalClassification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name    string
+		err     *service.UpstreamFailoverError
+		outcome string
+	}{
+		{
+			name: "credential",
+			err: &service.UpstreamFailoverError{
+				Stage: service.GatewayFailureStageAccountAuth,
+			},
+			outcome: "credential_failover_exhausted",
+		},
+		{
+			name:    "rate_limit",
+			err:     &service.UpstreamFailoverError{StatusCode: http.StatusTooManyRequests},
+			outcome: "rate_limit_exhausted",
+		},
+		{
+			name:    "generic",
+			err:     &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway},
+			outcome: "failover_exhausted",
+		},
+	}
+	for _, protocol := range []struct {
+		name string
+		run  func(*gin.Context, *service.UpstreamFailoverError)
+	}{
+		{name: "responses", run: func(c *gin.Context, err *service.UpstreamFailoverError) {
+			(&GatewayHandler{}).handleResponsesFailoverExhausted(c, err, false)
+		}},
+		{name: "anthropic", run: func(c *gin.Context, err *service.UpstreamFailoverError) {
+			(&OpenAIGatewayHandler{}).handleAnthropicFailoverExhausted(c, err, false)
+		}},
+	} {
+		for _, tc := range tests {
+			t.Run(protocol.name+"_"+tc.name, func(t *testing.T) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Set(service.OpsUpstreamErrorsKey, []*service.OpsUpstreamErrorEvent{{
+					UpstreamStatusCode: tc.err.StatusCode,
+				}})
+				protocol.run(c, tc.err)
+				events := c.MustGet(service.OpsUpstreamErrorsKey).([]*service.OpsUpstreamErrorEvent)
+				require.Len(t, events, 1)
+				require.Equal(t, tc.outcome, events[0].FinalOutcome)
+				require.GreaterOrEqual(t, events[0].FinalClientStatusCode, http.StatusBadRequest)
+			})
+		}
+	}
+}
+
+func TestOpenAIRequestBudgetExhaustionCreatesTerminalOpsEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	(&OpenAIGatewayHandler{}).handleOpenAIRequestBudgetExhausted(c, false)
+	(&OpenAIGatewayHandler{}).handleOpenAIRequestBudgetExhausted(c, false)
+
+	require.Equal(t, http.StatusGatewayTimeout, recorder.Code)
+	events := c.MustGet(service.OpsUpstreamErrorsKey).([]*service.OpsUpstreamErrorEvent)
+	require.Len(t, events, 1)
+	require.Equal(t, http.StatusGatewayTimeout, events[0].UpstreamStatusCode)
+	require.Equal(t, http.StatusGatewayTimeout, events[0].FinalClientStatusCode)
+	require.Equal(t, "request_budget_exhausted", events[0].FinalOutcome)
 }
 
 func TestResponsesFailoverExhaustedAfterForwardedTerminalMarksOpsWithoutDuplicateFrame(t *testing.T) {

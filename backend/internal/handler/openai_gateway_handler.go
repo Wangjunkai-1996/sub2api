@@ -1703,6 +1703,7 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 	}
 	if failoverErr != nil && failoverErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(failoverErr)
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "credential_failover_exhausted")
 		h.anthropicStreamingAwareError(c, status, "api_error", message, streamStarted)
 		return
 	}
@@ -1711,10 +1712,18 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 		if status <= 0 {
 			status = http.StatusServiceUnavailable
 		}
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "capacity_shed")
 		h.anthropicStreamingAwareError(c, status, "api_error", failoverErr.ClientMessage, streamStarted)
 		return
 	}
 	status, errType, errMsg := h.mapUpstreamError(failoverErr.StatusCode)
+	outcome := "failover_exhausted"
+	if service.IsOpenAISilentRefusalErrorBody(failoverErr.ResponseBody) {
+		outcome = "silent_refusal"
+	} else if failoverErr.StatusCode == http.StatusTooManyRequests {
+		outcome = "rate_limit_exhausted"
+	}
+	service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, outcome)
 	h.anthropicStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -3483,6 +3492,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 	}
 	if failoverErr.IsOpenAIRequestBodyTooLarge() {
 		service.SetOpsUpstreamError(c, http.StatusRequestEntityTooLarge, service.OpenAIRequestBodyTooLargeClientMessage, "")
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, http.StatusRequestEntityTooLarge, "request_body_too_large")
 		h.handleStreamingAwareError(
 			c,
 			http.StatusRequestEntityTooLarge,
@@ -3501,6 +3511,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		if message == "" {
 			message = service.OpenAIConversationSessionExpiredClientMessage
 		}
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "session_blocked")
 		h.handleStreamingAwareError(c, status, "conversation_session_expired", message, streamStarted)
 		return
 	}
@@ -3509,12 +3520,14 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		if message == "" {
 			message = "previous_response_id requires an OpenAI API-key account for HTTP requests"
 		}
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, http.StatusBadRequest, "continuation_unsupported")
 		h.handleStreamingAwareError(c, http.StatusBadRequest, "invalid_request_error", message, streamStarted)
 		return
 	}
 	copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
 	if failoverErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(failoverErr)
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "credential_failover_exhausted")
 		h.handleStreamingAwareError(c, status, "upstream_error", message, streamStarted)
 		return
 	}
@@ -3523,6 +3536,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		if status <= 0 {
 			status = http.StatusServiceUnavailable
 		}
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "capacity_shed")
 		h.handleStreamingAwareError(c, status, "server_error", failoverErr.ClientMessage, streamStarted)
 		return
 	}
@@ -3530,6 +3544,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 	responseBody := failoverErr.ResponseBody
 	if service.IsOpenAISilentRefusalErrorBody(responseBody) {
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
+		service.MarkOpsUpstreamFinalOutcome(c, failoverErr, http.StatusBadGateway, "silent_refusal")
 		h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage(), streamStarted)
 		return
 	}
@@ -3553,6 +3568,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 				c.Set(service.OpsSkipPassthroughKey, true)
 			}
 
+			service.MarkOpsUpstreamFinalOutcome(c, failoverErr, respCode, "error_passthrough")
 			h.handleStreamingAwareError(c, respCode, "upstream_error", msg, streamStarted)
 			return
 		}
@@ -3564,6 +3580,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 
 	// 使用默认的错误映射
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+	service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "failover_exhausted")
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -3615,6 +3632,7 @@ func isSafeRetryAfter(value string) bool {
 func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
+	service.MarkOpsUpstreamFinalOutcome(c, nil, status, "failover_exhausted")
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -3852,6 +3870,7 @@ func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context
 	c.Set(openAIRequestBudgetResponseKey, true)
 	const message = "The request could not complete within the upstream time budget"
 	service.SetOpsUpstreamError(c, http.StatusGatewayTimeout, message, "")
+	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusGatewayTimeout, "request_budget_exhausted")
 	h.handleStreamingAwareError(c, http.StatusGatewayTimeout, "request_timeout", message, streamStarted)
 }
 

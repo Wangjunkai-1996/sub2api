@@ -595,12 +595,16 @@ func sanitizeOpsUpstreamErrors(entry *OpsInsertErrorLogInput) error {
 		out.Stage = truncateString(strings.TrimSpace(out.Stage), 64)
 		out.Scope = truncateString(strings.TrimSpace(out.Scope), 64)
 		out.Reason = truncateString(strings.TrimSpace(out.Reason), 128)
+		out.FinalOutcome = truncateString(strings.TrimSpace(out.FinalOutcome), 64)
 
 		if out.AccountID < 0 {
 			out.AccountID = 0
 		}
 		if out.UpstreamStatusCode < 0 {
 			out.UpstreamStatusCode = 0
+		}
+		if out.FinalClientStatusCode < 100 || out.FinalClientStatusCode > 599 {
+			out.FinalClientStatusCode = 0
 		}
 		if out.AtUnixMs < 0 {
 			out.AtUnixMs = 0
@@ -614,7 +618,7 @@ func sanitizeOpsUpstreamErrors(entry *OpsInsertErrorLogInput) error {
 		// Drop fully-empty events (can happen if only status code was known).
 		// Judged on the original detail so an older attempt whose detail is
 		// cleared by the body window below is still retained.
-		if out.UpstreamStatusCode == 0 && out.Message == "" && detail == "" {
+		if out.UpstreamStatusCode == 0 && out.FinalClientStatusCode == 0 && out.FinalOutcome == "" && out.Message == "" && detail == "" {
 			continue
 		}
 		if keepBody && detail != "" {

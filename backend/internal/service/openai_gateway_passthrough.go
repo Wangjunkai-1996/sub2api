@@ -1910,6 +1910,14 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	var bareErrorPayload []byte
 	bareErrorAccountSideEffectsPending := false
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
+	streamErrorRecorded := false
+	recordStreamError := func(payload []byte, kind, message string) {
+		if streamErrorRecorded || clientDisconnected {
+			return
+		}
+		s.recordOpenAIStreamUpstreamError(c, account, true, upstreamRequestID, kind, payload, message)
+		streamErrorRecorded = true
+	}
 	// pendingLines 在首个可见输出前保留前导事件，确保无输出失败仍可安全 failover。
 	pendingLines := make([]string, 0, 8)
 
@@ -1980,6 +1988,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
 			bareErrorAccountSideEffectsPending = false
 		}
+		recordStreamError(bareErrorPayload, "http_error", failedMessage)
 		if clientDisconnected || !writePendingLines() {
 			return
 		}
@@ -2109,6 +2118,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					}
 				}
 				if outputStarted && !cyberHit {
+					if !(codexFailureTerminal && eventType == "error") {
+						recordStreamError(dataBytes, "http_error", failedMessage)
+					}
 					if codexFailureTerminal && eventType == "error" {
 						// Wait for the authoritative response.failed before mutating
 						// account health; EOF synthesis applies the pending effect.
@@ -2135,7 +2147,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 						if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
 							// 命中透传规则也要记录 ops 上游错误事件（对齐 CC/Messages 与
 							// antigravity 先例），否则透传命中的 failed 在监控中不可见。
-							s.recordOpenAIStreamUpstreamError(c, account, true, upstreamRequestID, "http_error", dataBytes, failedMessage)
+							recordStreamError(dataBytes, "http_error", failedMessage)
 							MarkResponseCommitted(c)
 							c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 							c.JSON(status, gin.H{
@@ -2146,6 +2158,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 							})
 							return resultWithUsage(), fmt.Errorf("upstream response failed: passthrough rule matched message=%s", errMsg)
 						}
+					}
+					if !cyberHit && !sawBareError {
+						recordStreamError(dataBytes, "http_error", failedMessage)
 					}
 				}
 				forceFlushFailedEvent = true
@@ -2248,6 +2263,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 		if errors.Is(err, bufio.ErrTooLong) {
 			logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, err)
+			recordStreamError(nil, "stream_read_error", "response_too_large")
 			return resultWithUsage(), err
 		}
 		if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
@@ -2261,6 +2277,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		if clientDisconnected {
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete after disconnect: %w", err)
 		}
+		readMessage := "OpenAI stream read error"
+		if errText := strings.TrimSpace(err.Error()); errText != "" {
+			readMessage += ": " + errText
+		}
+		recordStreamError(nil, "stream_read_error", readMessage)
 		s.recordOpenAIProxyStreamDisconnect(account, err, upstreamRequestID)
 		logger.LegacyPrintf("service.openai_gateway",
 			"[OpenAI passthrough] 流读取异常中断: account=%d request_id=%s err=%v",
@@ -2283,6 +2304,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			return resultWithUsage(),
 				s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event")
 		}
+		recordStreamError(nil, "stream_missing_terminal", "OpenAI stream ended before a terminal event")
 		s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
 		return resultWithUsage(), errors.New("stream usage incomplete: missing terminal event")
 	}

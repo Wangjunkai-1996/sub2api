@@ -340,6 +340,49 @@ func SetOpsUpstreamError(c *gin.Context, upstreamStatusCode int, upstreamMessage
 	setOpsUpstreamError(c, upstreamStatusCode, upstreamMessage, upstreamDetail)
 }
 
+// MarkOpsUpstreamFinalOutcome annotates the last upstream attempt with the
+// client-facing status and failover classification selected after retries are
+// exhausted. If no attempt was recorded, it adds a request-local terminal
+// event so handler-side timeouts remain diagnosable.
+func MarkOpsUpstreamFinalOutcome(c *gin.Context, failoverErr *UpstreamFailoverError, clientStatusCode int, outcome string) {
+	if c == nil {
+		return
+	}
+	annotate := func(event *OpsUpstreamErrorEvent) {
+		event.FinalClientStatusCode = clientStatusCode
+		event.FinalOutcome = strings.TrimSpace(outcome)
+		if failoverErr != nil {
+			event.RetryableOnSameAccount = failoverErr.RetryableOnSameAccount
+			event.RequestScopedTransient = failoverErr.RequestScopedTransient
+		}
+	}
+	raw, _ := c.Get(OpsUpstreamErrorsKey)
+	events, _ := raw.([]*OpsUpstreamErrorEvent)
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if event == nil {
+			continue
+		}
+		annotate(event)
+		return
+	}
+
+	event := OpsUpstreamErrorEvent{Kind: "request_error"}
+	if failoverErr != nil {
+		event.UpstreamStatusCode = failoverErr.StatusCode
+		event.Stage = string(failoverErr.Stage)
+		event.Scope = string(failoverErr.Scope)
+		event.Reason = string(failoverErr.Reason)
+	} else if value, ok := c.Get(OpsUpstreamStatusCodeKey); ok {
+		event.UpstreamStatusCode, _ = value.(int)
+	}
+	if value, ok := c.Get(OpsUpstreamErrorMessageKey); ok {
+		event.Message, _ = value.(string)
+	}
+	annotate(&event)
+	appendOpsUpstreamError(c, event)
+}
+
 func setOpsUpstreamError(c *gin.Context, upstreamStatusCode int, upstreamMessage, upstreamDetail string) {
 	if c == nil {
 		return
@@ -383,6 +426,14 @@ type OpsUpstreamErrorEvent struct {
 	// Outcome
 	UpstreamStatusCode int    `json:"upstream_status_code,omitempty"`
 	UpstreamRequestID  string `json:"upstream_request_id,omitempty"`
+
+	// Final outcome is populated when the handler maps an exhausted upstream
+	// failure to the client response. It keeps the original upstream status
+	// above while making status mappings and capacity classification explicit.
+	FinalClientStatusCode  int    `json:"final_client_status_code,omitempty"`
+	FinalOutcome           string `json:"final_outcome,omitempty"`
+	RetryableOnSameAccount bool   `json:"retryable_on_same_account,omitempty"`
+	RequestScopedTransient bool   `json:"request_scoped_transient,omitempty"`
 
 	// UpstreamURL is the actual upstream URL that was called (host + path, query/fragment stripped).
 	// Helps debug 404/routing errors by showing which endpoint was targeted.

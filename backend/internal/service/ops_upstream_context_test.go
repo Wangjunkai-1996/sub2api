@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -308,6 +309,54 @@ func TestParseOpsUpstreamErrorsMarksLegacyProxyAttributionUnknown(t *testing.T) 
 	require.Len(t, events, 1)
 	require.Nil(t, events[0].ProxyID)
 	require.Equal(t, opsProxyNameUnknown, events[0].ProxyName)
+}
+
+func TestMarkOpsUpstreamFinalOutcomeAnnotatesLastAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		UpstreamStatusCode: http.StatusBadGateway,
+		Kind:               "failover",
+		Message:            "Our servers are currently overloaded. Please try again later.",
+	})
+
+	MarkOpsUpstreamFinalOutcome(c, &UpstreamFailoverError{
+		StatusCode:             http.StatusBadGateway,
+		RetryableOnSameAccount: true,
+		RequestScopedTransient: true,
+	}, http.StatusServiceUnavailable, "capacity_shed")
+
+	raw, ok := c.Get(OpsUpstreamErrorsKey)
+	require.True(t, ok)
+	events, ok := raw.([]*OpsUpstreamErrorEvent)
+	require.True(t, ok)
+	require.Len(t, events, 1)
+	require.Equal(t, http.StatusBadGateway, events[0].UpstreamStatusCode)
+	require.Equal(t, http.StatusServiceUnavailable, events[0].FinalClientStatusCode)
+	require.Equal(t, "capacity_shed", events[0].FinalOutcome)
+	require.True(t, events[0].RetryableOnSameAccount)
+	require.True(t, events[0].RequestScopedTransient)
+	encoded := marshalOpsUpstreamErrors(events)
+	require.NotNil(t, encoded)
+	require.Contains(t, *encoded, `"final_client_status_code":503`)
+	require.Contains(t, *encoded, `"final_outcome":"capacity_shed"`)
+}
+
+func TestMarkOpsUpstreamFinalOutcomeAddsTerminalEventWithoutAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	SetOpsUpstreamError(c, http.StatusGatewayTimeout, "request budget exhausted", "")
+
+	MarkOpsUpstreamFinalOutcome(c, nil, http.StatusGatewayTimeout, "request_budget_exhausted")
+
+	raw, ok := c.Get(OpsUpstreamErrorsKey)
+	require.True(t, ok)
+	events := raw.([]*OpsUpstreamErrorEvent)
+	require.Len(t, events, 1)
+	require.Equal(t, http.StatusGatewayTimeout, events[0].UpstreamStatusCode)
+	require.Equal(t, "request budget exhausted", events[0].Message)
+	require.Equal(t, http.StatusGatewayTimeout, events[0].FinalClientStatusCode)
+	require.Equal(t, "request_budget_exhausted", events[0].FinalOutcome)
 }
 
 func TestParseOpsUpstreamErrorsPreservesExplicitDirectAttribution(t *testing.T) {

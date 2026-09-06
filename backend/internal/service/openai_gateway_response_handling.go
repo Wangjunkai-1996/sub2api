@@ -275,6 +275,14 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 	codexFailureTerminal := account != nil && account.IsOpenAIOAuthLike()
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
+	streamErrorRecorded := false
+	recordStreamError := func(payload []byte, kind, message string) {
+		if streamErrorRecorded || clientDisconnected {
+			return
+		}
+		s.recordOpenAIStreamUpstreamError(c, account, false, upstreamRequestID, kind, payload, message)
+		streamErrorRecorded = true
+	}
 	markPreOutputFailoverSafe := func(failoverErr *UpstreamFailoverError) *UpstreamFailoverError {
 		if failoverErr != nil && stageBeforeClientOutput && (firstOutputTimeout > 0 || c.Writer.Written()) {
 			// A committed writer can only contain stable keepalive comments while the
@@ -420,6 +428,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
 			bareErrorAccountSideEffectsPending = false
 		}
+		if codexFailureTerminal && sawBareError && !sawResponseFailed {
+			recordStreamError(bareErrorPayload, "http_error", failedMessage)
+		}
 		if codexFailureTerminal && sawBareError && !sawResponseFailed && !clientDisconnected {
 			applyAttemptResponseHeaders()
 			if _, err := writePendingString(buildOpenAIResponseFailedSSE(responseID, originalModel, bareErrorPayload, failedMessage)); err != nil {
@@ -440,6 +451,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		flushPending("Client disconnected during final flush, returning collected usage")
 		if !sawTerminalEvent {
 			if clientOutputHasStarted() && !clientDisconnected {
+				message := "OpenAI stream ended before a terminal event"
+				recordStreamError(nil, "stream_missing_terminal", message)
 				s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
 			}
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
@@ -488,6 +501,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		}
 		if errors.Is(scanErr, bufio.ErrTooLong) {
 			logger.LegacyPrintf("service.openai_gateway", "SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, scanErr)
+			recordStreamError(nil, "stream_read_error", "response_too_large")
 			sendErrorEvent("response_too_large")
 			return resultWithUsage(), scanErr, true
 		}
@@ -502,6 +516,11 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if clientDisconnected {
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete after disconnect: %w", scanErr), true
 		}
+		readMessage := "OpenAI stream read error"
+		if errText := strings.TrimSpace(scanErr.Error()); errText != "" {
+			readMessage += ": " + errText
+		}
+		recordStreamError(nil, "stream_read_error", readMessage)
 		s.recordOpenAIProxyStreamDisconnect(account, scanErr, upstreamRequestID)
 		sendErrorEvent("stream_read_error")
 		return resultWithUsage(), fmt.Errorf("stream read error: %w", scanErr), true
@@ -599,6 +618,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					}
 				}
 				if outputStarted && !cyberHit {
+					if !(codexFailureTerminal && eventType == "error") {
+						recordStreamError(dataBytes, "http_error", failedMessage)
+					}
 					if codexFailureTerminal && eventType == "error" {
 						// OpenAI commonly follows a bare error with response.failed.
 						// Defer account health updates so the pair is applied once.
@@ -631,7 +653,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 								sawFailedEvent = true
 								// 命中透传规则也要记录 ops 上游错误事件（对齐 CC/Messages 与
 								// antigravity 先例），否则透传命中的 failed 在监控中不可见。
-								s.recordOpenAIStreamUpstreamError(c, account, false, upstreamRequestID, "http_error", dataBytes, failedMessage)
+								recordStreamError(dataBytes, "http_error", failedMessage)
 								MarkResponseCommitted(c)
 								c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 								c.JSON(status, gin.H{
@@ -643,6 +665,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 								streamEarlyErr = fmt.Errorf("upstream response failed: passthrough rule matched message=%s", errMsg)
 								return
 							}
+						}
+						if !cyberHit && !sawBareError {
+							recordStreamError(dataBytes, "http_error", failedMessage)
 						}
 					}
 				}
