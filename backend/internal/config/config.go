@@ -968,6 +968,10 @@ type GatewayConfig struct {
 	// OpenAIRequestBudgetSeconds: native HTTP Responses 从入口、排队到全部重试共用的总预算（秒）。
 	// 0 使用安全默认值 300 秒；该预算必须短于下游网关的整体超时。
 	OpenAIRequestBudgetSeconds int `mapstructure:"openai_request_budget_seconds"`
+	// OpenAIAtomicStreamFailover: native HTTP Responses 流式请求在最终成功事件前
+	// 是否暂存整段 SSE，以便上游晚到的失败可以安全重试或切换账号。
+	// 通过 Load 加载时默认开启；手工构造的零值 Config 仍保持关闭。
+	OpenAIAtomicStreamFailover bool `mapstructure:"openai_atomic_stream_failover"`
 	// 请求体最大字节数，用于网关请求体大小限制
 	MaxBodySize int64 `mapstructure:"max_body_size"`
 	// TextMaxBodySize limits endpoints that cannot carry inline image/video payloads.
@@ -2374,6 +2378,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 120)
 	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 240)
 	viper.SetDefault("gateway.openai_request_budget_seconds", 300)
+	viper.SetDefault("gateway.openai_atomic_stream_failover", true)
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)

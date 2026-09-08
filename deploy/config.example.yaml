@@ -229,6 +229,9 @@ gateway:
   # End-to-end budget shared by queueing, upstream attempts, and retries (seconds; default 300).
   # Must remain below the downstream gateway timeout so Sub2API can emit a terminal response.failed.
   openai_request_budget_seconds: 300
+  # Buffer native HTTP Responses SSE until a successful terminal event so late upstream failures can retry/fail over atomically.
+  # Enabled by default: this changes TTFT and increases per-request buffering; set false to keep legacy streaming behavior.
+  openai_atomic_stream_failover: true
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456

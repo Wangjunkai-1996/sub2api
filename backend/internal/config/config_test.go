@@ -429,6 +429,7 @@ func TestLoadDefaultOpenAIResponseTimeouts(t *testing.T) {
 	require.Equal(t, 120, cfg.Gateway.OpenAIFirstOutputTimeoutSeconds)
 	require.Equal(t, 240, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
 	require.Equal(t, 300, cfg.Gateway.OpenAIRequestBudgetSeconds)
+	require.True(t, cfg.Gateway.OpenAIAtomicStreamFailover)
 }
 
 func TestLoadOpenAIFirstOutputTimeoutsFromEnv(t *testing.T) {
@@ -436,12 +437,25 @@ func TestLoadOpenAIFirstOutputTimeoutsFromEnv(t *testing.T) {
 	t.Setenv("GATEWAY_OPENAI_FIRST_OUTPUT_TIMEOUT_SECONDS", "90")
 	t.Setenv("GATEWAY_OPENAI_HIGH_EFFORT_FIRST_OUTPUT_TIMEOUT_SECONDS", "240")
 	t.Setenv("GATEWAY_OPENAI_REQUEST_BUDGET_SECONDS", "180")
+	t.Setenv("GATEWAY_OPENAI_ATOMIC_STREAM_FAILOVER", "false")
 
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, 90, cfg.Gateway.OpenAIFirstOutputTimeoutSeconds)
 	require.Equal(t, 240, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
 	require.Equal(t, 180, cfg.Gateway.OpenAIRequestBudgetSeconds)
+	require.False(t, cfg.Gateway.OpenAIAtomicStreamFailover)
+}
+
+func TestLoadOpenAIAtomicStreamFailoverFromYAML(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("gateway:\n  openai_atomic_stream_failover: true\n"), 0o600))
+	t.Setenv("CONFIG_FILE", configPath)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.True(t, cfg.Gateway.OpenAIAtomicStreamFailover)
 }
 
 func TestValidateOpenAIFirstOutputTimeoutMinimum(t *testing.T) {
