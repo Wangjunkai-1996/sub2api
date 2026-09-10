@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseCodexSessionImportEntriesSupportsRawTokenJSONAndArray(t *testing.T) {
@@ -648,6 +649,73 @@ func TestImportCodexSessionsAccessTokenOnlySameWorkspaceDifferentUsersCreatesTwo
 	}
 }
 
+func TestImportCodexSessionsPersistsCompleteEgressPoolForNewAccounts(t *testing.T) {
+	svc := newCodexImportMemoryAdminService(nil)
+	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	concurrency := 3
+	req := CodexSessionImportRequest{
+		SkipDefaultGroupBind: boolPtr(true),
+		parsedEgressPool: &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{11, 12, 13},
+			PrimaryRouteID:       11,
+			ConcurrencyPerEgress: &concurrency,
+		},
+	}
+	entries := []codexImportEntry{{Index: 1, Value: buildCodexAccessOnlyImportValue(t, "workspace-1", "user-1")}}
+
+	result, err := handler.importCodexSessions(context.Background(), req, entries)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Created)
+	require.Len(t, svc.createdAccounts, 1)
+	created := svc.createdAccounts[0]
+	require.Equal(t, 3, created.Concurrency)
+	require.NotNil(t, created.EgressPool)
+	require.Equal(t, []int64{11, 12, 13}, created.EgressPool.RouteIDs)
+	require.Equal(t, int64(11), created.EgressPool.PrimaryRouteID)
+}
+
+func TestImportCodexSessionsPersistsCompleteEgressPoolForExistingAccounts(t *testing.T) {
+	existingToken := buildCodexAccessToken(t, "workspace-1", "user-1", time.Now().Add(time.Hour))
+	svc := newCodexImportMemoryAdminService([]service.Account{{
+		ID:             10,
+		Name:           "existing",
+		Platform:       service.PlatformOpenAI,
+		Type:           service.AccountTypeOAuth,
+		EgressRevision: 7,
+		Credentials: map[string]any{
+			"chatgpt_account_id": "workspace-1",
+			"chatgpt_user_id":    "user-1",
+			"access_token":       existingToken,
+		},
+	}})
+	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	concurrency := 3
+	req := CodexSessionImportRequest{
+		SkipDefaultGroupBind: boolPtr(true),
+		parsedEgressPool: &service.ReplaceAccountPoolInput{
+			Mode:                 service.EgressModePool,
+			RouteIDs:             []int64{11, 12, 13},
+			PrimaryRouteID:       11,
+			ConcurrencyPerEgress: &concurrency,
+		},
+	}
+	entries := []codexImportEntry{{Index: 1, Value: map[string]any{"access_token": existingToken}}}
+
+	result, err := handler.importCodexSessions(context.Background(), req, entries)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Updated)
+	require.Len(t, svc.updatedAccounts, 1)
+	updated := svc.updatedAccounts[0].input
+	require.NotNil(t, updated.EgressPool)
+	require.Equal(t, []int64{11, 12, 13}, updated.EgressPool.RouteIDs)
+	require.Equal(t, int64(11), updated.EgressPool.PrimaryRouteID)
+	require.Equal(t, 3, *updated.EgressPool.ConcurrencyPerEgress)
+	require.Equal(t, int64(7), *updated.EgressPool.ExpectedRevision)
+}
+
 func TestImportCodexSessionsAccessTokenOnlySameWorkspaceAndUserDifferentTokensCreatesTwoAccounts(t *testing.T) {
 	svc := newCodexImportMemoryAdminService(nil)
 	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
@@ -720,6 +788,46 @@ func TestImportCodexSessionsAccessTokenOnlySameUserUpdatesExisting(t *testing.T)
 	}
 	if got := svc.updatedAccounts[0].input.Extra["openai_long_context_billing_enabled"]; got != false {
 		t.Fatalf("openai_long_context_billing_enabled = %v, want false", got)
+	}
+}
+
+func TestImportCodexSessionsExplicitOffPersistsCanonicalWarmupPolicy(t *testing.T) {
+	existingToken := buildCodexAccessToken(t, "workspace-1", "user-1", time.Now().Add(time.Hour))
+	svc := newCodexImportMemoryAdminService([]service.Account{{
+		ID:       10,
+		Name:     "existing",
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Credentials: map[string]any{
+			"chatgpt_account_id": "workspace-1",
+			"chatgpt_user_id":    "user-1",
+			"access_token":       existingToken,
+		},
+		Extra: map[string]any{
+			service.OpenAICodexWarmupPolicyExtraKey: service.OpenAIWindowWarmupPolicyContinuous,
+			"preserved":                             true,
+		},
+	}})
+	handler := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	off := service.OpenAIWindowWarmupPolicyOff
+
+	result, err := handler.importCodexSessions(context.Background(), CodexSessionImportRequest{
+		SkipDefaultGroupBind:    boolPtr(true),
+		OpenAICodexWarmupPolicy: &off,
+	}, []codexImportEntry{{Index: 1, Value: map[string]any{"access_token": existingToken}}})
+
+	if err != nil {
+		t.Fatalf("importCodexSessions error = %v", err)
+	}
+	if result.Updated != 1 || result.Created != 0 || result.Failed != 0 {
+		t.Fatalf("result = %+v, want one updated account", result)
+	}
+	updatedExtra := svc.updatedAccounts[0].input.Extra
+	if got := updatedExtra[service.OpenAICodexWarmupPolicyExtraKey]; got != service.OpenAIWindowWarmupPolicyOff {
+		t.Fatalf("canonical warmup policy = %v, want off", got)
+	}
+	if got := updatedExtra["preserved"]; got != true {
+		t.Fatalf("preserved extra = %v, want true", got)
 	}
 }
 

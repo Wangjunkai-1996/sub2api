@@ -37,6 +37,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
+	ctx = ContextWithSelectedAccountEgress(ctx, account)
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return nil, wrapOpenAIWSFallback("egress_lease", useErr)
+		}
+		defer releaseUse()
+	}
 	responseModelObserver := &upstreamResponseModelObserver{}
 
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -199,6 +207,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		Account: account,
 		WSURL:   wsURL,
 		Headers: wsHeaders,
+		RequiredBindingID: func() string {
+			if account.SelectedEgress == nil {
+				return ""
+			}
+			return strings.TrimSpace(account.SelectedEgress.BindingID)
+		}(),
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -358,6 +372,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	responseID := ""
+	responseRoutingBound := false
+	bindResponseRouting := func() {
+		if responseRoutingBound || strings.TrimSpace(responseID) == "" {
+			return
+		}
+		responseRoutingBound = true
+		s.bindOpenAIResponseRouting(ctx, c, account, responseID, lease.BindingID(), lease.ConnID())
+	}
 	var finalResponse []byte
 	wroteDownstream := false
 	needModelReplace := originalModel != mappedModel
@@ -374,6 +396,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
+	upstreamTerminalStatusCode := 0
 	clientDisconnected := false
 	clientDisconnectDrainStartedAt := time.Time{}
 	readTimeout := s.openAIWSReadTimeout()
@@ -416,11 +439,15 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			UpstreamResponseModel:         responseModelObserver.Model(),
 			UpstreamResponseModelConflict: responseModelObserver.Conflict(),
 			UpstreamResponseServiceTier:   responseModelObserver.ServiceTier(),
+			ImageCount:                    imageCounter.Count(),
+			ImageOutputSizes:              imageCounter.Sizes(),
 			ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTier(reqBody)),
 			ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
+			RequestedReasoningEffort:      CanonicalRequestedReasoningEffortFromReqBody(reqBody, originalModel, mappedModel),
 			Stream:                        reqStream,
 			OpenAIWSMode:                  true,
 			UpstreamTerminalEvent:         upstreamTerminalEvent,
+			UpstreamTerminalStatusCode:    upstreamTerminalStatusCode,
 			ResponseHeaders:               lease.HandshakeHeaders(),
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
@@ -466,6 +493,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		if clientDisconnected {
 			return
 		}
+		bindResponseRouting()
 		frame := make([]byte, 0, len(message)+8)
 		frame = append(frame, "data: "...)
 		frame = append(frame, message...)
@@ -764,6 +792,7 @@ readLoop:
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
 			}
 			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
+			upstreamTerminalStatusCode = openAIWSTerminalHealthStatus(message)
 			// A terminal event must be the final JSON document in its WS message.
 			// Ignore any tail for the completed client turn, but never reuse the
 			// ambiguous upstream connection for another request.
@@ -804,18 +833,18 @@ readLoop:
 			responseID = strings.TrimSpace(gjson.GetBytes(finalResponse, "id").String())
 		}
 
+		bindResponseRouting()
 		c.Data(http.StatusOK, "application/json", finalResponse)
 	} else {
 		flushStreamWriter(true)
 	}
-
-	if responseID != "" && stateStore != nil {
-		ttl := s.openAIWSResponseStickyTTL()
-		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
-		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
-	}
 	if stateStore != nil && storeDisabled && sessionHash != "" {
-		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), s.openAIWSSessionStickyTTL())
+		ttl := s.openAIWSSessionStickyTTL()
+		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), ttl)
+		bindingID := strings.TrimSpace(lease.BindingID())
+		if bindingID != "" {
+			logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, bindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, bindingID, ttl))
+		}
 	}
 	firstTokenMsValue := -1
 	if firstTokenMs != nil {
@@ -840,10 +869,7 @@ readLoop:
 		clientDisconnected,
 	)
 
-	result := resultWithUsage()
-	result.ImageCount = imageCounter.Count()
-	result.ImageOutputSizes = imageCounter.Sizes()
-	return result, nil
+	return resultWithUsage(), nil
 }
 
 // ProxyResponsesWebSocketFromClient 处理客户端入站 WebSocket（OpenAI Responses WS Mode）并转发到上游。

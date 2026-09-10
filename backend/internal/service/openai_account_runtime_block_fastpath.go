@@ -343,13 +343,74 @@ func (s *OpenAIGatewayService) openAIAccountRuntimeBlockLock(accountID int64) *s
 	return mu
 }
 
-func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, _ string) (uint64, bool) {
+// Keep the account out of scheduler candidates while Redis decides whether a
+// real upstream Cyber mark is new. References isolate concurrent decisions;
+// finishing a duplicate removes only its own temporary gate.
+func (s *OpenAIGatewayService) beginOpenAICyberCooldownClassification(accountID int64) func() {
+	if s == nil || accountID <= 0 {
+		return func() {}
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	pending := 0
+	if value, ok := s.openaiCyberCooldownPending.Load(accountID); ok {
+		pending, _ = value.(int)
+	}
+	s.openaiCyberCooldownPending.Store(accountID, pending+1)
+	mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			value, ok := s.openaiCyberCooldownPending.Load(accountID)
+			if !ok {
+				return
+			}
+			count, valid := value.(int)
+			if !valid || count <= 1 {
+				s.openaiCyberCooldownPending.Delete(accountID)
+				return
+			}
+			s.openaiCyberCooldownPending.Store(accountID, count-1)
+		})
+	}
+}
+
+func (s *OpenAIGatewayService) openAICyberCooldownClassificationPendingLocked(accountID int64) bool {
+	value, ok := s.openaiCyberCooldownPending.Load(accountID)
+	if !ok {
+		return false
+	}
+	pending, ok := value.(int)
+	return ok && pending > 0
+}
+
+func (s *OpenAIGatewayService) isOpenAICyberCooldownClassificationPending(accountID int64) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.openAICyberCooldownClassificationPendingLocked(accountID)
+}
+
+func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, reason string) (uint64, bool) {
 	generation := s.openaiAccountRuntimeBlockSequence.Add(1)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)
 	now := time.Now()
 	blockUntil := until
 	if blockUntil.IsZero() || !blockUntil.After(now) {
 		blockUntil = now.Add(openAIStopSchedulingBridgeCooldown)
+	}
+	if strings.HasPrefix(reason, openAICyberAccountCooldownReason+":") || strings.HasPrefix(reason, "openai_window_warmup:") {
+		current, _ := s.openaiLocalCooldownRuntimeUntil.Load(account.ID)
+		currentUntil, _ := current.(time.Time)
+		if blockUntil.After(currentUntil) {
+			s.openaiLocalCooldownRuntimeUntil.Store(account.ID, blockUntil)
+		}
 	}
 
 	for {
@@ -386,6 +447,7 @@ func (s *OpenAIGatewayService) ClearAccountSchedulingBlock(accountID int64) {
 	mu.Lock()
 	defer mu.Unlock()
 	s.openaiAccountRuntimeBlockUntil.Delete(accountID)
+	s.openaiLocalCooldownRuntimeUntil.Delete(accountID)
 	s.openaiOAuth429RetryStartedAt.Delete(accountID)
 	s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
 }
@@ -397,6 +459,9 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	mu := s.openAIAccountRuntimeBlockLock(account.ID)
 	mu.Lock()
 	defer mu.Unlock()
+	if s.openAICyberCooldownClassificationPendingLocked(account.ID) {
+		return true
+	}
 	value, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
 	if !ok {
 		return false
@@ -494,9 +559,11 @@ func accountPersistedSchedulingCooldownActive(account *Account) bool {
 }
 
 type openAIAccountRuntimeBlockSnapshot struct {
-	until      time.Time
-	generation uint64
-	blocked    bool
+	until        time.Time
+	generation   uint64
+	blocked      bool
+	localBlocked bool
+	cyberPending bool
 }
 
 func (s *OpenAIGatewayService) peekOpenAIAccountRuntimeBlock(account *Account) openAIAccountRuntimeBlockSnapshot {
@@ -506,20 +573,31 @@ func (s *OpenAIGatewayService) peekOpenAIAccountRuntimeBlock(account *Account) o
 	mu := s.openAIAccountRuntimeBlockLock(account.ID)
 	mu.Lock()
 	defer mu.Unlock()
+	snapshot := openAIAccountRuntimeBlockSnapshot{
+		cyberPending: s.openAICyberCooldownClassificationPendingLocked(account.ID),
+	}
+	if value, ok := s.openaiLocalCooldownRuntimeUntil.Load(account.ID); ok {
+		until, _ := value.(time.Time)
+		snapshot.localBlocked = time.Now().Before(until)
+		if !snapshot.localBlocked {
+			s.openaiLocalCooldownRuntimeUntil.Delete(account.ID)
+		}
+	}
 	value, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
 	if !ok {
-		return openAIAccountRuntimeBlockSnapshot{}
+		return snapshot
 	}
 	until, isTime := value.(time.Time)
 	if !isTime || until.IsZero() || !time.Now().Before(until) {
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 		s.openaiOAuth429RetryStartedAt.Delete(account.ID)
 		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
-		return openAIAccountRuntimeBlockSnapshot{}
+		return snapshot
 	}
 	generation, _ := s.openaiAccountRuntimeBlockGeneration.Load(account.ID)
 	gen, _ := generation.(uint64)
-	return openAIAccountRuntimeBlockSnapshot{until: until, generation: gen, blocked: true}
+	snapshot.until, snapshot.generation, snapshot.blocked = until, gen, true
+	return snapshot
 }
 
 // clearOpenAIAccountRuntimeBlockIfUnchanged deletes the in-process account block
@@ -552,11 +630,15 @@ func (s *OpenAIGatewayService) clearOpenAIAccountRuntimeBlockIfUnchanged(account
 // block is dropped with generation+deadline CAS. Model-scoped transient blocks
 // are left alone. This is fail-open if a DB write failed or the snapshot has
 // not caught up yet: empty cooldown fields drop the local account-level block.
+// Cyber and warmup auth guards remain fail-closed independently of DB state.
 func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlocked(account *Account, requestedModel string) bool {
 	if s == nil {
 		return false
 	}
 	snapshot := s.peekOpenAIAccountRuntimeBlock(account)
+	if snapshot.cyberPending || snapshot.localBlocked {
+		return true
+	}
 	if snapshot.blocked {
 		if accountPersistedSchedulingCooldownActive(account) {
 			return true

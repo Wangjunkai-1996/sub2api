@@ -86,6 +86,7 @@ const (
 )
 
 type openAIProfitControlGateCtxKey struct{}
+type openAISelectionPreserveStickyBindingCtxKey struct{}
 
 // openAIProfitControlSuppressCtxKey 标记本请求显式跳过利润门（独立图片/视频
 // 端点、Grok 媒体、count_tokens、live 等利润门范围外流量）。所有装门点看到该
@@ -288,13 +289,27 @@ func attachSelectionProfitGate(ctx context.Context, sel *AccountSelectionResult)
 // （ProfitControlVetoLatest / GatewayProfitControlVetoLatest）与准入后粘性
 // 绑定，否则这两步会因为看不到调度栈内安装的门而退化为空操作。
 func ContextWithSelectionProfitGate(ctx context.Context, sel *AccountSelectionResult) context.Context {
-	if sel == nil || sel.profitGate == nil {
+	if sel == nil {
+		return ctx
+	}
+	if sel.Account != nil && sel.Account.LegacyEgressAdmission != nil {
+		ctx = contextWithLegacyAccountEgressAdmission(ctx, sel.Account.LegacyEgressAdmission)
+	}
+	if sel.preserveStickyBinding && !preserveOpenAISelectionStickyBinding(ctx) {
+		ctx = context.WithValue(ctx, openAISelectionPreserveStickyBindingCtxKey{}, true)
+	}
+	if sel.profitGate == nil {
 		return ctx
 	}
 	if existing, ok := ctx.Value(openAIProfitControlGateCtxKey{}).(*openAIProfitControlGate); ok && existing == sel.profitGate {
 		return ctx
 	}
 	return context.WithValue(ctx, openAIProfitControlGateCtxKey{}, sel.profitGate)
+}
+
+func preserveOpenAISelectionStickyBinding(ctx context.Context) bool {
+	preserve, _ := ctx.Value(openAISelectionPreserveStickyBindingCtxKey{}).(bool)
+	return preserve
 }
 
 // openAIProfitControlVetoReason 报告利润门是否否决该账号。ctx 中没有门
@@ -342,7 +357,8 @@ func (s *OpenAIGatewayService) ProfitControlVetoLatest(ctx context.Context, sele
 // only after the terminal post-slot check, so an account rejected after a rate
 // refresh cannot become the new sticky target.
 func (s *OpenAIGatewayService) bindOpenAIStickySessionDuringSelection(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
-	if gatewayProfitControlGateActive(ctx) || preserveOpenAIGuardianParentBinding(ctx, sessionHash) {
+	if gatewayProfitControlGateActive(ctx) || preserveOpenAIGuardianParentBinding(ctx, sessionHash) ||
+		preserveOpenAISelectionStickyBinding(ctx) {
 		return nil
 	}
 	return s.BindStickySession(ctx, groupID, sessionHash, accountID)
@@ -358,7 +374,7 @@ func (s *OpenAIGatewayService) BindStickySessionAfterProfitAdmission(ctx context
 	if sessionHash == "" || accountID <= 0 {
 		return nil
 	}
-	if preserveOpenAIGuardianParentBinding(ctx, sessionHash) {
+	if preserveOpenAIGuardianParentBinding(ctx, sessionHash) || preserveOpenAISelectionStickyBinding(ctx) {
 		return nil
 	}
 	if !gatewayProfitControlGateActive(ctx) {

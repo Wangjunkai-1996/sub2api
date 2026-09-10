@@ -2,11 +2,13 @@ package admin
 
 import (
 	"context"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
@@ -111,6 +113,36 @@ func (h *ProxyHandler) GetAll(c *gin.Context) {
 	out := make([]dto.AdminProxy, 0, len(proxies))
 	for i := range proxies {
 		out = append(out, *dto.ProxyFromServiceAdmin(&proxies[i]))
+	}
+	response.Success(c, out)
+}
+
+// GetOptions returns the credential-free proxy catalog used by account forms.
+// GET /api/v1/admin/proxies/options
+func (h *ProxyHandler) GetOptions(c *gin.Context) {
+	const maxProxyOptions = 1000
+	proxies, total, err := h.adminService.ListProxiesWithAccountCount(
+		c.Request.Context(), 1, maxProxyOptions, "", "", "", "name", "asc",
+	)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if total > maxProxyOptions {
+		response.ErrorFrom(c, infraerrors.New(
+			http.StatusConflict,
+			"PROXY_OPTIONS_LIMIT_EXCEEDED",
+			"proxy option catalog exceeds the supported limit",
+		))
+		return
+	}
+
+	now := time.Now()
+	out := make([]dto.ProxyOption, 0, len(proxies))
+	for i := range proxies {
+		if option := dto.ProxyOptionFromService(&proxies[i], now); option != nil {
+			out = append(out, *option)
+		}
 	}
 	response.Success(c, out)
 }

@@ -70,6 +70,36 @@ func (c *gatewayCache) DeleteSessionAccountID(ctx context.Context, groupID int64
 	return c.rdb.Del(ctx, key).Err()
 }
 
+var compareAndDeleteSessionAccountIDScript = redis.NewScript(`
+local current = redis.call('GET', KEYS[1])
+if current == false or current ~= ARGV[1] then
+  return 0
+end
+redis.call('DEL', KEYS[1])
+return 1
+`)
+
+func (c *gatewayCache) CompareAndDeleteSessionAccountID(
+	ctx context.Context,
+	groupID int64,
+	sessionHash string,
+	expectedAccountID int64,
+) (bool, error) {
+	if c == nil || c.rdb == nil || strings.TrimSpace(sessionHash) == "" || expectedAccountID <= 0 {
+		return false, nil
+	}
+	deleted, err := compareAndDeleteSessionAccountIDScript.Run(
+		ctx,
+		c.rdb,
+		[]string{buildSessionKey(groupID, sessionHash)},
+		strconv.FormatInt(expectedAccountID, 10),
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+	return deleted == 1, nil
+}
+
 var claimOpenAIResponsesSessionWindowScript = redis.NewScript(`
 local previous = redis.call('GET', KEYS[1])
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
@@ -223,8 +253,6 @@ func (c *gatewayCache) ReleaseGrokVideoBilled(ctx context.Context, key string) e
 	return c.rdb.Del(ctx, grokVideoBilledPrefix+key).Err()
 }
 
-// Compile-time assertion: gatewayCache must implement CyberSessionBlockStore.
-var _ service.CyberSessionBlockStore = (*gatewayCache)(nil)
 var _ service.LiveCallStore = (*gatewayCache)(nil)
 
 const reasoningContentPrefix = "reasoning_content:"
@@ -267,86 +295,6 @@ func (c *gatewayCache) GetReasoningContent(ctx context.Context, itemID string) (
 		return "", err
 	}
 	return val, nil
-}
-
-const (
-	cyberSessionBlockPrefix         = "cyber_session_block:"
-	cyberSessionScopePrefix         = "cyber_session_scope:"
-	cyberSessionRedisCommandMaxKeys = 128
-)
-
-// SetCyberSessionBlocked writes exact blocks in bounded transactions. The
-// coarse scope is activated only after all exact blocks have been stored.
-func (c *gatewayCache) SetCyberSessionBlocked(ctx context.Context, scopeKey string, keys []string, ttl time.Duration) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	exactKeys := make([]string, 0, cyberSessionRedisCommandMaxKeys)
-	flush := func() error {
-		if len(exactKeys) == 0 {
-			return nil
-		}
-		pipe := c.rdb.TxPipeline()
-		for _, key := range exactKeys {
-			pipe.Set(ctx, cyberSessionBlockPrefix+key, "1", ttl)
-		}
-		_, err := pipe.Exec(ctx)
-		exactKeys = exactKeys[:0]
-		return err
-	}
-	for _, key := range keys {
-		if key != "" {
-			exactKeys = append(exactKeys, key)
-			if len(exactKeys) == cyberSessionRedisCommandMaxKeys {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	if err := flush(); err != nil {
-		return err
-	}
-	if scopeKey != "" {
-		return c.rdb.Set(ctx, cyberSessionScopePrefix+scopeKey, "1", ttl).Err()
-	}
-	return nil
-}
-
-func (c *gatewayCache) IsCyberSessionScopeActive(ctx context.Context, scopeKey string) (bool, error) {
-	n, err := c.rdb.Exists(ctx, cyberSessionScopePrefix+scopeKey).Result()
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
-}
-
-// FindCyberSessionBlocked checks bounded batches in caller order and stops at
-// the first blocked key, preserving the original earliest-match behavior.
-func (c *gatewayCache) FindCyberSessionBlocked(ctx context.Context, keys []string) (string, error) {
-	if len(keys) == 0 {
-		return "", nil
-	}
-	for start := 0; start < len(keys); start += cyberSessionRedisCommandMaxKeys {
-		end := start + cyberSessionRedisCommandMaxKeys
-		if end > len(keys) {
-			end = len(keys)
-		}
-		redisKeys := make([]string, end-start)
-		for i, key := range keys[start:end] {
-			redisKeys[i] = cyberSessionBlockPrefix + key
-		}
-		values, err := c.rdb.MGet(ctx, redisKeys...).Result()
-		if err != nil {
-			return "", err
-		}
-		for i, value := range values {
-			if value != nil {
-				return keys[start+i], nil
-			}
-		}
-	}
-	return "", nil
 }
 
 var claimLiveControllerScript = redis.NewScript(`
@@ -405,22 +353,32 @@ func (c *gatewayCache) SaveLiveCall(ctx context.Context, record *service.LiveCal
 		return fmt.Errorf("invalid live call record")
 	}
 	values := map[string]any{
-		"call_id":          record.CallID,
-		"account_id":       record.AccountID,
-		"api_key_id":       record.APIKeyID,
-		"user_id":          record.UserID,
-		"group_id":         record.GroupID,
-		"subscription_id":  record.SubscriptionID,
-		"lease_id":         record.LeaseID,
-		"model":            record.Model,
-		"created_at":       record.CreatedAt.UnixMilli(),
-		"expires_at":       record.ExpiresAt.UnixMilli(),
-		"controller":       record.Controller,
-		"controller_owner": record.ControllerOwner,
-		"user_agent":       record.UserAgent,
-		"ip_address":       record.IPAddress,
-		"inbound_endpoint": record.InboundEndpoint,
-		"attestation":      record.AttestationCiphertext,
+		"call_id":                      record.CallID,
+		"account_id":                   record.AccountID,
+		"api_key_id":                   record.APIKeyID,
+		"user_id":                      record.UserID,
+		"group_id":                     record.GroupID,
+		"subscription_id":              record.SubscriptionID,
+		"lease_id":                     record.LeaseID,
+		"egress_binding_id":            record.EgressBindingID,
+		"egress_lease_id":              record.EgressLeaseID,
+		"egress_route_id":              record.EgressRouteID,
+		"egress_identity_id":           record.EgressIdentityID,
+		"egress_config_version":        record.EgressConfigVersion,
+		"egress_authority_revision":    record.EgressAuthorityRevision,
+		"legacy_egress_binding_id":     record.LegacyEgressBindingID,
+		"legacy_egress_route_id":       record.LegacyEgressRouteID,
+		"legacy_egress_identity_id":    record.LegacyEgressIdentityID,
+		"legacy_egress_config_version": record.LegacyEgressConfigVersion,
+		"model":                        record.Model,
+		"created_at":                   record.CreatedAt.UnixMilli(),
+		"expires_at":                   record.ExpiresAt.UnixMilli(),
+		"controller":                   record.Controller,
+		"controller_owner":             record.ControllerOwner,
+		"user_agent":                   record.UserAgent,
+		"ip_address":                   record.IPAddress,
+		"inbound_endpoint":             record.InboundEndpoint,
+		"attestation":                  record.AttestationCiphertext,
 	}
 	key := liveCallKey(record.CallHash)
 	pipe := c.rdb.TxPipeline()
@@ -445,23 +403,33 @@ func (c *gatewayCache) GetLiveCall(ctx context.Context, callHash string) (*servi
 	createdAt := time.UnixMilli(parseInt("created_at"))
 	expiresAt := time.UnixMilli(parseInt("expires_at"))
 	return &service.LiveCallRecord{
-		CallID:                values["call_id"],
-		CallHash:              callHash,
-		AccountID:             parseInt("account_id"),
-		APIKeyID:              parseInt("api_key_id"),
-		UserID:                parseInt("user_id"),
-		GroupID:               parseInt("group_id"),
-		SubscriptionID:        parseInt("subscription_id"),
-		LeaseID:               values["lease_id"],
-		Model:                 values["model"],
-		CreatedAt:             createdAt,
-		ExpiresAt:             expiresAt,
-		Controller:            values["controller"],
-		ControllerOwner:       values["controller_owner"],
-		UserAgent:             values["user_agent"],
-		IPAddress:             values["ip_address"],
-		InboundEndpoint:       values["inbound_endpoint"],
-		AttestationCiphertext: values["attestation"],
+		CallID:                    values["call_id"],
+		CallHash:                  callHash,
+		AccountID:                 parseInt("account_id"),
+		APIKeyID:                  parseInt("api_key_id"),
+		UserID:                    parseInt("user_id"),
+		GroupID:                   parseInt("group_id"),
+		SubscriptionID:            parseInt("subscription_id"),
+		LeaseID:                   values["lease_id"],
+		EgressBindingID:           values["egress_binding_id"],
+		EgressLeaseID:             values["egress_lease_id"],
+		EgressRouteID:             parseInt("egress_route_id"),
+		EgressIdentityID:          values["egress_identity_id"],
+		EgressConfigVersion:       parseInt("egress_config_version"),
+		EgressAuthorityRevision:   parseInt("egress_authority_revision"),
+		LegacyEgressBindingID:     values["legacy_egress_binding_id"],
+		LegacyEgressRouteID:       parseInt("legacy_egress_route_id"),
+		LegacyEgressIdentityID:    values["legacy_egress_identity_id"],
+		LegacyEgressConfigVersion: parseInt("legacy_egress_config_version"),
+		Model:                     values["model"],
+		CreatedAt:                 createdAt,
+		ExpiresAt:                 expiresAt,
+		Controller:                values["controller"],
+		ControllerOwner:           values["controller_owner"],
+		UserAgent:                 values["user_agent"],
+		IPAddress:                 values["ip_address"],
+		InboundEndpoint:           values["inbound_endpoint"],
+		AttestationCiphertext:     values["attestation"],
 	}, nil
 }
 

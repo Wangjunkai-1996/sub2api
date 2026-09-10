@@ -918,6 +918,60 @@ export type AccountType = 'oauth' | 'setup-token' | 'apikey' | 'upstream' | 'bed
 export type OAuthAddMethod = 'oauth' | 'setup-token'
 export type ProxyProtocol = 'http' | 'https' | 'socks5' | 'socks5h'
 
+/** OpenAI ChatGPT/Codex five-hour window warmup policy. */
+export type OpenAICodexWarmupPolicy = 'off' | 'initial_once' | 'continuous'
+
+/** Durable warmup job states returned by the admin API. */
+export type OpenAIWindowWarmupState =
+  | 'pending'
+  | 'armed'
+  | 'due'
+  | 'running'
+  | 'retrying'
+  | 'uncertain'
+  | 'possibly_sent'
+  | 'paused'
+  | 'blocked'
+  | 'blocked_config'
+  | 'failed'
+  | 'completed'
+
+export interface OpenAIWindowWarmupJob {
+  id: number
+  account_id: number
+  quota_scope: 'global' | string
+  state: OpenAIWindowWarmupState | string
+  trigger: string
+  cycle_key: string
+  cycle_generation: number
+  observed_reset_at?: string | null
+  next_attempt_at?: string | null
+  attempt_count: number
+  sent_at?: string | null
+  lease_until?: string | null
+  last_attempt_at?: string | null
+  last_success_at?: string | null
+  status_code?: number | null
+  last_error_code?: string | null
+  last_error?: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** Redacted account-level warmup status; no credential or response content. */
+export interface OpenAIWindowWarmupStatus {
+  policy: OpenAICodexWarmupPolicy
+  state?: OpenAIWindowWarmupState | string | null
+  next_run_at?: string | null
+  next_attempt_at?: string | null
+  last_success_at?: string | null
+  observed_reset_at?: string | null
+  attempt_count?: number
+  last_error_code?: string | null
+  last_error?: string | null
+  job?: OpenAIWindowWarmupJob | null
+}
+
 // Claude Model type (returned by /v1/models and account models API)
 export interface ClaudeModel {
   id: string
@@ -955,6 +1009,119 @@ export interface Proxy {
   expiry_warn_days: number
   created_at: string
   updated_at: string
+}
+
+/** Credential-free proxy projection used by account assignment controls. */
+export interface ProxyOption {
+  id: number
+  name: string
+  display_endpoint: string
+  status: 'active' | 'inactive' | 'expired'
+  selectable: boolean
+  disabled_reason?: string | null
+  account_count?: number
+}
+
+export type EgressMode = 'legacy' | 'pool' | 'inherited'
+export type EgressKind = 'proxy' | 'direct'
+export type EgressRouteState =
+  | 'pending_verification'
+  | 'active'
+  | 'inactive'
+  | 'expired'
+  | 'identity_mismatch'
+  | 'retired'
+
+/** Redacted route projection used by account assignment UIs. */
+export interface AssignableEgressRoute {
+  id: number
+  ref?: string
+  kind: EgressKind
+  name?: string | null
+  display_name?: string | null
+  proxy_name?: string | null
+  protocol?: string | null
+  proxy_id?: number | null
+  revision?: number
+  state: EgressRouteState
+  eligible: boolean
+  reason_code?: string | null
+  observed_ip?: string | null
+  public_ip?: string | null
+  ip_address?: string | null
+  identity_status?: string | null
+  verified_at?: string | null
+  probe_success?: boolean | null
+  probe_reason_code?: string | null
+  probe_message?: string | null
+  probe_observed_ip?: string | null
+  probe_observed_at?: string | null
+  probe_latency_ms?: number | null
+  country?: string | null
+  country_code?: string | null
+  expires_at?: string | null
+}
+
+export interface AccountEgressCatalogCapabilities {
+  mutation_enabled: boolean
+  reason_code?: string | null
+}
+
+export interface AssignableEgressRouteCatalog {
+  items: AssignableEgressRoute[]
+  generation?: string | number | null
+  /** Server-authoritative route selected for OAuth handshakes. */
+  default_route_id?: number | null
+  /** Authoritative default capacity assigned to each selected static egress. */
+  default_concurrency?: number | null
+  capabilities: AccountEgressCatalogCapabilities
+}
+
+export interface AccountEgressPoolWrite {
+  route_ids: number[]
+  primary_route_id: number | null
+  concurrency_per_egress: number
+  revision?: number
+}
+
+export type AccountEgressPoolOperation = 'append' | 'remove' | 'replace'
+
+export interface BulkAccountEgressPoolWrite {
+  operation: AccountEgressPoolOperation
+  route_ids: number[]
+  primary_route_id?: number | null
+  concurrency_per_egress?: number
+  revision?: number
+}
+
+export interface AccountEgressPool extends AccountEgressPoolWrite {
+  routes?: AssignableEgressRoute[]
+  inherited?: boolean
+  inherited_from_account_id?: number | null
+}
+
+export interface AccountEgressSummary {
+  configured_route_count: number
+  eligible_route_count: number
+  degraded_route_count?: number
+  concurrency_per_egress: number
+  effective_capacity: number
+  current_concurrency?: number
+  primary_route_id?: number | null
+  routes?: AssignableEgressRoute[]
+  inherited?: boolean
+  inherited_from_account_id?: number | null
+  bindings?: AccountEgressCapacityBinding[]
+  route_usage?: AccountEgressCapacityBinding[]
+  breakdown?: AccountEgressCapacityBinding[]
+}
+
+export interface AccountEgressCapacityBinding {
+  route_id: number
+  name?: string
+  observed_ip?: string | null
+  eligible?: boolean
+  current_concurrency?: number
 }
 
 export interface ProxyAccountSummary {
@@ -1192,6 +1359,10 @@ export interface Account {
   concurrency: number
   load_factor?: number | null
   current_concurrency?: number // Real-time concurrency count from Redis
+  egress_mode?: EgressMode
+  egress_revision?: number
+  egress_summary?: AccountEgressSummary | null
+  egress_pool?: AccountEgressPool | null
   scheduler_score?: {
     base_score: number
     sticky_score?: number
@@ -1287,6 +1458,11 @@ export interface Account {
   parent_privacy_mode?: string
   parent_subscription_expires_at?: string
   parent_chatgpt_account_id?: string
+
+  // OpenAI Codex five-hour window warmup (runtime state is job-backed).
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
+  openai_window_warmup?: OpenAIWindowWarmupStatus | null
+  codex_warmup?: OpenAIWindowWarmupStatus | null
 }
 
 // The admin account list may return this compact shape when lite=1. Detail
@@ -1371,7 +1547,7 @@ export interface GrokBillingSummary {
 }
 
 export interface AccountUsageInfo {
-  source?: 'passive' | 'active'
+  source?: 'passive' | 'cached' | 'active'
   updated_at: string | null
   five_hour: UsageProgress | null
   seven_day: UsageProgress | null
@@ -1421,6 +1597,11 @@ export interface AccountUsageInfo {
   error_code?: string
 
   error?: string            // usage 获取失败时的错误信息
+}
+
+export interface AccountUsageRequestResult {
+  usage: AccountUsageInfo | null
+  error: string | null
 }
 
 // OpenAI Codex usage snapshot (from response headers)
@@ -1474,6 +1655,8 @@ export interface CreateAccountRequest {
   extra?: Record<string, unknown>
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   load_factor?: number | null
   priority?: number
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
@@ -1482,6 +1665,8 @@ export interface CreateAccountRequest {
   auto_pause_on_expired?: boolean
   upstream_billing_probe_enabled?: boolean
   confirm_mixed_channel_risk?: boolean
+  /** Optional explicit policy; backend also accepts the extra key for older clients. */
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface UpdateAccountRequest {
@@ -1492,6 +1677,8 @@ export interface UpdateAccountRequest {
   extra?: Record<string, unknown>
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   load_factor?: number | null
   priority?: number
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
@@ -1503,6 +1690,7 @@ export interface UpdateAccountRequest {
   upstream_billing_probe_enabled?: boolean
   upstream_billing_rate_sync_enabled?: boolean
   confirm_mixed_channel_risk?: boolean
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export type GrokMediaEligibilityMode = 'auto' | 'enabled' | 'disabled'
@@ -1621,6 +1809,8 @@ export interface CodexSessionImportRequest {
   group_ids?: number[]
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   priority?: number
   rate_multiplier?: number
   load_factor?: number | null
@@ -1631,6 +1821,7 @@ export interface CodexSessionImportRequest {
   update_existing?: boolean
   skip_default_group_bind?: boolean
   confirm_mixed_channel_risk?: boolean
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface OpenAICodexPATCreateRequest {
@@ -1640,6 +1831,8 @@ export interface OpenAICodexPATCreateRequest {
   group_ids?: number[]
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   priority?: number
   rate_multiplier?: number
   load_factor?: number | null
@@ -1649,6 +1842,7 @@ export interface OpenAICodexPATCreateRequest {
   extra?: Record<string, unknown>
   skip_default_group_bind?: boolean
   confirm_mixed_channel_risk?: boolean
+  openai_codex_warmup_policy?: OpenAICodexWarmupPolicy
 }
 
 export interface CodexSessionImportMessage {
@@ -1663,6 +1857,8 @@ export interface CodexSessionImportItem {
   action: 'created' | 'updated' | 'skipped' | 'failed'
   account_id?: number
   message?: string
+  warmup_queued: boolean
+  warmup_status: string
 }
 
 export interface CodexSessionImportResult {

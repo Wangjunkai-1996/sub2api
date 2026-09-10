@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -110,9 +112,13 @@ func ProvideBatchImageCleanupService(repo BatchImageRepository, accountRepo Acco
 func ProvideOpenAIOAuthService(
 	proxyRepo ProxyRepository,
 	oauthClient OpenAIOAuthClient,
+	settingService *SettingService,
+	egressService *EgressService,
 	privacyClientFactory PrivacyClientFactory,
 ) *OpenAIOAuthService {
 	svc := NewOpenAIOAuthService(proxyRepo, oauthClient)
+	svc.SetSettingService(settingService)
+	svc.SetEgressService(egressService)
 	svc.SetPrivacyClientFactory(privacyClientFactory)
 	return svc
 }
@@ -174,6 +180,104 @@ func ProvideOpenAITokenProvider(
 	return p
 }
 
+// ProvideOpenAIWindowWarmupOptions loads the bounded worker parameters once at
+// startup. The kill switch and allowlist remain dynamic and fail closed when
+// settings cannot be read.
+func ProvideOpenAIWindowWarmupOptions(settingService *SettingService) OpenAIWindowWarmupOptions {
+	settings, err := loadOpenAIWindowWarmupSettings(context.Background(), settingService)
+	if err != nil {
+		slog.Warn("openai_window_warmup_initial_settings_failed", "error", err)
+		settings = &SystemSettings{}
+		applyDefaultOpenAIWindowWarmupSettings(settings)
+	}
+
+	return OpenAIWindowWarmupOptions{
+		WorkerConcurrency: settings.OpenAIWindowWarmupWorkerConcurrency,
+		GlobalQPS:         settings.OpenAIWindowWarmupGlobalQPS,
+		BatchSize:         settings.OpenAIWindowWarmupBatchSize,
+		ScanInterval:      time.Duration(settings.OpenAIWindowWarmupScanSeconds) * time.Second,
+		RequestTimeout:    time.Duration(settings.OpenAIWindowWarmupRequestTimeoutSeconds) * time.Second,
+		LeaseDuration:     time.Duration(settings.OpenAIWindowWarmupLeaseSeconds) * time.Second,
+		ResetGrace:        time.Duration(settings.OpenAIWindowWarmupResetGraceSeconds) * time.Second,
+		ResetGraceSet:     true,
+		Model:             settings.OpenAIWindowWarmupProbeModel,
+		KillSwitch: OpenAIWindowWarmupKillSwitchFunc(func(ctx context.Context) (bool, error) {
+			current, settingsErr := loadOpenAIWindowWarmupSettings(ctx, settingService)
+			if settingsErr != nil {
+				return false, settingsErr
+			}
+			return current.OpenAIWindowWarmupEnabled, nil
+		}),
+		Allowlist: OpenAIWindowWarmupAllowlistFunc(func(ctx context.Context) ([]int64, error) {
+			return loadOpenAIWindowWarmupAllowlist(ctx, settingService)
+		}),
+	}
+}
+
+func loadOpenAIWindowWarmupAllowlist(ctx context.Context, settingService *SettingService) ([]int64, error) {
+	if settingService == nil || settingService.settingRepo == nil {
+		return nil, fmt.Errorf("openai window warmup setting service is not configured")
+	}
+	raw, err := settingService.settingRepo.GetValue(ctx, SettingKeyOpenAIWindowWarmupAllowlist)
+	if err != nil {
+		return nil, fmt.Errorf("read OpenAI window warmup allowlist: %w", err)
+	}
+	accountIDs, err := parseOpenAIWindowWarmupAllowlistStrict(raw)
+	if err != nil {
+		return nil, err
+	}
+	return append([]int64(nil), accountIDs...), nil
+}
+
+func loadOpenAIWindowWarmupSettings(ctx context.Context, settingService *SettingService) (*SystemSettings, error) {
+	if settingService == nil {
+		return nil, fmt.Errorf("openai window warmup setting service is not configured")
+	}
+	return settingService.GetAllSettings(ctx)
+}
+
+// ProvideOpenAIWindowOutboundAdapter wires the narrow outbound port to the
+// existing token, TLS, Agent Identity, and optional plugin transport paths.
+func ProvideOpenAIWindowOutboundAdapter(
+	accountRepo AccountRepository,
+	tokenProvider *OpenAITokenProvider,
+	httpUpstream HTTPUpstream,
+	tlsProfiles *TLSFingerprintProfileService,
+	pluginManager *PluginManager,
+	openAIGateway *OpenAIGatewayService,
+) *OpenAIWindowOutboundAdapter {
+	adapter := NewOpenAIWindowOutboundAdapter(accountRepo, tokenProvider, httpUpstream, tlsProfiles)
+	adapter.SetPluginManager(pluginManager)
+	adapter.SetAgentIdentityWSInvalidator(openAIGateway)
+	return adapter
+}
+
+func ProvideOpenAICodexWindowProbe(executor OpenAIOutboundExecutor, options OpenAIWindowWarmupOptions) *OpenAICodexWindowProbe {
+	return NewOpenAICodexWindowProbe(executor, options.Model)
+}
+
+// ProvideOpenAIWindowWarmupService constructs the service for dependency
+// wiring. Application startup controls its worker lifecycle after
+// PluginManager.Start and may disable it for image-only slots.
+func ProvideOpenAIWindowWarmupService(
+	repo OpenAIWindowWarmupRepository,
+	accountRepo AccountRepository,
+	executor OpenAIOutboundExecutor,
+	probe OpenAIWindowProbe,
+	audit *AuditLogService,
+	options OpenAIWindowWarmupOptions,
+	concurrency *ConcurrencyService,
+	quota *OpenAIQuotaService,
+	rateLimit *RateLimitService,
+) *OpenAIWindowWarmupService {
+	options.Concurrency = concurrency
+	if quota != nil {
+		options.UsageReconciler = OpenAIWindowWarmupUsageReconcilerFunc(quota.QueryUsageForWarmup)
+	}
+	options.AuthFailureHandler = rateLimit
+	return NewOpenAIWindowWarmupService(repo, accountRepo, executor, probe, audit, options)
+}
+
 // ProvideOpenAIQuotaService wires the OpenAI quota query/reset service.
 // It depends on the OpenAI token provider for refreshed access tokens and the
 // privacy client factory for the impersonated upstream HTTP client.
@@ -182,9 +286,13 @@ func ProvideOpenAIQuotaService(
 	proxyRepo ProxyRepository,
 	tokenProvider *OpenAITokenProvider,
 	privacyClientFactory PrivacyClientFactory,
+	pluginManager *PluginManager,
 	openAIGatewayService *OpenAIGatewayService,
+	openAIOAuthService *OpenAIOAuthService,
 ) *OpenAIQuotaService {
 	service := NewOpenAIQuotaService(accountRepo, proxyRepo, tokenProvider, privacyClientFactory)
+	service.SetPluginTransport(pluginManager)
+	service.SetOAuthEgressResolver(openAIOAuthService)
 	service.agentIdentityWS = openAIGatewayService
 	return service
 }
@@ -440,17 +548,20 @@ func ProvideDeferredService(accountRepo AccountRepository, timingWheel *TimingWh
 	return svc
 }
 
-// ProvideConcurrencyService creates ConcurrencyService and starts slot cleanup worker.
-func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, cfg *config.Config) *ConcurrencyService {
-	svc := NewConcurrencyService(cache)
-	if err := svc.CleanupStaleProcessSlots(context.Background()); err != nil {
-		logger.LegacyPrintf("service.concurrency", "Warning: startup cleanup stale process slots failed: %v", err)
-	}
+// ProvideConcurrencyService creates ConcurrencyService and starts the expired-slot cleanup worker.
+func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, egressRepo EgressRepository, cfg *config.Config) *ConcurrencyService {
+	svc := NewConcurrencyService(cache, egressRepo)
 	if cfg != nil {
 		svc.SetAccountLoadBatchCacheTTL(time.Duration(cfg.Gateway.Scheduling.LoadBatchCacheTTLMS) * time.Millisecond)
 		svc.StartSlotCleanupWorker(accountRepo, cfg.Gateway.Scheduling.SlotCleanupInterval)
 	}
 	return svc
+}
+
+func ProvideEgressIdentityVerificationWorker(egressService *EgressService) *EgressIdentityVerificationWorker {
+	worker := NewEgressIdentityVerificationWorker(egressService)
+	worker.Start()
+	return worker
 }
 
 // ProvideUserMessageQueueService 创建用户消息串行队列服务并启动清理 worker
@@ -818,6 +929,41 @@ func ProvideAPIKeyService(
 	return svc
 }
 
+// ProvideConfiguredOpenAIGatewayService keeps the public constructor stable
+// for focused unit tests while wiring the production dependency graph.
+func ProvideConfiguredOpenAIGatewayService(
+	accountRepo AccountRepository,
+	usageLogRepo UsageLogRepository,
+	usageBillingRepo UsageBillingRepository,
+	userRepo UserRepository,
+	userSubRepo UserSubscriptionRepository,
+	userGroupRateRepo UserGroupRateRepository,
+	cache GatewayCache,
+	cfg *config.Config,
+	schedulerSnapshot *SchedulerSnapshotService,
+	concurrencyService *ConcurrencyService,
+	billingService *BillingService,
+	rateLimitService *RateLimitService,
+	billingCacheService *BillingCacheService,
+	httpUpstream HTTPUpstream,
+	deferredService *DeferredService,
+	openAITokenProvider *OpenAITokenProvider,
+	grokTokenProvider *GrokTokenProvider,
+	resolver *ModelPricingResolver,
+	channelService *ChannelService,
+	balanceNotifyService *BalanceNotifyService,
+	settingService *SettingService,
+	userPlatformQuotaRepo UserPlatformQuotaRepository,
+) *OpenAIGatewayService {
+	return NewOpenAIGatewayService(
+		accountRepo, usageLogRepo, usageBillingRepo, userRepo, userSubRepo,
+		userGroupRateRepo, cache, cfg, schedulerSnapshot, concurrencyService,
+		billingService, rateLimitService, billingCacheService, httpUpstream,
+		deferredService, openAITokenProvider, grokTokenProvider, resolver,
+		channelService, balanceNotifyService, settingService, userPlatformQuotaRepo,
+	)
+}
+
 // ProviderSet is the Wire provider set for all services
 var ProviderSet = wire.NewSet(
 	// Core services
@@ -841,7 +987,7 @@ var ProviderSet = wire.NewSet(
 	NewAnnouncementService,
 	NewAdminService,
 	NewGatewayService,
-	NewOpenAIGatewayService,
+	ProvideConfiguredOpenAIGatewayService,
 	ProvideImageStorageSettingService,
 	ProvideImageTaskService,
 	ProvideBatchImageModelPricingResolver,
@@ -865,6 +1011,12 @@ var ProviderSet = wire.NewSet(
 	ProvideAntigravityTokenProvider,
 	ProvideGrokTokenProvider,
 	ProvideOpenAITokenProvider,
+	ProvideOpenAIWindowWarmupOptions,
+	ProvideOpenAIWindowOutboundAdapter,
+	wire.Bind(new(OpenAIOutboundExecutor), new(*OpenAIWindowOutboundAdapter)),
+	ProvideOpenAICodexWindowProbe,
+	wire.Bind(new(OpenAIWindowProbe), new(*OpenAICodexWindowProbe)),
+	ProvideOpenAIWindowWarmupService,
 	ProvideOpenAIQuotaService,
 	ProvideOpenAIQuotaAutoResetService,
 	ProvideGrokQuotaService,
@@ -899,6 +1051,8 @@ var ProviderSet = wire.NewSet(
 	NewSubscriptionService,
 	wire.Bind(new(DefaultSubscriptionAssigner), new(*SubscriptionService)),
 	ProvideConcurrencyService,
+	NewEgressService,
+	ProvideEgressIdentityVerificationWorker,
 	ProvideUserMessageQueueService,
 	NewUsageRecordWorkerPool,
 	ProvideSchedulerSnapshotService,

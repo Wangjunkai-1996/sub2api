@@ -76,6 +76,26 @@ func TestClassifySelectionFailureError_RateLimitedPool(t *testing.T) {
 	require.Equal(t, fallback, classifySelectionFailureError(fmt.Errorf("no available accounts"), fallback))
 }
 
+func TestClassifySelectionFailureError_AccountEgressAdmission(t *testing.T) {
+	fallback := noAccountErrorClassification{Status: http.StatusNotFound, ErrType: "model_not_found", Message: "fallback", ModelNotFound: true}
+
+	full := classifySelectionFailureError(fmt.Errorf("wrapped: %w", service.ErrAccountEgressCapacityFull), fallback)
+	require.Equal(t, http.StatusTooManyRequests, full.Status)
+	require.Equal(t, "rate_limit_error", full.ErrType)
+	require.False(t, full.ModelNotFound)
+
+	for _, admissionErr := range []error{
+		service.ErrAccountEgressUnavailable,
+		service.ErrAccountEgressNoRoute,
+		service.ErrAccountEgressConfigStale,
+	} {
+		got := classifySelectionFailureError(fmt.Errorf("wrapped: %w", admissionErr), fallback)
+		require.Equal(t, http.StatusServiceUnavailable, got.Status)
+		require.Equal(t, "api_error", got.ErrType)
+		require.False(t, got.ModelNotFound)
+	}
+}
+
 func TestClassifyNoAccountError_NilAPIKey_Falls503(t *testing.T) {
 	c := newTestGinContextWithRequest()
 	fd := &fakeDiagnoser{resp: service.ModelAvailabilityDiagnosis{HasAccountsInPool: true, HasModelSupport: false}}

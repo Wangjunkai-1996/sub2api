@@ -85,16 +85,18 @@ type liveTestDialer struct {
 	conn    *liveTestFrameConn
 	url     string
 	headers http.Header
+	proxy   string
 }
 
 func (d *liveTestDialer) Dial(
 	_ context.Context,
 	wsURL string,
 	headers http.Header,
-	_ string,
+	proxyURL string,
 ) (openAIWSClientConn, int, http.Header, error) {
 	d.url = wsURL
 	d.headers = headers.Clone()
+	d.proxy = proxyURL
 	return d.conn, http.StatusSwitchingProtocols, nil, nil
 }
 
@@ -113,8 +115,12 @@ type liveTestStore struct {
 	record *LiveCallRecord
 	// 注入 store 故障（模拟 Redis 抖动），区别于 ErrLiveCallNotFound。
 	claimErr         error
+	claimAllowed     *bool
 	getCallErr       error
 	getControllerErr error
+	markClosedErr    error
+	markClosedFirst  *bool
+	markClosedCalls  int
 }
 
 func (s *liveTestStore) SaveLiveCall(_ context.Context, record *LiveCallRecord, _ time.Duration) error {
@@ -143,6 +149,9 @@ func (s *liveTestStore) ClaimLiveController(_ context.Context, callHash, control
 	defer s.mu.Unlock()
 	if s.claimErr != nil {
 		return false, s.claimErr
+	}
+	if s.claimAllowed != nil && !*s.claimAllowed {
+		return false, nil
 	}
 	if s.record == nil || s.record.CallHash != callHash || s.record.Controller == LiveControllerClosed {
 		return false, nil
@@ -184,6 +193,13 @@ func (s *liveTestStore) GetLiveController(_ context.Context, callHash string) (s
 func (s *liveTestStore) MarkLiveCallClosed(_ context.Context, callHash string, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.markClosedCalls++
+	if s.markClosedErr != nil {
+		return false, s.markClosedErr
+	}
+	if s.markClosedFirst != nil && !*s.markClosedFirst {
+		return false, nil
+	}
 	if s.record == nil || s.record.CallHash != callHash || s.record.Controller == LiveControllerClosed {
 		return false, nil
 	}
@@ -194,8 +210,25 @@ func (s *liveTestStore) MarkLiveCallClosed(_ context.Context, callHash string, _
 
 type liveTestConcurrencyCache struct {
 	ConcurrencyCache
-	mu       sync.Mutex
-	releases int
+	mu                     sync.Mutex
+	releases               int
+	egressOwned            bool
+	egressRefreshErr       error
+	egressAcquires         int
+	egressRefreshes        int
+	egressLiveReleases     int
+	legacyOwned            bool
+	legacyAcquires         int
+	legacyRefreshes        int
+	legacyLiveReleases     int
+	legacyAccountID        int64
+	legacyAccountMax       int
+	legacyUserID           int64
+	legacyUserMax          int
+	legacyAPIKeyID         int64
+	legacyLeaseID          string
+	legacyIdentityID       string
+	legacyReplacingRegular bool
 }
 
 func (c *liveTestConcurrencyCache) AcquireLiveLease(
@@ -232,6 +265,115 @@ func (c *liveTestConcurrencyCache) ReleaseLiveLease(
 	c.releases++
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *liveTestConcurrencyCache) AcquireLiveLeaseForEgress(
+	context.Context,
+	AccountEgressLeaseRef,
+	int64,
+	int,
+	int64,
+	string,
+	bool,
+) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.egressAcquires++
+	return c.egressOwned, nil
+}
+
+func (c *liveTestConcurrencyCache) RefreshLiveLeaseForEgress(
+	context.Context,
+	AccountEgressLeaseRef,
+	int64,
+	int64,
+	string,
+) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.egressRefreshes++
+	return c.egressOwned, c.egressRefreshErr
+}
+
+func (c *liveTestConcurrencyCache) ReleaseLiveLeaseForEgress(
+	context.Context,
+	AccountEgressLeaseRef,
+	int64,
+	int64,
+	string,
+) error {
+	c.mu.Lock()
+	c.egressLiveReleases++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *liveTestConcurrencyCache) AcquireLiveLeaseForLegacyEgress(
+	_ context.Context,
+	accountID int64,
+	accountMax int,
+	userID int64,
+	userMax int,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+	replacingRegularSlots bool,
+) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyAcquires++
+	c.legacyAccountID = accountID
+	c.legacyAccountMax = accountMax
+	c.legacyUserID = userID
+	c.legacyUserMax = userMax
+	c.legacyAPIKeyID = apiKeyID
+	c.legacyLeaseID = leaseID
+	c.legacyIdentityID = identityID
+	c.legacyReplacingRegular = replacingRegularSlots
+	return c.legacyOwned, nil
+}
+
+func (c *liveTestConcurrencyCache) RefreshLiveLeaseForLegacyEgress(
+	_ context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyRefreshes++
+	c.legacyAccountID = accountID
+	c.legacyUserID = userID
+	c.legacyAPIKeyID = apiKeyID
+	c.legacyLeaseID = leaseID
+	c.legacyIdentityID = identityID
+	return c.legacyOwned, nil
+}
+
+func (c *liveTestConcurrencyCache) ReleaseLiveLeaseForLegacyEgress(
+	_ context.Context,
+	accountID int64,
+	userID int64,
+	apiKeyID int64,
+	leaseID string,
+	identityID string,
+) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyLiveReleases++
+	c.legacyAccountID = accountID
+	c.legacyUserID = userID
+	c.legacyAPIKeyID = apiKeyID
+	c.legacyLeaseID = leaseID
+	c.legacyIdentityID = identityID
+	return nil
+}
+
+type liveTestPoolConcurrencyCache struct {
+	*liveTestConcurrencyCache
+	*accountEgressCacheStub
 }
 
 type liveTestUsageRepo struct {
@@ -294,7 +436,8 @@ func TestFinalizeLiveCallIsIdempotentAndWritesZeroUsage(t *testing.T) {
 	service.finalizeLiveCall(record)
 
 	concurrencyCache.mu.Lock()
-	require.Equal(t, 1, concurrencyCache.releases)
+	require.Equal(t, 2, concurrencyCache.releases,
+		"every terminal attempt repeats the idempotent lease cleanup even when the closed marker already exists")
 	concurrencyCache.mu.Unlock()
 	usageRepo.mu.Lock()
 	require.Len(t, usageRepo.logs, 1)
@@ -308,6 +451,277 @@ func TestFinalizeLiveCallIsIdempotentAndWritesZeroUsage(t *testing.T) {
 	require.Zero(t, log.OutputTokens)
 	require.Zero(t, log.TotalCost)
 	require.Zero(t, log.ActualCost)
+}
+
+func liveTestPoolRecord(callID string) *LiveCallRecord {
+	return &LiveCallRecord{
+		CallID:                  callID,
+		CallHash:                hashLiveCallID(callID),
+		AccountID:               42,
+		APIKeyID:                22,
+		UserID:                  33,
+		LeaseID:                 "live-lease-" + callID,
+		EgressBindingID:         StableAccountEgressBindingID(42, 101),
+		EgressLeaseID:           "egress-lease-" + callID,
+		EgressRouteID:           101,
+		EgressIdentityID:        "501",
+		EgressConfigVersion:     7,
+		EgressAuthorityRevision: 7,
+		CreatedAt:               time.Now().Add(-time.Second),
+		ExpiresAt:               time.Now().Add(time.Hour),
+		Controller:              LiveControllerPending,
+	}
+}
+
+func liveTestLegacyEgressRecord(t *testing.T, callID string) *LiveCallRecord {
+	t.Helper()
+	account := legacyEgressTestAccount()
+	admission, err := resolveLegacyAccountEgressAdmission(account)
+	require.NoError(t, err)
+	return &LiveCallRecord{
+		CallID:                    callID,
+		CallHash:                  hashLiveCallID(callID),
+		AccountID:                 account.ID,
+		APIKeyID:                  22,
+		UserID:                    33,
+		LeaseID:                   "live-lease-" + callID,
+		LegacyEgressBindingID:     admission.BindingID,
+		LegacyEgressRouteID:       admission.RouteID,
+		LegacyEgressIdentityID:    admission.IdentityID,
+		LegacyEgressConfigVersion: admission.ConfigVersion,
+		CreatedAt:                 time.Now().Add(-time.Second),
+		ExpiresAt:                 time.Now().Add(time.Hour),
+		Controller:                LiveControllerPending,
+	}
+}
+
+func TestLegacyLiveLeaseRefreshAndReleaseUsePersistedIdentity(t *testing.T) {
+	record := liveTestLegacyEgressRecord(t, "legacy-refresh-release")
+	cache := &liveTestConcurrencyCache{legacyOwned: true}
+	service := &OpenAIGatewayService{concurrencyService: NewConcurrencyService(cache)}
+
+	require.True(t, service.refreshLiveLease(record))
+	service.releaseLiveConcurrencyLease(record)
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	require.Equal(t, 1, cache.legacyRefreshes)
+	require.Equal(t, 1, cache.legacyLiveReleases)
+	require.Zero(t, cache.releases)
+	require.Equal(t, record.AccountID, cache.legacyAccountID)
+	require.Equal(t, record.UserID, cache.legacyUserID)
+	require.Equal(t, record.APIKeyID, cache.legacyAPIKeyID)
+	require.Equal(t, record.LeaseID, cache.legacyLeaseID)
+	require.Equal(t, record.LegacyEgressIdentityID, cache.legacyIdentityID)
+}
+
+func TestLiveObserverRestoresPersistedLegacyEgress(t *testing.T) {
+	account := legacyEgressTestAccount()
+	account.Credentials = map[string]any{
+		"access_token":       "test-access-token",
+		"chatgpt_account_id": "acct_test",
+	}
+	record := liveTestLegacyEgressRecord(t, "legacy-observer")
+	attestationCipher := newLiveAttestationCipher(&config.Config{
+		JWT: config.JWTConfig{Secret: "legacy-live-observer-secret"},
+	})
+	var err error
+	record.AttestationCiphertext, err = attestationCipher.Encrypt(`{"v":1,"s":0,"t":"v1.sideband"}`)
+	require.NoError(t, err)
+	store := &liveTestStore{}
+	require.NoError(t, store.SaveLiveCall(context.Background(), record, time.Hour))
+	upstream := newLiveTestFrameConn()
+	upstream.reads <- liveTestFrame{
+		messageType: coderws.MessageText,
+		payload:     []byte(`{"type":"session.ended"}`),
+	}
+	dialer := &liveTestDialer{conn: upstream}
+	cache := &liveTestConcurrencyCache{legacyOwned: true}
+	service := &OpenAIGatewayService{
+		accountRepo:               &liveTestAccountRepo{account: account},
+		cache:                     store,
+		concurrencyService:        NewConcurrencyService(cache),
+		openaiWSPassthroughDialer: dialer,
+		liveAttestationCipher:     attestationCipher,
+	}
+
+	service.observeLiveCall(record)
+
+	require.Equal(t, account.Proxy.URL(), dialer.proxy)
+	require.Equal(t, "wss://chatgpt.com/backend-api/codex/legacy-observer", dialer.url)
+	cache.mu.Lock()
+	require.Equal(t, 1, cache.legacyLiveReleases)
+	require.Equal(t, record.LegacyEgressIdentityID, cache.legacyIdentityID)
+	cache.mu.Unlock()
+}
+
+func TestLiveSidebandRejectsChangedLegacyEgressConfig(t *testing.T) {
+	record := liveTestLegacyEgressRecord(t, "legacy-config-changed")
+	changed := legacyEgressTestAccount()
+	changed.EgressRevision++
+	dialer := &liveTestDialer{conn: newLiveTestFrameConn()}
+	service := &OpenAIGatewayService{
+		accountRepo:               &liveTestAccountRepo{account: changed},
+		openaiWSPassthroughDialer: dialer,
+	}
+
+	_, err := service.dialLiveSideband(context.Background(), record)
+	require.ErrorIs(t, err, ErrLiveUnavailable)
+	require.Empty(t, dialer.url)
+}
+
+func TestLiveControllerClaimFailureDoesNotRestoreEgressLease(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*OpenAIGatewayService, *LiveCallRecord) error
+	}{
+		{
+			name: "observer",
+			run: func(service *OpenAIGatewayService, record *LiveCallRecord) error {
+				service.observeLiveCall(record)
+				return nil
+			},
+		},
+		{
+			name: "proxy",
+			run: func(service *OpenAIGatewayService, record *LiveCallRecord) error {
+				return service.ProxyLiveSideband(context.Background(), record, new(coderws.Conn))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claimAllowed := false
+			record := liveTestPoolRecord("claim-loser-" + tc.name)
+			store := &liveTestStore{claimAllowed: &claimAllowed}
+			require.NoError(t, store.SaveLiveCall(context.Background(), record, time.Hour))
+			egressCache := &accountEgressCacheStub{refreshOwned: true}
+			poolCache := &liveTestPoolConcurrencyCache{
+				liveTestConcurrencyCache: &liveTestConcurrencyCache{egressOwned: true},
+				accountEgressCacheStub:   egressCache,
+			}
+			concurrencyService := NewConcurrencyService(poolCache)
+			t.Cleanup(concurrencyService.accountEgressAllocator.Close)
+			service := &OpenAIGatewayService{cache: store, concurrencyService: concurrencyService}
+
+			err := tc.run(service, record)
+			if tc.name == "proxy" {
+				require.ErrorIs(t, err, ErrLiveControllerChanged)
+			} else {
+				require.NoError(t, err)
+			}
+			_, refreshCalls, releaseCalls, _ := egressCache.counts()
+			require.Zero(t, refreshCalls, "a claim loser must not restore or refresh the persisted egress lease")
+			require.Zero(t, releaseCalls, "a claim loser must not delete another controller's egress lease")
+			service.liveEgressLeaseMu.Lock()
+			require.Empty(t, service.liveEgressLeases)
+			service.liveEgressLeaseMu.Unlock()
+		})
+	}
+}
+
+func TestFinalizeLiveCallAlwaysCleansPoolLeases(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*liveTestStore)
+	}{
+		{
+			name: "closed marker error",
+			configure: func(store *liveTestStore) {
+				store.markClosedErr = errors.New("redis: response lost")
+			},
+		},
+		{
+			name: "closed marker already exists",
+			configure: func(store *liveTestStore) {
+				first := false
+				store.markClosedFirst = &first
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			record := liveTestPoolRecord("finalize-" + tc.name)
+			store := &liveTestStore{}
+			require.NoError(t, store.SaveLiveCall(context.Background(), record, time.Hour))
+			tc.configure(store)
+			egressCache := &accountEgressCacheStub{refreshOwned: true}
+			liveCache := &liveTestConcurrencyCache{egressOwned: true}
+			poolCache := &liveTestPoolConcurrencyCache{
+				liveTestConcurrencyCache: liveCache,
+				accountEgressCacheStub:   egressCache,
+			}
+			concurrencyService := NewConcurrencyService(poolCache)
+			t.Cleanup(concurrencyService.accountEgressAllocator.Close)
+			lease, err := concurrencyService.RestoreAccountEgressLease(context.Background(), AccountEgressLeaseRef{
+				AccountID:         record.AccountID,
+				ID:                record.EgressLeaseID,
+				BindingID:         record.EgressBindingID,
+				RouteID:           record.EgressRouteID,
+				IdentityID:        record.EgressIdentityID,
+				ConfigVersion:     record.EgressConfigVersion,
+				AuthorityRevision: record.EgressAuthorityRevision,
+			})
+			require.NoError(t, err)
+			record.EgressLease = lease
+			service := &OpenAIGatewayService{cache: store, concurrencyService: concurrencyService}
+			require.NoError(t, service.rememberLiveEgressLease(record, lease, time.Now()))
+
+			service.finalizeLiveCall(record)
+
+			require.ErrorIs(t, context.Cause(lease.Context()), context.Canceled)
+			_, _, egressReleases, _ := egressCache.counts()
+			require.Equal(t, 1, egressReleases)
+			liveCache.mu.Lock()
+			require.Equal(t, 1, liveCache.egressLiveReleases)
+			liveCache.mu.Unlock()
+			service.liveEgressLeaseMu.Lock()
+			require.Empty(t, service.liveEgressLeases)
+			service.liveEgressLeaseMu.Unlock()
+		})
+	}
+}
+
+func TestRefreshLiveEgressLeaseToleratesOnlyIndeterminateErrorsInsideSafetyWindow(t *testing.T) {
+	record := liveTestPoolRecord("refresh-safety")
+	egressCache := &accountEgressCacheStub{refreshOwned: true}
+	liveCache := &liveTestConcurrencyCache{
+		egressOwned:      true,
+		egressRefreshErr: errors.New("redis: i/o timeout"),
+	}
+	poolCache := &liveTestPoolConcurrencyCache{
+		liveTestConcurrencyCache: liveCache,
+		accountEgressCacheStub:   egressCache,
+	}
+	concurrencyService := NewConcurrencyService(poolCache)
+	t.Cleanup(concurrencyService.accountEgressAllocator.Close)
+	lease, err := concurrencyService.RestoreAccountEgressLease(context.Background(), AccountEgressLeaseRef{
+		AccountID:         record.AccountID,
+		ID:                record.EgressLeaseID,
+		BindingID:         record.EgressBindingID,
+		RouteID:           record.EgressRouteID,
+		IdentityID:        record.EgressIdentityID,
+		ConfigVersion:     record.EgressConfigVersion,
+		AuthorityRevision: record.EgressAuthorityRevision,
+	})
+	require.NoError(t, err)
+	record.EgressLease = lease
+	service := &OpenAIGatewayService{concurrencyService: concurrencyService}
+	require.NoError(t, service.rememberLiveEgressLease(record, lease, time.Now()))
+
+	require.True(t, service.refreshLiveLease(record), "a single indeterminate Redis error remains inside the safety window")
+	service.liveEgressLeaseMu.Lock()
+	service.liveEgressLeases[record.CallHash].liveLastConfirmed = time.Now().Add(-liveLeaseTransientSafetyWindow)
+	service.liveEgressLeaseMu.Unlock()
+	require.False(t, service.refreshLiveLease(record), "the controller must stop before Redis can expire its Live slots")
+
+	liveCache.mu.Lock()
+	liveCache.egressRefreshErr = nil
+	liveCache.egressOwned = false
+	liveCache.mu.Unlock()
+	service.liveEgressLeaseMu.Lock()
+	service.liveEgressLeases[record.CallHash].liveLastConfirmed = time.Now()
+	service.liveEgressLeaseMu.Unlock()
+	require.False(t, service.refreshLiveLease(record), "a definitive missing lease is terminal even inside the safety window")
+	service.releaseLiveEgressLease(record)
 }
 
 func TestGetLiveCallForIdentityRejectsMismatchedCaller(t *testing.T) {

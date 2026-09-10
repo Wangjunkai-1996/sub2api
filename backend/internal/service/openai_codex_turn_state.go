@@ -148,6 +148,29 @@ func (s *OpenAIGatewayService) guardOpenAICodexTurnStateEcho(c *gin.Context, acc
 	}
 }
 
+func (s *OpenAIGatewayService) clearOpenAICodexTurnStateForRecovery(c *gin.Context, expectedAccountID int64) {
+	if c == nil || c.Request == nil {
+		return
+	}
+	c.Request.Header.Del(openAICodexTurnStateHeader)
+	seed := openAICodexTurnStateSeed(c)
+	if seed == "" || expectedAccountID <= 0 {
+		return
+	}
+	raw, ok := s.openaiCodexTurnStateOrigins.Load(seed)
+	if !ok {
+		return
+	}
+	origin, ok := raw.(openAICodexTurnStateOrigin)
+	if !ok {
+		s.openaiCodexTurnStateOrigins.CompareAndDelete(seed, raw)
+		return
+	}
+	if origin.accountID == expectedAccountID {
+		s.openaiCodexTurnStateOrigins.CompareAndDelete(seed, raw)
+	}
+}
+
 // sweepOpenAICodexTurnStateOrigins 机会式清扫过期溯源记录：每 256 次写入
 // 全量遍历一轮，防止仅靠读侧惰性删除导致的慢泄漏（会话键无上界）。
 func (s *OpenAIGatewayService) sweepOpenAICodexTurnStateOrigins() {

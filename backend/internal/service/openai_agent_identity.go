@@ -296,14 +296,43 @@ func ensureAgentIdentityTaskForAccount(ctx context.Context, repo AccountReposito
 	if err != nil {
 		return err
 	}
+	expectedCredentials := shallowCopyMap(credAccount.Credentials)
 	credentials := make(map[string]any, len(credAccount.Credentials)+1)
 	for key, value := range credAccount.Credentials {
 		credentials[key] = value
 	}
 	credentials["task_id"] = newTaskID
-	if err := persistAccountCredentials(ctx, repo, credAccount, credentials); err != nil {
+	conditionalRepo, ok := repo.(OpenAICredentialCASRepository)
+	if !ok {
+		return errors.New("agent identity credential CAS repository is not configured")
+	}
+	applied, err := conditionalRepo.UpdateOpenAIOAuthCredentialsIfUnchanged(
+		ctx, credAccount.ID, expectedCredentials, credAccount.ProxyID, credentials,
+	)
+	if err != nil {
 		return err
 	}
+	if !applied {
+		current, readErr := repo.GetByID(ctx, credAccount.ID)
+		if readErr != nil || current == nil {
+			if readErr == nil {
+				readErr = ErrAccountNotFound
+			}
+			return fmt.Errorf("agent identity credential CAS lost: %w", readErr)
+		}
+		if current.IsOpenAIAgentIdentity() &&
+			strings.TrimSpace(current.GetCredential("agent_runtime_id")) == strings.TrimSpace(credAccount.GetCredential("agent_runtime_id")) &&
+			strings.TrimSpace(current.GetCredential("task_id")) != "" &&
+			strings.TrimSpace(current.GetCredential("task_id")) != expectedTaskID {
+			credAccount.Credentials = shallowCopyMap(current.Credentials)
+			if !account.IsShadow() {
+				account.Credentials = shallowCopyMap(current.Credentials)
+			}
+			return nil
+		}
+		return errors.New("agent identity credentials changed during task registration")
+	}
+	credAccount.Credentials = shallowCopyMap(credentials)
 	if !account.IsShadow() && account != credAccount {
 		account.Credentials = shallowCopyMap(credAccount.Credentials)
 	}

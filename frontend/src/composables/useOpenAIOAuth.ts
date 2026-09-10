@@ -27,6 +27,33 @@ export interface OpenAITokenInfo {
 
 export type OpenAIOAuthPlatform = 'openai'
 
+export interface OpenAIOAuthEgressSelection {
+  proxyId?: number | null
+  egressRouteId?: number | null
+}
+
+type OpenAIOAuthEgressPayload = {
+  proxy_id?: number
+  egress_route_id?: number
+}
+
+function buildOpenAIOAuthEgressPayload(
+  selection?: OpenAIOAuthEgressSelection
+): OpenAIOAuthEgressPayload {
+  const proxyId = selection?.proxyId ?? null
+  const egressRouteId = selection?.egressRouteId ?? null
+  if (proxyId != null && egressRouteId != null) {
+    throw new Error('OpenAI OAuth proxy and egress route cannot be selected together')
+  }
+  if (egressRouteId != null) {
+    return { egress_route_id: egressRouteId }
+  }
+  if (proxyId != null) {
+    return { proxy_id: proxyId }
+  }
+  return {}
+}
+
 export function useOpenAIOAuth() {
   const appStore = useAppStore()
   const { t } = useI18n()
@@ -50,7 +77,7 @@ export function useOpenAIOAuth() {
 
   // Generate auth URL for OpenAI OAuth
   const generateAuthUrl = async (
-    proxyId?: number | null,
+    egress?: OpenAIOAuthEgressSelection,
     redirectUri?: string
   ): Promise<boolean> => {
     loading.value = true
@@ -60,9 +87,8 @@ export function useOpenAIOAuth() {
     error.value = ''
 
     try {
-      const payload: Record<string, unknown> = {}
-      if (proxyId) {
-        payload.proxy_id = proxyId
+      const payload = buildOpenAIOAuthEgressPayload(egress) as OpenAIOAuthEgressPayload & {
+        redirect_uri?: string
       }
       if (redirectUri) {
         payload.redirect_uri = redirectUri
@@ -95,7 +121,7 @@ export function useOpenAIOAuth() {
     code: string,
     currentSessionId: string,
     state: string,
-    proxyId?: number | null
+    egress?: OpenAIOAuthEgressSelection
   ): Promise<OpenAITokenInfo | null> => {
     if (!code.trim() || !currentSessionId || !state.trim()) {
       error.value = 'Missing auth code, session ID, or state'
@@ -106,13 +132,11 @@ export function useOpenAIOAuth() {
     error.value = ''
 
     try {
-      const payload: { session_id: string; code: string; state: string; proxy_id?: number } = {
+      const payload = {
         session_id: currentSessionId,
         code: code.trim(),
-        state: state.trim()
-      }
-      if (proxyId) {
-        payload.proxy_id = proxyId
+        state: state.trim(),
+        ...buildOpenAIOAuthEgressPayload(egress)
       }
 
       const tokenInfo = await adminAPI.accounts.exchangeCode(`${endpointPrefix}/exchange-code`, payload)
@@ -135,7 +159,7 @@ export function useOpenAIOAuth() {
   // clientId: 指定 OAuth client_id（用于第三方渠道获取的 RT，如 app_LlGpXReQgckcGGUo2JrYvtJK）
   const validateRefreshToken = async (
     refreshToken: string,
-    proxyId?: number | null,
+    egress?: OpenAIOAuthEgressSelection,
     clientId?: string
   ): Promise<OpenAITokenInfo | null> => {
     if (!refreshToken.trim()) {
@@ -150,7 +174,7 @@ export function useOpenAIOAuth() {
       // Use dedicated refresh-token endpoint
       const tokenInfo = await adminAPI.accounts.refreshOpenAIToken(
         refreshToken.trim(),
-        proxyId,
+        buildOpenAIOAuthEgressPayload(egress),
         `${endpointPrefix}/refresh-token`,
         clientId
       )
