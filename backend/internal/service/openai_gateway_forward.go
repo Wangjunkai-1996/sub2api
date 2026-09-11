@@ -760,7 +760,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		imageInputSize = imageCfg.InputSize
 	}
 	// Get access token
-	token, _, err := s.GetAccessToken(ctx, account)
+	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,10 +1016,20 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	compactModelFallbackRetried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
-	for {
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 && OpenAIRetryBudgetExpired(ctx) {
+			return nil, ErrOpenAIRetryBudgetExhausted
+		}
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		var headerGuard *openAIFirstOutputHeaderGuard
+		upstreamCtxReleased := false
+		releaseAttemptContext := func() {
+			if !upstreamCtxReleased {
+				upstreamCtxReleased = true
+				releaseUpstreamCtx()
+			}
+		}
 		if firstOutputTimeout > 0 {
 			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
 				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
@@ -1029,7 +1039,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if headerGuard == nil {
 			// The request context must remain live until the response body has been
 			// consumed. Header-guard attempts own this release themselves.
-			defer releaseUpstreamCtx()
+			defer releaseAttemptContext()
 		}
 		if err != nil {
 			if headerGuard != nil {
@@ -1090,6 +1100,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				if err := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); err != nil {
 					return nil, fmt.Errorf("agent identity task recovery failed: %w", err)
 				}
+				releaseAttemptContext()
 				continue
 			}
 			respBody = s.redactAgentIdentitySensitiveBody(ctx, account, respBody)
@@ -1114,6 +1125,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					httpInvalidEncryptedContentRetryTried = true
 					rejectedFieldRetryState.remember(body)
 					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s)", account.Name)
+					releaseAttemptContext()
 					continue
 				}
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
@@ -1125,6 +1137,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				requestView = newOpenAIRequestView(body)
 				reqBody = nil
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request after %s (account: %s)", reason, account.Name)
+				releaseAttemptContext()
 				continue
 			}
 			if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
@@ -1143,6 +1156,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					"[OpenAI] Retrying explicit compact request once with fallback model (account: %s, from: %s, to: %s, upstream_code: %s)",
 					account.Name, fromModel, fallbackModel, upstreamCode,
 				)
+				releaseAttemptContext()
 				continue
 			}
 			if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody) {
@@ -1214,6 +1228,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 						upstreamModel = fallbackModel
 						compactModelFallbackRetried = true
 						SetOpsUpstreamModel(c, fallbackModel)
+						_ = resp.Body.Close()
+						releaseAttemptContext()
 						continue
 					}
 					if resp.Body != nil {
@@ -1261,6 +1277,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 						upstreamModel = fallbackModel
 						compactModelFallbackRetried = true
 						SetOpsUpstreamModel(c, fallbackModel)
+						_ = resp.Body.Close()
+						releaseAttemptContext()
 						continue
 					}
 				}

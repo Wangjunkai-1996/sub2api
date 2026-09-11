@@ -135,6 +135,9 @@ func (p *OpenAITokenProvider) ensureMetrics() {
 // GetAccessToken returns a valid access_token.
 func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
 	p.ensureMetrics()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if account == nil {
 		return "", errors.New("account is nil")
 	}
@@ -170,6 +173,7 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		needsRefresh = false
 	}
 	refreshFailed := false
+	var refreshErr error
 
 	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		p.metrics.refreshRequests.Add(1)
@@ -177,12 +181,28 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
 		if err != nil {
+			// Preserve cancellation and account-level credential failures. The
+			// request caller uses these errors to exclude this account and retry
+			// with another one; returning an old bearer would defeat that path.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
+			p.metrics.refreshFailure.Add(1)
+			if isOpenAIAccountCredentialFailure(err) {
+				return "", err
+			}
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
 				return "", err
 			}
+			if result != nil && result.Account != nil {
+				account = result.Account
+				expiresAt = account.GetCredentialAsTime("expires_at")
+			}
 			slog.Warn("openai_token_refresh_failed", "account_id", account.ID, "error", err)
-			p.metrics.refreshFailure.Add(1)
 			refreshFailed = true
+			refreshErr = err
+		} else if result == nil {
+			return "", errors.New("openai oauth refresh returned no result")
 		} else if result.LockHeld {
 			if p.refreshPolicy.OnLockHeld == ProviderLockHeldWaitForCache {
 				p.metrics.lockContention.Add(1)
@@ -196,12 +216,17 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 					return token, nil
 				}
 			}
-		} else if result.Refreshed {
-			p.metrics.refreshSuccess.Add(1)
-			account = result.Account
-			expiresAt = account.GetCredentialAsTime("expires_at")
 		} else {
+			if result.Account == nil {
+				return "", errors.New("openai oauth refresh returned no account")
+			}
 			account = result.Account
+			if isOAuthRefreshRequestPath(ctx) && !account.IsActive() {
+				return "", errOAuthRefreshAccountStateChanged
+			}
+			if result.Refreshed {
+				p.metrics.refreshSuccess.Add(1)
+			}
 			expiresAt = account.GetCredentialAsTime("expires_at")
 		}
 	} else if needsRefresh && p.tokenCache != nil {
@@ -231,12 +256,24 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 	accessToken := account.GetCredential("access_token")
 	if strings.TrimSpace(accessToken) == "" {
+		if refreshErr != nil {
+			return "", refreshErr
+		}
 		return "", errors.New("access_token not found in credentials")
+	}
+	if refreshFailed && expiresAt != nil && !time.Now().Before(*expiresAt) {
+		// An expired bearer cannot be a useful transient fallback. Returning the
+		// refresh error lets the request path classify permanent OAuth failures,
+		// while avoiding a guaranteed upstream 401 for temporary outages.
+		return "", refreshErr
 	}
 
 	// 3) Populate cache with TTL.
 	if p.tokenCache != nil {
 		latestAccount, isStale := CheckTokenVersion(ctx, account, p.accountRepo)
+		if isOAuthRefreshRequestPath(ctx) && latestAccount != nil && !latestAccount.IsActive() {
+			return "", errOAuthRefreshAccountStateChanged
+		}
 		if isStale && latestAccount != nil {
 			slog.Debug("openai_token_version_stale_use_latest", "account_id", account.ID)
 			accessToken = latestAccount.GetOpenAIAccessToken()

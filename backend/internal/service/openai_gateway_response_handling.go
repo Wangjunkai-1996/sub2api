@@ -1106,6 +1106,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			if failureDelivered {
 				return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
 			}
+			// Long reasoning requests may legitimately remain silent before their
+			// first semantic event. Let the dedicated first-output deadline govern
+			// that phase; the stream idle timeout resumes once semantic output starts.
+			if !firstOutputProgressObserved && firstOutputTimeout > streamInterval && !sawBareError && !sawResponseFailed {
+				continue
+			}
 			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
 			if time.Since(lastRead) < streamInterval {
 				continue

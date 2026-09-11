@@ -949,6 +949,11 @@ const (
 	ImageConcurrencyOverflowModeWait   = "wait"
 )
 
+const (
+	DefaultOpenAIRequestBudgetSeconds = 600
+	DefaultOpenAIRetryBudgetSeconds   = 300
+)
+
 // GatewayConfig API网关相关配置
 type GatewayConfig struct {
 	// 等待上游响应头的超时时间（秒），0表示无超时
@@ -966,8 +971,11 @@ type GatewayConfig struct {
 	// 0 表示回退到 OpenAIFirstOutputTimeoutSeconds。
 	OpenAIHighEffortFirstOutputTimeoutSeconds int `mapstructure:"openai_high_effort_first_output_timeout_seconds"`
 	// OpenAIRequestBudgetSeconds: native HTTP Responses 从入口、排队到全部重试共用的总预算（秒）。
-	// 0 使用安全默认值 300 秒；该预算必须短于下游网关的整体超时。
+	// 0 使用安全默认值 600 秒；0 不能禁用硬预算。
 	OpenAIRequestBudgetSeconds int `mapstructure:"openai_request_budget_seconds"`
+	// OpenAIRetryBudgetSeconds: 请求入口后的错误重试/换号资格窗口（秒）。
+	// 0 自动使用 min(300, OpenAIRequestBudgetSeconds 的有效值)，不会禁用重试窗口。
+	OpenAIRetryBudgetSeconds int `mapstructure:"openai_retry_budget_seconds"`
 	// OpenAIAtomicStreamFailover: native HTTP Responses 流式请求在最终成功事件前
 	// 是否暂存整段 SSE，以便上游晚到的失败可以安全重试或切换账号。
 	// 通过 Load 加载时默认关闭；仅在明确需要原子 failover 时开启。
@@ -1111,6 +1119,28 @@ type GatewayConfig struct {
 	// CNProviders: 国产 OpenAI 兼容供应商（kimi/zhipu/deepseek）的余额检测配置。
 	// 仅作用于 payg（按量付费）账号：周期探测余额，低于阈值则临时停调。
 	CNProviders GatewayCNProvidersConfig `mapstructure:"cn_providers"`
+}
+
+// EffectiveOpenAIRequestBudgetSeconds returns the non-zero hard budget used by
+// the Responses gateway. Zero is retained as a compatibility-safe default.
+func (c GatewayConfig) EffectiveOpenAIRequestBudgetSeconds() int {
+	if c.OpenAIRequestBudgetSeconds == 0 {
+		return DefaultOpenAIRequestBudgetSeconds
+	}
+	return c.OpenAIRequestBudgetSeconds
+}
+
+// EffectiveOpenAIRetryBudgetSeconds returns the error retry/failover window.
+// Zero derives the smaller of the default retry window and hard budget.
+func (c GatewayConfig) EffectiveOpenAIRetryBudgetSeconds() int {
+	budget := c.EffectiveOpenAIRequestBudgetSeconds()
+	if c.OpenAIRetryBudgetSeconds == 0 {
+		if budget < DefaultOpenAIRetryBudgetSeconds {
+			return budget
+		}
+		return DefaultOpenAIRetryBudgetSeconds
+	}
+	return c.OpenAIRetryBudgetSeconds
 }
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
@@ -2378,8 +2408,10 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_response_header_timeout", 0)
 	viper.SetDefault("gateway.grok_response_header_timeout", 120)
 	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 120)
-	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 240)
-	viper.SetDefault("gateway.openai_request_budget_seconds", 300)
+	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", DefaultOpenAIRequestBudgetSeconds)
+	viper.SetDefault("gateway.openai_request_budget_seconds", DefaultOpenAIRequestBudgetSeconds)
+	// Zero preserves compatibility with older configs and derives min(300, effective hard budget).
+	viper.SetDefault("gateway.openai_retry_budget_seconds", 0)
 	// Keep real-time SSE as the default. Strict atomic replay remains opt-in for
 	// operators who prefer late-failure retry over first-token latency.
 	viper.SetDefault("gateway.openai_atomic_stream_failover", false)
@@ -3323,9 +3355,20 @@ func (c *Config) Validate() error {
 		(c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds > 0 && c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds < 30) {
 		return fmt.Errorf("gateway.openai_high_effort_first_output_timeout_seconds must be 0 or between 30-1800 seconds")
 	}
-	if c.Gateway.OpenAIRequestBudgetSeconds < 0 || c.Gateway.OpenAIRequestBudgetSeconds > 330 ||
+	if c.Gateway.OpenAIRequestBudgetSeconds < 0 || c.Gateway.OpenAIRequestBudgetSeconds > 600 ||
 		(c.Gateway.OpenAIRequestBudgetSeconds > 0 && c.Gateway.OpenAIRequestBudgetSeconds < 60) {
-		return fmt.Errorf("gateway.openai_request_budget_seconds must be 0 or between 60-330 seconds")
+		return fmt.Errorf("gateway.openai_request_budget_seconds must be 0 or between 60-600 seconds")
+	}
+	effectiveOpenAIRequestBudget := c.Gateway.OpenAIRequestBudgetSeconds
+	if effectiveOpenAIRequestBudget == 0 {
+		effectiveOpenAIRequestBudget = DefaultOpenAIRequestBudgetSeconds
+	}
+	if c.Gateway.OpenAIRetryBudgetSeconds < 0 || c.Gateway.OpenAIRetryBudgetSeconds > DefaultOpenAIRequestBudgetSeconds ||
+		(c.Gateway.OpenAIRetryBudgetSeconds > 0 && c.Gateway.OpenAIRetryBudgetSeconds < 60) {
+		return fmt.Errorf("gateway.openai_retry_budget_seconds must be 0 or between 60-600 seconds")
+	}
+	if c.Gateway.OpenAIRetryBudgetSeconds > effectiveOpenAIRequestBudget {
+		return fmt.Errorf("gateway.openai_retry_budget_seconds must not exceed effective gateway.openai_request_budget_seconds (%d)", effectiveOpenAIRequestBudget)
 	}
 	if c.Gateway.Live.MaxSessionDurationSeconds <= 0 {
 		c.Gateway.Live.MaxSessionDurationSeconds = 3600

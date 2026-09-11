@@ -175,8 +175,6 @@ type grokMediaEligibilityProber interface {
 const (
 	maxOpenAIFirstOutputTimeoutSwitches = 1
 	maxOpenAISessionBlockedRecoveries   = 1
-	defaultOpenAIRequestBudget          = 300 * time.Second
-	minOpenAIRetryAttemptRemaining      = 30 * time.Second
 	openAIRequestBudgetDeadlineKey      = "openai_request_budget_deadline"
 	openAIRequestBudgetResponseKey      = "openai_request_budget_response_written"
 )
@@ -650,6 +648,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	var passthroughFailoverState openAIPassthroughFailoverState
+	attemptCount := 0
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -667,8 +666,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	c.Request = c.Request.WithContext(pricingCtx)
 
 	for {
-		if openAIRequestBudgetShouldStop(c) {
+		if openAIRequestBudgetExpired(c) {
 			h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+			return
+		}
+		if attemptCount > 0 && service.OpenAIRetryBudgetExpired(c.Request.Context()) {
+			h.handleOpenAIRetryBudgetExhausted(c, streamStarted)
 			return
 		}
 		// Streaming Forward intentionally detaches the upstream request so usage can
@@ -694,7 +697,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
-			if openAIRequestBudgetShouldStop(c) {
+			if openAIRequestBudgetExpired(c) {
 				h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
 				return
 			}
@@ -817,9 +820,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			)
 			return
 		}
-		if openAIRequestBudgetShouldStop(c) {
+		if openAIRequestBudgetExpired(c) {
 			releaseAccount()
 			h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+			return
+		}
+		if attemptCount > 0 && service.OpenAIRetryBudgetExpired(c.Request.Context()) {
+			releaseAccount()
+			h.handleOpenAIRetryBudgetExhausted(c, streamStarted)
 			return
 		}
 
@@ -833,6 +841,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// 从不可变的 canonical forwardBody 派生本次尝试 body 并整块剔除上游私有的加密
 		// reasoning item（含耦合的 id/summary），避免非透传上游 400 拒绝 Kiro reasoning 形态。
 		attemptBody := h.deriveOpenAIForwardAttemptBody(reqLog, forwardBody, account, &passthroughFailoverState)
+		attemptCount++
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
@@ -900,6 +909,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
 				return
 			}
+			if errors.Is(err, service.ErrOpenAIRetryBudgetExhausted) {
+				submitResponsesUsage(result)
+				h.handleOpenAIRetryBudgetExhausted(c, streamStarted || c.Writer.Written())
+				return
+			}
 			if result != nil && result.ClientDisconnect {
 				reqLog.Info("openai.client_disconnected",
 					zap.Int64("account_id", account.ID),
@@ -925,8 +939,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			} else {
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
-					if openAIRequestBudgetShouldStop(c) {
+					if openAIRequestBudgetExpired(c) {
 						h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
+						return
+					}
+					if service.OpenAIRetryBudgetExpired(c.Request.Context()) {
+						h.handleOpenAIRetryBudgetExhausted(c, streamStarted || c.Writer.Written())
 						return
 					}
 					if failoverClientGone(c) {
@@ -1022,12 +1040,18 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 							case <-c.Request.Context().Done():
 								if openAIRequestBudgetExpired(c) {
 									h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+								} else if service.OpenAIRetryBudgetExpired(c.Request.Context()) {
+									h.handleOpenAIRetryBudgetExhausted(c, streamStarted)
 								}
 								return
 							case <-time.After(retryDelay):
 							}
 							continue
 						}
+					}
+					if service.OpenAIRetryBudgetExpired(c.Request.Context()) {
+						h.handleOpenAIRetryBudgetExhausted(c, streamStarted)
+						return
 					}
 					// Consume the bounded first-output budget only when this attempt is
 					// actually switching accounts. Same-account retries are not switches.
@@ -3899,14 +3923,18 @@ func (h *OpenAIGatewayHandler) beginOpenAIResponsesRequestBudget(c *gin.Context,
 	if c == nil || c.Request == nil {
 		return func() {}
 	}
-	budget := defaultOpenAIRequestBudget
-	if h != nil && h.cfg != nil && h.cfg.Gateway.OpenAIRequestBudgetSeconds > 0 {
-		budget = time.Duration(h.cfg.Gateway.OpenAIRequestBudgetSeconds) * time.Second
+	gatewayCfg := config.GatewayConfig{}
+	if h != nil && h.cfg != nil {
+		gatewayCfg = h.cfg.Gateway
 	}
-	deadline := startedAt.Add(budget)
-	requestCtx, cancel := context.WithDeadline(c.Request.Context(), deadline)
+	hardBudget := time.Duration(gatewayCfg.EffectiveOpenAIRequestBudgetSeconds()) * time.Second
+	retryBudget := time.Duration(gatewayCfg.EffectiveOpenAIRetryBudgetSeconds()) * time.Second
+	hardDeadline := startedAt.Add(hardBudget)
+	retryDeadline := startedAt.Add(retryBudget)
+	requestCtx, cancel := context.WithDeadline(c.Request.Context(), hardDeadline)
+	requestCtx = service.WithOpenAIRetryBudgetDeadline(requestCtx, retryDeadline)
 	c.Request = c.Request.WithContext(requestCtx)
-	c.Set(openAIRequestBudgetDeadlineKey, deadline)
+	c.Set(openAIRequestBudgetDeadlineKey, hardDeadline)
 	return cancel
 }
 
@@ -3927,11 +3955,6 @@ func openAIRequestBudgetExpired(c *gin.Context) bool {
 	return ok && time.Until(deadline) <= 0
 }
 
-func openAIRequestBudgetShouldStop(c *gin.Context) bool {
-	deadline, ok := openAIRequestBudgetDeadline(c)
-	return ok && time.Until(deadline) < minOpenAIRetryAttemptRemaining
-}
-
 func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context, streamStarted bool) {
 	if c == nil || c.GetBool(openAIRequestBudgetResponseKey) {
 		return
@@ -3941,6 +3964,13 @@ func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context
 	service.SetOpsUpstreamError(c, http.StatusGatewayTimeout, message, "")
 	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusGatewayTimeout, "request_budget_exhausted")
 	h.handleStreamingAwareError(c, http.StatusGatewayTimeout, "request_timeout", message, streamStarted)
+}
+
+func (h *OpenAIGatewayHandler) handleOpenAIRetryBudgetExhausted(c *gin.Context, streamStarted bool) {
+	const message = "The upstream retry window has expired"
+	service.SetOpsUpstreamError(c, http.StatusBadGateway, message, "")
+	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusBadGateway, "retry_budget_exhausted")
+	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", message, streamStarted)
 }
 
 func openAIRequestAllowsFailoverReplay(c *gin.Context) bool {

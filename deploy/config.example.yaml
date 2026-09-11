@@ -224,11 +224,16 @@ gateway:
   # Pre-output attempt staging is capped at 8 MiB; overflow fails over without exposing partial SSE data.
   # 首次输出前的单次尝试暂存上限为 8 MiB；溢出时切号且不暴露不完整 SSE 数据。
   openai_first_output_timeout_seconds: 120
-  # Optional high/xhigh/max override (seconds, 0=use the standard timeout; default 240)
-  openai_high_effort_first_output_timeout_seconds: 240
-  # End-to-end budget shared by queueing, upstream attempts, and retries (seconds; default 300).
-  # Must remain below the downstream gateway timeout so Sub2API can emit a terminal response.failed.
-  openai_request_budget_seconds: 300
+  # Optional high/xhigh/max override (seconds, 0=use the standard timeout; default 600).
+  # High-effort reasoning may wait up to 10 minutes for its first semantic output.
+  openai_high_effort_first_output_timeout_seconds: 600
+  # End-to-end hard budget shared by queueing, upstream attempts, and retries (seconds; default 600).
+  # A value of 0 uses the safe 600-second default and cannot disable this limit.
+  openai_request_budget_seconds: 600
+  # Error retry/account failover eligibility window from request entry (seconds).
+  # 0 derives min(300, effective request budget); set 300 for the normal five-minute retry window.
+  # An attempt that started before this window may continue until the 600-second hard budget.
+  openai_retry_budget_seconds: 300
   # Buffer native HTTP Responses SSE until a successful terminal event so late upstream failures can retry/fail over atomically.
   # Disabled by default to keep real-time streaming; enable only when strict atomic failover is required.
   openai_atomic_stream_failover: false

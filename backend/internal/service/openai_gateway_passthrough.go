@@ -337,7 +337,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 
 	// Get access token
-	token, _, err := s.GetAccessToken(ctx, account)
+	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
 		return nil, err
 	}
@@ -360,22 +360,32 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	responseID := ""
 	imageCount := 0
 	var imageOutputSizes []string
-	for {
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 && OpenAIRetryBudgetExpired(ctx) {
+			return nil, ErrOpenAIRetryBudgetExhausted
+		}
 		actualModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 		if actualModel == "" {
 			actualModel = reqModel
 		}
 		SetOpsUpstreamModel(c, actualModel)
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		upstreamCtxReleased := false
+		releaseAttemptContext := func() {
+			if !upstreamCtxReleased {
+				upstreamCtxReleased = true
+				releaseUpstreamCtx()
+			}
+		}
 		upstreamReq, buildErr := s.buildUpstreamRequestOpenAIPassthrough(upstreamCtx, c, account, body, token)
 		if buildErr != nil {
-			releaseUpstreamCtx()
+			releaseAttemptContext()
 			return nil, buildErr
 		}
 		// Keep the detached request context alive through the response body. Several
 		// retries can occur in this loop; the deferred release is bounded by those
 		// retries and avoids canceling the request immediately after construction.
-		defer releaseUpstreamCtx()
+		defer releaseAttemptContext()
 
 		upstreamStart := time.Now()
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
@@ -396,6 +406,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
 				body = retryBody
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying passthrough request after %s (account: %s)", reason, account.Name)
+				releaseAttemptContext()
 				continue
 			}
 			if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, probeBody) {
@@ -404,6 +415,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 				if recoveryErr := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); recoveryErr != nil {
 					return nil, fmt.Errorf("agent identity task recovery failed: %w", recoveryErr)
 				}
+				releaseAttemptContext()
 				continue
 			}
 			upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(probeBody)))
@@ -421,6 +433,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 					"[OpenAI passthrough] Retrying explicit compact request once with fallback model (account: %s, from: %s, to: %s, upstream_code: %s)",
 					account.Name, fromModel, fallbackModel, extractUpstreamErrorCode(probeBody),
 				)
+				releaseAttemptContext()
 				continue
 			}
 
@@ -457,6 +470,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 					body = retryBody
 					upstreamPassthroughModel = fallbackModel
 					compactModelFallbackRetried = true
+					_ = resp.Body.Close()
+					releaseAttemptContext()
 					continue
 				}
 				if signal, ok := asOpenAICompactFallbackSignal(handleErr); ok {
@@ -484,6 +499,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 					body = retryBody
 					upstreamPassthroughModel = fallbackModel
 					compactModelFallbackRetried = true
+					_ = resp.Body.Close()
+					releaseAttemptContext()
 					continue
 				}
 				if signal, ok := asOpenAICompactFallbackSignal(handleErr); ok {

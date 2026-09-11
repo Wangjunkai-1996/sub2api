@@ -294,6 +294,21 @@ func (s *OpenAIGatewayService) SelectAccountForTokenCount(
 	requiredCapability OpenAIEndpointCapability,
 	platform string,
 ) (*Account, error) {
+	return s.SelectAccountForTokenCountExcluding(ctx, groupID, sessionHash, requestedModel, requiredCapability, platform, nil)
+}
+
+// SelectAccountForTokenCountExcluding is the request-retry variant of
+// SelectAccountForTokenCount. The legacy helper remains source-compatible;
+// callers that fail over within one request pass the accounts already tried.
+func (s *OpenAIGatewayService) SelectAccountForTokenCountExcluding(
+	ctx context.Context,
+	groupID *int64,
+	sessionHash string,
+	requestedModel string,
+	requiredCapability OpenAIEndpointCapability,
+	platform string,
+	excludedIDs map[int64]struct{},
+) (*Account, error) {
 	ctx = WithOpenAIProfitControlSuppressed(ctx)
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
 	return s.selectAccountForModelWithExclusions(
@@ -302,7 +317,7 @@ func (s *OpenAIGatewayService) SelectAccountForTokenCount(
 		platform,
 		sessionHash,
 		requestedModel,
-		nil,
+		excludedIDs,
 		false,
 		0,
 		requiredCapability,

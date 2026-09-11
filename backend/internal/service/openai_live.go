@@ -684,6 +684,9 @@ func (s *OpenAIGatewayService) shouldFailoverLiveCreateError(account *Account, e
 		// 凭证读取和网络传输错误都可能只影响当前账号或代理。
 		return true
 	}
+	if upstreamErr.IsCredentialFailure() {
+		return true
+	}
 	return s.shouldFailoverOpenAIUpstreamResponse(account,
 		upstreamErr.StatusCode,
 		"",
@@ -697,7 +700,7 @@ func (s *OpenAIGatewayService) createUpstreamLiveCall(
 	request *LiveCallRequest,
 	attestation string,
 ) (*LiveCallCreated, error) {
-	token, _, err := s.GetAccessToken(ctx, account)
+	token, _, err := s.getRequestCredential(ctx, nil, account)
 	if err != nil {
 		logLiveCreateStageFailure(ctx, account.ID, "access_token", err)
 		return nil, err

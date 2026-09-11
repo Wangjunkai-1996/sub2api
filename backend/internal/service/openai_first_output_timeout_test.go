@@ -389,6 +389,43 @@ func TestOpenAINativeFirstOutputTimeoutDisarmsAfterSemanticOutput(t *testing.T) 
 	require.Equal(t, "42", rec.Result().Header.Get("X-Ratelimit-Remaining-Requests"))
 }
 
+func TestOpenAINativeLongFirstOutputDeadlineSuppressesStreamIdle(t *testing.T) {
+	cfg := &config.Config{Gateway: config.GatewayConfig{
+		OpenAIFirstOutputTimeoutSeconds: 2,
+		StreamDataIntervalTimeout:       1,
+		MaxLineSize:                     defaultMaxLineSize,
+	}}
+	// Both values are expressed in seconds by production config. Keeping the
+	// stream before semantic output past the idle interval exercises the guard;
+	// the longer first-output deadline must remain authoritative.
+	svc := &OpenAIGatewayService{cfg: cfg, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
+	pr, pw := io.Pipe()
+	released := make(chan struct{})
+	go func() {
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_idle_guard\"}}\n\n"))
+		// Keep the stream before semantic output past the idle interval. The
+		// first-output deadline is longer, so this must not fail on stream idle.
+		time.Sleep(1100 * time.Millisecond)
+		close(released)
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_idle_guard\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"))
+	}()
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: pr}
+
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
+	require.NoError(t, err)
+	select {
+	case <-released:
+	default:
+		t.Fatal("upstream was not allowed to remain before semantic output")
+	}
+	require.Contains(t, rec.Body.String(), "response.output_text.delta")
+}
+
 func TestOpenAINativeFirstOutputTimeoutWaitsForCompleteSemanticEvent(t *testing.T) {
 	const lineSize = 68106
 	prefix := `data: {"type":"response.output_text.delta","delta":"`

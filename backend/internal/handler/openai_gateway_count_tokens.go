@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -95,38 +96,48 @@ func (h *OpenAIGatewayHandler) ResponsesInputTokens(c *gin.Context) {
 	c.Request = c.Request.WithContext(service.WithOpenAIProfitControlSuppressed(c.Request.Context()))
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
-	requestStart := time.Now()
-	account, err := h.gatewayService.SelectAccountForTokenCount(
-		c.Request.Context(),
-		apiKey.GroupID,
-		sessionHash,
-		routingModel,
-		service.OpenAIEndpointCapabilityChatCompletions,
-		requestPlatform,
-	)
-	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
-	if err != nil {
-		reqLog.Warn("openai_input_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)))
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, routingModel, reqModel)
-		cls = classifySelectionFailureError(err, cls)
-		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-		}
-		h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
-		return
+	failedAccountIDs := make(map[int64]struct{})
+	maxSwitches := h.maxAccountSwitches
+	if maxSwitches <= 0 {
+		maxSwitches = 3
 	}
-	if account == nil {
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, routingModel, reqModel)
-		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimited(c)
+	for attempt := 0; ; attempt++ {
+		if failoverClientGone(c) {
+			return
 		}
-		h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
-		return
-	}
-
-	setOpsSelectedAccount(c, account.ID, account.Platform)
-	if err := h.gatewayService.ForwardResponsesInputTokens(c.Request.Context(), c, account, forwardBody); err != nil {
-		reqLog.Error("openai_input_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+		requestStart := time.Now()
+		account, selectErr := h.gatewayService.SelectAccountForTokenCountExcluding(
+			c.Request.Context(), apiKey.GroupID, sessionHash, routingModel,
+			service.OpenAIEndpointCapabilityChatCompletions, requestPlatform, failedAccountIDs,
+		)
+		service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
+		if selectErr != nil || account == nil {
+			if len(failedAccountIDs) > 0 {
+				h.errorResponse(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+				return
+			}
+			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, routingModel, reqModel)
+			cls = classifySelectionFailureError(selectErr, cls)
+			if !cls.ModelNotFound {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
+			}
+			h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			return
+		}
+		setOpsSelectedAccount(c, account.ID, account.Platform)
+		forwardErr := h.gatewayService.ForwardResponsesInputTokens(c.Request.Context(), c, account, forwardBody)
+		if forwardErr == nil {
+			return
+		}
+		var failoverErr *service.UpstreamFailoverError
+		if !errors.As(forwardErr, &failoverErr) || !failoverErr.ShouldRetryNextAccount() || attempt >= maxSwitches {
+			if !c.Writer.Written() {
+				h.errorResponse(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+			}
+			return
+		}
+		failedAccountIDs[account.ID] = struct{}{}
+		reqLog.Warn("openai_input_tokens.upstream_failover_switching", zap.Int64("account_id", account.ID), zap.Int("attempt", attempt+1), zap.Error(forwardErr))
 	}
 }
 
@@ -260,7 +271,6 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		return
 	}
 
-	requestStart := time.Now()
 	// count_tokens 不计费：显式豁免利润门，避免高倍率账号池被门排除后连
 	// token 计数都返回 no available accounts。
 	c.Request = c.Request.WithContext(service.WithOpenAIProfitControlSuppressed(c.Request.Context()))
@@ -270,58 +280,67 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		currentRoutingModel = preferredMappedModel
 	}
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
-	selection, _, selectErr := h.gatewayService.SelectAccountWithSchedulerForCapability(
-		c.Request.Context(),
-		apiKey.GroupID,
-		"",
-		sessionHash,
-		currentRoutingModel,
-		nil,
-		service.OpenAIUpstreamTransportAny,
-		service.OpenAIEndpointCapabilityChatCompletions,
-		false,
-		false,
-		false,
-		requestPlatform,
-	)
-	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
-	if selectErr != nil {
-		reqLog.Warn("openai_count_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(selectErr, requestPlatform)))
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
-		cls = classifySelectionFailureError(selectErr, cls)
-		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
+	failedAccountIDs := make(map[int64]struct{})
+	maxSwitches := h.maxAccountSwitches
+	if maxSwitches <= 0 {
+		maxSwitches = 3
+	}
+	for attempt := 0; ; attempt++ {
+		if failoverClientGone(c) {
+			return
 		}
-		h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
-		return
-	}
-	if selection == nil || selection.Account == nil {
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
-		if !cls.ModelNotFound {
-			markOpsRoutingCapacityLimited(c)
+		requestStart := time.Now()
+		selection, _, selectErr := h.gatewayService.SelectAccountWithSchedulerForCapability(
+			c.Request.Context(), apiKey.GroupID, "", sessionHash, currentRoutingModel,
+			failedAccountIDs, service.OpenAIUpstreamTransportAny,
+			service.OpenAIEndpointCapabilityChatCompletions, false, false, false, requestPlatform,
+		)
+		service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
+		if selectErr != nil || selection == nil || selection.Account == nil {
+			if len(failedAccountIDs) > 0 {
+				h.anthropicErrorResponse(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+				return
+			}
+			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+			cls = classifySelectionFailureError(selectErr, cls)
+			if !cls.ModelNotFound {
+				markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
+			}
+			h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			return
 		}
-		h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
-		return
-	}
 
-	account := selection.Account
-	sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
-	setOpsSelectedAccount(c, account.ID, account.Platform)
-	accountRelease, acquireErr := h.acquireCountTokensAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqLog)
-	if acquireErr != nil {
-		status, errType, _, message := concurrencyErrorResponse(acquireErr, "account")
-		h.anthropicErrorResponse(c, status, errType, message)
-		return
-	}
-
-	account = selection.Account
-	forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
-	defaultMappedModel := preferredMappedModel
-	if accountRelease != nil {
-		defer accountRelease()
-	}
-	if forwardErr := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, defaultMappedModel); forwardErr != nil {
-		reqLog.Error("openai_count_tokens.forward_failed", zap.Int64("account_id", account.ID), zap.Error(forwardErr))
+		account := selection.Account
+		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
+		setOpsSelectedAccount(c, account.ID, account.Platform)
+		accountRelease, acquireErr := h.acquireCountTokensAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqLog)
+		if acquireErr != nil {
+			if attempt < maxSwitches && c.Request.Context().Err() == nil {
+				failedAccountIDs[account.ID] = struct{}{}
+				reqLog.Warn("openai_count_tokens.account_slot_unavailable_switching", zap.Int64("account_id", account.ID), zap.Error(acquireErr))
+				continue
+			}
+			status, errType, _, message := concurrencyErrorResponse(acquireErr, "account")
+			h.anthropicErrorResponse(c, status, errType, message)
+			return
+		}
+		forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
+		forwardErr := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, preferredMappedModel)
+		if accountRelease != nil {
+			accountRelease()
+		}
+		if forwardErr == nil {
+			return
+		}
+		var failoverErr *service.UpstreamFailoverError
+		if !errors.As(forwardErr, &failoverErr) || !failoverErr.ShouldRetryNextAccount() || attempt >= maxSwitches {
+			if !c.Writer.Written() {
+				h.anthropicErrorResponse(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
+			}
+			return
+		}
+		failedAccountIDs[account.ID] = struct{}{}
+		reqLog.Warn("openai_count_tokens.upstream_failover_switching", zap.Int64("account_id", account.ID), zap.Int("attempt", attempt+1), zap.Error(forwardErr))
 	}
 }
 

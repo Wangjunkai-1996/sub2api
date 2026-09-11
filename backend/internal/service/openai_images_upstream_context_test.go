@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,29 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 )
+
+func TestForwardOpenAIImagesOAuth_MissingTokenReturnsAccountFailover(t *testing.T) {
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","response_format":"b64_json"}`)
+	c, _ := newOpenAIImagesTestContext(t, body)
+	svc := newOpenAIImagesTestService(nil)
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+	account := &Account{
+		ID:       41,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		Credentials: map[string]any{
+			"expires_at": "2000-01-01T00:00:00Z",
+		},
+	}
+
+	_, err = svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr), "missing OAuth token must be retryable on another account")
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.Equal(t, NextAccountRetry, failoverErr.NextAccountAction)
+}
 
 func newOpenAIImagesTestContext(t *testing.T, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()

@@ -100,11 +100,39 @@ func (s *OpenAIGatewayService) getRequestCredential(ctx context.Context, c *gin.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	if account == nil {
 		return "", "", errors.New("account is nil")
 	}
 	if !account.IsGrokOAuth() {
-		return s.GetAccessToken(ctx, account)
+		if account.IsOpenAIOAuthLike() && !account.IsActive() {
+			return "", "", newOpenAIAccountCredentialFailover(c, account, errors.New("OpenAI OAuth account is not active"))
+		}
+		credentialAccount := account
+		if account.IsShadow() && account.IsOpenAIOAuthLike() {
+			resolved, err := resolveCredentialAccount(ctx, s.accountRepo, account)
+			if err != nil {
+				if !errors.Is(err, errCredentialAccountStateChanged) {
+					return "", "", err
+				}
+				return "", "", newOpenAIAccountCredentialFailover(c, account, err)
+			}
+			if resolved == nil || !resolved.IsCredentialUsableForShadow() {
+				return "", "", newOpenAIAccountCredentialFailover(c, account, errors.New("shadow parent account is not usable"))
+			}
+			credentialAccount = resolved
+		}
+		credentialCtx := ctx
+		if account.IsOpenAIOAuthLike() {
+			credentialCtx = withOAuthRefreshRequestPath(ctx)
+		}
+		token, kind, err := s.GetAccessToken(credentialCtx, credentialAccount)
+		if err == nil || ctx.Err() != nil || !account.IsOpenAIOAuthLike() || !isOpenAIAccountCredentialFailure(err) {
+			return token, kind, err
+		}
+		return "", "", newOpenAIAccountCredentialFailover(c, account, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return "", "", err
@@ -212,6 +240,64 @@ func (s *OpenAIGatewayService) getRequestCredential(ctx context.Context, c *gin.
 		}
 	}
 	return "", "", s.newGrokCredentialFailover(c, account, class)
+}
+
+// isOpenAIAccountCredentialFailure limits request-level failover to errors that
+// identify the selected OAuth credential as unusable. Provider/DB outages must
+// not rotate every account in the pool.
+func isOpenAIAccountCredentialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var permanentErr *accountPermanentRefreshError
+	if errors.As(err, &permanentErr) || errors.Is(err, errOAuthRefreshAccountStateChanged) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"access_token not found",
+		"refresh_token is missing",
+		"invalid_grant",
+		"invalid_refresh_token",
+		"token_expired",
+		"refresh_token_reused",
+		"refresh_token_invalidated",
+		"app_session_terminated",
+		"access_denied",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func newOpenAIAccountCredentialFailover(c *gin.Context, account *Account, cause error) *UpstreamFailoverError {
+	message := "OpenAI OAuth account credentials are unavailable"
+	if cause != nil && strings.Contains(strings.ToLower(cause.Error()), "refresh_token is missing") {
+		message = "OpenAI OAuth account credentials are missing or expired"
+	}
+	if c != nil && account != nil {
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			ProxyID:   nil,
+			ProxyName: opsProxyNameUnknown,
+			Platform:  account.Platform,
+			AccountID: account.ID,
+			Stage:     string(GatewayFailureStageAccountAuth),
+			Scope:     string(GatewayFailureScopeAccount),
+			Reason:    string(OpenAIUpstreamAccessStateReason),
+			Kind:      "credential_failover",
+			Message:   message,
+		})
+	}
+	return &UpstreamFailoverError{
+		Stage:             GatewayFailureStageAccountAuth,
+		Scope:             GatewayFailureScopeAccount,
+		Reason:            OpenAIUpstreamAccessStateReason,
+		NextAccountAction: NextAccountRetry,
+		ClientStatusCode:  http.StatusBadGateway,
+		ClientMessage:     message,
+	}
 }
 
 func grokCredentialAcquisitionContext(ctx context.Context, c *gin.Context) (context.Context, context.CancelFunc, bool) {
