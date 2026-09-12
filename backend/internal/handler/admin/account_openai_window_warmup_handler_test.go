@@ -301,6 +301,27 @@ func TestOpenAIWindowWarmupRequeueHandlerReplaysIdempotencyKey(t *testing.T) {
 	require.Equal(t, 1, accountRepo.getCalls)
 }
 
+func TestOpenAIWindowWarmupRequeueHandlerReturnsBadRequestForExpiredAccount(t *testing.T) {
+	previousCoordinator := service.DefaultIdempotencyCoordinator()
+	service.SetDefaultIdempotencyCoordinator(nil)
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(previousCoordinator) })
+
+	repo := &warmupHandlerRepository{}
+	router, adminService, accountRepo, _ := setupWarmupHandlerRouter(t, repo)
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	adminService.account.ExpiresAt = &expiredAt
+	accountRepo.account.ExpiresAt = &expiredAt
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/42/codex-warmup/requeue", bytes.NewBufferString(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE")
+	require.Zero(t, repo.enqueueCalls)
+}
+
 func TestOpenAIWindowWarmupUnblockHandler(t *testing.T) {
 	previousCoordinator := service.DefaultIdempotencyCoordinator()
 	service.SetDefaultIdempotencyCoordinator(nil)

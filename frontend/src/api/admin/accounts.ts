@@ -855,7 +855,7 @@ export async function unblockCodexWarmup(accountID: number): Promise<OpenAIWindo
 export async function listCodexWarmupJobs(
   page = 1,
   pageSize = 20,
-  filters?: { account_id?: number; state?: string; policy?: OpenAICodexWarmupPolicy }
+  filters?: { account_id?: number; state?: string }
 ): Promise<OpenAIWindowWarmupJobListResponse> {
   const { data } = await apiClient.get<OpenAIWindowWarmupJobListResponse>('/admin/codex-window-warmup/jobs', {
     params: { page, page_size: pageSize, ...filters }

@@ -321,6 +321,83 @@ func (r *openAIWindowWarmupRepository) CleanupExpiredAttempts(ctx context.Contex
 	return result.RowsAffected()
 }
 
+// PauseIneligibleJobs fences durable work whose account can no longer run a
+// warmup. Accounts are locked before jobs so this cannot race an identity
+// update that holds the same account lock. Already-fenced uncertain rows are
+// skipped after the first pass to avoid rewriting them on every reconciliation.
+func (r *openAIWindowWarmupRepository) PauseIneligibleJobs(ctx context.Context, limit int) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("nil openai warmup repository")
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	query := `
+	WITH locked_accounts AS MATERIALIZED (
+	    SELECT a.id, a.openai_warmup_identity_generation
+	    FROM accounts AS a
+	    WHERE (
+	        a.platform::text <> 'openai'
+	        OR a.type::text <> 'oauth'
+	        OR a.parent_account_id IS NOT NULL
+	        OR COALESCE(a.quota_dimension::text, 'global') <> 'global'
+	        OR a.status::text <> 'active'
+	        OR NOT a.schedulable
+	        OR a.deleted_at IS NOT NULL
+	        OR (a.expires_at IS NOT NULL AND a.expires_at <= NOW())
+	        OR (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > NOW())
+	    )
+	    AND EXISTS (
+	        SELECT 1
+	        FROM openai_window_warmup_jobs AS j
+	        WHERE j.account_id = a.id
+	          AND j.identity_generation = a.openai_warmup_identity_generation
+	          AND j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'possibly_sent', 'uncertain')
+	          AND NOT (j.state = 'uncertain' AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL)
+	    )
+	    ORDER BY a.id
+	    LIMIT $1
+	    FOR SHARE SKIP LOCKED
+	), candidates AS MATERIALIZED (
+	    SELECT j.id,
+	           (j.sent_at IS NOT NULL OR j.state IN ('uncertain', 'possibly_sent')) AS may_have_sent
+	    FROM locked_accounts AS a
+	    JOIN openai_window_warmup_jobs AS j
+	      ON j.account_id = a.id
+	     AND j.identity_generation = a.openai_warmup_identity_generation
+	    WHERE j.state IN ('pending', 'armed', 'due', 'running', 'retrying', 'possibly_sent', 'uncertain')
+	      AND NOT (j.state = 'uncertain' AND j.lease_owner IS NULL AND j.lease_token IS NULL AND j.lease_until IS NULL)
+	    ORDER BY j.id
+	    LIMIT $1
+	    FOR UPDATE OF j SKIP LOCKED
+	), updated AS (
+	    UPDATE openai_window_warmup_jobs AS j
+	    SET state = CASE WHEN c.may_have_sent THEN 'uncertain' ELSE 'paused' END,
+	        next_attempt_at = NOW(),
+	        last_error_code = CASE
+	            WHEN c.may_have_sent THEN COALESCE(NULLIF(j.last_error_code, ''), 'account_ineligible')
+	            ELSE 'account_ineligible'
+	        END,
+	        last_error = NULL,
+	        lease_owner = NULL,
+	        lease_token = NULL,
+	        lease_until = NULL,
+	        uncertain_observed_reset_at = CASE WHEN c.may_have_sent THEN j.uncertain_observed_reset_at ELSE NULL END,
+	        uncertain_observed_at = CASE WHEN c.may_have_sent THEN j.uncertain_observed_at ELSE NULL END,
+	        uncertain_terminal_observed = CASE WHEN c.may_have_sent THEN j.uncertain_terminal_observed ELSE FALSE END,
+	        updated_at = NOW()
+	    FROM candidates AS c
+	    WHERE j.id = c.id
+	    RETURNING j.id
+	)
+	SELECT COUNT(*) FROM updated`
+	var changed int64
+	if err := r.db.QueryRowContext(ctx, query, limit).Scan(&changed); err != nil {
+		return 0, err
+	}
+	return changed, nil
+}
+
 func (r *openAIWindowWarmupRepository) CleanupSupersededTerminalJobs(ctx context.Context, limit int) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("nil openai warmup repository")

@@ -961,6 +961,8 @@ export interface OpenAIWindowWarmupJob {
 /** Redacted account-level warmup status; no credential or response content. */
 export interface OpenAIWindowWarmupStatus {
   policy: OpenAICodexWarmupPolicy
+  queued?: boolean
+  changed?: boolean
   state?: OpenAIWindowWarmupState | string | null
   next_run_at?: string | null
   next_attempt_at?: string | null

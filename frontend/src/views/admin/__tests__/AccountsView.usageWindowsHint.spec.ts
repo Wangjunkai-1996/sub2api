@@ -263,6 +263,67 @@ describe('admin AccountsView usage windows hint', () => {
     expect(retrying.text()).toContain('admin.accounts.openai.windowWarmup.nextRun')
   })
 
+  it('renders the queued-by-trigger fallback as a pending warmup state', async () => {
+    listAccounts.mockResolvedValueOnce({
+      items: [{
+        id: 10,
+        name: 'projection-fallback',
+        platform: 'openai',
+        type: 'oauth',
+        status: 'active',
+        schedulable: true,
+        openai_codex_warmup_policy: 'continuous',
+        openai_window_warmup: {
+          policy: 'continuous',
+          state: 'queued_by_trigger'
+        },
+        created_at: '2026-08-31T00:00:00Z',
+        updated_at: '2026-08-31T00:00:00Z'
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const fallback = wrapper.get('[data-test="window-warmup-10"]')
+    expect(fallback.text()).toContain('admin.accounts.openai.windowWarmup.states.pending')
+    expect(fallback.text()).not.toContain('admin.accounts.openai.windowWarmup.states.queued_by_trigger')
+  })
+
+  it('hides warmup actions for expired accounts', async () => {
+    listAccounts.mockResolvedValueOnce({
+      items: [{
+        id: 11,
+        name: 'expired-account',
+        platform: 'openai',
+        type: 'oauth',
+        status: 'active',
+        schedulable: true,
+        expires_at: 1,
+        openai_codex_warmup_policy: 'continuous',
+        openai_window_warmup: {
+          policy: 'continuous',
+          state: 'pending'
+        },
+        created_at: '2026-08-31T00:00:00Z',
+        updated_at: '2026-08-31T00:00:00Z'
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="window-warmup-11"]').findAll('button')).toHaveLength(0)
+  })
+
   it('shows account multipliers with enough precision to match declared rates', async () => {
     listAccounts.mockResolvedValueOnce({
       items: [{

@@ -298,7 +298,7 @@
                   {{ openAIWindowWarmupStateLabel(row) }}
                 </span>
                 <button
-                  v-if="row.openai_codex_warmup_policy !== 'off'"
+                  v-if="openAIWindowWarmupState(row) !== 'off' && isOpenAIWindowWarmupActionable(row)"
                   type="button"
                   class="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-primary-600 disabled:opacity-50 dark:hover:bg-dark-700"
                   :disabled="warmupActionAccountID === row.id"
@@ -309,7 +309,7 @@
                   <Icon name="refresh" size="xs" :class="{ 'animate-spin': warmupActionAccountID === row.id }" />
                 </button>
                 <button
-                  v-if="isOpenAIWindowWarmupBlocked(row)"
+                  v-if="isOpenAIWindowWarmupBlocked(row) && isOpenAIWindowWarmupActionable(row)"
                   type="button"
                   class="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-emerald-600 disabled:opacity-50 dark:hover:bg-dark-700"
                   :disabled="warmupActionAccountID === row.id"
@@ -1956,7 +1956,15 @@ const isOpenAIWindowWarmupAccount = (row: Account): boolean =>
 const openAIWindowWarmupState = (row: Account): string => {
   const policy = row.openai_window_warmup?.policy ?? row.openai_codex_warmup_policy ?? 'off'
   if (policy === 'off') return 'off'
-  return row.openai_window_warmup?.state || 'pending'
+  const state = row.openai_window_warmup?.state || 'pending'
+  return state === 'queued_by_trigger' ? 'pending' : state
+}
+
+const isOpenAIWindowWarmupActionable = (row: Account): boolean => {
+  if (row.status !== 'active' || !row.schedulable) return false
+  if (row.expires_at != null && row.expires_at > 0 && row.expires_at * 1000 <= Date.now()) return false
+  if (row.temp_unschedulable_until && new Date(row.temp_unschedulable_until).getTime() > Date.now()) return false
+  return true
 }
 
 const isOpenAIWindowWarmupFiveHourUnsupported = (row: Account): boolean =>

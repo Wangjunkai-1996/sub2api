@@ -25,6 +25,8 @@ type warmupRepositorySpy struct {
 	enqueues                  []OpenAIWindowWarmupEnqueue
 	cycles                    map[string]*OpenAIWindowWarmupJob
 	currentBatchCalls         int
+	pauseIneligibleCalls      int
+	pauseIneligibleLimit      int
 	action                    string
 	state                     string
 	code                      string
@@ -114,6 +116,12 @@ func (r *warmupRepositorySpy) CleanupExpiredAttempts(context.Context, int) (int6
 }
 
 func (r *warmupRepositorySpy) CleanupSupersededTerminalJobs(context.Context, int) (int64, error) {
+	return 0, nil
+}
+
+func (r *warmupRepositorySpy) PauseIneligibleJobs(_ context.Context, limit int) (int64, error) {
+	r.pauseIneligibleCalls++
+	r.pauseIneligibleLimit = limit
 	return 0, nil
 }
 
@@ -2735,6 +2743,36 @@ func TestWarmupEligibilityUsesInjectedClock(t *testing.T) {
 	require.False(t, warmupAccountEligibleAt(account, expires))
 	account.AutoPauseOnExpired = false
 	require.False(t, warmupAccountEligibleAt(account, expires), "expired accounts stay ineligible even when auto-pause is disabled")
+}
+
+func TestOpenAIWindowWarmupUnblockRequiresEnabledPolicy(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyOff)
+	repo := &warmupRepositorySpy{}
+	warmup := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+
+	job, changed, err := warmup.UnblockAccount(context.Background(), account.ID)
+
+	require.Error(t, err)
+	require.Nil(t, job)
+	require.False(t, changed)
+	require.Equal(t, "OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", infraerrors.Reason(err))
+	require.Empty(t, repo.enqueues)
+}
+
+func TestOpenAIWindowWarmupReconcilePausesIneligibleJobsWithEmptyCohort(t *testing.T) {
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	account := warmupEligibleAccount(now, OpenAIWindowWarmupPolicyContinuous)
+	expiredAt := now.Add(-time.Minute)
+	account.ExpiresAt = &expiredAt
+	repo := &warmupRepositorySpy{}
+	warmup := newWarmupTestService(repo, account, &warmupProbeStub{}, nil, now, true)
+
+	warmup.reconcileAccounts(context.Background())
+
+	require.Equal(t, 1, repo.pauseIneligibleCalls)
+	require.Equal(t, 500, repo.pauseIneligibleLimit)
+	require.Empty(t, repo.enqueues)
 }
 
 func TestOpenAIWindowWarmupOptionsPreserveExplicitZeroGrace(t *testing.T) {

@@ -268,12 +268,13 @@ type AccountWithConcurrency struct {
 // so groups/account_groups never appear in the list payload.
 type AccountListItemWithConcurrency struct {
 	*dto.AccountListItem
-	CurrentConcurrency int                          `json:"current_concurrency"`
-	SchedulerScore     *AccountSchedulerScore       `json:"scheduler_score,omitempty"`
-	SchedulerScores    []AccountSchedulerGroupScore `json:"scheduler_scores,omitempty"`
-	CurrentWindowCost  *float64                     `json:"current_window_cost,omitempty"`
-	ActiveSessions     *int                         `json:"active_sessions,omitempty"`
-	CurrentRPM         *int                         `json:"current_rpm,omitempty"`
+	CurrentConcurrency int                               `json:"current_concurrency"`
+	SchedulerScore     *AccountSchedulerScore            `json:"scheduler_score,omitempty"`
+	SchedulerScores    []AccountSchedulerGroupScore      `json:"scheduler_scores,omitempty"`
+	CurrentWindowCost  *float64                          `json:"current_window_cost,omitempty"`
+	ActiveSessions     *int                              `json:"active_sessions,omitempty"`
+	CurrentRPM         *int                              `json:"current_rpm,omitempty"`
+	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
 }
 
 type simpleModeGroupReference struct {
@@ -916,6 +917,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 				CurrentWindowCost:  item.CurrentWindowCost,
 				ActiveSessions:     item.ActiveSessions,
 				CurrentRPM:         item.CurrentRPM,
+				OpenAIWindowWarmup: item.OpenAIWindowWarmup,
 			}
 		}
 		etag := buildAccountsListETag(compact, total, page, pageSize, platform, accountType, status, search, true)

@@ -524,7 +524,7 @@ func (h *AccountHandler) UpdateOpenAIWindowWarmupPolicyBatch(c *gin.Context) {
 				} else if status != nil {
 					item.Queued = status.Queued
 					item.State = status.State
-					if status.Queued {
+					if status.Queued && service.IsOpenAIWindowWarmupStateActive(status.State) {
 						result.Queued++
 					}
 				}

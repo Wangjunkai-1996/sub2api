@@ -508,6 +508,7 @@ type OpenAIWindowWarmupRepository interface {
 	QueueStats(context.Context, []int64) (OpenAIWindowWarmupQueueStats, error)
 	CleanupExpiredAttempts(context.Context, int) (int64, error)
 	CleanupSupersededTerminalJobs(context.Context, int) (int64, error)
+	PauseIneligibleJobs(context.Context, int) (int64, error)
 	ReserveGlobalSend(context.Context, time.Duration, time.Duration) (string, bool, error)
 	ReleaseGlobalSend(context.Context, string) (bool, error)
 	RenewLease(context.Context, int64, string, string, time.Duration) (bool, error)
@@ -759,6 +760,7 @@ func (s *OpenAIWindowWarmupService) reconcileAccounts(ctx context.Context) {
 	}
 	_, _ = s.repo.CleanupExpiredAttempts(ctx, 500)
 	_, _ = s.repo.CleanupSupersededTerminalJobs(ctx, 500)
+	_, _ = s.repo.PauseIneligibleJobs(ctx, 500)
 	accounts, accountIDs, ok := s.refreshWarmupCohort(ctx)
 	if !ok || len(accountIDs) == 0 {
 		return
@@ -1006,10 +1008,22 @@ func (s *OpenAIWindowWarmupService) RequeueAccount(ctx context.Context, accountI
 		return nil, false, err
 	}
 	if !warmupAccountEligibleAt(account, s.now()) {
-		return nil, false, errors.New("account is not eligible for OpenAI window warmup")
+		return nil, false, infraerrors.BadRequest(
+			"OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE",
+			"Account is not currently eligible for OpenAI window warmup",
+		)
+	}
+	if !OpenAIWindowWarmupPolicyForAccount(account).Enabled() {
+		return nil, false, infraerrors.BadRequest(
+			"OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE",
+			"Account must have an enabled OpenAI window warmup policy",
+		)
 	}
 	if !s.accountAllowed(ctx, accountID) {
-		return nil, false, errors.New("account is outside the configured OpenAI window warmup cohort")
+		return nil, false, infraerrors.BadRequest(
+			"OPENAI_WINDOW_WARMUP_ACCOUNT_OUTSIDE_COHORT",
+			"Account is outside the configured OpenAI window warmup cohort",
+		)
 	}
 	current, currentErr := s.repo.GetCurrent(ctx, accountID, OpenAIWindowWarmupQuotaScopeGlobal)
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
@@ -1095,8 +1109,23 @@ func (s *OpenAIWindowWarmupService) UnblockAccount(ctx context.Context, accountI
 	if err != nil || account == nil {
 		return nil, false, err
 	}
+	if !warmupAccountEligibleAt(account, s.now()) {
+		return nil, false, infraerrors.BadRequest(
+			"OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE",
+			"Account is not currently eligible for OpenAI window warmup",
+		)
+	}
+	if !OpenAIWindowWarmupPolicyForAccount(account).Enabled() {
+		return nil, false, infraerrors.BadRequest(
+			"OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE",
+			"Account must have an enabled OpenAI window warmup policy",
+		)
+	}
 	if !s.accountAllowed(ctx, accountID) {
-		return nil, false, errors.New("account is outside the configured OpenAI window warmup cohort")
+		return nil, false, infraerrors.BadRequest(
+			"OPENAI_WINDOW_WARMUP_ACCOUNT_OUTSIDE_COHORT",
+			"Account is outside the configured OpenAI window warmup cohort",
+		)
 	}
 	current, currentErr := s.repo.GetCurrent(ctx, accountID, OpenAIWindowWarmupQuotaScopeGlobal)
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
