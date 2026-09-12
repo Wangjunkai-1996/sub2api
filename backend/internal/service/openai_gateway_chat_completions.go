@@ -731,6 +731,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			firstChunk = false
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
+			if comment := openAITTFTComment(c, firstTokenMs); comment != "" {
+				// Commit telemetry with the existing buffered output, preserving pre-output retries.
+				pendingSSE = append(pendingSSE, comment)
+			}
 		}
 		if countSearch {
 			searchCount += countGrokNativeSearchCallsInSSEDataDedup([]byte(payload), streamSearchSeen)

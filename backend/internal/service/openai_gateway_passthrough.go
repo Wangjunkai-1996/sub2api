@@ -1899,6 +1899,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	var firstTokenMs *int
 	responseID := ""
 	ttftMode := s.openAITTFTMode(ctx)
+	ttftCommentSent := false
 	responseRoutingBound := false
 	bindResponseRouting := func() {
 		if responseRoutingBound || strings.TrimSpace(responseID) == "" {
@@ -1986,7 +1987,25 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		flushPending = false
 	}
 	defer flushPendingOutput()
+	writeTTFTComment := func(insideEvent bool) bool {
+		if !ttftCommentSent {
+			if comment := openAITTFTComment(c, firstTokenMs); comment != "" {
+				if insideEvent {
+					comment = strings.TrimSuffix(comment, "\n")
+				}
+				ttftCommentSent = true
+				if _, err := fmt.Fprint(w, comment); err != nil {
+					clientDisconnected = true
+					return false
+				}
+			}
+		}
+		return true
+	}
 	writePendingLines := func() bool {
+		if !writeTTFTComment(false) {
+			return false
+		}
 		for _, pending := range pendingLines {
 			if _, err := fmt.Fprintln(w, pending); err != nil {
 				clientDisconnected = true
@@ -2249,10 +2268,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			if !clientOutputStarted {
 				stopKeepalive()
 			}
-			if !clientOutputStarted && len(pendingLines) > 0 {
+			if !clientOutputStarted {
 				if !writePendingLines() {
 					continue
 				}
+			} else if !writeTTFTComment(true) {
+				continue
 			}
 			if _, err := fmt.Fprintln(w, line); err != nil {
 				clientDisconnected = true

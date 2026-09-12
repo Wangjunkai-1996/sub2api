@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -138,11 +139,28 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 	var firstTokenMs *int
 	ttftMode := s.openAITTFTMode(ctx)
+	ttftCommentSent := false
+	ttftCommentRequested := openAITTFTCommentRequested(c)
+	writeTTFTComment := func(dst io.Writer, insideEvent bool) error {
+		if ttftCommentSent || !ttftCommentRequested {
+			return nil
+		}
+		if comment := openAITTFTComment(c, firstTokenMs); comment != "" {
+			if insideEvent {
+				comment = strings.TrimSuffix(comment, "\n")
+			}
+			ttftCommentSent = true
+			_, err := io.WriteString(dst, comment)
+			return err
+		}
+		return nil
+	}
 	firstOutputProgressObserved := false
 	// atomicStreamRetry keeps OAuth/SetupToken Responses attempts private until a
 	// successful terminal event. A bounded stage overflow remains a replayable
 	// attempt failure; it must never expose a partial stream downstream.
 	atomicStreamCommitted := false
+	clientOutputStarted := false
 	bufferedWriter := bufio.NewWriterSize(w, 4*1024)
 	var firstOutputStage *openAIFirstOutputStage
 	if stageBeforeClientOutput {
@@ -172,6 +190,11 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// the only path that makes staged bytes visible.
 			if atomicStreamRetry && !atomicStreamCommitted {
 				return nil
+			}
+			// A failed write can still expose the timing comment or staged bytes.
+			clientOutputStarted = true
+			if err := writeTTFTComment(w, false); err != nil {
+				return err
 			}
 			if err := firstOutputStage.CommitTo(w); err != nil {
 				return err
@@ -300,7 +323,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	responsesSemanticOutputSeen := false
 	capacityFailoverSuppressedLogged := false
 	failedMessage := ""
-	clientOutputStarted := false
 	clientOutputHasStarted := func() bool {
 		if stageBeforeClientOutput {
 			return clientOutputStarted
@@ -321,6 +343,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		clientOutputStarted = true
 		bindResponseRouting()
 		applyAttemptResponseHeaders()
+		if err := writeTTFTComment(w, false); err != nil {
+			return err
+		}
 		if err := firstOutputStage.CommitTo(w); err != nil {
 			return err
 		}
@@ -385,6 +410,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		completedTTFTEvent := eventStartsTTFTOutput
 		completedTerminalEvent := eventEndsStream
 		firstProgressEvent := completedProgressEvent && !firstOutputProgressObserved
+		if ttftCommentRequested && completedTTFTEvent && firstTokenMs == nil {
+			ms := int(time.Since(startTime).Milliseconds())
+			firstTokenMs = &ms
+		}
 		shouldFlush := firstProgressEvent || eventShouldFlush || (queueDrained && clientOutputStarted)
 		if atomicStreamRetry && !atomicStreamCommitted {
 			shouldFlush = false
@@ -901,6 +930,19 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 
 			// 写入客户端（客户端断开后继续 drain 上游）
 			if !clientDisconnected && !failureDelivered && !suppressCurrentEvent {
+				if ttftCommentRequested && !ttftCommentSent && (firstOutputStage == nil || firstOutputStage.closed) && startsTTFTOutput {
+					if firstTokenMs == nil {
+						ms := int(time.Since(startTime).Milliseconds())
+						firstTokenMs = &ms
+					}
+					// A single comment line preserves an already-open SSE event and
+					// reaches the receiver before a possibly terminal data payload.
+					if err := writeTTFTComment(bufferedWriter, true); err != nil {
+						handlePendingWriteError(err)
+						s.parseSSEUsageBytesWithType(dataBytes, eventType, usage)
+						return
+					}
+				}
 				shouldFlush := queueDrained && (clientOutputStarted || startsClientOutput)
 				if firstTokenMs == nil && startsVisibleOutput {
 					// 保证首个 token 事件尽快出站，避免影响 TTFT。
