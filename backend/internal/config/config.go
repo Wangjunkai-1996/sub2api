@@ -950,8 +950,9 @@ const (
 )
 
 const (
-	DefaultOpenAIRequestBudgetSeconds = 600
-	DefaultOpenAIRetryBudgetSeconds   = 300
+	DefaultOpenAIRequestBudgetSeconds                = 900
+	DefaultOpenAIHighEffortFirstOutputTimeoutSeconds = 600
+	DefaultOpenAIRetryBudgetSeconds                  = 300
 )
 
 // GatewayConfig API网关相关配置
@@ -971,7 +972,7 @@ type GatewayConfig struct {
 	// 0 表示回退到 OpenAIFirstOutputTimeoutSeconds。
 	OpenAIHighEffortFirstOutputTimeoutSeconds int `mapstructure:"openai_high_effort_first_output_timeout_seconds"`
 	// OpenAIRequestBudgetSeconds: native HTTP Responses 从入口、排队到全部重试共用的总预算（秒）。
-	// 0 使用安全默认值 600 秒；0 不能禁用硬预算。
+	// 0 使用安全默认值 900 秒；0 不能禁用硬预算。
 	OpenAIRequestBudgetSeconds int `mapstructure:"openai_request_budget_seconds"`
 	// OpenAIRetryBudgetSeconds: 请求入口后的错误重试/换号资格窗口（秒）。
 	// 0 自动使用 min(300, OpenAIRequestBudgetSeconds 的有效值)，不会禁用重试窗口。
@@ -2408,7 +2409,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_response_header_timeout", 0)
 	viper.SetDefault("gateway.grok_response_header_timeout", 120)
 	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 120)
-	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", DefaultOpenAIRequestBudgetSeconds)
+	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", DefaultOpenAIHighEffortFirstOutputTimeoutSeconds)
 	viper.SetDefault("gateway.openai_request_budget_seconds", DefaultOpenAIRequestBudgetSeconds)
 	// Zero preserves compatibility with older configs and derives min(300, effective hard budget).
 	viper.SetDefault("gateway.openai_retry_budget_seconds", 0)
@@ -3355,15 +3356,15 @@ func (c *Config) Validate() error {
 		(c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds > 0 && c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds < 30) {
 		return fmt.Errorf("gateway.openai_high_effort_first_output_timeout_seconds must be 0 or between 30-1800 seconds")
 	}
-	if c.Gateway.OpenAIRequestBudgetSeconds < 0 || c.Gateway.OpenAIRequestBudgetSeconds > 600 ||
+	if c.Gateway.OpenAIRequestBudgetSeconds < 0 || c.Gateway.OpenAIRequestBudgetSeconds > DefaultOpenAIRequestBudgetSeconds ||
 		(c.Gateway.OpenAIRequestBudgetSeconds > 0 && c.Gateway.OpenAIRequestBudgetSeconds < 60) {
-		return fmt.Errorf("gateway.openai_request_budget_seconds must be 0 or between 60-600 seconds")
+		return fmt.Errorf("gateway.openai_request_budget_seconds must be 0 or between 60-900 seconds")
 	}
 	effectiveOpenAIRequestBudget := c.Gateway.OpenAIRequestBudgetSeconds
 	if effectiveOpenAIRequestBudget == 0 {
 		effectiveOpenAIRequestBudget = DefaultOpenAIRequestBudgetSeconds
 	}
-	if c.Gateway.OpenAIRetryBudgetSeconds < 0 || c.Gateway.OpenAIRetryBudgetSeconds > DefaultOpenAIRequestBudgetSeconds ||
+	if c.Gateway.OpenAIRetryBudgetSeconds < 0 || c.Gateway.OpenAIRetryBudgetSeconds > 600 ||
 		(c.Gateway.OpenAIRetryBudgetSeconds > 0 && c.Gateway.OpenAIRetryBudgetSeconds < 60) {
 		return fmt.Errorf("gateway.openai_retry_budget_seconds must be 0 or between 60-600 seconds")
 	}

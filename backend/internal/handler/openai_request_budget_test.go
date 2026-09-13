@@ -18,7 +18,7 @@ func TestBeginOpenAIResponsesRequestBudgetSplitsHardAndRetryDeadlines(t *testing
 	c.Request = req
 	startedAt := time.Now()
 	h := &OpenAIGatewayHandler{cfg: &config.Config{Gateway: config.GatewayConfig{
-		OpenAIRequestBudgetSeconds: 600,
+		OpenAIRequestBudgetSeconds: 900,
 		OpenAIRetryBudgetSeconds:   300,
 	}}}
 	cleanup := h.beginOpenAIResponsesRequestBudget(c, startedAt)
@@ -26,7 +26,7 @@ func TestBeginOpenAIResponsesRequestBudgetSplitsHardAndRetryDeadlines(t *testing
 
 	hardDeadline, ok := openAIRequestBudgetDeadline(c)
 	require.True(t, ok)
-	require.WithinDuration(t, startedAt.Add(600*time.Second), hardDeadline, time.Second)
+	require.WithinDuration(t, startedAt.Add(900*time.Second), hardDeadline, time.Second)
 	require.False(t, service.OpenAIRetryBudgetExpired(c.Request.Context()))
 }
 
@@ -36,7 +36,7 @@ func TestOpenAIRequestRetryBudgetUsesCompatibilityDefaultAndStopsOnlyRetry(t *te
 	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
 	startedAt := time.Now().Add(-301 * time.Second)
 	h := &OpenAIGatewayHandler{cfg: &config.Config{Gateway: config.GatewayConfig{
-		OpenAIRequestBudgetSeconds: 600,
+		OpenAIRequestBudgetSeconds: 900,
 		OpenAIRetryBudgetSeconds:   0,
 	}}}
 	cleanup := h.beginOpenAIResponsesRequestBudget(c, startedAt)
