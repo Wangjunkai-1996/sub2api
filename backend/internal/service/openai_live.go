@@ -1101,6 +1101,7 @@ func liveSessionEnded(err error) bool {
 	return errors.Is(err, ErrLiveCallNotFound) ||
 		errors.Is(err, ErrLiveUnavailable) ||
 		errors.Is(err, ErrAccountEgressLeaseFenced) ||
+		errors.Is(err, ErrAccountEgressLeaseDraining) ||
 		errors.Is(err, ErrAccountEgressLeaseLost) ||
 		errors.Is(err, context.DeadlineExceeded)
 }

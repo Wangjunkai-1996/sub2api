@@ -49,19 +49,43 @@ func (r *egressRepository) LoadAccountEgressAuthorities(
 		return nil, service.ErrEgressRouteInvalid
 	}
 	rows, err := exec.QueryContext(ctx, `
-		SELECT id, egress_mode, egress_revision
-		FROM accounts
-		WHERE id=ANY($1) AND deleted_at IS NULL
-		ORDER BY id`, pq.Array(accountIDs))
+		SELECT a.id,
+			CASE WHEN a.parent_account_id IS NOT NULL
+				THEN COALESCE(parent.egress_mode, a.egress_mode)
+				ELSE a.egress_mode END AS egress_mode,
+			a.egress_revision,
+			CASE
+				WHEN a.deleted_at IS NOT NULL THEN 'account_deleted'
+				WHEN a.parent_account_id IS NOT NULL AND parent.id IS NULL THEN 'parent_missing'
+				WHEN parent.deleted_at IS NOT NULL THEN 'parent_deleted'
+				WHEN a.status = $2 THEN 'account_disabled'
+				WHEN a.status = $3 THEN 'account_inactive'
+				WHEN a.status = $4 THEN 'account_error'
+				WHEN a.status = $5 THEN 'account_expired'
+				WHEN a.expires_at IS NOT NULL AND a.expires_at <= NOW() THEN 'account_expired'
+				WHEN parent.status = $2 THEN 'parent_disabled'
+				WHEN parent.status = $3 THEN 'parent_inactive'
+				WHEN parent.status = $4 THEN 'parent_error'
+				WHEN parent.status = $5 THEN 'parent_expired'
+				WHEN parent.expires_at IS NOT NULL AND parent.expires_at <= NOW() THEN 'parent_expired'
+				ELSE ''
+			END AS revocation_reason
+		FROM accounts a
+		LEFT JOIN accounts parent ON parent.id = a.parent_account_id
+		WHERE a.id=ANY($1)
+		ORDER BY a.id`, pq.Array(accountIDs), service.StatusDisabled, "inactive", service.StatusError, service.StatusExpired)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var authority service.AccountEgressAuthority
-		if err := rows.Scan(&authority.AccountID, &authority.Mode, &authority.Revision); err != nil {
+		var revocationReason string
+		if err := rows.Scan(&authority.AccountID, &authority.Mode, &authority.Revision, &revocationReason); err != nil {
 			return nil, err
 		}
+		authority.Revoked = revocationReason != ""
+		authority.RevocationReason = revocationReason
 		result[authority.AccountID] = authority
 	}
 	return result, rows.Err()

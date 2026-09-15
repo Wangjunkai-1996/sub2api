@@ -26,20 +26,22 @@ const (
 )
 
 var (
-	ErrAccountEgressCapacityFull = errors.New("account egress capacity full")
-	ErrAccountEgressUnavailable  = errors.New("account egress allocator unavailable")
-	ErrAccountEgressNoRoute      = errors.New("account egress route unavailable")
-	ErrAccountEgressConfigStale  = errors.New("account egress config stale")
-	ErrAccountEgressLeaseFenced  = errors.New("account egress lease fenced")
-	ErrAccountEgressLeaseLost    = errors.New("account egress lease lost")
+	ErrAccountEgressCapacityFull  = errors.New("account egress capacity full")
+	ErrAccountEgressUnavailable   = errors.New("account egress allocator unavailable")
+	ErrAccountEgressNoRoute       = errors.New("account egress route unavailable")
+	ErrAccountEgressConfigStale   = errors.New("account egress config stale")
+	ErrAccountEgressLeaseFenced   = errors.New("account egress lease fenced")
+	ErrAccountEgressLeaseDraining = errors.New("account egress lease draining")
+	ErrAccountEgressLeaseLost     = errors.New("account egress lease lost")
 )
 
 type AccountEgressLeaseRefreshStatus string
 
 const (
-	AccountEgressLeaseRefreshActive AccountEgressLeaseRefreshStatus = "ACTIVE"
-	AccountEgressLeaseRefreshFenced AccountEgressLeaseRefreshStatus = "FENCED"
-	AccountEgressLeaseRefreshLost   AccountEgressLeaseRefreshStatus = "LOST"
+	AccountEgressLeaseRefreshActive   AccountEgressLeaseRefreshStatus = "ACTIVE"
+	AccountEgressLeaseRefreshDraining AccountEgressLeaseRefreshStatus = "DRAINING"
+	AccountEgressLeaseRefreshFenced   AccountEgressLeaseRefreshStatus = "FENCED"
+	AccountEgressLeaseRefreshLost     AccountEgressLeaseRefreshStatus = "LOST"
 )
 
 type AccountEgressStatus string
@@ -660,7 +662,7 @@ func (a *AccountEgressAllocator) refreshDue() {
 	fencedRefs := make([]AccountEgressLeaseRef, 0, len(due))
 	for _, lease := range due {
 		switch lease.phaseSnapshot() {
-		case accountEgressLeasePhaseActive:
+		case accountEgressLeasePhaseActive, accountEgressLeasePhaseDraining:
 			activeRefs = append(activeRefs, lease.ref())
 		case accountEgressLeasePhaseFenced:
 			fencedRefs = append(fencedRefs, lease.ref())
@@ -689,6 +691,7 @@ func (a *AccountEgressAllocator) applyRefreshResult(
 	now time.Time,
 ) {
 	var lost []*AccountEgressLease
+	var draining []*AccountEgressLease
 	var fenced []*AccountEgressLease
 	a.mu.Lock()
 	for _, ref := range refs {
@@ -707,6 +710,14 @@ func (a *AccountEgressAllocator) applyRefreshResult(
 		switch statuses[ref.Key()] {
 		case AccountEgressLeaseRefreshActive:
 			state.lastConfirmed = now
+		case AccountEgressLeaseRefreshDraining:
+			state.lastConfirmed = now
+			logger.L().Warn("account_egress_lease_draining",
+				zap.Int64("account_id", ref.AccountID),
+				zap.String("lease_id", ref.ID),
+				zap.String("reason", "config_or_route_changed"),
+			)
+			draining = append(draining, state.lease)
 		case AccountEgressLeaseRefreshFenced:
 			state.lastConfirmed = now
 			fenced = append(fenced, state.lease)
@@ -719,6 +730,9 @@ func (a *AccountEgressAllocator) applyRefreshResult(
 
 	for _, lease := range fenced {
 		lease.markFenced()
+	}
+	for _, lease := range draining {
+		lease.markDraining()
 	}
 	for _, lease := range lost {
 		lease.markLost()
@@ -769,6 +783,7 @@ func (a *AccountEgressAllocator) applyAuthorityResult(
 	err error,
 	now time.Time,
 ) {
+	var draining []*AccountEgressLease
 	var fenced []*AccountEgressLease
 	a.mu.Lock()
 	for _, ref := range refs {
@@ -778,13 +793,32 @@ func (a *AccountEgressAllocator) applyAuthorityResult(
 		}
 		if err != nil {
 			if now.Sub(state.lastAuthorityConfirmed) >= a.authorityFailureWindow {
-				fenced = append(fenced, state.lease)
+				logger.L().Warn("account_egress_lease_draining",
+					zap.Int64("account_id", ref.AccountID),
+					zap.String("lease_id", ref.ID),
+					zap.String("reason", "authority_unavailable"),
+				)
+				draining = append(draining, state.lease)
 			}
 			continue
 		}
 		authority, ok := authorities[ref.AccountID]
-		if !ok || authority.Mode != EgressModePool || authority.Revision != ref.AuthorityRevision {
+		if !ok || authority.Revoked {
+			logger.L().Warn("account_egress_lease_revoked",
+				zap.Int64("account_id", ref.AccountID),
+				zap.String("lease_id", ref.ID),
+				zap.String("reason", authority.RevocationReason),
+			)
 			fenced = append(fenced, state.lease)
+			continue
+		}
+		if authority.Mode != EgressModePool || authority.Revision != ref.AuthorityRevision {
+			logger.L().Warn("account_egress_lease_draining",
+				zap.Int64("account_id", ref.AccountID),
+				zap.String("lease_id", ref.ID),
+				zap.String("reason", "authority_changed"),
+			)
+			draining = append(draining, state.lease)
 			continue
 		}
 		state.lastAuthorityConfirmed = now
@@ -792,6 +826,9 @@ func (a *AccountEgressAllocator) applyAuthorityResult(
 	a.mu.Unlock()
 	for _, lease := range fenced {
 		lease.markFenced()
+	}
+	for _, lease := range draining {
+		lease.markDraining()
 	}
 	if err != nil {
 		logger.L().Warn("account_egress_authority_refresh_failed",
@@ -813,6 +850,9 @@ func (a *AccountEgressAllocator) refreshOne(ctx context.Context, lease *AccountE
 	statuses, redisErr := a.cache.RefreshAccountEgressLeases(ctx, []AccountEgressLeaseRef{ref}, a.leaseTTL)
 	if redisErr == nil {
 		switch statuses[ref.Key()] {
+		case AccountEgressLeaseRefreshDraining:
+			lease.markDraining()
+		case AccountEgressLeaseRefreshActive:
 		case AccountEgressLeaseRefreshFenced:
 			lease.markFenced()
 			return ErrAccountEgressLeaseFenced
@@ -822,7 +862,6 @@ func (a *AccountEgressAllocator) refreshOne(ctx context.Context, lease *AccountE
 			a.mu.Unlock()
 			lease.markLost()
 			return ErrAccountEgressLeaseLost
-		case AccountEgressLeaseRefreshActive:
 		default:
 			a.mu.Lock()
 			delete(a.leases, ref.Key())
@@ -884,13 +923,22 @@ func (a *AccountEgressAllocator) refreshAuthorityOne(
 		if insideWindow {
 			return fmt.Errorf("%w: authority refresh: %v", ErrAccountEgressUnavailable, authorityErr)
 		}
-		lease.markFenced()
-		return fmt.Errorf("%w: authority safety window expired: %v", ErrAccountEgressLeaseFenced, authorityErr)
+		lease.markDraining()
+		return nil
 	}
 	authority, ok := authorities[ref.AccountID]
-	if !ok || authority.Mode != EgressModePool || authority.Revision != ref.AuthorityRevision {
+	if !ok || authority.Revoked {
+		logger.L().Warn("account_egress_lease_revoked",
+			zap.Int64("account_id", ref.AccountID),
+			zap.String("lease_id", ref.ID),
+			zap.String("reason", authority.RevocationReason),
+		)
 		lease.markFenced()
 		return ErrAccountEgressLeaseFenced
+	}
+	if authority.Mode != EgressModePool || authority.Revision != ref.AuthorityRevision {
+		lease.markDraining()
+		return nil
 	}
 	a.mu.Lock()
 	if state := a.leases[ref.Key()]; state != nil {
@@ -999,6 +1047,7 @@ type accountEgressLeasePhase uint8
 
 const (
 	accountEgressLeasePhaseActive accountEgressLeasePhase = iota
+	accountEgressLeasePhaseDraining
 	accountEgressLeasePhaseFenced
 	accountEgressLeasePhaseLost
 	accountEgressLeasePhaseReleased
@@ -1063,7 +1112,7 @@ func (l *AccountEgressLease) AcquireUse() (func(), error) {
 	if l.phase != accountEgressLeasePhaseActive || !l.owner {
 		err := l.terminalCause
 		if err == nil {
-			err = context.Canceled
+			err = ErrAccountEgressLeaseDraining
 		}
 		l.mu.Unlock()
 		return nil, err
@@ -1103,7 +1152,7 @@ func (l *AccountEgressLease) Detach() bool {
 	if l.detached {
 		return l.phase == accountEgressLeasePhaseActive && l.owner
 	}
-	if l.phase != accountEgressLeasePhaseActive || !l.owner || l.requestStop == nil {
+	if (l.phase != accountEgressLeasePhaseActive && l.phase != accountEgressLeasePhaseDraining) || !l.owner || l.requestStop == nil {
 		return false
 	}
 	stop := l.requestStop
@@ -1228,7 +1277,7 @@ func (l *AccountEgressLease) markFenced() {
 		return
 	}
 	l.mu.Lock()
-	if l.phase != accountEgressLeasePhaseActive {
+	if l.phase != accountEgressLeasePhaseActive && l.phase != accountEgressLeasePhaseDraining {
 		l.mu.Unlock()
 		return
 	}
@@ -1240,6 +1289,17 @@ func (l *AccountEgressLease) markFenced() {
 		cancel(ErrAccountEgressLeaseFenced)
 	}
 	l.finalizeIfDrained()
+}
+
+func (l *AccountEgressLease) markDraining() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.phase == accountEgressLeasePhaseActive {
+		l.phase = accountEgressLeasePhaseDraining
+	}
+	l.mu.Unlock()
 }
 
 func (l *AccountEgressLease) markLost() {
@@ -1289,7 +1349,7 @@ func (l *AccountEgressLease) terminalError() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.phase == accountEgressLeasePhaseActive && l.owner {
+	if (l.phase == accountEgressLeasePhaseActive || l.phase == accountEgressLeasePhaseDraining) && l.owner {
 		return nil
 	}
 	if l.terminalCause != nil {

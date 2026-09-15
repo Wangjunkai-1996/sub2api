@@ -855,6 +855,7 @@ func TestLiveSessionEndedTreatsLeaseLossAsTerminal(t *testing.T) {
 	}{
 		{"租约丢失", ErrLiveUnavailable, true},
 		{"租约丢失（被包装）", fmt.Errorf("refresh live lease: %w", ErrLiveUnavailable), true},
+		{"租约进入排空", ErrAccountEgressLeaseDraining, true},
 		{"上游报告会话已关闭", ErrLiveCallNotFound, true},
 		{"到达会话时长上限", context.DeadlineExceeded, true},
 		{"控制权被他人接管", ErrLiveControllerChanged, false},

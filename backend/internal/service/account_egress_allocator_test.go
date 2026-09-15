@@ -363,7 +363,7 @@ func TestAccountEgressLeaseDetachCancelReleaseRaceIsIdempotent(t *testing.T) {
 	}, time.Second, 5*time.Millisecond)
 }
 
-func TestAccountEgressLeaseDatabaseAuthorityMismatchFences(t *testing.T) {
+func TestAccountEgressLeaseDatabaseAuthorityMismatchDrainsWithoutCanceling(t *testing.T) {
 	config := accountEgressAllocatorTestConfig(0)
 	config.Version = int64(9)<<31 | 17
 	config.AuthorityRevision = 9
@@ -382,8 +382,31 @@ func TestAccountEgressLeaseDatabaseAuthorityMismatchFences(t *testing.T) {
 	require.NoError(t, err)
 
 	err = resolved.Lease.Refresh(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, resolved.Lease.Context().Err())
+	_, err = resolved.Lease.AcquireUse()
+	require.ErrorIs(t, err, ErrAccountEgressLeaseDraining)
+	resolved.Lease.Release()
+}
+
+func TestAccountEgressLeaseRevokedAuthorityFences(t *testing.T) {
+	config := accountEgressAllocatorTestConfig(0)
+	cache := &accountEgressCacheStub{
+		acquireResults: []AccountEgressAcquireResult{accountEgressAllocatorAcquiredResult()},
+		refreshOwned:   true,
+	}
+	authority := &accountEgressAuthorityReaderStub{authorities: map[int64]AccountEgressAuthority{
+		config.AccountID: {AccountID: config.AccountID, Mode: EgressModePool, Revision: config.AuthorityRevision, Revoked: true},
+	}}
+	allocator := newAccountEgressAllocatorWithTiming(cache, time.Second, time.Hour, time.Second, time.Minute, time.Now, authority)
+	defer allocator.Close()
+	resolved, err := allocator.Acquire(context.Background(), AccountEgressAcquireRequest{Config: config, LeaseID: "revoked-authority"})
+	require.NoError(t, err)
+	err = resolved.Lease.Refresh(context.Background())
 	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
 	require.ErrorIs(t, context.Cause(resolved.Lease.Context()), ErrAccountEgressLeaseFenced)
+	_, err = resolved.Lease.AcquireUse()
+	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
 	resolved.Lease.Release()
 }
 
@@ -409,7 +432,9 @@ func TestAccountEgressLeaseUsesExplicitAuthorityRevisionAtSaturatedVersion(t *te
 
 	authority.authorities[config.AccountID] = AccountEgressAuthority{AccountID: config.AccountID, Mode: EgressModePool, Revision: 10}
 	err = resolved.Lease.Refresh(context.Background())
-	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
+	require.NoError(t, err)
+	_, err = resolved.Lease.AcquireUse()
+	require.ErrorIs(t, err, ErrAccountEgressLeaseDraining)
 	resolved.Lease.Release()
 }
 
@@ -429,8 +454,10 @@ func TestAccountEgressLeaseChecksDatabaseAuthorityWhenRedisRefreshErrors(t *test
 	require.NoError(t, err)
 
 	err = resolved.Lease.RefreshWithinSafetyWindow(context.Background())
-	require.ErrorIs(t, err, ErrAccountEgressLeaseFenced)
-	require.ErrorIs(t, context.Cause(resolved.Lease.Context()), ErrAccountEgressLeaseFenced)
+	require.NoError(t, err)
+	require.NoError(t, resolved.Lease.Context().Err())
+	_, err = resolved.Lease.AcquireUse()
+	require.ErrorIs(t, err, ErrAccountEgressLeaseDraining)
 	resolved.Lease.Release()
 }
 

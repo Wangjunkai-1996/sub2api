@@ -113,6 +113,11 @@ func (s *ProxyProbeServiceSuite) TestProbeProxy_AllFailed() {
 	require.ErrorContains(s.T(), err, "all probe URLs failed")
 }
 
+func (s *ProxyProbeServiceSuite) TestAggregateProbeErrorsPreservesEarlierHTTPStatus() {
+	err := aggregateProbeErrors([]string{"request failed with status: 503"}, io.ErrUnexpectedEOF)
+	require.ErrorContains(s.T(), err, "status: 503")
+}
+
 func (s *ProxyProbeServiceSuite) TestProbeProxy_InvalidJSON() {
 	s.setupProxyServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.RequestURI, "ip-api.com") {

@@ -177,8 +177,26 @@ func (w *EgressIdentityVerificationWorker) verifyOnce(parent context.Context, ti
 		}
 		succeeded := make(map[int64]struct{}, len(results))
 		for _, result := range results {
-			if _, requested := expected[result.RouteID]; result.Success && requested {
-				succeeded[result.RouteID] = struct{}{}
+			if _, requested := expected[result.RouteID]; requested {
+				proxyID := int64(0)
+				state := "unknown"
+				if result.Route != nil {
+					state = result.Route.State
+					if result.Route.ProxyID != nil {
+						proxyID = *result.Route.ProxyID
+					}
+				}
+				if result.Success {
+					succeeded[result.RouteID] = struct{}{}
+				}
+				if !result.Success {
+					slog.Warn("egress_identity_reverify_result",
+						"route_id", result.RouteID,
+						"proxy_id", proxyID,
+						"reason", result.ReasonCode,
+						"state", state,
+					)
+				}
 			}
 		}
 		failed := len(expected) - len(succeeded)

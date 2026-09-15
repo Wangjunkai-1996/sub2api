@@ -44,13 +44,15 @@ const (
 	AccountPoolOperationRemove  = "remove"
 	AccountPoolOperationReplace = "replace"
 
-	EgressProbeReasonRouteNotFound      = "route_not_found"
-	EgressProbeReasonRouteUnavailable   = "route_unavailable"
-	EgressProbeReasonProbeFailed        = "probe_failed"
-	EgressProbeReasonInvalidObservation = "invalid_observation"
-	EgressProbeReasonRevisionConflict   = "revision_conflict"
-	EgressProbeReasonPersistenceFailed  = "persistence_failed"
-	EgressProbeReasonRequestCanceled    = "request_canceled"
+	EgressProbeReasonRouteNotFound       = "route_not_found"
+	EgressProbeReasonRouteUnavailable    = "route_unavailable"
+	EgressProbeReasonProbeFailed         = "probe_failed"
+	EgressProbeReasonInvalidObservation  = "invalid_observation"
+	EgressProbeReasonRevisionConflict    = "revision_conflict"
+	EgressProbeReasonPersistenceFailed   = "persistence_failed"
+	EgressProbeReasonRequestCanceled     = "request_canceled"
+	EgressProbeReasonUpstreamUnavailable = "upstream_unavailable"
+	EgressProbeReasonIdentityMismatch    = "identity_mismatch"
 )
 
 var (
@@ -127,9 +129,11 @@ type AccountEgressPoolConfigDomain struct {
 // AccountEgressAuthority is the writer-database fence consulted by lease
 // refresh batches. Missing accounts are intentionally absent from the result.
 type AccountEgressAuthority struct {
-	AccountID int64
-	Mode      string
-	Revision  int64
+	AccountID        int64
+	Mode             string
+	Revision         int64
+	Revoked          bool
+	RevocationReason string
 }
 
 type ReplaceAccountPoolInput struct {
@@ -410,7 +414,7 @@ func (s *EgressService) probeRoute(ctx context.Context, routeID int64) EgressPro
 	result := EgressProbeResult{RouteID: routeID, LatencyMs: -1, ObservedAt: time.Now()}
 	route, err := s.repo.GetRoute(ctx, routeID)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if probeContextCanceled(ctx) {
 			result.ReasonCode = EgressProbeReasonRequestCanceled
 		} else if errors.Is(err, ErrEgressRouteNotFound) {
 			result.ReasonCode = EgressProbeReasonRouteNotFound
@@ -432,8 +436,12 @@ func (s *EgressService) probeRoute(ctx context.Context, routeID int64) EgressPro
 	exitInfo, latencyMs, probeErr := s.prober.ProbeProxy(ctx, proxyURL)
 	result.LatencyMs = latencyMs
 	if probeErr != nil {
-		if errors.Is(probeErr, context.Canceled) || errors.Is(probeErr, context.DeadlineExceeded) {
+		if probeContextCanceled(ctx) {
 			result.ReasonCode = EgressProbeReasonRequestCanceled
+			return result
+		}
+		if isProbeUpstreamUnavailable(probeErr) {
+			result.ReasonCode = EgressProbeReasonUpstreamUnavailable
 			return result
 		}
 		return s.persistProbeFailure(ctx, result, route, EgressProbeReasonProbeFailed)
@@ -446,19 +454,68 @@ func (s *EgressService) probeRoute(ctx context.Context, routeID int64) EgressPro
 		return s.persistProbeFailure(ctx, result, route, EgressProbeReasonInvalidObservation)
 	}
 	result.ObservedIP = observedIP
+
+	// An inactive or identity-mismatched route is being recovered. Require a
+	// second independent observation before re-enabling it so one transient
+	// response cannot turn a quarantined route into active capacity.
+	if route.State == EgressRouteStateInactive || route.State == EgressRouteStateIdentityMismatch {
+		recheck, recheckLatency, recheckErr := s.prober.ProbeProxy(ctx, proxyURL)
+		result.LatencyMs = recheckLatency
+		if recheckErr != nil {
+			if probeContextCanceled(ctx) {
+				result.ReasonCode = EgressProbeReasonRequestCanceled
+				return result
+			}
+			if isProbeUpstreamUnavailable(recheckErr) {
+				result.ReasonCode = EgressProbeReasonUpstreamUnavailable
+				return result
+			}
+			return s.persistProbeFailure(ctx, result, route, EgressProbeReasonProbeFailed)
+		}
+		if recheck == nil {
+			return s.persistProbeFailure(ctx, result, route, EgressProbeReasonInvalidObservation)
+		}
+		recheckIP, parseErr := canonicalPublicEgressIP(recheck.IP)
+		if parseErr != nil {
+			return s.persistProbeFailure(ctx, result, route, EgressProbeReasonInvalidObservation)
+		}
+		expectedIP := ""
+		if route.ExpectedIdentity != nil {
+			expectedIP, parseErr = canonicalPublicEgressIP(route.ExpectedIdentity.PublicIP)
+			if parseErr != nil {
+				return s.persistProbeFailure(ctx, result, route, EgressProbeReasonInvalidObservation)
+			}
+		}
+		if recheckIP != observedIP || (expectedIP != "" && observedIP != expectedIP) {
+			// Never recover on disagreeing observations. Persisting a probe error
+			// keeps the route ineligible even when the second response happens to
+			// match the expected identity.
+			result.ObservedIP = recheckIP
+			return s.persistProbeFailure(ctx, result, route, EgressProbeReasonInvalidObservation)
+		}
+		observedIP = recheckIP
+		result.ObservedIP = observedIP
+	}
 	updated, err := s.repo.RecordProbeObservation(ctx, EgressProbeObservation{
 		RouteID:          route.ID,
 		ExpectedRevision: route.Revision,
 		ObservedIP:       observedIP,
-		LatencyMs:        latencyMs,
+		LatencyMs:        result.LatencyMs,
 		ObservedAt:       result.ObservedAt,
 	})
 	if err != nil {
-		result.ReasonCode = egressProbePersistenceReason(err)
+		result.ReasonCode = egressProbePersistenceReason(ctx, err)
 		return result
 	}
-	result.Success = true
 	result.Route = updated
+	result.Success = updated != nil && updated.State == EgressRouteStateActive
+	if !result.Success && result.ReasonCode == "" {
+		if updated != nil && updated.State == EgressRouteStateIdentityMismatch {
+			result.ReasonCode = EgressProbeReasonIdentityMismatch
+		} else {
+			result.ReasonCode = EgressProbeReasonProbeFailed
+		}
+	}
 	return result
 }
 
@@ -471,7 +528,7 @@ func (s *EgressService) persistProbeFailure(ctx context.Context, result EgressPr
 		ProbeError:       reasonCode,
 	})
 	if err != nil {
-		result.ReasonCode = egressProbePersistenceReason(err)
+		result.ReasonCode = egressProbePersistenceReason(ctx, err)
 		return result
 	}
 	result.Route = updated
@@ -479,14 +536,33 @@ func (s *EgressService) persistProbeFailure(ctx context.Context, result EgressPr
 	return result
 }
 
-func egressProbePersistenceReason(err error) string {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func egressProbePersistenceReason(ctx context.Context, err error) string {
+	if probeContextCanceled(ctx) {
 		return EgressProbeReasonRequestCanceled
 	}
 	if errors.Is(err, ErrEgressRouteConflict) {
 		return EgressProbeReasonRevisionConflict
 	}
 	return EgressProbeReasonPersistenceFailed
+}
+
+func probeContextCanceled(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
+func isProbeUpstreamUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, status := range []string{"403", "429", "500", "502", "503", "504"} {
+		if strings.Contains(message, "status: "+status) ||
+			strings.Contains(message, "status "+status) ||
+			strings.Contains(message, "http "+status) {
+			return true
+		}
+	}
+	return false
 }
 
 func routeCanBeProbed(route *EgressRoute, now time.Time) bool {

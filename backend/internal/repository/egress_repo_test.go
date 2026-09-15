@@ -266,20 +266,56 @@ func TestLoadAccountEgressAuthoritiesUsesOneSortedBatchQuery(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	mock.ExpectQuery(`(?s)SELECT id, egress_mode, egress_revision.*id=ANY\(\$1\).*ORDER BY id`).
-		WithArgs(sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "egress_mode", "egress_revision"}).
-			AddRow(int64(7), service.EgressModePool, int64(12)).
-			AddRow(int64(11), service.EgressModeLegacy, int64(3)))
+	mock.ExpectQuery(`(?s)SELECT a\.id,.*LEFT JOIN accounts parent.*WHERE a\.id=ANY\(\$1\).*ORDER BY a\.id`).
+		WithArgs(sqlmock.AnyArg(), service.StatusDisabled, "inactive", service.StatusError, service.StatusExpired).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "egress_mode", "egress_revision", "revocation_reason"}).
+			AddRow(int64(7), service.EgressModePool, int64(12), "").
+			AddRow(int64(11), service.EgressModeLegacy, int64(3), ""))
 
 	got, err := (&egressRepository{db: db}).LoadAccountEgressAuthorities(
 		context.Background(), []int64{11, 7, 11, 0, -1},
 	)
 	require.NoError(t, err)
 	require.Equal(t, map[int64]service.AccountEgressAuthority{
-		7:  {AccountID: 7, Mode: service.EgressModePool, Revision: 12},
-		11: {AccountID: 11, Mode: service.EgressModeLegacy, Revision: 3},
+		7:  {AccountID: 7, Mode: service.EgressModePool, Revision: 12, Revoked: false},
+		11: {AccountID: 11, Mode: service.EgressModeLegacy, Revision: 3, Revoked: false},
 	}, got)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestLoadAccountEgressAuthoritiesUsesParentModeAndMarksExplicitRevocations(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectQuery(`(?s)SELECT a\.id,.*LEFT JOIN accounts parent.*WHERE a\.id=ANY\(\$1\).*ORDER BY a\.id`).
+		WithArgs(sqlmock.AnyArg(), service.StatusDisabled, "inactive", service.StatusError, service.StatusExpired).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "egress_mode", "egress_revision", "revocation_reason"}).
+			AddRow(int64(21), service.EgressModePool, int64(8), "").
+			AddRow(int64(22), service.EgressModePool, int64(13), "").
+			AddRow(int64(23), service.EgressModePool, int64(4), "parent_disabled").
+			AddRow(int64(24), service.EgressModePool, int64(6), "account_expired").
+			AddRow(int64(25), service.EgressModePool, int64(7), "account_deleted").
+			AddRow(int64(26), service.EgressModePool, int64(9), "parent_missing"))
+
+	got, err := (&egressRepository{db: db}).LoadAccountEgressAuthorities(
+		context.Background(), []int64{21, 22, 23, 24, 25, 26, 9999},
+	)
+	require.NoError(t, err)
+	require.Equal(t, service.AccountEgressAuthority{AccountID: 21, Mode: service.EgressModePool, Revision: 8}, got[21])
+	require.Equal(t, service.AccountEgressAuthority{AccountID: 22, Mode: service.EgressModePool, Revision: 13}, got[22])
+	require.False(t, got[21].Revoked)
+	require.False(t, got[22].Revoked)
+	require.True(t, got[23].Revoked)
+	require.Equal(t, "parent_disabled", got[23].RevocationReason)
+	require.True(t, got[24].Revoked)
+	require.Equal(t, "account_expired", got[24].RevocationReason)
+	require.True(t, got[25].Revoked)
+	require.Equal(t, "account_deleted", got[25].RevocationReason)
+	require.True(t, got[26].Revoked)
+	require.Equal(t, "parent_missing", got[26].RevocationReason)
+	_, exists := got[9999]
+	require.False(t, exists, "missing account ids must not produce authority rows")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

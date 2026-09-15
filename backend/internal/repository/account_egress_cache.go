@@ -162,6 +162,10 @@ var (
 			activeTotal = activeTotal + load
 			mappedLegacyTotal = mappedLegacyTotal + legacyLoad
 		end
+		-- poolTotalKey is the authoritative count. Identity indexes come from the
+		-- new config and may intentionally omit identities held by draining leases;
+		-- counting only those indexes would block admission during a config swap.
+		activeTotal = redis.call('ZCARD', poolTotalKey)
 		local candidates = {}
 		local eligibleIdentities = {}
 		local effectiveCapacity = 0
@@ -301,6 +305,12 @@ var (
 
 		local metadataBindingHash = redis.call('HGET', metadataKey, 'binding_hash')
 		if metadataBindingHash ~= false then
+			-- A drained or hard-fenced reservation is terminal for this request
+			-- identity. Never let an idempotent retry turn it active again.
+			local metadataState = redis.call('HGET', metadataKey, 'state') or 'active'
+			if metadataState ~= 'active' then
+				return result('CONFIG_STALE', nil)
+			end
 			if tonumber(redis.call('HGET', metadataKey, 'version') or '0') ~= expectedVersion then
 				return result('CONFIG_STALE', nil)
 			end
@@ -502,6 +512,10 @@ var (
 			keepalive()
 			return 'FENCED'
 		end
+		if state == 'draining' then
+			keepalive()
+			return 'DRAINING'
+		end
 		if state ~= 'active' then
 			return 'LOST'
 		end
@@ -510,9 +524,9 @@ var (
 		local configAuthorityRevision = redis.call('HGET', configKey, 'authority_revision')
 		local bindingMapping = redis.call('HGET', configKey, 'binding:' .. expectedBindingHash)
 		if (mode ~= 'pool' and mode ~= 'transition') or configVersion ~= expectedVersion or configAuthorityRevision ~= expectedAuthorityRevision or bindingMapping ~= expectedBindingMapping then
-			redis.call('HSET', metadataKey, 'state', 'fenced')
+			redis.call('HSET', metadataKey, 'state', 'draining')
 			keepalive()
-			return 'FENCED'
+			return 'DRAINING'
 		end
 		redis.call('HSET', metadataKey, 'state', 'active')
 		keepalive()
@@ -547,16 +561,26 @@ var (
 			return 'LOST'
 		end
 		local state = redis.call('HGET', metadataKey, 'state') or 'active'
-		if state ~= 'active' and state ~= 'fenced' then
+		-- A hard-fenced lease is terminal and must never be revived. Draining
+		-- leases retain capacity only until their existing transport releases.
+		if state == 'fenced' then
+			redis.call('ZADD', identityKey, 'XX', nowMillis, leaseMember)
+			redis.call('ZADD', poolTotalKey, 'XX', nowMillis, leaseMember)
+			redis.call('PEXPIRE', identityKey, ttl * 2)
+			redis.call('PEXPIRE', poolTotalKey, ttl * 2)
+			redis.call('PEXPIRE', metadataKey, ttl * 2)
+			return 'FENCED'
+		end
+		if state ~= 'active' and state ~= 'draining' then
 			return 'LOST'
 		end
-		redis.call('HSET', metadataKey, 'state', 'fenced')
+		redis.call('HSET', metadataKey, 'state', 'draining')
 		redis.call('ZADD', identityKey, 'XX', nowMillis, leaseMember)
 		redis.call('ZADD', poolTotalKey, 'XX', nowMillis, leaseMember)
 		redis.call('PEXPIRE', identityKey, ttl * 2)
 		redis.call('PEXPIRE', poolTotalKey, ttl * 2)
 		redis.call('PEXPIRE', metadataKey, ttl * 2)
-		return 'FENCED'
+		return 'DRAINING'
 	`)
 
 	accountEgressReleaseScript = redis.NewScript(`
@@ -1132,7 +1156,7 @@ func (c *concurrencyCache) refreshAccountEgressLeases(
 		}
 		status := service.AccountEgressLeaseRefreshStatus(value)
 		switch status {
-		case service.AccountEgressLeaseRefreshActive, service.AccountEgressLeaseRefreshFenced, service.AccountEgressLeaseRefreshLost:
+		case service.AccountEgressLeaseRefreshActive, service.AccountEgressLeaseRefreshDraining, service.AccountEgressLeaseRefreshFenced, service.AccountEgressLeaseRefreshLost:
 			results[command.key] = status
 		default:
 			return nil, fmt.Errorf("invalid account egress refresh status %q", value)
@@ -1311,16 +1335,9 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		if err != nil {
 			return nil, err
 		}
-		if totalCount != poolActiveTotal {
-			results[command.config.AccountID] = service.AccountEgressLoadInfo{
-				AccountID:     command.config.AccountID,
-				Status:        service.AccountEgressStatusConfigStale,
-				ActiveTotal:   poolActiveTotal,
-				IdentityLoads: identityLoads,
-				ConfigVersion: command.config.Version,
-			}
-			continue
-		}
+		// pool total includes leases draining from identities removed by a config
+		// swap; current identity indexes intentionally cannot account for them.
+		poolActiveTotal = totalCount
 		waitingCount, err := intAt(7, "waiting count")
 		if err != nil {
 			return nil, err
