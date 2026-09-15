@@ -67,6 +67,17 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 		return nil
 	}
 
+	// Native token counting shares recovery admission, but does not acquire a
+	// generation slot or prove that generation capacity has recovered.
+	selection := &AccountSelectionResult{Account: account, Acquired: true}
+	if err := s.AdmitOpenAI429Selection(ctx, selection); err != nil {
+		return err
+	}
+	if selection.ReleaseFunc != nil {
+		defer selection.ReleaseFunc()
+	}
+	account = selection.Account
+
 	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
 		var failoverErr *UpstreamFailoverError

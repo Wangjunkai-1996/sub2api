@@ -82,6 +82,7 @@ func TestOpenAISetupTokenImagesUsesOAuthResponsesPath(t *testing.T) {
 		ID:          73,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeSetupToken,
+		Status:      StatusActive,
 		Credentials: map[string]any{"access_token": "setup-token"},
 	}
 	parsed := &OpenAIImagesRequest{
@@ -97,9 +98,9 @@ func TestOpenAISetupTokenImagesUsesOAuthResponsesPath(t *testing.T) {
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.False(t, failoverErr.SameAccountRetryDeadline.IsZero())
+	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode, "unexpected failover: %+v", failoverErr)
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
 	require.Contains(t, upstream.lastReq.URL.String(), "/backend-api/codex/responses")
 }
 
@@ -234,6 +235,7 @@ func TestOpenAISetupTokenMessagesUsesCodexBridgeAndTurnState(t *testing.T) {
 
 func openAISetupTokenCompatAccount(id int64) *Account {
 	return &Account{
+		Status:      StatusActive,
 		ID:          id,
 		Name:        "openai-setup-token",
 		Platform:    PlatformOpenAI,

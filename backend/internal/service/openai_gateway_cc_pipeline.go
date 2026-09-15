@@ -326,6 +326,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 				break
 			}
 		}
+		observeOpenAI429RecoveryOutput(c.Request.Context(), account, []byte(payload), "")
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
 			ms := int(time.Since(startTime).Milliseconds())
 			st.FirstTokenMs = &ms

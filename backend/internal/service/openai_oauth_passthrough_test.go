@@ -37,6 +37,7 @@ type httpUpstreamRecorder struct {
 	resp      *http.Response
 	responses []*http.Response
 	err       error
+	onDo      func()
 }
 
 type passthroughErrReadCloser struct {
@@ -66,6 +67,9 @@ func (r passthroughErrReadCloser) Close() error {
 
 func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	u.lastReq = req
+	if u.onDo != nil {
+		u.onDo()
+	}
 	u.lastProxyURL = proxyURL
 	if req != nil && req.Body != nil {
 		b, _ := io.ReadAll(req.Body)
@@ -849,10 +853,10 @@ func TestOpenAIGatewayService_OAuthPassthrough_UpstreamRequestIgnoresClientCance
 	reqCtx, cancel := context.WithCancel(context.Background())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil)).WithContext(reqCtx)
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
-	cancel()
+	defer cancel()
 
 	originalBody := []byte(`{"model":"gpt-5.2","stream":true,"store":true,"instructions":"local-test-instructions","input":[{"type":"text","text":"hi"}]}`)
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_passthrough_ctx"}},
 		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
@@ -1094,10 +1098,10 @@ func TestOpenAIGatewayService_OAuthLegacy_UpstreamRequestIgnoresClientCancel(t *
 	reqCtx, cancel := context.WithCancel(context.Background())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil)).WithContext(reqCtx)
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
-	cancel()
+	defer cancel()
 
 	originalBody := []byte(`{"model":"gpt-5.2","stream":false,"store":true,"input":[{"type":"text","text":"hi"}]}`)
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_legacy_ctx"}},
 		Body: io.NopCloser(strings.NewReader(strings.Join([]string{

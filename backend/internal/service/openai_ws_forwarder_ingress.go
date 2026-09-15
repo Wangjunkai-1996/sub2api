@@ -100,6 +100,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
+	ctx, hooks, releaseRecovery, recoveryErr := s.withOpenAIWS429Recovery(ctx, account, hooks)
+	if recoveryErr != nil {
+		return recoveryErr
+	}
+	defer releaseRecovery()
 
 	// 预取一次 OpenAI Fast Policy settings，绑定到 ctx，让该 WS session
 	// 内所有帧的 evaluateOpenAIFastPolicy 调用复用同一份快照，避免每帧
@@ -1092,6 +1097,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 
 			eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
+			observeOpenAI429RecoveryOutput(ctx, account, upstreamMessage, eventType)
 			responseModelObserver.ObserveOpenAI(upstreamMessage, eventType)
 			if responseID == "" && eventResponseID != "" {
 				responseID = eventResponseID

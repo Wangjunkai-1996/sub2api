@@ -676,6 +676,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if data, ok := extractOpenAISSEDataLine(line); ok {
 			dataBytes := []byte(data)
 			eventType := effectiveOpenAISSEEventType(dataBytes, pendingSSEEventType)
+			observeOpenAI429RecoveryOutput(ctx, account, dataBytes, eventType)
 			if codexFailureTerminal && sawBareError && !sawResponseFailed &&
 				(eventType == "response.completed" || eventType == "response.done") {
 				// A later successful terminal is authoritative over a pending bare
@@ -1874,7 +1875,8 @@ func openAICacheCreationTokensFromUsage(value gjson.Result) int {
 }
 
 func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
-	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	reader := openAI429RecoveryResponseReader(ctx, resp, account, resolveUpstreamResponseReadLimit(s.cfg))
+	body, err := ReadUpstreamResponseBody(reader, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
 	}
@@ -1960,6 +1962,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// A continuation may arrive as soon as the response body is observable.
 	// Persist its account and egress fences before exposing the ID downstream.
 	s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	observeOpenAI429RecoveryOutput(ctx, account, body, "")
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
@@ -2071,6 +2074,7 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	// Keep the converted JSON response under the same pre-write continuation
 	// fence as native non-streaming JSON responses.
 	s.bindHTTPResponseAccount(c.Request.Context(), c, account, responseID)
+	observeOpenAI429RecoveryOutput(c.Request.Context(), account, body, "")
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}

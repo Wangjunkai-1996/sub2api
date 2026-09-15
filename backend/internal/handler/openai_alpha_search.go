@@ -139,13 +139,19 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 				reqLog.Info("openai_alpha_search.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
+			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, false) {
+				return
+			}
 			if len(failedAccountIDs) == 0 {
+				if waitForOpenAI429Selection(c, err, 0) {
+					continue
+				}
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, requestedModel, requestedModel, service.PlatformOpenAI)
 				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
-				h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+				h.handleSelectionFailure(c, cls, false)
 				return
 			}
 			if lastFailoverErr != nil {
@@ -159,6 +165,10 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		accountRelease, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, false, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquireRecoveryDeferred {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// 利润终检否决：排除该账号重新选号；否决次数达上限则按无可用账号终止。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
@@ -230,7 +240,9 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 					return
 				case <-time.After(retryDelay):
 				}
-				continue
+				if sameAccountRetryDeadlineAllows(failoverErr) {
+					continue
+				}
 			}
 		}
 		h.gatewayService.RecordOpenAIAccountSwitch()

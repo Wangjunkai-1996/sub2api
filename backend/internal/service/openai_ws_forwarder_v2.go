@@ -37,7 +37,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
+	clientLifecycleCtx := ctx
 	ctx = ContextWithSelectedAccountEgress(ctx, account)
+	ctx, releaseProbe := openAI429ProbeContext(ctx, account)
+	defer releaseProbe()
 	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
 		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
 		if useErr != nil {
@@ -402,8 +405,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	readTimeout := s.openAIWSReadTimeout()
 	upstreamReadCtx := ctx
 	upstreamReadDetached := false
+	var releaseDetachedProbe func()
+	defer func() {
+		if releaseDetachedProbe != nil {
+			releaseDetachedProbe()
+		}
+	}()
 	clientRequestCanceled := func() bool {
-		return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+		return clientLifecycleCtx != nil && errors.Is(clientLifecycleCtx.Err(), context.Canceled)
 	}
 	markClientDisconnected := func(cause string) {
 		if clientDisconnected {
@@ -412,7 +421,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		clientDisconnected = true
 		clientDisconnectDrainStartedAt = time.Now()
 		if !upstreamReadDetached {
-			upstreamReadCtx = context.WithoutCancel(ctx)
+			upstreamReadCtx, releaseDetachedProbe = openAI429ProbeContext(context.WithoutCancel(ctx), account)
 			upstreamReadDetached = true
 		}
 		logOpenAIWSModeInfo(
@@ -628,6 +637,7 @@ readLoop:
 		}
 
 		eventType, eventResponseID, responseField := parseOpenAIWSEventEnvelope(message)
+		observeOpenAI429RecoveryOutput(ctx, account, message, eventType)
 		if eventType == "" {
 			continue
 		}

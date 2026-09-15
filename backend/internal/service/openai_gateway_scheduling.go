@@ -1238,7 +1238,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				return selection, nil
 			}
 			if isAccountEgressAdmissionError(acquireErr) {
-				lastEgressAdmissionErr = acquireErr
+				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
 				if stickyAccountID > 0 && stickyAccountID == account.ID {
 					stickySpillover = true
 				}
@@ -1304,6 +1304,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	// whole conversation to a cache-cold account.
 	stickySpillover := false
 	var lastEgressAdmissionErr error
+	var recoveryRejected openAI429SelectionRejections
 	if sessionHash != "" {
 		accountID := stickyAccountID
 		if accountID > 0 && !isExcluded(accountID) {
@@ -1340,7 +1341,8 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 						}
 
 						if isAccountEgressAdmissionError(err) {
-							lastEgressAdmissionErr = err
+							lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, err)
+							recoveryRejected.record(account.ID, err)
 							stickySpillover = true
 						} else {
 							waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
@@ -1506,7 +1508,8 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				return selection, true, nil
 			}
 			if isAccountEgressAdmissionError(err) {
-				lastEgressAdmissionErr = err
+				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, err)
+				recoveryRejected.record(fresh.ID, err)
 			}
 		}
 		return nil, true, nil
@@ -1551,7 +1554,8 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				return selection, nil
 			}
 			if isAccountEgressAdmissionError(err) {
-				lastEgressAdmissionErr = err
+				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, err)
+				recoveryRejected.record(fresh.ID, err)
 			}
 		}
 	} else {
@@ -1595,13 +1599,16 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 			continue
 		}
+		if _, rejected := recoveryRejected[fresh.ID]; rejected {
+			continue
+		}
 		if accountUsesEnforcedEgressPool(ctx, s.settingService, fresh) {
 			result, acquireErr := s.tryAcquireAccountSlot(ctx, fresh)
 			if acquireErr == nil && result != nil && result.Acquired {
 				return s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 			}
 			if isAccountEgressAdmissionError(acquireErr) {
-				lastEgressAdmissionErr = acquireErr
+				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
 				continue
 			}
 			if acquireErr != nil {
@@ -1659,7 +1666,20 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 }
 
 func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, account *Account) (*AcquireResult, error) {
-	return acquireAccountSlotForSelection(ctx, s.concurrencyService, s.settingService, account)
+	result, err := acquireAccountSlotForSelection(ctx, s.concurrencyService, s.settingService, account)
+	if err != nil || result == nil || !result.Acquired {
+		return result, err
+	}
+	selection := &AccountSelectionResult{Account: result.Account, Acquired: true, ReleaseFunc: result.ReleaseFunc}
+	if err := s.AdmitOpenAI429Selection(ctx, selection); err != nil {
+		if result.ReleaseFunc != nil {
+			result.ReleaseFunc()
+		}
+		return nil, err
+	}
+	result.Account = selection.Account
+	result.ReleaseFunc = selection.ReleaseFunc
+	return result, nil
 }
 
 func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccount(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
@@ -1979,8 +1999,17 @@ func (s *OpenAIGatewayService) newSelectionResult(ctx context.Context, account *
 
 func (s *OpenAIGatewayService) newAcquiredSelectionResult(ctx context.Context, account *Account, release func()) (*AccountSelectionResult, error) {
 	selection, err := s.newSelectionResult(ctx, account, true, release, nil)
+	if err == nil {
+		if account != nil {
+			selection.Account.OpenAI429Attempt = account.OpenAI429Attempt
+		}
+		err = s.AdmitOpenAI429Selection(ctx, selection)
+	}
 	if err != nil && release != nil {
 		release()
+	}
+	if err != nil {
+		return nil, err
 	}
 	return selection, err
 }

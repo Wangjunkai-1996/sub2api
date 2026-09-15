@@ -37,6 +37,7 @@ type Account struct {
 	EgressBindings                 []AccountEgressBinding
 	SelectedEgress                 *ResolvedAccountEgress        `json:"-"` // request-local only; never persisted or cached
 	LegacyEgressAdmission          *LegacyAccountEgressAdmission `json:"-"` // request-local rollout-off identity fence
+	OpenAI429Attempt               *OpenAI429Attempt             `json:"-"` // request-local recovery generation and probe lease
 	EgressPoolWrite                *ReplaceAccountPoolInput      `json:"-"` // request-local admin write intent
 	Concurrency                    int
 	Priority                       int

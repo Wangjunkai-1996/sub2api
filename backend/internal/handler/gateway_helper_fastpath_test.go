@@ -20,6 +20,26 @@ type concurrencyCacheMock struct {
 	releaseIngressCalled  int32
 }
 
+func (m *concurrencyCacheMock) AcquireOpenAI429Attempt(context.Context, int64, string, string, time.Duration) (service.OpenAI429Admission, error) {
+	return service.OpenAI429Admission{Allowed: true, Generation: "healthy"}, nil
+}
+
+func (m *concurrencyCacheMock) FailOpenAI429Attempt(context.Context, int64, string, string, string, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (m *concurrencyCacheMock) AcceptOpenAI429Attempt(context.Context, int64, string, string, string, string) (bool, error) {
+	return true, nil
+}
+
+func (m *concurrencyCacheMock) RefreshOpenAI429Probe(context.Context, int64, string, string, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (m *concurrencyCacheMock) ReleaseOpenAI429Probe(context.Context, int64, string, string, string) (bool, error) {
+	return true, nil
+}
+
 func (m *concurrencyCacheMock) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
 	if m.acquireAccountSlotFn != nil {
 		return m.acquireAccountSlotFn(ctx, accountID, maxConcurrency, requestID)

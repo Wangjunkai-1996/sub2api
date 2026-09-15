@@ -2103,6 +2103,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				}
 			}
 			eventType := effectiveOpenAISSEEventType(dataBytes, rawEventType)
+			observeOpenAI429RecoveryOutput(ctx, account, dataBytes, eventType)
 			if codexFailureTerminal && sawBareError && !sawResponseFailed && eventType != "response.failed" {
 				suppressCurrentEvent = true
 			}
@@ -2366,7 +2367,8 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	originalModel string,
 	mappedModel string,
 ) (*openaiNonStreamingResultPassthrough, error) {
-	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	reader := openAI429RecoveryResponseReader(ctx, resp, account, resolveUpstreamResponseReadLimit(s.cfg))
+	body, err := ReadUpstreamResponseBody(reader, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
 	}
@@ -2422,6 +2424,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	}
 	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
 	s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	observeOpenAI429RecoveryOutput(ctx, account, body, "")
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
@@ -2502,6 +2505,7 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	}
 	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
 	s.bindHTTPResponseAccount(c.Request.Context(), c, account, responseID)
+	observeOpenAI429RecoveryOutput(c.Request.Context(), account, body, "")
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}

@@ -747,7 +747,8 @@ func (s *OpenAIGatewayService) acquirePreviousResponseAccountSlot(
 		case <-timer.C:
 		}
 
-		result, err = s.tryAcquireAccountSlot(waitCtx, account)
+		// Recovery admission belongs to the request, not this temporary wait.
+		result, err = acquireAccountSlotForSelection(waitCtx, s.concurrencyService, s.settingService, account)
 		if err == nil && result != nil && result.Acquired {
 			return result, nil
 		}

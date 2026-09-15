@@ -97,6 +97,7 @@ func (h *OpenAIGatewayHandler) ResponsesInputTokens(c *gin.Context) {
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	failedAccountIDs := make(map[int64]struct{})
+	var recoveryErr error
 	maxSwitches := h.maxAccountSwitches
 	if maxSwitches <= 0 {
 		maxSwitches = 3
@@ -112,6 +113,20 @@ func (h *OpenAIGatewayHandler) ResponsesInputTokens(c *gin.Context) {
 		)
 		service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 		if selectErr != nil || account == nil {
+			if recoveryErr != nil && (selectErr == nil || errors.Is(selectErr, service.ErrNoAvailableAccounts)) {
+				if waitForOpenAI429Selection(c, recoveryErr, attempt) {
+					clear(failedAccountIDs)
+					recoveryErr = nil
+					attempt--
+					continue
+				}
+				h.handleSelectionFailure(c, classifySelectionFailureError(recoveryErr, noAccountErrorClassification{}), false)
+				return
+			}
+			if waitForOpenAI429Selection(c, selectErr, len(failedAccountIDs)) {
+				attempt--
+				continue
+			}
 			if len(failedAccountIDs) > 0 {
 				h.errorResponse(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 				return
@@ -121,13 +136,23 @@ func (h *OpenAIGatewayHandler) ResponsesInputTokens(c *gin.Context) {
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
 			}
-			h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			h.handleSelectionFailure(c, cls, false)
 			return
 		}
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		forwardErr := h.gatewayService.ForwardResponsesInputTokens(c.Request.Context(), c, account, forwardBody)
 		if forwardErr == nil {
 			return
+		}
+		var cooldown *service.OpenAI429CooldownError
+		if errors.As(forwardErr, &cooldown) || errors.Is(forwardErr, service.ErrOpenAI429RecoveryUnavailable) {
+			var previousCooldown *service.OpenAI429CooldownError
+			if recoveryErr == nil || (cooldown != nil && (!errors.As(recoveryErr, &previousCooldown) || cooldown.RetryAfter < previousCooldown.RetryAfter)) {
+				recoveryErr = forwardErr
+			}
+			failedAccountIDs[account.ID] = struct{}{}
+			attempt-- // Admission deferrals do not spend the upstream failover budget.
+			continue
 		}
 		var failoverErr *service.UpstreamFailoverError
 		if !errors.As(forwardErr, &failoverErr) || !failoverErr.ShouldRetryNextAccount() || attempt >= maxSwitches {
@@ -297,6 +322,13 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		)
 		service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 		if selectErr != nil || selection == nil || selection.Account == nil {
+			if h.handleOpenAI429DeferredSelection(c, selectErr, false, true) {
+				return
+			}
+			if waitForOpenAI429Selection(c, selectErr, len(failedAccountIDs)) {
+				attempt--
+				continue
+			}
 			if len(failedAccountIDs) > 0 {
 				h.anthropicErrorResponse(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 				return
@@ -306,7 +338,7 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimitedIfNoAvailable(c, selectErr)
 			}
-			h.anthropicErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			h.handleAnthropicSelectionFailure(c, cls, false)
 			return
 		}
 
@@ -315,15 +347,24 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		accountRelease, acquireErr := h.acquireCountTokensAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqLog)
 		if acquireErr != nil {
+			var cooldown *service.OpenAI429CooldownError
+			if errors.As(acquireErr, &cooldown) || errors.Is(acquireErr, service.ErrOpenAI429RecoveryUnavailable) {
+				c.Set(openAI429DeferredSelectionKey, acquireErr)
+			}
 			if attempt < maxSwitches && c.Request.Context().Err() == nil {
 				failedAccountIDs[account.ID] = struct{}{}
 				reqLog.Warn("openai_count_tokens.account_slot_unavailable_switching", zap.Int64("account_id", account.ID), zap.Error(acquireErr))
 				continue
 			}
+			if h.handleOpenAI429DeferredSelection(c, acquireErr, false, true) {
+				return
+			}
 			status, errType, _, message := concurrencyErrorResponse(acquireErr, "account")
 			h.anthropicErrorResponse(c, status, errType, message)
 			return
 		}
+		account = selection.Account
+		c.Set(openAI429DeferredSelectionKey, nil)
 		forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
 		forwardErr := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, preferredMappedModel)
 		if accountRelease != nil {
@@ -362,6 +403,12 @@ func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
 	if selection.Acquired {
 		if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, selection.ReleaseFunc, reqLog); recheckErr != nil {
 			return nil, recheckErr
+		}
+		if err := h.gatewayService.AdmitOpenAI429Selection(ctx, selection); err != nil {
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			return nil, err
 		}
 		return wrapReleaseOnDone(ctx, selection.ReleaseFunc), nil
 	}
@@ -413,8 +460,15 @@ func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
 		return nil, recheckErr
 	}
 	selection.ReleaseFunc = accountRelease
+	selection.Acquired = true
+	if err := h.gatewayService.AdmitOpenAI429Selection(ctx, selection); err != nil {
+		if accountRelease != nil {
+			accountRelease()
+		}
+		return nil, err
+	}
 	if bindErr := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); bindErr != nil {
 		reqLog.Warn("openai_count_tokens.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(bindErr))
 	}
-	return wrapReleaseOnDone(ctx, accountRelease), nil
+	return wrapReleaseOnDone(ctx, selection.ReleaseFunc), nil
 }

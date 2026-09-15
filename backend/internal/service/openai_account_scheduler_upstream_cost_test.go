@@ -13,6 +13,7 @@ import (
 )
 
 type upstreamCostTrackingConcurrencyCache struct {
+	healthyOpenAI429TestCache
 	ConcurrencyCache
 	loadMap       map[int64]*AccountLoadInfo
 	acquireLimits map[int64][]int

@@ -153,6 +153,7 @@ func TestForwardAsAnthropic_UsesExactFableMessagesDispatchModel(t *testing.T) {
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -202,6 +203,7 @@ func TestForwardAsAnthropic_NormalizesRoutingAndEffortForGpt54XHigh(t *testing.T
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -331,6 +333,7 @@ func rawGPT56ResponsesAPIKeyAccount(requestedModel, mappedModel string) *Account
 
 func rawGPT56ResponsesOAuthAccount(requestedModel, mappedModel string) *Account {
 	return &Account{
+		Status:      StatusActive,
 		ID:          502,
 		Name:        "gpt56-oauth",
 		Platform:    PlatformOpenAI,
@@ -684,6 +687,7 @@ func TestForwardAsAnthropic_OAuthCompatKeepsFullReplayForCacheGrowth(t *testing.
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1041,6 +1045,7 @@ func TestForwardAsAnthropic_DoesNotAttachPreviousResponseIDForOAuthCompat(t *tes
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1080,6 +1085,7 @@ func TestForwardAsAnthropic_ReusesOAuthCodexTurnState(t *testing.T) {
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1152,6 +1158,7 @@ func TestForwardAsAnthropic_OAuthRestoresCodexIdentityHeaders(t *testing.T) {
 				cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 			}
 			account := &Account{
+				Status:      StatusActive,
 				ID:          1,
 				Name:        "openai-oauth",
 				Platform:    PlatformOpenAI,
@@ -1186,6 +1193,7 @@ func TestForwardAsAnthropic_OAuthDigestFallbackReusesTurnStateWithoutExplicitKey
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1244,6 +1252,7 @@ func TestForwardAsAnthropic_OAuthMetadataSessionSurvivesDigestPrefixRewrite(t *t
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1301,6 +1310,7 @@ func TestForwardAsAnthropic_OAuthMetadataSessionSurvivesChangingCacheControlAnch
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1353,6 +1363,7 @@ func TestForwardAsAnthropic_OAuthKeepsSystemAsDeveloperInput(t *testing.T) {
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1392,6 +1403,7 @@ func TestForwardAsAnthropic_OAuthAddsClaudeCodeTodoGuardForCompatModel(t *testin
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1429,6 +1441,7 @@ func TestForwardAsAnthropic_OAuthPreservesClaudeCodeToolCallID(t *testing.T) {
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1573,6 +1586,7 @@ func TestForwardAsAnthropic_ForcedCodexInstructionsTemplatePrependsRenderedInstr
 		httpUpstream: upstream,
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1620,6 +1634,7 @@ func TestForwardAsAnthropic_ForcedCodexInstructionsTemplateUsesCachedTemplateCon
 		httpUpstream: upstream,
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1665,6 +1680,7 @@ func TestForwardAsAnthropic_ClientDisconnectDrainsUpstreamUsage(t *testing.T) {
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1707,6 +1723,7 @@ func TestForwardAsAnthropic_TerminalUsageWithoutUpstreamCloseReturns(t *testing.
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1768,6 +1785,7 @@ func TestForwardAsAnthropic_EventNamedTerminalWithoutUpstreamCloseReturns(t *tes
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1836,6 +1854,7 @@ func TestForwardAsAnthropic_EventNamedTerminalWithKeepaliveReturns(t *testing.T)
 		httpUpstream: upstream,
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1891,6 +1910,7 @@ func TestForwardAsAnthropic_BufferedTerminalWithoutUpstreamCloseReturns(t *testi
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1989,6 +2009,7 @@ func TestForwardAsAnthropic_BufferedEventNamedTerminalWithoutUpstreamCloseReturn
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -2041,6 +2062,7 @@ func TestForwardAsAnthropic_MissingTerminalBeforeOutputReturnsFailoverAndOps(t *
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -2096,6 +2118,7 @@ func TestForwardAsAnthropic_MissingTerminalAfterOutputRecordsOpsWithoutFailover(
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -2149,6 +2172,7 @@ func TestForwardAsAnthropic_MissingTerminalAfterClientDisconnectSkipsOpsAndFailo
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -2199,6 +2223,7 @@ func TestForwardAsAnthropic_CompleteStreamDoesNotRecordMissingTerminalOps(t *tes
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -2238,7 +2263,7 @@ func TestForwardAsAnthropic_UpstreamRequestIgnoresClientCancel(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":false}`)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)).WithContext(reqCtx)
 	c.Request.Header.Set("Content-Type", "application/json")
-	cancel()
+	defer cancel()
 
 	upstreamBody := strings.Join([]string{
 		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","model":"gpt-5.4","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`,
@@ -2246,7 +2271,7 @@ func TestForwardAsAnthropic_UpstreamRequestIgnoresClientCancel(t *testing.T) {
 		"data: [DONE]",
 		"",
 	}, "\n")
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_ctx"}},
 		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
@@ -2254,6 +2279,7 @@ func TestForwardAsAnthropic_UpstreamRequestIgnoresClientCancel(t *testing.T) {
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,

@@ -249,6 +249,7 @@ func (r groupAwareStubOpenAIAccountRepo) ListSchedulableUngroupedByPlatform(ctx 
 }
 
 type stubConcurrencyCache struct {
+	healthyOpenAI429TestCache
 	ConcurrencyCache
 	loadBatchErr    error
 	loadMap         map[int64]*AccountLoadInfo
@@ -1962,7 +1963,7 @@ func TestOpenAIStreamingResponseFailedBeforeOutputRateLimitUsesPoolRetryPolicy(t
 
 // 流内 rate limit 进入 OAuth 同账号重试窗口，但不立即写账号级限流/封禁状态：
 // HTTP 200 流的 x-codex-* 头不能让窗口内的账号提前失去调度资格。
-func TestOpenAIStreamingResponseFailedRateLimitDoesNotBlockAccountScheduling(t *testing.T) {
+func TestOpenAIStreamingResponseFailedRateLimitWithoutAdmissionUsesFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{
 		Gateway: config.GatewayConfig{
@@ -2005,9 +2006,9 @@ func TestOpenAIStreamingResponseFailedRateLimitDoesNotBlockAccountScheduling(t *
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.False(t, failoverErr.SameAccountRetryDeadline.IsZero())
-	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
 func TestOpenAIStreamingResponseFailedAfterOutputSanitizesVerboseResponseForClient(t *testing.T) {

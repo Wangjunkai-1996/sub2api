@@ -380,17 +380,15 @@ func (s *OpenAIGatewayService) newOpenAIAccountFailoverErrorWithClassificationHe
 	shouldDisable bool,
 	retryableOnSameAccount bool,
 ) *UpstreamFailoverError {
-	oauth429Retry := s.shouldRetryOpenAIOAuth429OnSameAccountWithResponse(account, statusCode, shouldDisable, classificationHeaders, responseBody)
 	failoverErr := newOpenAIUpstreamFailoverError(
 		statusCode,
 		responseHeaders,
 		responseBody,
 		upstreamMsg,
-		retryableOnSameAccount || oauth429Retry,
+		retryableOnSameAccount,
 	)
-	if oauth429Retry {
-		failoverErr.SameAccountRetryDeadline = s.openAIOAuth429RetryDeadline(account)
-		failoverErr.SameAccountRetryDelay = openAIOAuth429SameAccountRetryDelay(responseHeaders, failoverErr.SameAccountRetryDeadline)
+	if statusCode == http.StatusTooManyRequests && isOpenAIOAuthAccount(account) && !failoverErr.RequestScopedTransient {
+		failoverErr.RetryableOnSameAccount = false
 	}
 	return failoverErr
 }

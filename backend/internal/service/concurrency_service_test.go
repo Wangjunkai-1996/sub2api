@@ -16,6 +16,7 @@ import (
 
 // stubConcurrencyCacheForTest 用于并发服务单元测试的缓存桩
 type stubConcurrencyCacheForTest struct {
+	healthyOpenAI429TestCache
 	acquireResult        bool
 	acquireErr           error
 	releaseErr           error

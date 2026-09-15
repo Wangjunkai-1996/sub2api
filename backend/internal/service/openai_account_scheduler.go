@@ -323,6 +323,7 @@ type openAISelectionProbeBudget struct {
 	rechecks               int
 	attempted              map[int64]struct{}
 	egressRejected         map[openAIEgressAdmissionIdentity]error
+	recoveryRejected       openAI429SelectionRejections
 	lastEgressAdmissionErr error
 	limited                bool
 	stickyAdmissionFull    bool
@@ -410,7 +411,10 @@ func (b *openAISelectionProbeBudget) recordEgressAdmissionFailure(
 	if b == nil || !isAccountEgressAdmissionError(err) {
 		return
 	}
-	b.lastEgressAdmissionErr = err
+	b.lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(b.lastEgressAdmissionErr, err)
+	if account != nil {
+		b.recoveryRejected.record(account.ID, err)
+	}
 	if !accountUsesEnforcedEgressPool(ctx, settings, account) {
 		return
 	}
@@ -429,7 +433,13 @@ func (b *openAISelectionProbeBudget) egressAdmissionFailure(
 	settings *SettingService,
 	account *Account,
 ) (error, bool) {
-	if b == nil || !accountUsesEnforcedEgressPool(ctx, settings, account) {
+	if b == nil || account == nil {
+		return nil, false
+	}
+	if recoveryErr, rejected := b.recoveryRejected[account.ID]; rejected {
+		return recoveryErr, true
+	}
+	if !accountUsesEnforcedEgressPool(ctx, settings, account) {
 		return nil, false
 	}
 	identity, ok := openAIEgressAdmissionIdentityForAccount(account)
@@ -1397,7 +1407,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			if isAccountEgressAdmissionError(acquireErr) {
 				budget.recordEgressAdmissionFailure(ctx, s.service.settingService, candidate.account, acquireErr)
 				budget.recordStickyAdmissionFull(req, candidate.account.ID, acquireErr)
-				lastEgressAdmissionErr = acquireErr
+				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
 				continue
 			}
 			return nil, compactBlocked, acquireErr
@@ -1449,7 +1459,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 				if isAccountEgressAdmissionError(acquireErr) {
 					budget.recordEgressAdmissionFailure(ctx, s.service.settingService, fresh, acquireErr)
 					budget.recordStickyAdmissionFull(req, fresh.ID, acquireErr)
-					lastEgressAdmissionErr = acquireErr
+					lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
 					continue
 				}
 				return nil, compactBlocked, acquireErr
@@ -1465,7 +1475,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		if isAccountEgressAdmissionError(selectErr) {
 			budget.recordEgressAdmissionFailure(ctx, s.service.settingService, fresh, selectErr)
 			budget.recordStickyAdmissionFull(req, fresh.ID, selectErr)
-			lastEgressAdmissionErr = selectErr
+			lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, selectErr)
 			continue
 		}
 		return selection, compactBlocked, selectErr
@@ -1571,7 +1581,7 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 			if isAccountEgressAdmissionError(acquireErr) {
 				budget.recordEgressAdmissionFailure(ctx, s.service.settingService, account, acquireErr)
 				budget.recordStickyAdmissionFull(req, account.ID, acquireErr)
-				lastEgressAdmissionErr = acquireErr
+				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
 				continue
 			}
 			return nil, acquireErr
@@ -2032,7 +2042,7 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 	loadSkew := attempt.loadSkew
 	lastEgressAdmissionErr := budget.lastEgressAdmissionFailure()
 	if isAccountEgressAdmissionError(attempt.err) {
-		lastEgressAdmissionErr = attempt.err
+		lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, attempt.err)
 	}
 
 	if len(attempt.selectionOrder) == 0 {
@@ -2046,7 +2056,7 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 		if !isAccountEgressAdmissionError(stickyErr) {
 			return nil, candidateCount, topK, loadSkew, stickyErr
 		}
-		lastEgressAdmissionErr = stickyErr
+		lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, stickyErr)
 	} else if stickyFallback != nil {
 		return stickyFallback, candidateCount, topK, loadSkew, nil
 	}
@@ -2094,9 +2104,14 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				compactBlocked = true
 				continue
 			}
+			if budget != nil {
+				if _, rejected := budget.recoveryRejected[fresh.ID]; rejected {
+					continue
+				}
+			}
 			if accountUsesEnforcedEgressPool(ctx, s.service.settingService, fresh) {
 				if rejectedErr, rejected := budget.egressAdmissionFailure(ctx, s.service.settingService, fresh); rejected {
-					lastEgressAdmissionErr = rejectedErr
+					lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, rejectedErr)
 					continue
 				}
 				var result *AcquireResult
@@ -2120,7 +2135,7 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				}
 				if isAccountEgressAdmissionError(acquireErr) {
 					budget.recordEgressAdmissionFailure(ctx, s.service.settingService, fresh, acquireErr)
-					lastEgressAdmissionErr = acquireErr
+					lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
 					continue
 				}
 				if acquireErr != nil {
@@ -3172,7 +3187,6 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Accoun
 		}
 	}
 	if success {
-		s.openaiOAuth429RetryStartedAt.Delete(accountID)
 		s.clearOpenAIAccountModelTransientState(accountID, normalizeOpenAIAccountModelTransientModel(model))
 	}
 	scheduler := s.getOpenAIAccountScheduler(context.Background())

@@ -4,13 +4,17 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -82,6 +86,7 @@ func TestClassifySelectionFailureError_AccountEgressAdmission(t *testing.T) {
 	full := classifySelectionFailureError(fmt.Errorf("wrapped: %w", service.ErrAccountEgressCapacityFull), fallback)
 	require.Equal(t, http.StatusTooManyRequests, full.Status)
 	require.Equal(t, "rate_limit_error", full.ErrType)
+	require.Equal(t, "egress_capacity_exhausted", full.ErrCode)
 	require.False(t, full.ModelNotFound)
 
 	for _, admissionErr := range []error{
@@ -93,6 +98,123 @@ func TestClassifySelectionFailureError_AccountEgressAdmission(t *testing.T) {
 		require.Equal(t, http.StatusServiceUnavailable, got.Status)
 		require.Equal(t, "api_error", got.ErrType)
 		require.False(t, got.ModelNotFound)
+	}
+}
+
+func TestSelectionFailurePoolCodeRequiresPoolEvidence(t *testing.T) {
+	fallback := classifyNoAccountError(context.Background(), nil, nil, "gpt-5", "gpt-5", service.PlatformOpenAI)
+	exhausted := classifySelectionFailureError(fmt.Errorf("selection: %w", service.ErrNoAvailableAccounts), fallback)
+	require.Equal(t, "account_pool_exhausted", exhausted.ErrCode)
+	require.Equal(t, 2, exhausted.RetryAfterSeconds)
+
+	unexpected := classifySelectionFailureError(errors.New("scheduler repository unavailable"), fallback)
+	require.Equal(t, http.StatusServiceUnavailable, unexpected.Status)
+	require.Empty(t, unexpected.ErrCode)
+	require.Zero(t, unexpected.RetryAfterSeconds)
+}
+
+func TestSelectionFailureResponseCarriesPoolCodeAndRetryAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{name: "empty pool", err: service.ErrNoAvailableAccounts, status: http.StatusServiceUnavailable, code: "account_pool_exhausted"},
+		{name: "full egress", err: service.ErrAccountEgressCapacityFull, status: http.StatusTooManyRequests, code: "egress_capacity_exhausted"},
+		{name: "shared rate limit", err: &service.OpenAI429CooldownError{RetryAfter: 1500 * time.Millisecond}, status: http.StatusTooManyRequests, code: "account_pool_rate_limited"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, anthropic := range []bool{false, true} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				fallback := classifyNoAccountError(c.Request.Context(), nil, nil, "gpt-5", "gpt-5", service.PlatformOpenAI)
+				classification := classifySelectionFailureError(tc.err, fallback)
+				h := &OpenAIGatewayHandler{}
+				if anthropic {
+					h.handleAnthropicSelectionFailure(c, classification, false)
+				} else {
+					h.handleSelectionFailure(c, classification, false)
+				}
+				require.Equal(t, tc.status, recorder.Code)
+				require.Equal(t, "2", recorder.Header().Get("Retry-After"))
+				require.Equal(t, tc.code, gjson.Get(recorder.Body.String(), "error.code").String())
+				if anthropic {
+					require.Equal(t, "error", gjson.Get(recorder.Body.String(), "type").String())
+				}
+			}
+		})
+	}
+}
+
+func TestSelectionFailureAfterStreamStartPreservesHeadersAndEmitsOneTerminal(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Header("Content-Type", "text/event-stream")
+	_, err := c.Writer.WriteString(": ping\n\n")
+	require.NoError(t, err)
+	c.Writer.Flush()
+	headers := c.Writer.Header().Clone()
+	classification := classifyNoAccountError(c.Request.Context(), nil, nil, "gpt-5", "gpt-5", service.PlatformOpenAI)
+
+	(&OpenAIGatewayHandler{}).handleSelectionFailure(c, classification, true)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, headers, c.Writer.Header())
+	require.Equal(t, 1, strings.Count(recorder.Body.String(), "event: response.failed\n"))
+	require.Contains(t, recorder.Body.String(), `"code":"account_pool_exhausted"`)
+	require.NotContains(t, recorder.Body.String(), "event: error\n")
+}
+
+func TestOpenAI429SelectionWaitIsOnceAndRequiresKnownShortRecovery(t *testing.T) {
+	c := newTestGinContextWithRequest()
+	cooldown := &service.OpenAI429CooldownError{RetryAfter: time.Nanosecond}
+	require.True(t, waitForOpenAI429Selection(c, cooldown, 0))
+	require.False(t, waitForOpenAI429Selection(c, cooldown, 0), "one request cannot repeatedly wait for pool recovery")
+
+	for _, tc := range []struct {
+		name     string
+		err      error
+		excluded int
+	}{
+		{name: "empty pool", err: service.ErrNoAvailableAccounts},
+		{name: "full egress", err: service.ErrAccountEgressCapacityFull},
+		{name: "recovery cache unavailable", err: service.ErrOpenAI429RecoveryUnavailable},
+		{name: "unknown recovery time", err: &service.OpenAI429CooldownError{}},
+		{name: "long cooldown", err: &service.OpenAI429CooldownError{RetryAfter: 4 * time.Second}},
+		{name: "already attempted account", err: cooldown, excluded: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.False(t, waitForOpenAI429Selection(newTestGinContextWithRequest(), tc.err, tc.excluded))
+		})
+	}
+}
+
+func TestOpenAI429SelectionWaitHonorsCancellationBudgetAndCommittedOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(*gin.Context)
+	}{
+		{name: "canceled", prepare: func(c *gin.Context) {
+			ctx, cancel := context.WithCancel(c.Request.Context())
+			cancel()
+			c.Request = c.Request.WithContext(ctx)
+		}},
+		{name: "request budget", prepare: func(c *gin.Context) {
+			c.Set(openAIRequestBudgetDeadlineKey, time.Now().Add(time.Second))
+		}},
+		{name: "semantic output", prepare: func(c *gin.Context) {
+			_, err := c.Writer.WriteString("data: response content\n\n")
+			require.NoError(t, err)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestGinContextWithRequest()
+			tc.prepare(c)
+			require.False(t, waitForOpenAI429Selection(c, &service.OpenAI429CooldownError{RetryAfter: 2 * time.Second}, 0))
+		})
 	}
 }
 

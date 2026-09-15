@@ -115,7 +115,10 @@ func accountUsesLegacyEgressMirror(
 }
 
 func isAccountEgressAdmissionError(err error) bool {
+	var cooldown *OpenAI429CooldownError
 	return errors.Is(err, ErrAccountEgressCapacityFull) ||
+		errors.As(err, &cooldown) ||
+		errors.Is(err, ErrOpenAI429RecoveryUnavailable) ||
 		errors.Is(err, ErrAccountEgressUnavailable) ||
 		errors.Is(err, ErrAccountEgressNoRoute) ||
 		errors.Is(err, ErrAccountEgressConfigStale)
@@ -224,6 +227,11 @@ func selectionAccount(acquired *AcquireResult, fallback *Account) *Account {
 		return acquired.Account
 	}
 	if fallback != nil {
+		if acquired != nil && acquired.Account != nil && acquired.Account.OpenAI429Attempt != nil {
+			requestAccount := *fallback
+			requestAccount.OpenAI429Attempt = acquired.Account.OpenAI429Attempt
+			return &requestAccount
+		}
 		return fallback
 	}
 	if acquired != nil {

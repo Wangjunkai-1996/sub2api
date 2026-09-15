@@ -11,6 +11,7 @@ import (
 )
 
 type egressAffinityConcurrencyCache struct {
+	healthyOpenAI429TestCache
 	ConcurrencyCache
 	*accountEgressCacheStub
 
@@ -18,6 +19,13 @@ type egressAffinityConcurrencyCache struct {
 	waitErr        error
 	waitIncrements int
 	waitDecrements int
+	recoveryProbe  bool
+}
+
+func (c *egressAffinityConcurrencyCache) AcquireOpenAI429Attempt(
+	_ context.Context, _ int64, _, token string, _ time.Duration,
+) (OpenAI429Admission, error) {
+	return OpenAI429Admission{Allowed: true, Generation: token, Probe: c.recoveryProbe}, nil
 }
 
 type egressAffinityGatewayCache struct {
@@ -365,7 +373,8 @@ func TestPreviousResponseRequiredBindingWaitsWithoutSpilling(t *testing.T) {
 				AuthorityRevision: poolConfig.AuthorityRevision,
 			},
 		}},
-		waitAllowed: true,
+		waitAllowed:   true,
+		recoveryProbe: true,
 	}
 	concurrency := NewConcurrencyService(cache)
 	defer concurrency.accountEgressAllocator.Close()
@@ -376,6 +385,7 @@ func TestPreviousResponseRequiredBindingWaitsWithoutSpilling(t *testing.T) {
 		}}},
 		concurrencyService: concurrency,
 		settingService:     NewSettingService(accountEgressSettingRepoStub{value: string(AccountEgressPoolRolloutEnforce)}, nil),
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: []Account{*account}},
 	}
 
 	ctx := WithRequiredAccountEgressBinding(context.Background(), candidate.BindingID)
@@ -387,7 +397,12 @@ func TestPreviousResponseRequiredBindingWaitsWithoutSpilling(t *testing.T) {
 	require.Equal(t, 1, cache.waitIncrements)
 	require.Equal(t, 1, cache.waitDecrements)
 	require.Equal(t, candidate.BindingID, cache.lastAcquire.RequiredBindingID)
-	result.ReleaseFunc()
+	selection, err := service.newAcquiredSelectionResult(ctx, result.Account, result.ReleaseFunc)
+	require.NoError(t, err)
+	t.Cleanup(selection.ReleaseFunc)
+	require.NotNil(t, selection.Account.OpenAI429Attempt)
+	require.True(t, selection.Account.OpenAI429Attempt.Probe())
+	require.NoError(t, selection.Account.OpenAI429Attempt.Context().Err(), "leaving the wait loop must not cancel the admitted request's recovery probe")
 }
 
 func TestOpenAIPreviousResponseEgressFenceBypassesWeightedMovableSelection(t *testing.T) {

@@ -136,6 +136,12 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 				reqLog.Info("openai_embeddings.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
+			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
+				continue
+			}
+			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, false) {
+				return
+			}
 			reqLog.Warn("openai_embeddings.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
@@ -146,7 +152,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
-				h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+				h.handleSelectionFailure(c, cls, false)
 				return
 			}
 			if lastFailoverErr != nil {
@@ -161,13 +167,17 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
 			}
-			h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			h.handleSelectionFailure(c, cls, false)
 			return
 		}
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, "", selection, false, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquireRecoveryDeferred {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// 利润终检否决：排除该账号重新选号；否决次数达上限则按无可用账号终止。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {

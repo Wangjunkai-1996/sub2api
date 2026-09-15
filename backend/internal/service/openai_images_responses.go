@@ -1341,16 +1341,18 @@ type openAIImagesOAuthNonStreamingPayload struct {
 func (s *OpenAIGatewayService) readOpenAIImagesOAuthNonStreamingResponse(
 	resp *http.Response,
 	c *gin.Context,
+	account *Account,
 	fallbackModel string,
 	deferClientErrors bool,
 ) (openAIImagesOAuthNonStreamingPayload, error) {
 	payload := openAIImagesOAuthNonStreamingPayload{DeferredClientErrors: deferClientErrors}
 	var body []byte
 	var err error
+	reader := openAI429RecoveryResponseReader(c.Request.Context(), resp, account, resolveUpstreamResponseReadLimit(s.cfg))
 	if deferClientErrors {
-		body, err = readUpstreamResponseBodyLimited(resp.Body, resolveUpstreamResponseReadLimit(s.cfg))
+		body, err = readUpstreamResponseBodyLimited(reader, resolveUpstreamResponseReadLimit(s.cfg))
 	} else {
-		body, err = ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+		body, err = ReadUpstreamResponseBody(reader, s.cfg, c, openAITooLargeError)
 	}
 	if err != nil {
 		if shouldClassifyOpenAIUpstreamStreamReadError(err, c.Request.Context()) {
@@ -1395,6 +1397,7 @@ func (s *OpenAIGatewayService) readOpenAIImagesOAuthNonStreamingResponse(
 	payload.CreatedAt = createdAt
 	payload.UsageRaw = usageRaw
 	payload.FirstMeta = firstMeta
+	acceptOpenAI429Recovery(c.Request.Context(), account)
 	return payload, nil
 }
 
@@ -1421,10 +1424,11 @@ func applyOpenAIImagesOAuthNonStreamingError(c *gin.Context, payload openAIImage
 func (s *OpenAIGatewayService) handleOpenAIImagesOAuthNonStreamingResponse(
 	resp *http.Response,
 	c *gin.Context,
+	account *Account,
 	responseFormat string,
 	fallbackModel string,
 ) (OpenAIUsage, int, []string, error) {
-	payload, err := s.readOpenAIImagesOAuthNonStreamingResponse(resp, c, fallbackModel, false)
+	payload, err := s.readOpenAIImagesOAuthNonStreamingResponse(resp, c, account, fallbackModel, false)
 	if err != nil {
 		applyOpenAIImagesOAuthNonStreamingError(c, payload, err)
 		return OpenAIUsage{}, 0, nil, err
@@ -1442,6 +1446,7 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthNonStreamingResponse(
 func (s *OpenAIGatewayService) handleOpenAIImagesOAuthStreamingResponse(
 	resp *http.Response,
 	c *gin.Context,
+	account *Account,
 	startTime time.Time,
 	responseFormat string,
 	streamPrefix string,
@@ -1502,6 +1507,7 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthStreamingResponse(
 		if !gjson.ValidBytes(dataBytes) {
 			return
 		}
+		observeOpenAI429RecoveryOutput(c.Request.Context(), account, dataBytes, "")
 		if meta, eventCreatedAt, ok := extractOpenAIResponsesImageMetaFromLifecycleEvent(dataBytes); ok {
 			mergeOpenAIResponsesImageMeta(&streamMeta, meta)
 			if eventCreatedAt > 0 {
@@ -2023,7 +2029,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuthBatch(
 			continue
 		}
 
-		payload, responseErr := s.readOpenAIImagesOAuthNonStreamingResponse(resp, c, requestModel, true)
+		payload, responseErr := s.readOpenAIImagesOAuthNonStreamingResponse(resp, c, account, requestModel, true)
 		_ = resp.Body.Close()
 		if responseErr != nil {
 			if firstFailure == nil {
@@ -2295,7 +2301,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 	// keepalive 心跳字节，避免 failover 第 2 轮起把上一轮心跳残留误判为已写响应。
 	writerSizeBeforeResponse := OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c)
 	if parsed.Stream {
-		usage, imageCount, imageOutputSizes, firstTokenMs, err = s.handleOpenAIImagesOAuthStreamingResponse(resp, c, startTime, parsed.ResponseFormat, openAIImagesStreamPrefix(parsed), requestModel)
+		usage, imageCount, imageOutputSizes, firstTokenMs, err = s.handleOpenAIImagesOAuthStreamingResponse(resp, c, account, startTime, parsed.ResponseFormat, openAIImagesStreamPrefix(parsed), requestModel)
 		if err != nil {
 			if imageCount > 0 {
 				return &OpenAIForwardResult{
@@ -2326,7 +2332,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 			)
 		}
 	} else {
-		usage, imageCount, imageOutputSizes, err = s.handleOpenAIImagesOAuthNonStreamingResponse(resp, c, parsed.ResponseFormat, requestModel)
+		usage, imageCount, imageOutputSizes, err = s.handleOpenAIImagesOAuthNonStreamingResponse(resp, c, account, parsed.ResponseFormat, requestModel)
 		if err != nil {
 			return nil, s.handleOpenAIImagesOAuthResponseError(
 				upstreamCtx,

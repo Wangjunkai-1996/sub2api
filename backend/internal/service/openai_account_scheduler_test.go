@@ -87,6 +87,7 @@ func (r schedulerGroupAwareOpenAIAccountRepo) ListSchedulableUngroupedByPlatform
 }
 
 type schedulerTestConcurrencyCache struct {
+	healthyOpenAI429TestCache
 	ConcurrencyCache
 	loadBatchErr    error
 	loadMap         map[int64]*AccountLoadInfo

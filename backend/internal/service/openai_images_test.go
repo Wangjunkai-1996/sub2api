@@ -929,6 +929,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthSingleImageDoesNotPassN(t *testi
 	svc.httpUpstream = upstream
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       1,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -1010,7 +1011,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthLikeBatchFansOutAndAggregatesUsa
 				svc := &OpenAIGatewayService{httpUpstream: upstream}
 				parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 				require.NoError(t, err)
-				account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: accountType, Credentials: map[string]any{"access_token": "token-123"}}
+				account := &Account{Status: StatusActive, ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: accountType, Credentials: map[string]any{"access_token": "token-123"}}
 
 				result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 				require.NoError(t, err)
@@ -1214,7 +1215,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchReturnsPartialSuccess(t *te
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
-	account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+	account := &Account{Status: StatusActive, ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 	require.NoError(t, err)
@@ -1262,7 +1263,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchStopsBeforeNextImageAfterCl
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
-	account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+	account := &Account{Status: StatusActive, ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 	result, err := svc.ForwardImages(requestCtx, c, account, body, parsed, "")
 
@@ -1313,7 +1314,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchPreservesPartialRateLimitSi
 	}
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
-	account := &Account{ID: 9, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+	account := &Account{Status: StatusActive, ID: 9, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 
@@ -1378,7 +1379,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchUsesLatestCodexSnapshotHead
 			svc := &OpenAIGatewayService{httpUpstream: &httpUpstreamRecorder{responses: responses}}
 			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 			require.NoError(t, err)
-			account := &Account{ID: 10, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+			account := &Account{Status: StatusActive, ID: 10, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 			result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 
@@ -1423,7 +1424,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchDefersChildReadErrors(t *te
 	}
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
-	account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+	account := &Account{Status: StatusActive, ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 	require.NoError(t, err)
@@ -1451,7 +1452,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchAllFailuresReturnError(t *t
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
-	account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+	account := &Account{Status: StatusActive, ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 	require.Nil(t, result)
@@ -1551,7 +1552,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthBatchAllHTTPFailuresPreserveFail
 			}
 			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 			require.NoError(t, err)
-			account := &Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
+			account := &Account{Status: StatusActive, ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
 
 			result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 
@@ -1677,6 +1678,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthUpstreamHTTPErrorSurfacesRealErr
 	}
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       1,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -1735,6 +1737,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthNonStreamModerationBlockedReturn
 	}
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       1,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -1785,6 +1788,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthNonStreamServerErrorReturnsFailo
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{
+		Status:   StatusActive,
 		ID:       21,
 		Name:     "openai-oauth-server-error",
 		Platform: PlatformOpenAI,
@@ -1814,7 +1818,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthNonStreamServerErrorReturnsFailo
 	require.Equal(t, http.StatusBadGateway, events[0].UpstreamStatusCode)
 }
 
-func TestOpenAIGatewayServiceForwardImages_OAuth429CarriesSameAccountRetryWindow(t *testing.T) {
+func TestOpenAIGatewayServiceForwardImages_OAuth429SwitchesWithoutSameAccountRetry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","response_format":"b64_json"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
@@ -1830,16 +1834,15 @@ func TestOpenAIGatewayServiceForwardImages_OAuth429CarriesSameAccountRetryWindow
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{ID: 22, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "token-123"}}
-	startedAt := time.Now()
 
 	result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
 
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.Equal(t, time.Second, failoverErr.SameAccountRetryDelay)
-	require.WithinDuration(t, startedAt.Add(openAIOAuth429RetryWindow), failoverErr.SameAccountRetryDeadline, time.Second)
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.Zero(t, failoverErr.SameAccountRetryDelay)
+	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
 }
 
 func TestOpenAIImagesOAuthBodyReadTransportErrorFailover(t *testing.T) {
@@ -1858,7 +1861,7 @@ func TestOpenAIImagesOAuthBodyReadTransportErrorFailover(t *testing.T) {
 	account := &Account{ID: 5400, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	svc := &OpenAIGatewayService{}
 
-	_, _, _, readErr := svc.handleOpenAIImagesOAuthNonStreamingResponse(resp, c, "b64_json", "gpt-image-2")
+	_, _, _, readErr := svc.handleOpenAIImagesOAuthNonStreamingResponse(resp, c, nil, "b64_json", "gpt-image-2")
 	require.Error(t, readErr)
 	err := svc.handleOpenAIImagesOAuthResponseError(context.Background(), c, account, "gpt-image-2", "https://api.openai.com/v1/responses", resp, OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c), readErr)
 
@@ -1975,6 +1978,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthStreamServerErrorAfterFlushDoesN
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{
+		Status:   StatusActive,
 		ID:       22,
 		Name:     "openai-oauth-partial-server-error",
 		Platform: PlatformOpenAI,
@@ -2389,6 +2393,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthStreamingTransformsEvents(t *tes
 	svc.httpUpstream = upstream
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       2,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -2543,6 +2548,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthEditsMultipartUsesResponsesAPI(t
 	svc.httpUpstream = upstream
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       3,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -2605,6 +2611,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthEditsStreamingTransformsEvents(t
 	svc.httpUpstream = upstream
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       4,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -2795,6 +2802,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthStreamingHandlesOutputItemDoneFa
 	svc.httpUpstream = upstream
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       5,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -2851,6 +2859,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthStreamingHandlesMultilineSSE(t *
 	}
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       11,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -2915,6 +2924,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuthStreamingDrainsAfterClientDiscon
 	svc.httpUpstream = upstream
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       9,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,

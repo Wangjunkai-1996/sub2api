@@ -170,6 +170,12 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 				reqLog.Info("openai.images.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
+			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
+				continue
+			}
+			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, false) {
+				return
+			}
 			reqLog.Warn("openai.images.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
@@ -180,11 +186,10 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
-				message := cls.Message
 				if !cls.ModelNotFound {
-					message = "No available compatible accounts"
+					cls.Message = "No available compatible accounts"
 				}
-				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, message, streamStarted)
+				h.handleSelectionFailure(c, cls, streamStarted)
 				return
 			}
 			if lastFailoverErr != nil {
@@ -199,11 +204,10 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
 			}
-			message := cls.Message
 			if !cls.ModelNotFound {
-				message = "No available compatible accounts"
+				cls.Message = "No available compatible accounts"
 			}
-			h.handleStreamingAwareError(c, cls.Status, cls.ErrType, message, streamStarted)
+			h.handleSelectionFailure(c, cls, streamStarted)
 			return
 		}
 
@@ -222,6 +226,10 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, effectiveStream, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquireRecoveryDeferred {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// Images 调度不装利润门，此分支实际不可达；防御性排除重选并受同一否决上限约束。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
@@ -233,6 +241,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
+		account = selection.Account
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		if !effectiveStream && !jsonKeepaliveStarted {
 			stopJSONKeepalive = service.StartOpenAIImagesJSONKeepalive(c, h.openAIImagesJSONKeepaliveInterval())
@@ -322,7 +331,9 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 								return
 							case <-time.After(retryDelay):
 							}
-							continue
+							if sameAccountRetryDeadlineAllows(failoverErr) {
+								continue
+							}
 						}
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
