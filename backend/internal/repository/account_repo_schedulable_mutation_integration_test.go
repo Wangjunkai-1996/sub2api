@@ -23,17 +23,15 @@ func (e *failSchedulableOutboxQueryExecutor) QueryContext(ctx context.Context, q
 	return e.sqlExecutor.QueryContext(ctx, query, args...)
 }
 
-type cancelSchedulableQueryExecutor struct {
-	sqlExecutor
+type cancelOnSetAccountRecorder struct {
+	schedulerCacheRecorder
 	cancel context.CancelFunc
 }
 
-func (e *cancelSchedulableQueryExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	rows, err := e.sqlExecutor.QueryContext(ctx, query, args...)
-	if err == nil && strings.Contains(query, "WITH updated AS") {
-		e.cancel()
-	}
-	return rows, err
+func (r *cancelOnSetAccountRecorder) SetAccount(ctx context.Context, account *service.Account) error {
+	err := r.schedulerCacheRecorder.SetAccount(ctx, account)
+	r.cancel()
+	return err
 }
 
 func TestAccountRepositorySetSchedulablePersistsSwitchAndOutbox(t *testing.T) {
@@ -99,8 +97,11 @@ func TestAccountRepositorySetSchedulableDetachesSnapshotAfterCommit(t *testing.T
 	t.Cleanup(func() { _ = client.Account.DeleteOneID(account.ID).Exec(context.Background()) })
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	cache := &schedulerCacheRecorder{}
-	repo := newAccountRepositoryWithSQL(client, &cancelSchedulableQueryExecutor{sqlExecutor: integrationDB, cancel: cancel}, cache)
+	cache := &cancelOnSetAccountRecorder{
+		schedulerCacheRecorder: schedulerCacheRecorder{},
+		cancel:                 cancel,
+	}
+	repo := newAccountRepositoryWithSQL(client, integrationDB, cache)
 
 	require.NoError(t, repo.SetSchedulable(ctx, account.ID, false))
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
