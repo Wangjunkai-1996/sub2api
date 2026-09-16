@@ -362,7 +362,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 						return
 					}
 					// Retry account-scoped transients in pool mode; move on first for request-scoped overloads.
-					if openAIAccountRetryBeforeFailoverAllowed(failoverErr) {
+					if openAIAccountRetryBeforeFailoverAllowed(c.Request.Context(), failoverErr) {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++

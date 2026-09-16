@@ -36,6 +36,10 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	var releaseProbeContext func()
 	if request != nil {
 		request = request.WithContext(ContextWithSelectedAccountEgress(request.Context(), account))
+		if HasOpenAIModelDispatchBudget(request.Context()) {
+			// A 307/308 must not silently replay a model POST outside the shared budget.
+			request = request.WithContext(WithHTTPUpstreamRedirectsDisabled(request.Context()))
+		}
 		if probe := openAI429AttemptFromContext(request.Context(), account); probe.Probe() {
 			upstreamCtx, release := openAI429ProbeContext(request.Context(), account)
 			releaseProbeContext = release
@@ -71,6 +75,9 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 		}
 		response.Body = &accountEgressUseBody{body: response.Body, release: releaseUse}
 		return response, nil
+	}
+	if err := takeOpenAIModelDispatch(request.Context(), account.ID); err != nil {
+		return finish(nil, err)
 	}
 	if s.pluginManager != nil {
 		response, handled, err := s.pluginManager.RoundTripOpenAIOAuth(request.Context(), request, proxyURL, account)

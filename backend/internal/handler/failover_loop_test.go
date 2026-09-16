@@ -102,14 +102,20 @@ func TestSameAccountRetryAllowedHonorsErrorMaxBeforeDeadline(t *testing.T) {
 }
 
 func TestOpenAIAccountRetryBeforeFailoverSkipsRequestScopedTransient(t *testing.T) {
-	require.False(t, openAIAccountRetryBeforeFailoverAllowed(&service.UpstreamFailoverError{
+	require.False(t, openAIAccountRetryBeforeFailoverAllowed(context.Background(), &service.UpstreamFailoverError{
 		RetryableOnSameAccount: true,
 		RequestScopedTransient: true,
 	}))
-	require.True(t, openAIAccountRetryBeforeFailoverAllowed(&service.UpstreamFailoverError{
+	require.True(t, openAIAccountRetryBeforeFailoverAllowed(context.Background(), &service.UpstreamFailoverError{
 		RetryableOnSameAccount: true,
 	}))
-	require.False(t, openAIAccountRetryBeforeFailoverAllowed(nil))
+	require.False(t, openAIAccountRetryBeforeFailoverAllowed(context.Background(), nil))
+}
+
+func TestOpenAIAccountRetryBeforeFailoverPrefersFreshAccountWithinResponsesBudget(t *testing.T) {
+	err := &service.UpstreamFailoverError{RetryableOnSameAccount: true}
+	require.False(t, openAIAccountRetryBeforeFailoverAllowed(service.WithOpenAIModelDispatchBudget(context.Background()), err))
+	require.True(t, openAIAccountRetryBeforeFailoverAllowed(context.Background(), err), "other endpoints retain existing pool behavior")
 }
 
 func TestSameAccountRetryDeadlineAllows(t *testing.T) {

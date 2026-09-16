@@ -1630,7 +1630,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	if lastEgressAdmissionErr != nil {
 		return nil, lastEgressAdmissionErr
 	}
-	return nil, ErrNoAvailableAccounts
+	return nil, noAvailableOpenAISelectionError(requestedModel, false, filterStats.summary("selection_order_exhausted"))
 }
 
 func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, groupID *int64, platform string) ([]Account, error) {

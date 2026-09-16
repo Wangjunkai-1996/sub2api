@@ -607,6 +607,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// Get subscription info (may be nil)
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
+	if requestPlatform == service.PlatformOpenAI {
+		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchBudget(c.Request.Context()))
+	}
 
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
@@ -924,6 +927,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				h.handleOpenAIRetryBudgetExhausted(c, streamStarted || c.Writer.Written())
 				return
 			}
+			if errors.Is(err, service.ErrOpenAIModelDispatchBudgetExhausted) {
+				submitResponsesUsage(result)
+				h.handleOpenAIModelDispatchBudgetExhausted(c, streamStarted || c.Writer.Written())
+				return
+			}
 			if result != nil && result.ClientDisconnect {
 				reqLog.Info("openai.client_disconnected",
 					zap.Int64("account_id", account.ID),
@@ -1034,7 +1042,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						)
 					}
 					// 账号级瞬时错误才在池模式下原地重试；请求级降载优先换号。
-					if openAIAccountRetryBeforeFailoverAllowed(failoverErr) {
+					if openAIAccountRetryBeforeFailoverAllowed(c.Request.Context(), failoverErr) {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++
@@ -1628,7 +1636,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 						return
 					}
 					// 账号级瞬时错误才在池模式下原地重试；请求级降载优先换号。
-					if openAIAccountRetryBeforeFailoverAllowed(failoverErr) {
+					if openAIAccountRetryBeforeFailoverAllowed(c.Request.Context(), failoverErr) {
 						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++
@@ -3613,6 +3621,9 @@ func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error,
 }
 
 func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, streamStarted bool) {
+	if failoverErr != nil && failoverErr.ShouldRetryNextAccount() {
+		markOpenAIRequestRetryExhausted(c)
+	}
 	if failoverErr == nil {
 		h.handleFailoverExhaustedSimple(c, http.StatusBadGateway, streamStarted)
 		return
@@ -3763,6 +3774,7 @@ func isSafeRetryAfter(value string) bool {
 
 // handleFailoverExhaustedSimple 简化版本，用于没有响应体的情况
 func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, statusCode int, streamStarted bool) {
+	markOpenAIRequestRetryExhausted(c)
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
 	service.SetOpsUpstreamError(c, statusCode, errMsg, "")
 	service.MarkOpsUpstreamFinalOutcome(c, nil, status, "failover_exhausted")
@@ -4004,6 +4016,7 @@ func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context
 		return
 	}
 	c.Set(openAIRequestBudgetResponseKey, true)
+	markOpenAIRequestRetryExhausted(c)
 	const message = "The request could not complete within the upstream time budget"
 	service.SetOpsUpstreamError(c, http.StatusGatewayTimeout, message, "")
 	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusGatewayTimeout, "request_budget_exhausted")
@@ -4011,10 +4024,27 @@ func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context
 }
 
 func (h *OpenAIGatewayHandler) handleOpenAIRetryBudgetExhausted(c *gin.Context, streamStarted bool) {
+	markOpenAIRequestRetryExhausted(c)
 	const message = "The upstream retry window has expired"
 	service.SetOpsUpstreamError(c, http.StatusBadGateway, message, "")
 	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusBadGateway, "retry_budget_exhausted")
 	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", message, streamStarted)
+}
+
+func (h *OpenAIGatewayHandler) handleOpenAIModelDispatchBudgetExhausted(c *gin.Context, streamStarted bool) {
+	markOpenAIRequestRetryExhausted(c)
+	const message = "The upstream model attempt limit has been reached"
+	service.SetOpsUpstreamError(c, http.StatusBadGateway, message, "")
+	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusBadGateway, "model_dispatch_budget_exhausted")
+	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", message, streamStarted)
+}
+
+// The downstream gateway must not restart an exhausted logical request with a
+// fresh account budget. This marks request-local exhaustion, not pool health.
+func markOpenAIRequestRetryExhausted(c *gin.Context) {
+	if c != nil && c.Request != nil && !c.Writer.Written() && service.HasOpenAIModelDispatchBudget(c.Request.Context()) {
+		c.Header("X-Sub2-Retry-Status", "exhausted")
+	}
 }
 
 func openAIRequestAllowsFailoverReplay(c *gin.Context) bool {

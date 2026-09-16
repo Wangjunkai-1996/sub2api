@@ -1626,10 +1626,12 @@ func (s *openAISelectionFilterStats) exclude(reason string) {
 	s.reasons[reason]++
 }
 
-// summary renders deterministic exclusion statistics for scheduling error
-// messages, e.g. "pool=3, filtered: model_not_supported=2 quota_auto_pause_7d=1".
+// summary renders deterministic exclusion statistics for scheduling errors.
+// pool is the snapshot after repository/runtime prefilters, never the configured
+// group size. Each initial candidate records only its first rejection reason.
 // Reasons are sorted lexicographically so the output is stable for tests and
-// log aggregation. extra, when non-empty, is appended as a trailing marker.
+// log aggregation. Later admission/recheck failures cannot establish a complete
+// current eligible count; keep that value explicitly unknown.
 func (s openAISelectionFilterStats) summary(extra string) string {
 	var b strings.Builder
 	_, _ = b.WriteString("pool=")
@@ -1652,6 +1654,28 @@ func (s openAISelectionFilterStats) summary(extra string) string {
 		_, _ = b.WriteString(", ")
 		_, _ = b.WriteString(extra)
 	}
+	_, _ = b.WriteString(", scope=post_prefilter_snapshot")
+	eligible := s.pool
+	for _, count := range s.reasons {
+		eligible -= count
+	}
+	stopReason := extra
+	if extra == "" {
+		stopReason = "initial_filter_exhausted"
+		if s.pool == 0 {
+			stopReason = "prefiltered_pool_empty"
+		} else if s.reasons["excluded"] == s.pool {
+			stopReason = "request_exclusions_exhausted"
+		}
+	}
+	_, _ = b.WriteString(", eligible_now=")
+	if extra == "" && eligible == 0 {
+		_, _ = b.WriteString("0")
+	} else {
+		_, _ = b.WriteString("unknown")
+	}
+	_, _ = b.WriteString(", stop_reason=")
+	_, _ = b.WriteString(stopReason)
 	return b.String()
 }
 

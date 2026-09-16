@@ -391,6 +391,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if err != nil {
+			if IsOpenAIModelDispatchStop(err) {
+				return nil, err
+			}
 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
 			// a failover so the handler switches to a healthy account.
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
@@ -801,7 +804,7 @@ func shouldFailoverOpenAIPassthroughResponse(account *Account, statusCode int, r
 	case http.StatusTooManyRequests, 529:
 		return true
 	}
-	if account == nil || account.Type != AccountTypeAPIKey {
+	if account == nil || (account.Type != AccountTypeAPIKey && !account.IsOpenAIOAuthLike()) {
 		return false
 	}
 	switch statusCode {
@@ -1380,6 +1383,7 @@ func logOpenAICapacityFailoverSuppressed(
 	path string,
 	upstreamRequestID string,
 	eventType string,
+	boundary ...*openAIStreamReplayBoundary,
 ) {
 	fields := []zap.Field{
 		zap.String("path", path),
@@ -1391,6 +1395,9 @@ func logOpenAICapacityFailoverSuppressed(
 			zap.Int64("account_id", account.ID),
 			zap.String("platform", account.Platform),
 		)
+	}
+	if len(boundary) > 0 && boundary[0] != nil {
+		fields = append(fields, boundary[0].fields()...)
 	}
 	logger.FromContext(ctx).Warn("gateway.failover_suppressed_after_semantic_output", fields...)
 }
@@ -1962,8 +1969,16 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		s.recordOpenAIStreamUpstreamError(c, account, true, upstreamRequestID, kind, payload, message)
 		streamErrorRecorded = true
 	}
-	// pendingLines 在首个可见输出前保留前导事件，确保无输出失败仍可安全 failover。
-	pendingLines := make([]string, 0, 8)
+	// Reuse the bounded native stage; never flush preamble merely to free memory.
+	pendingStage := newDefaultOpenAIFirstOutputStage()
+	defer func() {
+		if err := pendingStage.Close(); err != nil {
+			logger.FromContext(ctx).Warn("OpenAI passthrough staging cleanup failed", zap.Error(err))
+		}
+	}()
+	var replayBoundary openAIStreamReplayBoundary
+	replayLogger := logger.FromContext(ctx).With(zap.String("path", "passthrough_sse"),
+		zap.Int64("account_id", account.ID), zap.String("upstream_request_id", upstreamRequestID))
 
 	// ── 首个可见输出之前的下游 keepalive ──────────────────────────────────
 	//
@@ -1974,7 +1989,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	//    failover can buffer response.created / response.in_progress, so
 	//    keepalive must be based on downstream idle time."
 	//
-	// 上面的 pendingLines 正是同一种缓冲：首个可见输出到来之前，下游【一个字节
+	// 上面的 pendingStage 正是同一种缓冲：首个可见输出到来之前，下游【一个字节
 	// 都收不到】—— 连 HTTP 响应头都不会提交（gin 的 ResponseWriter 直到首次写入
 	// 才发送 header）。Forward 路径为此加了心跳，透传路径漏了。
 	//
@@ -1987,7 +2002,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	//   1. 提交 HTTP 响应头，让下游知道连接活着；
 	//   2. 刷新中间层的空闲超时（proxy_read_timeout 衡量的是两次读之间的间隔，
 	//      不是请求总时长），长推理因此不再被误杀；
-	//   3. 不写出任何 pendingLines、不泄露账号相关的头，
+	//   3. 不写出任何 pendingStage，
 	//      且心跳字节已由 OpenAICompactKeepaliveAdjustedWrittenSize 排除，
 	//      所以 pre-output failover 的能力完全不受影响（#3887 的记账在此复用）。
 	//
@@ -2028,18 +2043,21 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 		return true
 	}
-	writePendingLines := func() bool {
+	writePendingLines := func(reason string) bool {
+		stopKeepalive()
+		clientOutputStarted = true
+		replayBoundary.commit(replayLogger, reason, pendingStage.Buffered())
 		if !writeTTFTComment(false) {
 			return false
 		}
-		for _, pending := range pendingLines {
-			if _, err := fmt.Fprintln(w, pending); err != nil {
-				clientDisconnected = true
-				logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] Client disconnected during streaming, continue draining upstream for usage: account=%d", account.ID)
-				return false
-			}
+		if pendingStage.closed {
+			return true
 		}
-		pendingLines = pendingLines[:0]
+		if err := pendingStage.CommitTo(w); err != nil {
+			clientDisconnected = true
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] Client disconnected during streaming, continue draining upstream for usage: account=%d", account.ID)
+			return false
+		}
 		return true
 	}
 	ensureResponseFailedTerminal := func() {
@@ -2051,7 +2069,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			bareErrorAccountSideEffectsPending = false
 		}
 		recordStreamError(bareErrorPayload, "http_error", failedMessage)
-		if clientDisconnected || !writePendingLines() {
+		if clientDisconnected || !writePendingLines("synthesized_terminal_failure") {
 			return
 		}
 		if _, err := fmt.Fprint(w, buildOpenAIResponseFailedSSE(responseID, originalModel, bareErrorPayload, failedMessage)); err != nil {
@@ -2137,7 +2155,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				(eventType == "error" || eventType == "response.failed") &&
 				openAIStreamClientOutputStarted(c, clientOutputStarted) &&
 				isOpenAIUpstreamCapacityShedEvent(dataBytes) {
-				logOpenAICapacityFailoverSuppressed(ctx, account, "passthrough_sse", upstreamRequestID, eventType)
+				logOpenAICapacityFailoverSuppressed(ctx, account, "passthrough_sse", upstreamRequestID, eventType, &replayBoundary)
 				capacityFailoverSuppressedLogged = true
 			}
 			cyberHit := false
@@ -2210,7 +2228,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 						return resultWithUsage(),
 							s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
 					}
-					if !cyberHit && !sawBareError {
+					if !cyberHit && !sawBareError && !c.Writer.Written() {
 						if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
 							// 命中透传规则也要记录 ops 上游错误事件（对齐 CC/Messages 与
 							// antigravity 先例），否则透传命中的 failed 在监控中不可见。
@@ -2258,6 +2276,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				line = "data: " + string(sanitizedData)
 			}
 			lineStartsClientOutput = forceFlushFailedEvent || openAIStreamDataStartsClientOutput(trimmedData, eventType)
+			if lineStartsClientOutput && !suppressCurrentEvent {
+				replayBoundary.observe(trimmedData, eventType)
+			}
 			if lineStartsClientOutput && trimmedData != "[DONE]" && !openAIStreamEventTypeIsTerminal(eventType) {
 				semanticOutputSeen = true
 			}
@@ -2287,7 +2308,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 
 		if !clientDisconnected && !failureDelivered && !suppressCurrentEvent {
 			if !clientOutputStarted && !lineStartsClientOutput {
-				pendingLines = append(pendingLines, line)
+				_, stageErr := pendingStage.WriteString(line + "\n")
+				if stageErr != nil {
+					_ = resp.Body.Close()
+					return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID,
+						nil, "OpenAI passthrough first-output staging failed")
+				}
 				continue
 			}
 			// 真实输出开始，心跳的使命结束。停拍是幂等的，且会与心跳 goroutine
@@ -2296,7 +2322,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				stopKeepalive()
 			}
 			if !clientOutputStarted {
-				if !writePendingLines() {
+				if !writePendingLines("first_nonreplayable_event") {
 					continue
 				}
 			} else if !writeTTFTComment(true) {

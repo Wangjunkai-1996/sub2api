@@ -95,10 +95,13 @@ func sameAccountRetryAllowed(failoverErr *service.UpstreamFailoverError, retryCo
 	return retryLimit > 0 && retryCount < retryLimit
 }
 
-// Request-scoped overloads should move to another eligible account before
-// spending the request retry window on the same account. Account-scoped
-// transient failures retain the configured pool retry behavior.
-func openAIAccountRetryBeforeFailoverAllowed(failoverErr *service.UpstreamFailoverError) bool {
+// HTTP Responses with a shared dispatch budget move to a fresh account on
+// recoverable failures. Service-level compatibility repairs still run in place.
+// Other entry points retain their configured pool retry behavior.
+func openAIAccountRetryBeforeFailoverAllowed(ctx context.Context, failoverErr *service.UpstreamFailoverError) bool {
+	if service.HasOpenAIModelDispatchBudget(ctx) {
+		return false
+	}
 	return failoverErr != nil && failoverErr.RetryableOnSameAccount && !failoverErr.RequestScopedTransient
 }
 

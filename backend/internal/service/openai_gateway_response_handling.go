@@ -161,6 +161,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	// attempt failure; it must never expose a partial stream downstream.
 	atomicStreamCommitted := false
 	clientOutputStarted := false
+	var replayBoundary openAIStreamReplayBoundary
+	replayLogger := logger.FromContext(ctx).With(zap.String("path", "native_sse"),
+		zap.String("upstream_request_id", strings.TrimSpace(resp.Header.Get("x-request-id"))))
+	if account != nil {
+		replayLogger = replayLogger.With(zap.Int64("account_id", account.ID))
+	}
 	bufferedWriter := bufio.NewWriterSize(w, 4*1024)
 	var firstOutputStage *openAIFirstOutputStage
 	if stageBeforeClientOutput {
@@ -183,7 +189,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		}
 		return int64(bufferedWriter.Buffered())
 	}
-	flushBuffered := func() error {
+	flushBuffered := func(reason string) error {
 		if firstOutputStage != nil && !firstOutputStage.closed {
 			// An atomic attempt must never be committed by incidental flushes (for
 			// example timeout/error handling). The explicit terminal commit below is
@@ -193,6 +199,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 			// A failed write can still expose the timing comment or staged bytes.
 			clientOutputStarted = true
+			replayBoundary.commit(replayLogger, reason, firstOutputStage.Buffered())
 			if err := writeTTFTComment(w, false); err != nil {
 				return err
 			}
@@ -341,6 +348,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		atomicStreamCommitted = true
 		atomicStreamRetry = false
 		clientOutputStarted = true
+		replayBoundary.commit(replayLogger, "atomic_terminal", firstOutputStage.Buffered())
 		bindResponseRouting()
 		applyAttemptResponseHeaders()
 		if err := writeTTFTComment(w, false); err != nil {
@@ -434,7 +442,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				applyAttemptResponseHeaders()
 			}
 			if shouldFlush {
-				if err := flushBuffered(); err != nil {
+				if err := flushBuffered("completed_event"); err != nil {
 					clientDisconnected = true
 					logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming flush, continuing to drain upstream for billing")
 				} else {
@@ -473,7 +481,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		}
 		errorEventSent = true
 		payload := `{"type":"error","sequence_number":0,"error":{"type":"upstream_error","message":` + strconv.Quote(reason) + `,"code":` + strconv.Quote(reason) + `}}`
-		if err := flushBuffered(); err != nil {
+		if err := flushBuffered("synthetic_error"); err != nil {
 			clientDisconnected = true
 			return
 		}
@@ -481,7 +489,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			clientDisconnected = true
 			return
 		}
-		if err := flushBuffered(); err != nil {
+		if err := flushBuffered("synthetic_error"); err != nil {
 			clientDisconnected = true
 			return
 		}
@@ -521,7 +529,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if atomicStreamRetry && !atomicStreamCommitted {
 			return
 		}
-		if err := flushBuffered(); err != nil {
+		if err := flushBuffered("final_flush"); err != nil {
 			clientDisconnected = true
 			logger.LegacyPrintf("service.openai_gateway", "%s", disconnectMessage)
 			return
@@ -709,9 +717,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			forceFlushFailedEvent := false
 			if !capacityFailoverSuppressedLogged && account != nil && account.Platform == PlatformOpenAI &&
 				(eventType == "error" || eventType == "response.failed") &&
-				openAIStreamClientOutputStarted(c, clientOutputStarted) &&
+				clientOutputHasStarted() &&
 				isOpenAIUpstreamCapacityShedEvent(dataBytes) {
-				logOpenAICapacityFailoverSuppressed(ctx, account, "native_sse", upstreamRequestID, eventType)
+				logOpenAICapacityFailoverSuppressed(ctx, account, "native_sse", upstreamRequestID, eventType, &replayBoundary)
 				capacityFailoverSuppressedLogged = true
 			}
 			cyberHit := false
@@ -882,6 +890,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				line = s.replaceModelInSSELine(line, mappedModel, originalModel)
 			}
 			startsClientOutput := forceFlushFailedEvent || openAIStreamDataStartsClientOutput(data, eventType)
+			if startsClientOutput && !suppressCurrentEvent {
+				replayBoundary.observe(data, eventType)
+			}
 			startsVisibleOutput := openAIStreamDataStartsVisibleOutput(data, eventType)
 			startsTTFTOutput := openAIStreamDataStartsTTFT(data, eventType, forceFlushFailedEvent, ttftMode)
 			oversizedFirstSemanticLine := startsClientOutput && !eventStartsClientOutput &&
@@ -919,7 +930,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				}
 				stopFirstOutputTimer()
 				applyAttemptResponseHeaders()
-				if err := flushBuffered(); err != nil {
+				if err := flushBuffered("oversized_first_nonreplayable_event"); err != nil {
 					clientDisconnected = true
 					logger.LegacyPrintf("service.openai_gateway", "Client disconnected while committing oversized first semantic event, continuing to drain upstream for billing")
 				} else {
@@ -1031,7 +1042,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			} else {
 				eventInProgress = line != ""
 				if shouldFlush {
-					if err := flushBuffered(); err != nil {
+					if err := flushBuffered("completed_event"); err != nil {
 						clientDisconnected = true
 						logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming flush, continuing to drain upstream for billing")
 					} else {
@@ -1237,7 +1248,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
 				continue
 			}
-			if err := flushBuffered(); err != nil {
+			if err := flushBuffered("keepalive"); err != nil {
 				clientDisconnected = true
 				logger.LegacyPrintf("service.openai_gateway", "Client disconnected during keepalive flush, continuing to drain upstream for billing")
 			} else {
