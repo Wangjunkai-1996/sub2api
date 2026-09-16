@@ -1206,7 +1206,21 @@ func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 	if trimmed == "" {
 		return false
 	}
-	switch strings.TrimSpace(eventType) {
+	eventType = strings.TrimSpace(eventType)
+	if eventType == "" && gjson.Valid(trimmed) {
+		eventType = strings.TrimSpace(gjson.Get(trimmed, "type").String())
+	}
+	// An empty delta is structural progress only. It must stay inside the
+	// first-output replay window so a later transient terminal error can still
+	// fail over to another account.
+	if strings.HasSuffix(eventType, ".delta") {
+		if !gjson.Valid(trimmed) {
+			return true
+		}
+		delta := gjson.Get(trimmed, "delta")
+		return delta.Exists() && delta.String() != ""
+	}
+	switch eventType {
 	case "response.failed":
 		return false
 	case "error":
@@ -1219,6 +1233,24 @@ func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 		return !openAIStreamFailedEventShouldFailover(payload, extractOpenAISSEErrorMessage(payload))
 	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
 		return openAIStreamAddedEventStartsClientOutput([]byte(trimmed), eventType)
+	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done",
+		"response.audio_transcript.done", "response.function_call_arguments.done", "response.custom_tool_call_input.done",
+		"response.reasoning_summary_part.done":
+		if !gjson.Valid(trimmed) {
+			return true
+		}
+		return openAIStreamDataStartsVisibleOutput(trimmed, eventType)
+	case "response.content_part.done":
+		if !gjson.Valid(trimmed) {
+			return true
+		}
+		part := gjson.Get(trimmed, "part")
+		return part.Get("text").String() != "" || part.Get("transcript").String() != "" || part.Get("refusal").String() != ""
+	case "response.output_item.done":
+		if !gjson.Valid(trimmed) {
+			return true
+		}
+		return openAIStreamItemHasClientOutput(gjson.Get(trimmed, "item"))
 	}
 	return !openAIStreamEventIsPreamble(eventType)
 }
@@ -1232,6 +1264,18 @@ func openAIStreamItemHasVisibleOutput(item gjson.Result) bool {
 			if part.Get("text").String() != "" || part.Get("transcript").String() != "" {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func openAIStreamItemHasClientOutput(item gjson.Result) bool {
+	if openAIStreamItemHasVisibleOutput(item) || item.Get("encrypted_content").String() != "" {
+		return true
+	}
+	for _, part := range item.Get("content").Array() {
+		if part.Get("refusal").String() != "" {
+			return true
 		}
 	}
 	return false

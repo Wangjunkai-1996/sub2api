@@ -275,7 +275,71 @@ func TestOpenAIGatewayHandlerResponses_CapacityRetryThenUsesNormalAccountSwitchB
 
 	handler.Responses(c)
 
-	require.Equal(t, []int64{1, 1, 2, 3}, upstream.calls(), "status=%d body=%s", rec.Code, rec.Body.String())
+	// Request-scoped capacity errors move to another eligible account before
+	// spending the retry window on the same account.
+	require.Equal(t, []int64{1, 2, 3}, upstream.calls(), "status=%d body=%s", rec.Code, rec.Body.String())
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Contains(t, rec.Body.String(), `"delta":"ok"`)
+}
+
+func TestOpenAIGatewayHandlerResponses_CapacityFailoverKeepsDistinctCredentialCandidates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	account := func(id int64, accountType string, credential string) service.Account {
+		credentials := map[string]any{}
+		if accountType == service.AccountTypeAPIKey {
+			credentials["api_key"] = credential
+			credentials["base_url"] = "https://vip.mdkj.lol/v1"
+		} else {
+			credentials["access_token"] = credential
+		}
+		return service.Account{
+			ID: id, Name: fmt.Sprintf("credential-account-%d", id),
+			Platform: service.PlatformOpenAI, Type: accountType,
+			Status: service.StatusActive, Schedulable: true, Priority: int(id - 1),
+			Credentials: credentials,
+			Extra:       map[string]any{"openai_passthrough": false},
+		}
+	}
+
+	tests := []struct {
+		name  string
+		types []string
+	}{
+		{
+			name:  "same host different API keys",
+			types: []string{service.AccountTypeAPIKey, service.AccountTypeAPIKey, service.AccountTypeAPIKey},
+		},
+		{
+			name:  "API key to OAuth to API key",
+			types: []string{service.AccountTypeAPIKey, service.AccountTypeOAuth, service.AccountTypeAPIKey},
+		},
+		{
+			name:  "OAuth to API key to OAuth",
+			types: []string{service.AccountTypeOAuth, service.AccountTypeAPIKey, service.AccountTypeOAuth},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			accounts := []service.Account{
+				account(1, tt.types[0], "credential-1"),
+				account(2, tt.types[1], "credential-2"),
+				account(3, tt.types[2], "credential-3"),
+			}
+			upstream := &openAIResponsesCapacityFailoverUpstream{}
+			handler := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts)
+			c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(
+				`{"model":"gpt-5.1","stream":true,"input":"hello"}`,
+			))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			handler.Responses(c)
+
+			require.Equal(t, []int64{1, 2, 3}, upstream.calls(), "status=%d body=%s", rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Contains(t, rec.Body.String(), `"delta":"ok"`)
+		})
+	}
 }

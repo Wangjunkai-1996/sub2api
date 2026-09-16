@@ -101,6 +101,17 @@ func TestSameAccountRetryAllowedHonorsErrorMaxBeforeDeadline(t *testing.T) {
 	require.False(t, sameAccountRetryAllowed(err, 0, 0), "an explicit zero retry budget remains disabled")
 }
 
+func TestOpenAIAccountRetryBeforeFailoverSkipsRequestScopedTransient(t *testing.T) {
+	require.False(t, openAIAccountRetryBeforeFailoverAllowed(&service.UpstreamFailoverError{
+		RetryableOnSameAccount: true,
+		RequestScopedTransient: true,
+	}))
+	require.True(t, openAIAccountRetryBeforeFailoverAllowed(&service.UpstreamFailoverError{
+		RetryableOnSameAccount: true,
+	}))
+	require.False(t, openAIAccountRetryBeforeFailoverAllowed(nil))
+}
+
 func TestSameAccountRetryDeadlineAllows(t *testing.T) {
 	require.True(t, sameAccountRetryDeadlineAllows(&service.UpstreamFailoverError{}))
 	require.True(t, sameAccountRetryDeadlineAllows(&service.UpstreamFailoverError{

@@ -95,6 +95,13 @@ func sameAccountRetryAllowed(failoverErr *service.UpstreamFailoverError, retryCo
 	return retryLimit > 0 && retryCount < retryLimit
 }
 
+// Request-scoped overloads should move to another eligible account before
+// spending the request retry window on the same account. Account-scoped
+// transient failures retain the configured pool retry behavior.
+func openAIAccountRetryBeforeFailoverAllowed(failoverErr *service.UpstreamFailoverError) bool {
+	return failoverErr != nil && failoverErr.RetryableOnSameAccount && !failoverErr.RequestScopedTransient
+}
+
 // sameAccountRetryDeadlineAllows prevents a retry from starting after the
 // service-provided same-account retry window has elapsed.
 func sameAccountRetryDeadlineAllows(failoverErr *service.UpstreamFailoverError) bool {
