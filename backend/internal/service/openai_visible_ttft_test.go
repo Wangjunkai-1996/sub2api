@@ -41,6 +41,42 @@ func TestOpenAIVisibleOutputClassification(t *testing.T) {
 	}
 }
 
+func TestOpenAIClientOutputClassificationPreservesReplayBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		data      string
+		eventType string
+		want      bool
+	}{
+		{"empty text delta", `{"delta":""}`, "response.output_text.delta", false},
+		{"empty reasoning delta", `{"delta":""}`, "response.reasoning_text.delta", false},
+		{"null delta", `{"delta":null}`, "response.output_text.delta", true},
+		{"missing delta", `{}`, "response.output_text.delta", true},
+		{"object delta", `{"delta":{}}`, "response.output_text.delta", true},
+		{"malformed delta", `{"delta":`, "response.output_text.delta", true},
+		{"unknown empty delta", `{"delta":""}`, "response.unknown.delta", true},
+		{"empty text done", `{"text":""}`, "response.output_text.done", false},
+		{"null text done", `{"text":null}`, "response.output_text.done", true},
+		{"empty argument done", `{"arguments":""}`, "response.function_call_arguments.done", true},
+		{"empty custom input done", `{"input":""}`, "response.custom_tool_call_input.done", true},
+		{"unknown part done", `{"part":{"type":"opaque","value":"content"}}`, "response.content_part.done", true},
+		{"missing item done", `{}`, "response.output_item.done", true},
+		{"unknown item done", `{"item":{"type":"computer_call","action":{"type":"click"}}}`, "response.output_item.done", true},
+		{"empty message done", `{"item":{"type":"message","content":[]}}`, "response.output_item.done", false},
+		{"invalid message done", `{"item":{"type":"message","content":null}}`, "response.output_item.done", true},
+		{"empty reasoning done", `{"item":{"type":"reasoning","summary":[]}}`, "response.output_item.done", false},
+		{"encrypted reasoning done", `{"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}`, "response.output_item.done", true},
+		{"refusal done", `{"item":{"type":"message","content":[{"type":"refusal","refusal":"blocked"}]}}`, "response.output_item.done", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, openAIStreamDataStartsClientOutput(tc.data, tc.eventType))
+		})
+	}
+	const encrypted = `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}`
+	require.True(t, openAIStreamDataStartsClientOutput(encrypted, ""))
+	require.False(t, openAIStreamDataStartsVisibleOutput(encrypted, ""), "opaque output must not change visible TTFT")
+}
+
 func TestOpenAIResponsesTTFTStartsAtVisibleOutput(t *testing.T) {
 	for _, passthrough := range []bool{false, true} {
 		name := "native"

@@ -1122,13 +1122,14 @@ func openAIStreamEventIsPreamble(eventType string) bool {
 	}
 }
 
-func openAIStreamAddedEventStartsClientOutput(payload []byte, eventType string) bool {
+func openAIStreamStructuredEventStartsClientOutput(payload []byte, eventType string) bool {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return true
 	}
+	done := strings.HasSuffix(eventType, ".done")
 
 	switch strings.TrimSpace(eventType) {
-	case "response.output_item.added":
+	case "response.output_item.added", "response.output_item.done":
 		item := gjson.GetBytes(payload, "item")
 		if !item.Exists() || !item.IsObject() {
 			return true
@@ -1140,10 +1141,11 @@ func openAIStreamAddedEventStartsClientOutput(payload []byte, eventType string) 
 			}
 			summary := item.Get("summary")
 			if !summary.IsArray() {
-				return false
+				return done
 			}
 			for _, part := range summary.Array() {
-				if strings.TrimSpace(part.Get("type").String()) != "summary_text" || part.Get("text").String() != "" {
+				if strings.TrimSpace(part.Get("type").String()) != "summary_text" || part.Get("text").String() != "" ||
+					(done && part.Get("text").Type != gjson.String) {
 					return true
 				}
 			}
@@ -1151,16 +1153,16 @@ func openAIStreamAddedEventStartsClientOutput(payload []byte, eventType string) 
 		case "message":
 			content := item.Get("content")
 			if !content.IsArray() {
-				return false
+				return done
 			}
 			for _, part := range content.Array() {
 				switch strings.TrimSpace(part.Get("type").String()) {
 				case "output_text":
-					if part.Get("text").String() != "" {
+					if part.Get("text").String() != "" || (done && part.Get("text").Type != gjson.String) {
 						return true
 					}
 				case "refusal":
-					if part.Get("refusal").String() != "" {
+					if part.Get("refusal").String() != "" || (done && part.Get("refusal").Type != gjson.String) {
 						return true
 					}
 				default:
@@ -1169,33 +1171,33 @@ func openAIStreamAddedEventStartsClientOutput(payload []byte, eventType string) 
 			}
 			return false
 		case "function_call":
-			return item.Get("arguments").String() != ""
+			return done || item.Get("arguments").String() != ""
 		case "custom_tool_call":
-			return item.Get("input").String() != ""
+			return done || item.Get("input").String() != ""
 		case "compaction":
-			return item.Get("encrypted_content").String() != ""
+			return item.Get("encrypted_content").String() != "" || (done && item.Get("encrypted_content").Type != gjson.String)
 		default:
 			return true
 		}
-	case "response.content_part.added":
+	case "response.content_part.added", "response.content_part.done":
 		part := gjson.GetBytes(payload, "part")
 		if !part.Exists() || !part.IsObject() {
 			return true
 		}
 		switch strings.TrimSpace(part.Get("type").String()) {
 		case "output_text":
-			return part.Get("text").String() != ""
+			return part.Get("text").String() != "" || (done && part.Get("text").Type != gjson.String)
 		case "refusal":
-			return part.Get("refusal").String() != ""
+			return part.Get("refusal").String() != "" || (done && part.Get("refusal").Type != gjson.String)
 		default:
 			return true
 		}
-	case "response.reasoning_summary_part.added":
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
 		part := gjson.GetBytes(payload, "part")
 		if !part.Exists() || !part.IsObject() || strings.TrimSpace(part.Get("type").String()) != "summary_text" {
 			return true
 		}
-		return part.Get("text").String() != ""
+		return part.Get("text").String() != "" || (done && part.Get("text").Type != gjson.String)
 	default:
 		return true
 	}
@@ -1210,17 +1212,17 @@ func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 	if eventType == "" && gjson.Valid(trimmed) {
 		eventType = strings.TrimSpace(gjson.Get(trimmed, "type").String())
 	}
-	// An empty delta is structural progress only. It must stay inside the
-	// first-output replay window so a later transient terminal error can still
-	// fail over to another account.
-	if strings.HasSuffix(eventType, ".delta") {
+	switch eventType {
+	case "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+		"response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+		"response.audio.delta", "response.output_audio.delta", "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+		// Only known events with a valid empty string are replayable. Unknown or
+		// malformed payloads may carry output outside the fields we understand.
 		if !gjson.Valid(trimmed) {
 			return true
 		}
 		delta := gjson.Get(trimmed, "delta")
-		return delta.Exists() && delta.String() != ""
-	}
-	switch eventType {
+		return delta.Type != gjson.String || delta.Str != ""
 	case "response.failed":
 		return false
 	case "error":
@@ -1231,26 +1233,16 @@ func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 		// （content_policy / invalid_request 等）维持原样转发，保留上游错误细节。
 		payload := []byte(trimmed)
 		return !openAIStreamFailedEventShouldFailover(payload, extractOpenAISSEErrorMessage(payload))
-	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
-		return openAIStreamAddedEventStartsClientOutput([]byte(trimmed), eventType)
+	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added",
+		"response.output_item.done", "response.content_part.done", "response.reasoning_summary_part.done":
+		return openAIStreamStructuredEventStartsClientOutput([]byte(trimmed), eventType)
 	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done",
-		"response.audio_transcript.done", "response.function_call_arguments.done", "response.custom_tool_call_input.done",
-		"response.reasoning_summary_part.done":
+		"response.audio_transcript.done", "response.output_audio_transcript.done":
 		if !gjson.Valid(trimmed) {
 			return true
 		}
-		return openAIStreamDataStartsVisibleOutput(trimmed, eventType)
-	case "response.content_part.done":
-		if !gjson.Valid(trimmed) {
-			return true
-		}
-		part := gjson.Get(trimmed, "part")
-		return part.Get("text").String() != "" || part.Get("transcript").String() != "" || part.Get("refusal").String() != ""
-	case "response.output_item.done":
-		if !gjson.Valid(trimmed) {
-			return true
-		}
-		return openAIStreamItemHasClientOutput(gjson.Get(trimmed, "item"))
+		text := gjson.Get(trimmed, "text")
+		return text.Type != gjson.String || text.Str != ""
 	}
 	return !openAIStreamEventIsPreamble(eventType)
 }
@@ -1264,18 +1256,6 @@ func openAIStreamItemHasVisibleOutput(item gjson.Result) bool {
 			if part.Get("text").String() != "" || part.Get("transcript").String() != "" {
 				return true
 			}
-		}
-	}
-	return false
-}
-
-func openAIStreamItemHasClientOutput(item gjson.Result) bool {
-	if openAIStreamItemHasVisibleOutput(item) || item.Get("encrypted_content").String() != "" {
-		return true
-	}
-	for _, part := range item.Get("content").Array() {
-		if part.Get("refusal").String() != "" {
-			return true
 		}
 	}
 	return false
@@ -1726,10 +1706,9 @@ func openAIStreamFailedEventRetryableOnSameAccount(account *Account, payload []b
 	if account == nil {
 		return false
 	}
-	// 容量降载是请求级信号，不是账号级故障：上游只是让本次请求稍后再试。
-	// 换账号并不改变被降载的因素（客户端身份、模型容量都与账号无关），
-	// 只会让单个请求把整池账号逐个消耗掉，最终仍以同一个错误告终。
-	// 因此先在同一账号上做有界重试，用尽后才按常规流程切号。
+	// This marks same-account retry eligibility, not retry order. The Responses,
+	// Messages and Chat handlers prefer another account for request-scoped errors;
+	// other callers retain their own bounded retry policy.
 	if isOpenAIUpstreamCapacityShedEvent(payload) {
 		return true
 	}

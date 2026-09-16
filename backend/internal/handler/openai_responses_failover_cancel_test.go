@@ -32,8 +32,9 @@ type openAIResponsesFailoverCancelUpstream struct {
 
 type openAIResponsesCapacityFailoverUpstream struct {
 	service.HTTPUpstream
-	mu         sync.Mutex
-	accountIDs []int64
+	mu          sync.Mutex
+	accountIDs  []int64
+	prefixEvent string
 }
 
 func (u *openAIResponsesCapacityFailoverUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
@@ -49,6 +50,9 @@ func (u *openAIResponsesCapacityFailoverUpstream) Do(_ *http.Request, _ string, 
 		`data: {"type":"response.failed","response":{"id":"resp_capacity","status":"failed","error":{"code":"server_is_overloaded","message":"overloaded"}}}`,
 		"",
 	}, "\n")
+	if u.prefixEvent != "" {
+		body = "data: " + u.prefixEvent + "\n\n" + body
+	}
 	if accountID == 3 {
 		body = strings.Join([]string{
 			`data: {"type":"response.output_text.delta","delta":"ok"}`,
@@ -341,5 +345,58 @@ func TestOpenAIGatewayHandlerResponses_CapacityFailoverKeepsDistinctCredentialCa
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.Contains(t, rec.Body.String(), `"delta":"ok"`)
 		})
+	}
+}
+
+func TestOpenAIGatewayHandlerResponses_StreamReplayBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, passthrough := range []bool{false, true} {
+		for _, tc := range []struct {
+			name   string
+			event  string
+			replay bool
+		}{
+			{"empty text delta", `{"type":"response.output_text.delta","delta":""}`, true},
+			{"empty text done", `{"type":"response.output_text.done","text":""}`, true},
+			{"empty message done", `{"type":"response.output_item.done","item":{"type":"message","content":[]}}`, true},
+			{"text delta", `{"type":"response.output_text.delta","delta":"partial"}`, false},
+			{"null delta", `{"type":"response.output_text.delta","delta":null}`, false},
+			{"missing delta", `{"type":"response.output_text.delta"}`, false},
+			{"unknown delta", `{"type":"response.custom_payload.delta","delta":"","payload":"opaque"}`, false},
+			{"unknown done item", `{"type":"response.output_item.done","item":{"type":"computer_call","call_id":"call_1","action":{"type":"click","x":1,"y":2}}}`, false},
+			{"empty completed function call", `{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"refresh","arguments":""}}`, false},
+			{"empty completed custom call", `{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","name":"refresh","input":""}}`, false},
+			{"encrypted done", `{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"ciphertext","summary":[]}}`, false},
+			{"refusal done", `{"type":"response.content_part.done","part":{"type":"refusal","refusal":"blocked"}}`, false},
+			{"image output", `{"type":"response.image_generation_call.partial_image","partial_image_b64":"aW1hZ2U="}`, false},
+		} {
+			t.Run(fmt.Sprintf("passthrough=%t/%s", passthrough, tc.name), func(t *testing.T) {
+				accounts := make([]service.Account, 3)
+				for i := range accounts {
+					accounts[i] = service.Account{
+						ID: int64(i + 1), Name: fmt.Sprintf("stream-account-%d", i+1),
+						Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+						Status: service.StatusActive, Schedulable: true, Priority: i,
+						Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://api.example.test"},
+						Extra:       map[string]any{"openai_passthrough": passthrough},
+					}
+				}
+				upstream := &openAIResponsesCapacityFailoverUpstream{prefixEvent: tc.event}
+				handler := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts)
+				c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":"hello"}`))
+				c.Request.Header.Set("Content-Type", "application/json")
+				handler.Responses(c)
+
+				if tc.replay {
+					require.Equal(t, []int64{1, 2, 3}, upstream.calls(), rec.Body.String())
+					require.Contains(t, rec.Body.String(), `"delta":"ok"`)
+					require.NotContains(t, rec.Body.String(), tc.event, "discarded attempt events must remain private")
+				} else {
+					require.Equal(t, []int64{1}, upstream.calls(), rec.Body.String())
+					require.NotContains(t, rec.Body.String(), `"delta":"ok"`, "a second answer must not be appended")
+				}
+			})
+		}
 	}
 }

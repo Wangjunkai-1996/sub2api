@@ -71,7 +71,7 @@ func (u *openAIAtomicStreamFailoverUpstream) calls() []int64 {
 	return append([]int64(nil), u.accountIDs...)
 }
 
-func TestOpenAIGatewayHandlerResponses_AtomicCapacityRetriesThenSwitchesAccount(t *testing.T) {
+func TestOpenAIGatewayHandlerResponses_AtomicCapacitySwitchesWithoutLeakingFailedAttempt(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	accounts := []service.Account{
 		{
@@ -94,7 +94,7 @@ func TestOpenAIGatewayHandlerResponses_AtomicCapacityRetriesThenSwitchesAccount(
 
 	handler.Responses(c)
 
-	require.Equal(t, []int64{1, 1, 1, 1, 2}, upstream.calls())
+	require.Equal(t, []int64{1, 2}, upstream.calls())
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	require.Contains(t, recorder.Body.String(), "winning-fragment")
 	require.Contains(t, recorder.Body.String(), "resp_winning")
