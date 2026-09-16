@@ -322,7 +322,7 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		)
 		service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 		if selectErr != nil || selection == nil || selection.Account == nil {
-			if h.handleOpenAI429DeferredSelection(c, selectErr, false, true) {
+			if h.handleOpenAIDeferredSelection(c, selectErr, false, true) {
 				return
 			}
 			if waitForOpenAI429Selection(c, selectErr, len(failedAccountIDs)) {
@@ -349,14 +349,14 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		if acquireErr != nil {
 			var cooldown *service.OpenAI429CooldownError
 			if errors.As(acquireErr, &cooldown) || errors.Is(acquireErr, service.ErrOpenAI429RecoveryUnavailable) {
-				c.Set(openAI429DeferredSelectionKey, acquireErr)
+				c.Set(openAIDeferredSelectionKey, acquireErr)
 			}
 			if attempt < maxSwitches && c.Request.Context().Err() == nil {
 				failedAccountIDs[account.ID] = struct{}{}
 				reqLog.Warn("openai_count_tokens.account_slot_unavailable_switching", zap.Int64("account_id", account.ID), zap.Error(acquireErr))
 				continue
 			}
-			if h.handleOpenAI429DeferredSelection(c, acquireErr, false, true) {
+			if h.handleOpenAIDeferredSelection(c, acquireErr, false, true) {
 				return
 			}
 			status, errType, _, message := concurrencyErrorResponse(acquireErr, "account")
@@ -364,7 +364,7 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 			return
 		}
 		account = selection.Account
-		c.Set(openAI429DeferredSelectionKey, nil)
+		c.Set(openAIDeferredSelectionKey, nil)
 		forwardBody := mappedBodyForMessages(channelMapping.Mapped, channelMapping.MappedModel)
 		forwardErr := h.gatewayService.ForwardCountTokensAsAnthropic(c.Request.Context(), c, account, forwardBody, preferredMappedModel)
 		if accountRelease != nil {
@@ -403,6 +403,14 @@ func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
 	if selection.Acquired {
 		if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, selection.ReleaseFunc, reqLog); recheckErr != nil {
 			return nil, recheckErr
+		}
+		if err := h.gatewayService.RecheckOpenAIAccountSchedulable(ctx, account); err != nil {
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			selection.ReleaseFunc = nil
+			selection.Acquired = false
+			return nil, err
 		}
 		if err := h.gatewayService.AdmitOpenAI429Selection(ctx, selection); err != nil {
 			if selection.ReleaseFunc != nil {
@@ -458,6 +466,12 @@ func (h *OpenAIGatewayHandler) acquireCountTokensAccountSlot(
 
 	if recheckErr := h.recheckOpenAICyberCooldownAfterAcquire(ctx, account, accountRelease, reqLog); recheckErr != nil {
 		return nil, recheckErr
+	}
+	if err := h.gatewayService.RecheckOpenAIAccountSchedulable(ctx, account); err != nil {
+		if accountRelease != nil {
+			accountRelease()
+		}
+		return nil, err
 	}
 	selection.ReleaseFunc = accountRelease
 	selection.Acquired = true

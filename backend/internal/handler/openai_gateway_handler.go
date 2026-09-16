@@ -707,7 +707,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
 				continue
 			}
-			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, false) {
+			if h.handleOpenAIDeferredSelection(c, err, streamStarted, false) {
 				return
 			}
 			if failoverClientGone(c) {
@@ -788,7 +788,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
-		if slotResult == openAISlotAcquireRecoveryDeferred {
+		if slotResult == openAISlotAcquireReselect {
 			failedAccountIDs[account.ID] = struct{}{}
 			continue
 		}
@@ -1453,7 +1453,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
 				continue
 			}
-			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, true) {
+			if h.handleOpenAIDeferredSelection(c, err, streamStarted, true) {
 				return
 			}
 			reqLog.Warn("openai_messages.account_select_failed",
@@ -1494,7 +1494,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
-		if slotResult == openAISlotAcquireRecoveryDeferred {
+		if slotResult == openAISlotAcquireReselect {
 			failedAccountIDs[account.ID] = struct{}{}
 			continue
 		}
@@ -2229,7 +2229,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesUserSlot(
 	return wrapReleaseOnDone(ctx, userReleaseFunc), true
 }
 
-// openAISlotAcquireResult 是账号槽位获取的三态结果。
+// openAISlotAcquireResult describes slot admission and whether selection may retry.
 type openAISlotAcquireResult int
 
 const (
@@ -2241,7 +2241,7 @@ const (
 	// 后重新选号，全池耗尽由下一轮选号返回标准 no available accounts。
 	openAISlotAcquireProfitVetoed
 	// The slot was released before forwarding; try another eligible account.
-	openAISlotAcquireRecoveryDeferred
+	openAISlotAcquireReselect
 )
 
 // openAIWSTurnPricing 持有 WebSocket 连接内「当前 turn」的计费定价时刻。
@@ -2385,8 +2385,8 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 		}
 		account = latest
 		selection.Account = latest
-		if !h.admitOpenAI429AccountSlot(c, selection) {
-			return nil, openAISlotAcquireRecoveryDeferred
+		if !h.admitOpenAIAccountSlot(c, selection) {
+			return nil, openAISlotAcquireReselect
 		}
 		account = selection.Account
 		// 调度器已抢槽路径无门时由选号内部完成 eager 绑定；门下选号内部
@@ -2436,8 +2436,8 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 		selection.Account = latest
 		selection.Acquired = true
 		selection.ReleaseFunc = fastReleaseFunc
-		if !h.admitOpenAI429AccountSlot(c, selection) {
-			return nil, openAISlotAcquireRecoveryDeferred
+		if !h.admitOpenAIAccountSlot(c, selection) {
+			return nil, openAISlotAcquireReselect
 		}
 		account = selection.Account
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
@@ -2504,8 +2504,8 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	selection.Account = latest
 	selection.Acquired = true
 	selection.ReleaseFunc = accountReleaseFunc
-	if !h.admitOpenAI429AccountSlot(c, selection) {
-		return nil, openAISlotAcquireRecoveryDeferred
+	if !h.admitOpenAIAccountSlot(c, selection) {
+		return nil, openAISlotAcquireReselect
 	}
 	account = selection.Account
 	if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, groupID, sessionHash, account.ID); err != nil {
@@ -2977,6 +2977,17 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			selection.Account = latest
 			accountReleaseFunc = fastReleaseFunc
 		}
+		if err := h.gatewayService.RecheckOpenAIAccountSchedulable(admissionCtx, account); err != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+			}
+			if errors.Is(err, service.ErrNoAvailableAccounts) {
+				failedAccountIDs[account.ID] = struct{}{}
+				continue
+			}
+			closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account scheduling state unavailable, please reconnect")
+			return
+		}
 		// 准入完成：门并入连接 ctx，turn 级复核与 failover 重选共用。
 		ctx = admissionCtx
 		// Account selection starts a fresh upstream attempt. Clear any model
@@ -3117,6 +3128,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// 长连接跨峰谷/倍率刷新防护：每个 turn 按当前时刻重装门并复核
 				// 当前账号，越线即要求客户端重连重选（连接绑定单一上游账号，
 				// 无法中途换号）。本 turn 的准入与计费共用同一 pricingAt。
+				if err := h.gatewayService.RecheckOpenAIAccountSchedulable(ctx, account); err != nil {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", err)
+				}
 				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(ctx, apiKey.GroupID)
 				if _, vetoed, reason := h.gatewayService.ProfitControlVetoLatest(turnCtx, account); vetoed {
 					reqLog.Info("openai.websocket_turn_profit_vetoed",

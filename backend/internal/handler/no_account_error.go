@@ -194,7 +194,7 @@ func classifyNoAccountError(
 }
 
 func (h *OpenAIGatewayHandler) handleSelectionFailure(c *gin.Context, classification noAccountErrorClassification, streamStarted bool) {
-	classification = openAI429DeferredSelectionFailure(c, classification)
+	classification = openAIDeferredSelectionFailure(c, classification)
 	// Stop the compact heartbeat before inspecting or changing response headers.
 	if service.StopOpenAICompactSSEKeepaliveCommitted(c) {
 		streamStarted = true
@@ -207,7 +207,7 @@ func (h *OpenAIGatewayHandler) handleSelectionFailure(c *gin.Context, classifica
 }
 
 func (h *OpenAIGatewayHandler) handleAnthropicSelectionFailure(c *gin.Context, classification noAccountErrorClassification, streamStarted bool) {
-	classification = openAI429DeferredSelectionFailure(c, classification)
+	classification = openAIDeferredSelectionFailure(c, classification)
 	if !streamStarted && !c.Writer.Written() && classification.RetryAfterSeconds > 0 {
 		c.Header("Retry-After", strconv.Itoa(classification.RetryAfterSeconds))
 	}

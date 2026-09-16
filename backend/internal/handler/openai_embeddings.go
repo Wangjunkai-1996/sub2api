@@ -139,7 +139,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
 				continue
 			}
-			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, false) {
+			if h.handleOpenAIDeferredSelection(c, err, streamStarted, false) {
 				return
 			}
 			reqLog.Warn("openai_embeddings.account_select_failed",
@@ -174,7 +174,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, "", selection, false, &streamStarted, reqLog)
-		if slotResult == openAISlotAcquireRecoveryDeferred {
+		if slotResult == openAISlotAcquireReselect {
 			failedAccountIDs[account.ID] = struct{}{}
 			continue
 		}

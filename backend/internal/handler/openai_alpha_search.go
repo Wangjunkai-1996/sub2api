@@ -139,7 +139,7 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 				reqLog.Info("openai_alpha_search.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
-			if h.handleOpenAI429DeferredSelection(c, err, streamStarted, false) {
+			if h.handleOpenAIDeferredSelection(c, err, streamStarted, false) {
 				return
 			}
 			if len(failedAccountIDs) == 0 {
@@ -165,7 +165,7 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		accountRelease, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, false, &streamStarted, reqLog)
-		if slotResult == openAISlotAcquireRecoveryDeferred {
+		if slotResult == openAISlotAcquireReselect {
 			failedAccountIDs[account.ID] = struct{}{}
 			continue
 		}

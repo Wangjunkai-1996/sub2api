@@ -7,12 +7,15 @@ import (
 	"net/http"
 )
 
-const openAI429DeferredSelectionKey = "openai_429_deferred_selection_error"
+const openAIDeferredSelectionKey = "openai_deferred_selection_error"
 
-func (h *OpenAIGatewayHandler) admitOpenAI429AccountSlot(c *gin.Context, selection *service.AccountSelectionResult) bool {
-	err := h.gatewayService.AdmitOpenAI429Selection(c.Request.Context(), selection)
+func (h *OpenAIGatewayHandler) admitOpenAIAccountSlot(c *gin.Context, selection *service.AccountSelectionResult) bool {
+	err := h.gatewayService.RecheckOpenAIAccountSchedulable(c.Request.Context(), selection.Account)
 	if err == nil {
-		c.Set(openAI429DeferredSelectionKey, nil)
+		err = h.gatewayService.AdmitOpenAI429Selection(c.Request.Context(), selection)
+	}
+	if err == nil {
+		c.Set(openAIDeferredSelectionKey, nil)
 		return true
 	}
 	if selection.ReleaseFunc != nil {
@@ -20,12 +23,12 @@ func (h *OpenAIGatewayHandler) admitOpenAI429AccountSlot(c *gin.Context, selecti
 		selection.ReleaseFunc = nil
 	}
 	selection.Acquired = false
-	c.Set(openAI429DeferredSelectionKey, err)
+	c.Set(openAIDeferredSelectionKey, err)
 	return false
 }
 
-func (h *OpenAIGatewayHandler) handleOpenAI429DeferredSelection(c *gin.Context, err error, streamStarted, anthropic bool) bool {
-	value, exists := c.Get(openAI429DeferredSelectionKey)
+func (h *OpenAIGatewayHandler) handleOpenAIDeferredSelection(c *gin.Context, err error, streamStarted, anthropic bool) bool {
+	value, exists := c.Get(openAIDeferredSelectionKey)
 	deferred, ok := value.(error)
 	if !exists || !ok || deferred == nil {
 		return false
@@ -34,7 +37,7 @@ func (h *OpenAIGatewayHandler) handleOpenAI429DeferredSelection(c *gin.Context, 
 		err = deferred
 	}
 	classification := classifySelectionFailureError(err, noAccountErrorClassification{
-		Status: http.StatusServiceUnavailable, ErrType: "api_error", Message: "Service temporarily unavailable",
+		Status: http.StatusServiceUnavailable, ErrType: "api_error", ErrCode: "account_pool_exhausted", Message: "Service temporarily unavailable",
 	})
 	if anthropic {
 		h.handleAnthropicSelectionFailure(c, classification, streamStarted)
@@ -44,13 +47,13 @@ func (h *OpenAIGatewayHandler) handleOpenAI429DeferredSelection(c *gin.Context, 
 	return true
 }
 
-// A WaitPlan can become rate-limited while queued. Keep that reason until
+// A selected account can become disabled or rate-limited while queued. Keep that reason until
 // reselection has either found another account or exhausted the remaining pool.
-func openAI429DeferredSelectionFailure(c *gin.Context, classification noAccountErrorClassification) noAccountErrorClassification {
+func openAIDeferredSelectionFailure(c *gin.Context, classification noAccountErrorClassification) noAccountErrorClassification {
 	if classification.ErrCode != "account_pool_exhausted" {
 		return classification
 	}
-	if value, exists := c.Get(openAI429DeferredSelectionKey); exists {
+	if value, exists := c.Get(openAIDeferredSelectionKey); exists {
 		if err, ok := value.(error); ok {
 			return classifySelectionFailureError(err, classification)
 		}

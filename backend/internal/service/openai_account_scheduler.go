@@ -165,6 +165,7 @@ type openAIAccountLoadPlan struct {
 type openAIAccountLoadSelectionAttempt struct {
 	result              *AccountSelectionResult
 	selectionOrder      []openAIAccountCandidateScore
+	overflowPlan        *openAIAccountLoadPlan
 	candidateCount      int
 	topK                int
 	loadSkew            float64
@@ -322,6 +323,7 @@ type openAISelectionProbeBudget struct {
 	acquires               int
 	rechecks               int
 	attempted              map[int64]struct{}
+	eligibilityRejected    map[int64]struct{}
 	egressRejected         map[openAIEgressAdmissionIdentity]error
 	recoveryRejected       openAI429SelectionRejections
 	lastEgressAdmissionErr error
@@ -364,14 +366,28 @@ func (b *openAISelectionProbeBudget) recordRecheck() bool {
 	if b == nil {
 		return false
 	}
-	if !b.limited {
-		return true
-	}
-	if b.rechecks >= openAIAccountSelectionProbeLimit {
+	if b.limited && b.rechecks >= openAIAccountSelectionProbeLimit {
 		return false
 	}
 	b.rechecks++
 	return true
+}
+
+func (b *openAISelectionProbeBudget) rejectEligibility(accountID int64) {
+	if b.eligibilityRejected == nil {
+		b.eligibilityRejected = make(map[int64]struct{})
+	}
+	b.eligibilityRejected[accountID] = struct{}{}
+	// Stale Top-K entries may require overflow. Count the original probes too.
+	b.enableLimit()
+}
+
+func (b *openAISelectionProbeBudget) eligibilityWasRejected(accountID int64) bool {
+	if b == nil {
+		return false
+	}
+	_, rejected := b.eligibilityRejected[accountID]
+	return rejected
 }
 
 func (b *openAISelectionProbeBudget) acquireExhausted() bool {
@@ -1385,8 +1401,11 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		}
 	}
 	for i := 0; i < len(selectionOrder); i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, compactBlocked, err
+		}
 		candidate := selectionOrder[i]
-		if candidate.account == nil {
+		if candidate.account == nil || budget.eligibilityWasRejected(candidate.account.ID) {
 			continue
 		}
 		enforcedPool := accountUsesEnforcedEgressPool(ctx, s.service.settingService, candidate.account)
@@ -1417,7 +1436,12 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		}
 
 		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		if err := ctx.Err(); err != nil {
+			release(result)
+			return nil, compactBlocked, err
+		}
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			budget.rejectEligibility(candidate.account.ID)
 			release(result)
 			continue
 		}
@@ -1426,16 +1450,22 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			break
 		}
 		fresh, recheckErr := s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		if err := ctx.Err(); err != nil {
+			release(result)
+			return nil, compactBlocked, err
+		}
 		if recheckErr != nil {
 			release(result)
 			return nil, compactBlocked, recheckErr
 		}
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			budget.rejectEligibility(candidate.account.ID)
 			release(result)
 			continue
 		}
 		if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {
 			compactBlocked = true
+			budget.rejectEligibility(candidate.account.ID)
 			release(result)
 			continue
 		}
@@ -1518,7 +1548,7 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 	}
 	var lastEgressAdmissionErr error
 	for _, accountID := range []int64{req.StickyPreviousAccountID, req.StickyAccountID} {
-		if accountID <= 0 {
+		if accountID <= 0 || budget.eligibilityWasRejected(accountID) {
 			continue
 		}
 		if req.ExcludedIDs != nil {
@@ -1541,6 +1571,7 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 			return nil, err
 		}
 		if account == nil {
+			budget.rejectEligibility(accountID)
 			if accountID == req.StickyAccountID && strings.TrimSpace(req.SessionHash) != "" {
 				_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, req.SessionHash)
 			}
@@ -1874,6 +1905,9 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 		topK:           plan.topK,
 		loadSkew:       plan.loadSkew,
 	}
+	if hasAdmissionOverflow {
+		attempt.overflowPlan = &plan
+	}
 	if req.RequireCompact && len(plan.candidates) == 0 && len(plan.staleSnapshotCompactRetry) == 0 {
 		attempt.noCompactCandidates = true
 		attempt.err = ErrNoAvailableCompactAccounts
@@ -1924,6 +1958,9 @@ func (s *defaultOpenAIAccountScheduler) trySelectByLoadBalancePool(
 		if s.service.concurrencyService != nil {
 			if freshLoadMap, loadErr := getAccountLoadsForScheduling(ctx, s.service.concurrencyService, s.service.settingService, filtered, true); loadErr == nil {
 				retryPlan = s.buildOpenAIAccountLoadPlan(ctx, req, filtered, freshLoadMap)
+				if attempt.overflowPlan != nil {
+					attempt.overflowPlan = &retryPlan
+				}
 				haveRetry = true
 			}
 		}
@@ -2096,7 +2133,10 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 		wantAttempted := pass == 1 || pass == 3
 		wantKnownFull := pass >= 2
 		for _, candidate := range attempt.selectionOrder {
-			if candidate.account == nil {
+			if err := ctx.Err(); err != nil {
+				return nil, candidateCount, topK, loadSkew, err
+			}
+			if candidate.account == nil || budget.eligibilityWasRejected(candidate.account.ID) {
 				continue
 			}
 			if budget != nil && budget.limited {
@@ -2108,7 +2148,11 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				}
 			}
 			fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			if err := ctx.Err(); err != nil {
+				return nil, candidateCount, topK, loadSkew, err
+			}
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+				budget.rejectEligibility(candidate.account.ID)
 				continue
 			}
 			if !s.consumeOpenAISelectionDBRecheck(budget) {
@@ -2118,14 +2162,19 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
 			}
 			fresh, err := s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, candidateCount, topK, loadSkew, ctxErr
+			}
 			if err != nil {
 				return nil, candidateCount, topK, loadSkew, err
 			}
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+				budget.rejectEligibility(candidate.account.ID)
 				continue
 			}
 			if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {
 				compactBlocked = true
+				budget.rejectEligibility(candidate.account.ID)
 				continue
 			}
 			if budget != nil {
@@ -2175,8 +2224,37 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 			})
 			return selection, candidateCount, topK, loadSkew, selectErr
 		}
+		if budget != nil && budget.limited {
+			// A first rejection in this wait pass can enable the limit mid-pass.
+			passes = 4
+		}
 	}
 
+	// Only eligibility failures widen a stale Top-K here. Healthy busy accounts
+	// retain the existing wait fallback. Expand once using the existing ranking,
+	// with the same probe budget and rejected IDs across acquire and wait passes.
+	if attempt.overflowPlan != nil {
+		for _, candidate := range attempt.selectionOrder {
+			if candidate.account == nil || !budget.eligibilityWasRejected(candidate.account.ID) {
+				continue
+			}
+			attempt.selectionOrder = s.buildOpenAIEgressAdmissionOverflowOrder(req, *attempt.overflowPlan)
+			attempt.overflowPlan = nil
+			selection, blocked, err := s.tryAcquireOpenAISelectionOrderWithBudget(ctx, req,
+				openAIUnattemptedSelectionOrder(attempt.selectionOrder, budget), budget)
+			if err != nil && !isAccountEgressAdmissionError(err) {
+				return nil, candidateCount, topK, loadSkew, err
+			}
+			if selection != nil {
+				return selection, candidateCount, topK, loadSkew, nil
+			}
+			attempt.compactBlocked = compactBlocked || blocked
+			if err != nil {
+				attempt.err = err
+			}
+			return s.finishLoadBalanceSelectionFallback(ctx, req, attempt, budget, filterStats)
+		}
+	}
 	if lastEgressAdmissionErr != nil {
 		return nil, candidateCount, topK, loadSkew, lastEgressAdmissionErr
 	}

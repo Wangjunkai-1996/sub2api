@@ -2860,18 +2860,50 @@ func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64
 }
 
 func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetSchedulable(schedulable).
-		Save(ctx)
+	if r == nil || r.sql == nil {
+		return errors.New("account repository SQL executor is not configured")
+	}
+	// Commit the routing change and its propagation event together, including
+	// when the caller disconnects immediately after the statement completes.
+	dedupKey := schedulerOutboxDedupKey(service.SchedulerOutboxEventAccountChanged, &id, nil, nil)
+	rows, err := r.sql.QueryContext(ctx, `
+		WITH updated AS (
+			UPDATE accounts
+			SET schedulable = $1, updated_at = NOW()
+			WHERE id = $2 AND deleted_at IS NULL
+			RETURNING id
+			), enqueued AS (
+			INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload, dedup_key)
+			SELECT $3, updated.id, NULL, NULL, $4 FROM updated
+			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+			RETURNING account_id
+		)
+		SELECT id FROM updated
+	`, schedulable, id, service.SchedulerOutboxEventAccountChanged, dedupKey)
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
-		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue schedulable change failed: account=%d err=%v", id, err)
+	var updatedID int64
+	if !rows.Next() {
+		rowsErr := rows.Err()
+		closeErr := rows.Close()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return service.ErrAccountNotFound
+	}
+	if err := rows.Scan(&updatedID); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if !schedulable {
-		r.syncSchedulerAccountSnapshot(ctx, id)
+		r.syncSchedulerAccountSnapshotDetached(ctx, id)
 	}
 	return nil
 }
