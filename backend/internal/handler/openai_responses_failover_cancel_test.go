@@ -367,6 +367,7 @@ func TestOpenAIGatewayHandlerResponses_StreamReplayBoundary(t *testing.T) {
 			{"empty completed function call", `{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"refresh","arguments":""}}`, false},
 			{"empty completed custom call", `{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","name":"refresh","input":""}}`, false},
 			{"encrypted done", `{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"ciphertext","summary":[]}}`, false},
+			{"reasoning content done", `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"real"}]}}`, false},
 			{"refusal done", `{"type":"response.content_part.done","part":{"type":"refusal","refusal":"blocked"}}`, false},
 			{"image output", `{"type":"response.image_generation_call.partial_image","partial_image_b64":"aW1hZ2U="}`, false},
 		} {

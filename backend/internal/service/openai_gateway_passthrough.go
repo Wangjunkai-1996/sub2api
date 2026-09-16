@@ -1139,6 +1139,9 @@ func openAIStreamStructuredEventStartsClientOutput(payload []byte, eventType str
 			if item.Get("encrypted_content").String() != "" {
 				return true
 			}
+			if content := item.Get("content"); content.Exists() && (!content.IsArray() || len(content.Array()) > 0) {
+				return true
+			}
 			summary := item.Get("summary")
 			if !summary.IsArray() {
 				return done

@@ -65,6 +65,10 @@ func TestOpenAIClientOutputClassificationPreservesReplayBoundary(t *testing.T) {
 		{"empty message done", `{"item":{"type":"message","content":[]}}`, "response.output_item.done", false},
 		{"invalid message done", `{"item":{"type":"message","content":null}}`, "response.output_item.done", true},
 		{"empty reasoning done", `{"item":{"type":"reasoning","summary":[]}}`, "response.output_item.done", false},
+		{"empty reasoning content done", `{"item":{"type":"reasoning","summary":[],"content":[]}}`, "response.output_item.done", false},
+		{"reasoning content done", `{"item":{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"real"}]}}`, "response.output_item.done", true},
+		{"reasoning content added", `{"item":{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"real"}]}}`, "response.output_item.added", true},
+		{"null reasoning content done", `{"item":{"type":"reasoning","summary":[],"content":null}}`, "response.output_item.done", true},
 		{"encrypted reasoning done", `{"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}`, "response.output_item.done", true},
 		{"refusal done", `{"item":{"type":"message","content":[{"type":"refusal","refusal":"blocked"}]}}`, "response.output_item.done", true},
 	} {
