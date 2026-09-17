@@ -1193,6 +1193,13 @@ func TestProxyOpenAIWSHTTPBridgeTurnStagesMetadataBeforeCapacityFailover(t *test
 		"",
 		`data: {"type":"response.in_progress","response":{"id":"resp_shed"}}`,
 		"",
+		`data: {"type":"keepalive"}`,
+		"",
+		`data: {"type":"ping"}`,
+		"",
+		`event: keepalive`,
+		`data: {}`,
+		"",
 		`data: {"type":"response.failed","response":{"id":"resp_shed","status":"failed","error":{"message":"Our servers are currently overloaded. Please try again later."}}}`,
 		"",
 	}, "\n")

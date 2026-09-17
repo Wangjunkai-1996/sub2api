@@ -1125,6 +1125,33 @@ func openAIStreamEventIsPreamble(eventType string) bool {
 	}
 }
 
+func openAIStreamHeartbeatIsReplayable(data, eventType string) bool {
+	if !gjson.Valid(data) {
+		return false
+	}
+	payload := gjson.Parse(data)
+	if !payload.IsObject() {
+		return false
+	}
+	// Only known heartbeat metadata is safe to discard. Unknown fields may
+	// contain output, even when the event is named keepalive or ping.
+	replayable := true
+	payload.ForEach(func(key, value gjson.Result) bool {
+		switch key.Str {
+		case "type":
+			replayable = value.Type == gjson.String && strings.TrimSpace(value.Str) == eventType
+		case "sequence_number":
+			replayable = value.Type == gjson.Number
+		case "timestamp":
+			replayable = value.Type == gjson.Number || value.Type == gjson.String
+		default:
+			replayable = false
+		}
+		return replayable
+	})
+	return replayable
+}
+
 func openAIStreamStructuredEventStartsClientOutput(payload []byte, eventType string) bool {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return true
@@ -1219,6 +1246,8 @@ func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 		eventType = strings.TrimSpace(gjson.Get(trimmed, "type").String())
 	}
 	switch eventType {
+	case "keepalive", "ping":
+		return !openAIStreamHeartbeatIsReplayable(trimmed, eventType)
 	case "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
 		"response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
 		"response.audio.delta", "response.output_audio.delta", "response.audio_transcript.delta", "response.output_audio_transcript.delta":
@@ -1322,6 +1351,8 @@ func openAIStreamDataStartsSemanticTTFT(data, eventType string) bool {
 		eventType = strings.TrimSpace(gjson.Get(trimmed, "type").String())
 	}
 	switch eventType {
+	case "keepalive", "ping":
+		return !openAIStreamHeartbeatIsReplayable(trimmed, eventType)
 	case "response.failed":
 		return false
 	case "error":

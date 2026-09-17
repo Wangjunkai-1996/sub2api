@@ -18,6 +18,7 @@ import (
 )
 
 const replayTestBusySSE = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Service is busy. Please try again.\"}}}\n\n"
+const replayTestKeepaliveSSE = "data: {\"type\":\"keepalive\"}\n\n"
 
 func runReplayBoundaryStream(t *testing.T, passthrough bool, c *gin.Context, body io.ReadCloser) error {
 	t.Helper()
@@ -54,7 +55,7 @@ func TestOpenAIHTTPStreamReplayBoundaryEvidence(t *testing.T) {
 				n, err := c.Writer.WriteString(": keepalive\n\n")
 				require.NoError(t, err)
 				recordOpenAIStreamKeepaliveBytes(c, n)
-				err = runReplayBoundaryStream(t, passthrough, c, io.NopCloser(strings.NewReader("data: "+tc.event+"\n\n"+replayTestBusySSE)))
+				err = runReplayBoundaryStream(t, passthrough, c, io.NopCloser(strings.NewReader(replayTestKeepaliveSSE+"data: "+tc.event+"\n\n"+replayTestKeepaliveSSE+replayTestBusySSE)))
 				var failover *UpstreamFailoverError
 				require.Equal(t, tc.replay, errors.As(err, &failover))
 				require.Equal(t, !tc.replay, logs.ContainsMessage("gateway.failover_suppressed_after_semantic_output"))
@@ -70,6 +71,64 @@ func TestOpenAIHTTPStreamReplayBoundaryEvidence(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+func TestOpenAIHTTPStreamKeepaliveFailureReplaysWinningAttempt(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		for _, heartbeat := range []struct{ name, stream string }{
+			{"json", replayTestKeepaliveSSE},
+			{"metadata", "data: {\"type\":\"keepalive\",\"sequence_number\":1,\"timestamp\":1789608992}\n\n"},
+			{"named", "event: keepalive\ndata: {\"type\":\"keepalive\"}\n\n"},
+			{"event_name_only", "event: keepalive\ndata: {}\n\n"},
+			{"ping", "data: {\"type\":\"ping\"}\n\n"},
+			{"ping_event_name_only", "event: ping\ndata: {}\n\n"},
+		} {
+			for _, failure := range []struct {
+				name, stream string
+				readErr      error
+			}{
+				{name: "overload", stream: replayTestBusySSE},
+				{name: "generic_failure", stream: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"An error occurred while processing your request. Please try again.\"}}}\n\n"},
+				{name: "bare_error", stream: "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"An error occurred while processing your request. Please try again.\"}}\n\n"},
+				{name: "error_then_failed", stream: "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Service is busy. Please try again.\"}}\n\n" + replayTestBusySSE},
+				{name: "missing_terminal_eof"},
+				{name: "read_error", readErr: io.ErrUnexpectedEOF},
+			} {
+				for _, localKeepalive := range []string{"", ": local heartbeat\n\n"} {
+					t.Run(fmt.Sprintf("passthrough_%v/%s/%s/local_keepalive_%v", passthrough, heartbeat.name, failure.name, localKeepalive != ""), func(t *testing.T) {
+						c, rec := newPassthroughKeepaliveTestContext(t)
+						if localKeepalive != "" {
+							n, err := c.Writer.WriteString(localKeepalive)
+							require.NoError(t, err)
+							recordOpenAIStreamKeepaliveBytes(c, n)
+							c.Writer.Flush()
+						}
+						losing := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"losing\"}}\n\n" + heartbeat.stream + failure.stream
+						body := io.NopCloser(strings.NewReader(losing))
+						if failure.readErr != nil {
+							body = &openAIResponseFlushReadError{payload: []byte(losing), err: failure.readErr}
+						}
+						var failover *UpstreamFailoverError
+						err := runReplayBoundaryStream(t, passthrough, c, body)
+						require.ErrorAs(t, err, &failover)
+						require.Equal(t, localKeepalive != "" && !passthrough, failover.SafeToFailoverAfterWrite)
+						require.Equal(t, localKeepalive, rec.Body.String(), "the losing attempt must remain staged")
+						require.Equal(t, localKeepalive != "", c.Writer.Written())
+						require.Equal(t, -1, OpenAICompactKeepaliveAdjustedWrittenSize(c), "only local heartbeats may have been written")
+						winning := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"winning answer\"}\n\n" +
+							"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"winner\",\"status\":\"completed\"}}\n\n"
+						require.NoError(t, runReplayBoundaryStream(t, passthrough, c, io.NopCloser(strings.NewReader(winning))))
+						require.NotContains(t, rec.Body.String(), "losing")
+						require.NotContains(t, rec.Body.String(), "keepalive")
+						require.NotContains(t, rec.Body.String(), "response.failed")
+						require.Contains(t, rec.Body.String(), `"delta":"winning answer"`)
+						require.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.output_text.delta"`))
+						require.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.completed"`))
+					})
+				}
+			}
 		}
 	}
 }

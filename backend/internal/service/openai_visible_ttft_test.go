@@ -81,6 +81,39 @@ func TestOpenAIClientOutputClassificationPreservesReplayBoundary(t *testing.T) {
 	require.False(t, openAIStreamDataStartsVisibleOutput(encrypted, ""), "opaque output must not change visible TTFT")
 }
 
+func TestOpenAIHeartbeatReplayClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, data, eventType string
+		output                bool
+	}{
+		{"keepalive", `{"type":"keepalive"}`, "", false},
+		{"ping", `{"type":"ping"}`, "", false},
+		{"named heartbeat", `{}`, "keepalive", false},
+		{"metadata", `{"type":"keepalive","sequence_number":2,"timestamp":1789610000}`, "", false},
+		{"string timestamp", `{"type":"ping","timestamp":"2026-09-17T01:36:31Z"}`, "", false},
+		{"whitespace", ` {"type":" keepalive "} `, " keepalive ", false},
+		{"malformed", `{"type":"keepalive"`, "keepalive", true},
+		{"array", `[]`, "keepalive", true},
+		{"null", `null`, "keepalive", true},
+		{"non string type", `{"type":null}`, "keepalive", true},
+		{"conflicting type", `{"type":"response.output_text.delta","delta":"answer"}`, "keepalive", true},
+		{"duplicate conflicting type", `{"type":"keepalive","type":"response.completed"}`, "", true},
+		{"reverse duplicate type", `{"type":"response.output_text.delta","delta":"answer","type":"keepalive"}`, "", true},
+		{"invalid sequence", `{"type":"keepalive","sequence_number":{"text":"answer"}}`, "", true},
+		{"invalid timestamp", `{"type":"ping","timestamp":{"text":"answer"}}`, "", true},
+		{"text", `{"type":"keepalive","delta":"answer"}`, "", true},
+		{"tool", `{"type":"keepalive","arguments":"{}"}`, "", true},
+		{"encrypted reasoning", `{"type":"keepalive","item":{"type":"reasoning","encrypted_content":"opaque"}}`, "", true},
+		{"unknown metadata", `{"type":"keepalive","payload":"opaque"}`, "", true},
+		{"unknown event", `{"type":"heartbeat"}`, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.output, openAIStreamDataStartsClientOutput(tc.data, tc.eventType))
+			require.Equal(t, tc.output, openAIStreamDataStartsSemanticTTFT(tc.data, tc.eventType))
+		})
+	}
+}
+
 func TestOpenAIResponsesTTFTStartsAtVisibleOutput(t *testing.T) {
 	for _, passthrough := range []bool{false, true} {
 		name := "native"
@@ -124,6 +157,8 @@ func TestOpenAINativeMetadataDoesNotDisarmFirstOutputTimeout(t *testing.T) {
 		defer func() { _ = writer.Close() }()
 		_, _ = io.WriteString(writer, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\"}}\n\n")
 		_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_test\",\"type\":\"reasoning\",\"summary\":[]}}\n\n")
+		_, _ = io.WriteString(writer, "data: {\"type\":\"keepalive\"}\n\n")
+		_, _ = io.WriteString(writer, "event: ping\ndata: {}\n\n")
 		time.Sleep(1200 * time.Millisecond)
 	}()
 

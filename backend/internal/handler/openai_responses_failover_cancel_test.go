@@ -331,7 +331,7 @@ func TestOpenAIGatewayHandlerResponses_CapacityFailoverKeepsDistinctCredentialCa
 				account(2, tt.types[1], "credential-2"),
 				account(3, tt.types[2], "credential-3"),
 			}
-			upstream := &openAIResponsesCapacityFailoverUpstream{}
+			upstream := &openAIResponsesCapacityFailoverUpstream{prefixEvent: `{"type":"keepalive"}`}
 			handler := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts)
 			c, rec := newOpenAIResponsesFailoverTestContext(t, nil)
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(
@@ -356,6 +356,11 @@ func TestOpenAIGatewayHandlerResponses_StreamReplayBoundary(t *testing.T) {
 			event  string
 			replay bool
 		}{
+			{"keepalive", `{"type":"keepalive"}`, true},
+			{"ping", `{"type":"ping"}`, true},
+			{"heartbeat metadata", `{"type":"keepalive","sequence_number":1,"timestamp":1789610000}`, true},
+			{"heartbeat with output", `{"type":"keepalive","delta":"partial"}`, false},
+			{"heartbeat with unknown payload", `{"type":"ping","payload":"opaque"}`, false},
 			{"empty text delta", `{"type":"response.output_text.delta","delta":""}`, true},
 			{"empty text done", `{"type":"response.output_text.done","text":""}`, true},
 			{"empty message done", `{"type":"response.output_item.done","item":{"type":"message","content":[]}}`, true},

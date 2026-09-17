@@ -62,6 +62,31 @@ func TestProxyResponsesWebSocketFromClient_RewritesCapacityShedCodeForClient(t *
 			responseID:   "resp_shed",
 		},
 		{
+			name: "capacity_shed_after_json_heartbeats_fails_over_before_client_output",
+			upstreamEvents: [][]byte{
+				[]byte(`{"type":"response.created","response":{"id":"resp_heartbeat","status":"in_progress"}}`),
+				[]byte(`{"type":"keepalive"}`),
+				[]byte(`{"type":"ping"}`),
+				[]byte(`{"type":"keepalive","timestamp":1789608992,"sequence_number":3}`),
+				[]byte(`{"type":"response.failed","response":{"id":"resp_heartbeat","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}`),
+			},
+			wantAbsent:   []string{"response.created", "keepalive", "ping", "server_is_overloaded"},
+			wantFailover: true,
+			responseID:   "resp_heartbeat",
+		},
+		{
+			name: "keepalive_with_output_does_not_allow_replay",
+			upstreamEvents: [][]byte{
+				[]byte(`{"type":"response.created","response":{"id":"resp_heartbeat_output","status":"in_progress"}}`),
+				[]byte(`{"type":"keepalive","delta":"hello"}`),
+				[]byte(`{"type":"response.failed","response":{"id":"resp_heartbeat_output","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}`),
+			},
+			wantContains:   []string{`"delta":"hello"`, `"code":"server_error"`},
+			wantAbsent:     []string{"server_is_overloaded"},
+			responseID:     "resp_heartbeat_output",
+			serverErrCount: 1,
+		},
+		{
 			name: "non_retryable_policy_error_is_passed_through",
 			upstreamEvents: [][]byte{
 				[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"content_policy_violation","message":"request blocked by content policy"}}`),
