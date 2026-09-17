@@ -1962,16 +1962,17 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuthBatch(
 		upstreamURL := safeUpstreamURL(upstreamReq.URL.String())
 
 		upstreamStart := time.Now()
+		upstreamReq, sendState := trackOpenAIUpstreamSend(upstreamReq)
 		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		upstreamDuration += time.Since(upstreamStart)
 		if err != nil {
-			if firstFailure == nil {
-				firstFailure = &openAIImagesOAuthBatchFailure{transportErr: err, upstreamURL: upstreamURL}
+			if attempt == 0 && resp == nil && sendState.mayFailover(requestCtx, c, err) {
+				return nil, s.handleOpenAIUpstreamTransportError(requestCtx, c, account, err, false)
 			}
-			if (requestCtx != nil && requestCtx.Err() != nil) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				break
-			}
-			continue
+			firstFailure = &openAIImagesOAuthBatchFailure{transportErr: err, upstreamURL: upstreamURL}
+			partialHTTPFailure = nil
+			// An ambiguous failed POST may already have generated an image.
+			break
 		}
 		if ParseCodexRateLimitHeaders(resp.Header) != nil {
 			latestCodexHeaders = resp.Header.Clone()
@@ -2032,13 +2033,18 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuthBatch(
 		payload, responseErr := s.readOpenAIImagesOAuthNonStreamingResponse(resp, c, account, requestModel, true)
 		_ = resp.Body.Close()
 		if responseErr != nil {
+			failure := &openAIImagesOAuthBatchFailure{
+				response: resp, upstreamURL: upstreamURL, payload: payload, responseErr: responseErr,
+			}
+			var upstreamErr *OpenAIImagesUpstreamError
+			var failoverErr *UpstreamFailoverError
+			if !errors.As(responseErr, &upstreamErr) && !errors.As(responseErr, &failoverErr) {
+				firstFailure = failure
+				partialHTTPFailure = nil
+				break
+			}
 			if firstFailure == nil {
-				firstFailure = &openAIImagesOAuthBatchFailure{
-					response:    resp,
-					upstreamURL: upstreamURL,
-					payload:     payload,
-					responseErr: responseErr,
-				}
+				firstFailure = failure
 			}
 			continue
 		}
@@ -2244,9 +2250,13 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 	upstreamReq.Header.Set("OpenAI-Beta", "responses=experimental")
 
 	upstreamStart := time.Now()
+	upstreamReq, sendState := trackOpenAIUpstreamSend(upstreamReq)
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 	if err != nil {
+		if resp == nil && sendState.mayFailover(ctx, c, err) {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		return nil, s.handleOpenAIImagesOAuthTransportError(c, account, safeUpstreamURL(upstreamReq.URL.String()), err)
 	}
 	if resp.StatusCode >= 400 {
@@ -2425,18 +2435,14 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthResponseError(
 	err error,
 ) error {
 	responseWritten := c != nil && c.Writer != nil && OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c) != writerSizeBeforeResponse
-	if code, message, ok := OpenAIUpstreamStreamReadErrorDetails(err); ok {
-		// A body transport failure after a successful HTTP status is retryable only
-		// until real image output has reached the client. Keep the upstream headers
-		// and request ID available to the failover/error passthrough path.
-		headers := http.Header(nil)
+	if _, message, ok := OpenAIUpstreamStreamReadErrorDetails(err); ok {
+		// The generation request was accepted. A broken body cannot prove that
+		// the image was not generated, even before client output.
 		requestID := ""
-		statusCode := http.StatusBadGateway
 		if resp != nil {
-			headers = resp.Header.Clone()
 			requestID = strings.TrimSpace(resp.Header.Get("x-request-id"))
 		}
-		kind := "failover"
+		kind := "request_error"
 		if responseWritten {
 			kind = "retry_exhausted_failover"
 		}
@@ -2444,23 +2450,10 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthResponseError(
 			ProxyID:   opsUpstreamProxyID(account),
 			ProxyName: opsUpstreamProxyName(account),
 			Platform:  account.Platform, AccountID: account.ID, AccountName: account.Name,
-			UpstreamStatusCode: statusCode, UpstreamRequestID: requestID, UpstreamURL: upstreamURL,
+			UpstreamStatusCode: http.StatusBadGateway, UpstreamRequestID: requestID, UpstreamURL: upstreamURL,
 			Kind: kind, Message: message,
 		})
-		if responseWritten {
-			return err
-		}
-		responseBody := []byte(fmt.Sprintf(`{"error":{"type":"upstream_error","code":%q,"message":%q}}`, code, message))
-		shouldDisable := s.handleOpenAIAccountUpstreamError(ctx, account, statusCode, headers, responseBody, requestedModel)
-		return s.newOpenAIAccountFailoverError(
-			account,
-			statusCode,
-			headers,
-			responseBody,
-			message,
-			shouldDisable,
-			!shouldDisable && account.IsPoolMode() && account.IsPoolModeRetryableStatus(statusCode),
-		)
+		return err
 	}
 	var upstreamErr *OpenAIImagesUpstreamError
 	if !errors.As(err, &upstreamErr) {

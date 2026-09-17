@@ -28,7 +28,7 @@ func TestOpenAIForwardMayFailoverOnlyAfterNonSemanticWrite(t *testing.T) {
 }
 
 func TestOpenAIFirstOutputFailoverStopsAfterOneAccountSwitch(t *testing.T) {
-	failoverErr := &service.UpstreamFailoverError{SafeToFailoverAfterWrite: true}
+	failoverErr := &service.UpstreamFailoverError{SafeToFailoverAfterWrite: true, FirstOutputTimeout: true}
 	count := 0
 
 	require.False(t, openAIFirstOutputFailoverExhausted(failoverErr, &count))
@@ -46,6 +46,16 @@ func TestOpenAIFirstOutputFailoverDoesNotBoundRequestScopedTransient(t *testing.
 
 	for range 3 {
 		require.False(t, openAIFirstOutputFailoverExhausted(failoverErr, &count))
+	}
+	require.Zero(t, count)
+}
+
+func TestOpenAIFirstOutputFailoverDoesNotBoundHeartbeatOnlyReadErrors(t *testing.T) {
+	count := 0
+	for range 11 {
+		require.False(t, openAIFirstOutputFailoverExhausted(&service.UpstreamFailoverError{
+			SafeToFailoverAfterWrite: true,
+		}, &count))
 	}
 	require.Zero(t, count)
 }

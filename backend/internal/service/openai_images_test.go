@@ -1845,7 +1845,7 @@ func TestOpenAIGatewayServiceForwardImages_OAuth429SwitchesWithoutSameAccountRet
 	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
 }
 
-func TestOpenAIImagesOAuthBodyReadTransportErrorFailover(t *testing.T) {
+func TestOpenAIImagesOAuthBodyReadTransportErrorDoesNotFailoverAfterHTTPResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1866,20 +1866,15 @@ func TestOpenAIImagesOAuthBodyReadTransportErrorFailover(t *testing.T) {
 	err := svc.handleOpenAIImagesOAuthResponseError(context.Background(), c, account, "gpt-image-2", "https://api.openai.com/v1/responses", resp, OpenAIImagesJSONKeepaliveAdjustedWrittenSize(c), readErr)
 
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.JSONEq(t, `{"error":{"type":"upstream_error","code":"upstream_http2_stream_error","message":"Upstream HTTP/2 stream failed"}}`, string(failoverErr.ResponseBody))
-	require.Equal(t, "req_h2_read_failure", failoverErr.ResponseHeaders.Get("x-request-id"))
-	require.Equal(t, "preserved", failoverErr.ResponseHeaders.Get("x-upstream"))
-	resp.Header.Set("X-Upstream", "mutated")
-	require.Equal(t, "preserved", failoverErr.ResponseHeaders.Get("x-upstream"))
+	require.False(t, errors.As(err, &failoverErr), "an HTTP 200 image request may already have side effects; do not replay it")
+	require.ErrorIs(t, err, readErr)
 
 	rawEvents, ok := c.Get(OpsUpstreamErrorsKey)
 	require.True(t, ok)
 	events, ok := rawEvents.([]*OpsUpstreamErrorEvent)
 	require.True(t, ok)
 	require.Len(t, events, 1)
-	require.Equal(t, "failover", events[0].Kind)
+	require.Equal(t, "request_error", events[0].Kind)
 	require.Equal(t, "req_h2_read_failure", events[0].UpstreamRequestID)
 	require.Equal(t, "Upstream HTTP/2 stream failed", events[0].Message)
 }
@@ -1909,6 +1904,40 @@ func TestOpenAIImagesOAuthBodyReadErrorsNotMisclassified(t *testing.T) {
 			var failoverErr *UpstreamFailoverError
 			require.False(t, errors.As(got, &failoverErr))
 			require.ErrorIs(t, got, tt.err)
+		})
+	}
+}
+
+func TestOpenAIImagesOAuthBatchAmbiguousReadErrorOverridesEarlierHTTPFailure(t *testing.T) {
+	for _, firstHTTPFailure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("earlier_http_failure_%t", firstHTTPFailure), func(t *testing.T) {
+			body := []byte(`{"model":"gpt-image-2","prompt":"test","n":3}`)
+			c, _ := newOpenAIImagesTestContext(t, body)
+			responses := []*http.Response{}
+			if firstHTTPFailure {
+				responses = append(responses, &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"server_error","message":"unavailable"}}`)),
+				})
+			}
+			responses = append(responses, &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       &openAIImagesReadErrorBody{err: io.ErrUnexpectedEOF},
+			})
+			upstream := &httpUpstreamRecorder{responses: responses}
+			svc := newOpenAIImagesTestService(upstream)
+			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+			require.NoError(t, err)
+			account := &Account{ID: 11, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
+				Credentials: map[string]any{"access_token": "test-token"}}
+			_, err = svc.ForwardImages(c.Request.Context(), c, account, body, parsed, "")
+			var failoverErr *UpstreamFailoverError
+			require.Error(t, err)
+			require.False(t, errors.As(err, &failoverErr), "an earlier 503 must not hide an ambiguous accepted generation")
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			require.Len(t, upstream.requests, len(responses), "stop dispatching the batch after ambiguous image execution")
 		})
 	}
 }

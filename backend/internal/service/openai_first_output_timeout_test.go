@@ -744,7 +744,7 @@ func TestOpenAINativePreOutputStageKeepsPreamblePrivateAcrossKeepaliveWithoutTim
 	require.NotContains(t, body, "response.failed")
 }
 
-func TestOpenAINativePreOutputStreamIntervalTimeoutCommitsPreambleOnce(t *testing.T) {
+func TestOpenAINativePreOutputStreamIntervalTimeoutFailsOverPrivately(t *testing.T) {
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
 		OpenAIFirstOutputTimeoutSeconds: 0,
 		StreamDataIntervalTimeout:       1,
@@ -770,11 +770,10 @@ func TestOpenAINativePreOutputStreamIntervalTimeoutCommitsPreambleOnce(t *testin
 	<-writerDone
 	_ = pr.Close()
 
-	require.ErrorContains(t, err, "stream data interval timeout")
-	body := rec.Body.String()
-	require.Equal(t, 1, strings.Count(body, `data: {"type":"response.created"`))
-	require.Equal(t, 1, strings.Count(body, `data: {"type":"error"`))
-	require.Contains(t, body, `"code":"stream_timeout"`)
+	var failover *UpstreamFailoverError
+	require.ErrorAs(t, err, &failover)
+	require.Empty(t, rec.Body.String())
+	require.False(t, c.Writer.Written())
 }
 
 func TestOpenAINativePreOutputKeepaliveKeepsPassthroughFailureAsSSE(t *testing.T) {

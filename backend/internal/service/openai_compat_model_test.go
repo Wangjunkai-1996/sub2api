@@ -2079,10 +2079,8 @@ func TestForwardAsAnthropic_MissingTerminalBeforeOutputReturnsFailoverAndOps(t *
 	var failoverErr *UpstreamFailoverError
 	require.True(t, errors.As(err, &failoverErr), "missing terminal before output must use failover path")
 	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.Contains(t, string(failoverErr.ResponseBody), "OpenAI messages stream ended before a terminal event")
-	require.NotNil(t, result)
-	require.Zero(t, result.Usage.InputTokens)
-	require.Zero(t, result.Usage.OutputTokens)
+	require.Equal(t, OpenAIUpstreamStreamTruncatedCode, gjson.GetBytes(failoverErr.ResponseBody, "error.code").String())
+	require.Nil(t, result)
 	require.False(t, c.Writer.Written(), "no client body/header should be committed before safe failover")
 	require.Empty(t, rec.Body.String())
 
@@ -2092,7 +2090,7 @@ func TestForwardAsAnthropic_MissingTerminalBeforeOutputReturnsFailoverAndOps(t *
 	require.Equal(t, http.StatusBadGateway, events[0].UpstreamStatusCode)
 	require.Equal(t, int64(1), events[0].AccountID)
 	require.Equal(t, "rid_missing_terminal", events[0].UpstreamRequestID)
-	require.Contains(t, events[0].Message, "terminal event")
+	require.Equal(t, "Upstream response stream ended before completion", events[0].Message)
 }
 
 func TestForwardAsAnthropic_MissingTerminalAfterOutputRecordsOpsWithoutFailover(t *testing.T) {
@@ -2132,7 +2130,7 @@ func TestForwardAsAnthropic_MissingTerminalAfterOutputRecordsOpsWithoutFailover(
 
 	result, err := svc.ForwardAsAnthropic(context.Background(), c, account, body, "", "gpt-5.1")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "missing terminal event")
+	require.ErrorIs(t, err, ErrOpenAIUpstreamStreamTruncated)
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr), "partial output must not be replayed through failover")
 	require.NotNil(t, result)
@@ -2186,7 +2184,7 @@ func TestForwardAsAnthropic_MissingTerminalAfterClientDisconnectSkipsOpsAndFailo
 
 	result, err := svc.ForwardAsAnthropic(context.Background(), c, account, body, "", "gpt-5.1")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "missing terminal event")
+	require.ErrorIs(t, err, ErrOpenAIUpstreamStreamTruncated)
 	var failoverErr *UpstreamFailoverError
 	require.False(t, errors.As(err, &failoverErr))
 	require.NotNil(t, result)

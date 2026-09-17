@@ -242,6 +242,42 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 	return !gjson.ValidBytes(upstreamBody) && match(string(upstreamBody))
 }
 
+func isOpenAIStreamClientCancellation(message string, payload []byte) bool {
+	fields := []string{message}
+	for _, path := range []string{"response.error.code", "error.code", "code", "response.error.type", "error.type", "response.error.message", "error.message", "message"} {
+		fields = append(fields, gjson.GetBytes(payload, path).String())
+	}
+	for _, field := range fields {
+		field = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(field)), "_", " ")
+		for _, marker := range []string{"context canceled", "context cancelled", "client canceled", "client cancelled", "client disconnected", "request canceled", "request cancelled"} {
+			if strings.Contains(field, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isOpenAIStructuredStreamTransientError(payload []byte) bool {
+	if !gjson.ValidBytes(payload) {
+		return false
+	}
+	// Only explicit error fields identify a transient. Echoed request content
+	// and generic upstream_error envelopes are not evidence of replay safety.
+	for _, path := range []string{"response.error.code", "error.code", "code", "response.error.type", "error.type"} {
+		value := gjson.GetBytes(payload, path)
+		if value.Type != gjson.String {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(value.Str)) {
+		case "stream_read_error", OpenAIUpstreamStreamReadErrorCode, OpenAIUpstreamHTTP2StreamErrorCode, OpenAIUpstreamStreamTruncatedCode,
+			"server_error", "internal_error", "internal_server_error", "service_unavailable":
+			return true
+		}
+	}
+	return false
+}
+
 func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
 	switch statusCode {
 	case 401, 402, 403, 405, 429, 529:

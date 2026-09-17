@@ -43,7 +43,7 @@ func TestOpenAIHTTPStreamReplayBoundaryEvidence(t *testing.T) {
 			{"empty_delta", `{"type":"response.output_text.delta","delta":""}`, "", "", true},
 			{"empty_reasoning", `{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`, "", "", true},
 			{"text", `{"type":"response.output_text.delta","delta":"SECRET_CONTENT"}`, "response.output_text.delta", "nonempty_or_malformed_delta", false},
-			{"encrypted", `{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"SECRET_CONTENT"}}`, "response.output_item.added", "encrypted_reasoning", false},
+			{"encrypted", `{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"SECRET_CONTENT"}}`, "", "", true},
 			{"tool", `{"type":"response.function_call_arguments.delta","delta":"SECRET_CONTENT"}`, "response.function_call_arguments.delta", "tool_arguments", false},
 			{"unknown", `{"type":"response.future_event","value":"SECRET_CONTENT"}`, "response.future_event", "conservative_event", false},
 		} {

@@ -133,11 +133,17 @@ func TestOpenAIAtomicStreamIncompleteAttemptStaysPrivate(t *testing.T) {
 		{name: "eof"},
 		{name: "read_error", readErr: io.ErrUnexpectedEOF},
 		{name: "canceled", readErr: context.Canceled, canceled: true},
-		{name: "deadline", readErr: context.DeadlineExceeded, canceled: true},
+		{name: "attempt_deadline", readErr: context.DeadlineExceeded},
+		{name: "request_deadline", readErr: context.DeadlineExceeded, canceled: true},
 		{name: "stage_limit", suffix: strings.Repeat(delta, openAIFirstOutputStageMaxBytes/len(delta)+1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, recorder := newOpenAIAtomicStreamTestContext()
+			if tc.name == "request_deadline" {
+				requestCtx, cancel := context.WithDeadline(c.Request.Context(), time.Now().Add(-time.Second))
+				defer cancel()
+				c.Request = c.Request.WithContext(requestCtx)
+			}
 			store := NewOpenAIWSStateStore(nil)
 			svc := newOpenAIAtomicStreamTestService(store)
 			body := io.NopCloser(strings.NewReader(preamble + delta + tc.suffix))

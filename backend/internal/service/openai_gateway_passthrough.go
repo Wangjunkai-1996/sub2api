@@ -457,13 +457,6 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			resp.Body = newGrokResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize)
 		}
 
-		// x-codex-turn-state 溯源：下游回传由 writeOpenAIPassthroughResponseHeaders
-		// 在各 handler 的写头点强制放行，铸造账号在此统一记录，供出站守卫剥离
-		// failover 换号后的跨账号回带（openai_codex_turn_state.go）。
-		if extractOpenAICodexTurnState(resp.Header) != "" {
-			s.noteOpenAICodexTurnStateProvenance(c, account)
-		}
-
 		if reqStream {
 			result, handleErr := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
 			if handleErr != nil {
@@ -1236,6 +1229,81 @@ func openAIStreamStructuredEventStartsClientOutput(payload []byte, eventType str
 	}
 }
 
+// openAIStreamPrivateEncryptedReasoningEvent identifies the narrow Responses
+// event shape that can remain in the attempt-local stage. Encrypted reasoning
+// is protocol data and must be delivered on success, but exposing it before a
+// later upstream failure would make replay unsafe. Unknown fields are rejected
+// so a newly extended event cannot accidentally bypass the replay fence.
+func openAIStreamPrivateEncryptedReasoningEvent(payload []byte, eventType string) bool {
+	if eventType != "response.output_item.added" && eventType != "response.output_item.done" {
+		return false
+	}
+	if !gjson.ValidBytes(payload) {
+		return false
+	}
+	root := gjson.ParseBytes(payload)
+	item := root.Get("item")
+	if !item.Exists() || !item.IsObject() || item.Get("type").String() != "reasoning" || item.Get("encrypted_content").Type != gjson.String || item.Get("encrypted_content").String() == "" {
+		return false
+	}
+	valid := true
+	seen := make(map[string]bool, 5)
+	root.ForEach(func(key, value gjson.Result) bool {
+		if seen[key.Str] {
+			valid = false
+			return false
+		}
+		seen[key.Str] = true
+		switch key.Str {
+		case "type":
+			valid = value.Type == gjson.String && value.Str == eventType
+		case "sequence_number", "output_index":
+			valid = value.Type == gjson.Number && value.Num >= 0 && value.Num == float64(value.Int())
+		case "response_id":
+			valid = value.Type == gjson.String
+		case "item":
+			valid = value.IsObject()
+		default:
+			valid = false
+		}
+		return valid
+	})
+	if !valid {
+		return false
+	}
+	clear(seen)
+	item.ForEach(func(key, value gjson.Result) bool {
+		if seen[key.Str] {
+			valid = false
+			return false
+		}
+		seen[key.Str] = true
+		switch key.Str {
+		case "id", "type", "encrypted_content":
+			valid = value.Type == gjson.String
+		case "status":
+			valid = value.Type == gjson.String && (value.Str == "in_progress" || value.Str == "completed" || value.Str == "incomplete")
+		case "summary", "content":
+			valid = value.IsArray() && len(value.Array()) == 0
+		default:
+			valid = false
+		}
+		return valid
+	})
+	return valid
+}
+
+// HTTP may keep validated encrypted reasoning private; WS must retain the
+// conservative classifier because it does not use this attempt-local stage.
+func openAIHTTPStreamDataStartsClientOutput(data, eventType, wireEventType string) bool {
+	wireEventType = strings.TrimSpace(wireEventType)
+	if (wireEventType == "" || wireEventType == eventType) &&
+		openAIStreamPrivateEncryptedReasoningEvent([]byte(data), strings.TrimSpace(eventType)) {
+		return false
+	}
+	return openAIStreamDataStartsClientOutput(data, eventType)
+}
+
 func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 	trimmed := strings.TrimSpace(data)
 	if trimmed == "" {
@@ -1632,7 +1700,7 @@ func openAIStreamFailedEventShouldFailover(payload []byte, message string) bool 
 	if hit, _, _ := detectOpenAICyberPolicy(payload); hit {
 		return false
 	}
-	if isOpenAIContextWindowError(message, payload) {
+	if isOpenAIContextWindowError(message, payload) || isOpenAIStreamClientCancellation(message, payload) {
 		return false
 	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
@@ -1684,7 +1752,7 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	if hit, _, _ := detectOpenAICyberPolicy(payload); hit {
 		return false
 	}
-	if isOpenAIContextWindowError(message, payload) {
+	if isOpenAIContextWindowError(message, payload) || isOpenAIStreamClientCancellation(message, payload) {
 		return false
 	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
@@ -1694,6 +1762,12 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	case http.StatusForbidden:
 		return openAIStream403AccountFailure(payload, message)
 	case http.StatusUnauthorized, http.StatusTooManyRequests, 529:
+		return true
+	}
+	if !openAIStreamFailedEventShouldFailover(payload, message) {
+		return false
+	}
+	if isOpenAIStructuredStreamTransientError(payload) {
 		return true
 	}
 	if isOpenAITransientProcessingError(http.StatusBadRequest, message, payload) {
@@ -1941,15 +2015,27 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
 	}
-	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
-
 	// SSE headers
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
-	if v := resp.Header.Get("x-request-id"); v != "" {
-		c.Header("x-request-id", v)
+	applyAttemptResponseHeaders := func() {
+		if c.Writer.Written() {
+			// Stable keepalives may already have committed HTTP headers. In that
+			// case omit attempt headers, including optional turn-state, and do not
+			// record provenance for a value that never reached the client.
+			return
+		}
+		writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+		if v := resp.Header.Get("x-request-id"); v != "" {
+			c.Header("x-request-id", v)
+		}
+		s.noteStagedOpenAICodexTurnStateCommitted(c, account, c.Writer.Header())
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
 	}
 
 	w := c.Writer
@@ -2077,6 +2163,8 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	writePendingLines := func(reason string) bool {
 		stopKeepalive()
 		clientOutputStarted = true
+		bindResponseRouting()
+		applyAttemptResponseHeaders()
 		replayBoundary.commit(replayLogger, reason, pendingStage.Buffered())
 		if !writeTTFTComment(false) {
 			return false
@@ -2294,7 +2382,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			}
 			if responseID == "" {
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
-				bindResponseRouting()
+				if clientOutputStarted {
+					bindResponseRouting()
+				}
 			}
 			imageCounter.AddSSEData(dataBytes)
 			if sanitizedData, sanitized := sanitizeOpenAIResponseFailedEventForClient(
@@ -2306,11 +2396,15 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				trimmedData = strings.TrimSpace(string(sanitizedData))
 				line = "data: " + string(sanitizedData)
 			}
-			lineStartsClientOutput = forceFlushFailedEvent || openAIStreamDataStartsClientOutput(trimmedData, eventType)
+			semanticOutput := openAIStreamDataStartsClientOutput(trimmedData, eventType)
+			lineStartsClientOutput = forceFlushFailedEvent || semanticOutput
+			if !clientOutputStarted && !forceFlushFailedEvent {
+				lineStartsClientOutput = openAIHTTPStreamDataStartsClientOutput(trimmedData, eventType, pendingSSEEventType)
+			}
 			if lineStartsClientOutput && !suppressCurrentEvent {
 				replayBoundary.observe(trimmedData, eventType)
 			}
-			if lineStartsClientOutput && trimmedData != "[DONE]" && !openAIStreamEventTypeIsTerminal(eventType) {
+			if semanticOutput && trimmedData != "[DONE]" && !openAIStreamEventTypeIsTerminal(eventType) {
 				semanticOutputSeen = true
 			}
 			// OpenAI Responses streams that terminate with an empty
@@ -2384,11 +2478,15 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		if sawFailedEvent {
 			return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil || (c.Request != nil && c.Request.Context().Err() != nil) ||
+			(errors.Is(err, context.DeadlineExceeded) && openAIStreamClientOutputStarted(c, clientOutputStarted)) {
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", err)
 		}
 		if errors.Is(err, bufio.ErrTooLong) {
 			logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, err)
+			if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
+				return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI SSE line exceeds guarded first-output limit")
+			}
 			recordStreamError(nil, "stream_read_error", "response_too_large")
 			return resultWithUsage(), err
 		}
@@ -2487,8 +2585,6 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	}
 	logOpenAISuccessMissingUsage(ctx, c, account, resp, usage, "json", false)
 
-	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
-
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/json"
@@ -2508,6 +2604,11 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
 	s.bindHTTPResponseAccount(ctx, c, account, responseID)
 	observeOpenAI429RecoveryOutput(ctx, account, body, "")
+	StopOpenAICompactSSEKeepaliveCommitted(c)
+	if !c.Writer.Written() {
+		writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+		s.noteStagedOpenAICodexTurnStateCommitted(c, account, c.Writer.Header())
+	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
@@ -2576,7 +2677,6 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		body = []byte(bodyText)
 	}
 
-	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	logOpenAISuccessMissingUsage(c.Request.Context(), c, account, resp, usage, terminalType, false)
 
 	contentType := "application/json; charset=utf-8"
@@ -2589,6 +2689,11 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
 	s.bindHTTPResponseAccount(c.Request.Context(), c, account, responseID)
 	observeOpenAI429RecoveryOutput(c.Request.Context(), account, body, "")
+	StopOpenAICompactSSEKeepaliveCommitted(c)
+	if !c.Writer.Written() {
+		writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+		s.noteStagedOpenAICodexTurnStateCommitted(c, account, c.Writer.Header())
+	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
 	}
