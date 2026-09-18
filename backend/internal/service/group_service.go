@@ -9,9 +9,10 @@ import (
 )
 
 var (
-	ErrGroupNotFound = infraerrors.NotFound("GROUP_NOT_FOUND", "group not found")
-	ErrGroupExists   = infraerrors.Conflict("GROUP_EXISTS", "group name already exists")
-	ErrGroupNotEmpty = infraerrors.Conflict("GROUP_NOT_EMPTY", "group contains accounts")
+	ErrGroupNotFound       = infraerrors.NotFound("GROUP_NOT_FOUND", "group not found")
+	ErrGroupExists         = infraerrors.Conflict("GROUP_EXISTS", "group name already exists")
+	ErrGroupNotEmpty       = infraerrors.Conflict("GROUP_NOT_EMPTY", "group contains accounts")
+	ErrGroupUpdateConflict = infraerrors.Conflict("GROUP_UPDATE_CONFLICT", "group changed while it was being updated")
 )
 
 type GroupRepository interface {

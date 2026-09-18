@@ -201,17 +201,21 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	applyGrokCLIProxyHeaders(req)
 	if err := s.validateRequestHost(req); err != nil {
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 	profile := service.HTTPUpstreamProfileDefault
+	egressBinding := ""
 	if req != nil {
 		profile = service.HTTPUpstreamProfileFromContext(req.Context())
+		if egress, ok := service.HTTPUpstreamEgressFromContext(req.Context()); ok {
+			egressBinding = egress.BindingID
+		}
 	}
 
 	// 获取或创建对应的客户端，并标记请求占用
-	entry, err := s.acquireClientWithProfile(proxyURL, accountID, accountConcurrency, profile)
+	entry, err := s.acquireClientWithProfile(proxyURL, accountID, accountConcurrency, profile, egressBinding)
 	if err != nil {
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 
 	// 执行请求
@@ -225,10 +229,9 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 		return nil, err
 	}
-	s.recordOpenAIHTTP2Success(profile, entry.protocolMode, entry.proxyKey)
-
 	// 如果上游返回了压缩内容，解压后再交给业务层
 	decompressResponseBody(resp)
+	resp.Body = s.observeOpenAIHTTP2ResponseBody(req.Context(), resp.Body, profile, entry.protocolMode, entry.proxyKey)
 
 	// 包装响应体，在关闭时自动减少计数并更新时间戳
 	// 这确保了流式响应（如 SSE）在完全读取前不会被淘汰
@@ -255,28 +258,34 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	}
 	applyGrokCLIProxyHeaders(req)
 	upstreamProfile := service.HTTPUpstreamProfileDefault
+	egressBinding := ""
 	if req != nil {
 		upstreamProfile = service.HTTPUpstreamProfileFromContext(req.Context())
+		if egress, ok := service.HTTPUpstreamEgressFromContext(req.Context()); ok {
+			egressBinding = egress.BindingID
+		}
 	}
 
 	targetHost := ""
 	if req != nil && req.URL != nil {
 		targetHost = req.URL.Host
 	}
-	proxyInfo := "direct"
-	if proxyURL != "" {
-		proxyInfo = proxyURL
-	}
-	slog.Debug("tls_fingerprint_enabled", "account_id", accountID, "target", targetHost, "proxy", proxyInfo, "profile", profile.Name)
+	slog.Debug("tls_fingerprint_enabled",
+		"account_id", accountID,
+		"egress_binding", egressBinding,
+		"target", targetHost,
+		"proxy_configured", proxyURL != "",
+		"profile", profile.Name,
+	)
 
 	if err := s.validateRequestHost(req); err != nil {
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 
-	entry, err := s.acquireClientWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile)
+	entry, err := s.acquireClientWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile, egressBinding)
 	if err != nil {
 		slog.Debug("tls_fingerprint_acquire_client_failed", "account_id", accountID, "error", err)
-		return nil, err
+		return nil, service.MarkHTTPUpstreamRequestNotSent(err)
 	}
 
 	client := s.httpClientForUpstreamRequest(entry.client, req)
@@ -496,13 +505,13 @@ func isSupportedGrokCLIVersion(version string) bool {
 }
 
 // acquireClientWithTLS 获取或创建带 TLS 指纹的客户端
-func (s *httpUpstreamService) acquireClientWithTLS(proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile, upstreamProfile service.HTTPUpstreamProfile) (*upstreamClientEntry, error) {
-	return s.getClientEntryWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile, true, true)
+func (s *httpUpstreamService) acquireClientWithTLS(proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile, upstreamProfile service.HTTPUpstreamProfile, egressBinding ...string) (*upstreamClientEntry, error) {
+	return s.getClientEntryWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile, true, true, egressBinding...)
 }
 
 // getClientEntryWithTLS 获取或创建带 TLS 指纹的客户端条目
 // TLS 指纹客户端使用独立的缓存键，与普通客户端隔离
-func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile, upstreamProfile service.HTTPUpstreamProfile, markInFlight bool, enforceLimit bool) (*upstreamClientEntry, error) {
+func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile, upstreamProfile service.HTTPUpstreamProfile, markInFlight bool, enforceLimit bool, egressBinding ...string) (*upstreamClientEntry, error) {
 	isolation := s.getIsolationMode()
 	proxyKey, parsedProxy, err := normalizeProxyURL(proxyURL)
 	if err != nil {
@@ -511,7 +520,7 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	settings := s.resolvePoolSettings(isolation, accountConcurrency)
 	settings = s.applyProfilePoolSettings(settings, upstreamProfile)
 	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀
-	cacheKey := "tls:" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault)
+	cacheKey := "tls:" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault, firstEgressBinding(egressBinding))
 	poolKey := buildPoolKey(settings, upstreamProtocolModeDefault) + ":tls"
 
 	now := time.Now()
@@ -525,7 +534,7 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 			atomic.AddInt64(&entry.inFlight, 1)
 		}
 		s.mu.RUnlock()
-		slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "cache_key", cacheKey)
+		slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "egress_binding", firstEgressBinding(egressBinding))
 		return entry, nil
 	}
 	s.mu.RUnlock()
@@ -539,12 +548,12 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 				atomic.AddInt64(&entry.inFlight, 1)
 			}
 			s.mu.Unlock()
-			slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "cache_key", cacheKey)
+			slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "egress_binding", firstEgressBinding(egressBinding))
 			return entry, nil
 		}
 		slog.Debug("tls_fingerprint_evicting_stale_client",
 			"account_id", accountID,
-			"cache_key", cacheKey,
+			"egress_binding", firstEgressBinding(egressBinding),
 			"proxy_changed", entry.proxyKey != proxyKey,
 			"pool_changed", entry.poolKey != poolKey)
 		s.removeClientLocked(cacheKey, entry)
@@ -562,7 +571,11 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	}
 
 	// 创建带 TLS 指纹的 Transport
-	slog.Debug("tls_fingerprint_creating_new_client", "account_id", accountID, "cache_key", cacheKey, "proxy", proxyKey)
+	slog.Debug("tls_fingerprint_creating_new_client",
+		"account_id", accountID,
+		"egress_binding", firstEgressBinding(egressBinding),
+		"proxy_configured", proxyURL != "",
+	)
 	transport, err := buildUpstreamTransportWithTLSFingerprint(settings, parsedProxy, profile)
 	if err != nil {
 		s.mu.Unlock()
@@ -635,8 +648,8 @@ func (s *httpUpstreamService) acquireClient(proxyURL string, accountID int64, ac
 }
 
 // acquireClientWithProfile 获取或创建客户端，并按请求 profile 选择协议策略。
-func (s *httpUpstreamService) acquireClientWithProfile(proxyURL string, accountID int64, accountConcurrency int, profile service.HTTPUpstreamProfile) (*upstreamClientEntry, error) {
-	return s.getClientEntry(proxyURL, accountID, accountConcurrency, profile, true, true)
+func (s *httpUpstreamService) acquireClientWithProfile(proxyURL string, accountID int64, accountConcurrency int, profile service.HTTPUpstreamProfile, egressBinding ...string) (*upstreamClientEntry, error) {
+	return s.getClientEntry(proxyURL, accountID, accountConcurrency, profile, true, true, egressBinding...)
 }
 
 // getOrCreateClient 获取或创建客户端
@@ -661,7 +674,7 @@ func (s *httpUpstreamService) getOrCreateClient(proxyURL string, accountID int64
 // getClientEntry 获取或创建客户端条目
 // markInFlight=true 时会标记进行中请求，用于请求路径防止被淘汰
 // enforceLimit=true 时会限制客户端数量，超限且无法淘汰时返回错误
-func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, accountConcurrency int, profile service.HTTPUpstreamProfile, markInFlight bool, enforceLimit bool) (*upstreamClientEntry, error) {
+func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, accountConcurrency int, profile service.HTTPUpstreamProfile, markInFlight bool, enforceLimit bool, egressBinding ...string) (*upstreamClientEntry, error) {
 	// 获取隔离模式
 	isolation := s.getIsolationMode()
 	// 标准化代理 URL 并解析
@@ -674,7 +687,7 @@ func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, a
 	settings := s.resolvePoolSettings(isolation, accountConcurrency)
 	settings = s.applyProfilePoolSettings(settings, profile)
 	// 构建缓存键（根据隔离策略不同）
-	cacheKey := buildCacheKey(isolation, proxyKey, accountID, protocolMode)
+	cacheKey := buildCacheKey(isolation, proxyKey, accountID, protocolMode, firstEgressBinding(egressBinding))
 	// 构建连接池配置键（用于检测配置变更）
 	poolKey := buildPoolKey(settings, protocolMode)
 
@@ -749,11 +762,11 @@ func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, a
 
 // shouldReuseEntry 判断缓存条目是否可复用
 // 若代理或连接池配置发生变化，则需要重建客户端
-func (s *httpUpstreamService) shouldReuseEntry(entry *upstreamClientEntry, isolation, proxyKey, poolKey string) bool {
+func (s *httpUpstreamService) shouldReuseEntry(entry *upstreamClientEntry, _, proxyKey, poolKey string) bool {
 	if entry == nil {
 		return false
 	}
-	if isolation == config.ConnectionPoolIsolationAccount && entry.proxyKey != proxyKey {
+	if entry.proxyKey != proxyKey {
 		return false
 	}
 	if entry.poolKey != poolKey {
@@ -966,20 +979,31 @@ func buildPoolKey(settings poolSettings, protocolMode string) string {
 //   - proxy 模式: "proxy:{proxyKey}"
 //   - account 模式: "account:{accountID}"
 //   - account_proxy 模式: "account:{accountID}|proxy:{proxyKey}"
-func buildCacheKey(isolation, proxyKey string, accountID int64, protocolMode string) string {
+func buildCacheKey(isolation, proxyKey string, accountID int64, protocolMode string, egressBinding ...string) string {
 	var base string
-	switch isolation {
-	case config.ConnectionPoolIsolationAccount:
-		base = fmt.Sprintf("account:%d", accountID)
-	case config.ConnectionPoolIsolationAccountProxy:
-		base = fmt.Sprintf("account:%d|proxy:%s", accountID, proxyKey)
-	default:
-		base = fmt.Sprintf("proxy:%s", proxyKey)
+	if binding := firstEgressBinding(egressBinding); binding != "" {
+		base = fmt.Sprintf("account:%d|egress:%s", accountID, binding)
+	} else {
+		switch isolation {
+		case config.ConnectionPoolIsolationAccount:
+			base = fmt.Sprintf("account:%d", accountID)
+		case config.ConnectionPoolIsolationAccountProxy:
+			base = fmt.Sprintf("account:%d|proxy:%s", accountID, proxyKey)
+		default:
+			base = fmt.Sprintf("proxy:%s", proxyKey)
+		}
 	}
 	if protocolMode != "" && protocolMode != upstreamProtocolModeDefault {
 		base += "|proto:" + protocolMode
 	}
 	return base
+}
+
+func firstEgressBinding(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
 }
 
 func (s *httpUpstreamService) resolveOpenAIHTTP2Settings() openAIHTTP2Settings {
@@ -1071,12 +1095,20 @@ func isOpenAIHTTP2CompatibilityError(err error) bool {
 	if isUpstreamTimeoutError(err) {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	if msg == "" {
 		return false
 	}
+	if msg == "unexpected eof" {
+		return true
+	}
 	markers := []string{
 		"alpn",
+		"client connection force closed",
+		"client connection lost",
 		"no application protocol",
 		"protocol error",
 		"stream error",
@@ -1137,7 +1169,7 @@ func (s *httpUpstreamService) recordOpenAIHTTP2Failure(profile service.HTTPUpstr
 	activated, until := state.recordFailure(time.Now(), settings.fallbackErrorThreshold, settings.fallbackWindow, settings.fallbackTTL)
 	if activated {
 		slog.Warn("openai_http2_proxy_fallback_activated",
-			"proxy", proxyKey,
+			"proxy_configured", proxyKey != directProxyKey,
 			"fallback_until", until.Format(time.RFC3339))
 	}
 }
@@ -1214,6 +1246,65 @@ func (s *openAIHTTP2FallbackState) recordFailure(now time.Time, threshold int, w
 	s.windowStart = time.Time{}
 	s.errorCount = 0
 	return true, s.fallbackUntil
+}
+
+// observeOpenAIHTTP2ResponseBody delays the transport success signal until the
+// response body reaches a clean EOF. Receiving headers is not sufficient for a
+// streaming response: HTTP/2 proxy failures commonly surface only from Body.Read.
+func (s *httpUpstreamService) observeOpenAIHTTP2ResponseBody(
+	requestCtx context.Context,
+	body io.ReadCloser,
+	profile service.HTTPUpstreamProfile,
+	protocolMode string,
+	proxyKey string,
+) io.ReadCloser {
+	if profile != service.HTTPUpstreamProfileOpenAI ||
+		protocolMode != upstreamProtocolModeOpenAIH2 ||
+		!isHTTPProxyKey(proxyKey) {
+		return body
+	}
+	if body == nil {
+		s.recordOpenAIHTTP2Success(profile, protocolMode, proxyKey)
+		return nil
+	}
+	return &openAIHTTP2ObservedBody{
+		ReadCloser: body,
+		requestCtx: requestCtx,
+		onTerminal: func(err error) {
+			if errors.Is(err, io.EOF) {
+				s.recordOpenAIHTTP2Success(profile, protocolMode, proxyKey)
+				return
+			}
+			s.recordOpenAIHTTP2Failure(profile, protocolMode, proxyKey, err)
+		},
+	}
+}
+
+type openAIHTTP2ObservedBody struct {
+	io.ReadCloser
+	requestCtx context.Context
+	once       sync.Once
+	onTerminal func(error)
+}
+
+func (b *openAIHTTP2ObservedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == nil || openAIHTTP2BodyReadWasCanceled(b.requestCtx, err) {
+		return n, err
+	}
+	b.once.Do(func() {
+		if b.onTerminal != nil {
+			b.onTerminal(err)
+		}
+	})
+	return n, err
+}
+
+func openAIHTTP2BodyReadWasCanceled(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
 }
 
 // normalizeProxyURL 标准化代理 URL

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -159,6 +160,19 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 
 		if isOpenAIWSTerminalEvent(eventType) {
 			prewarmTerminalCount++
+			// Only a completed/done response proves that generate=false was
+			// accepted and the connection is safe to reuse. Failed, incomplete,
+			// cancelled, and contradictory nested statuses must stay on the
+			// fallback path; treating them as prewarmed would bind an unusable
+			// response id and contaminate the next business request.
+			terminalType := warmupTerminalTypeWithStatus(message, eventType)
+			if terminalType != "response.completed" && terminalType != "response.done" {
+				lease.MarkBroken()
+				return wrapOpenAIWSFallback(
+					"prewarm_"+strings.TrimPrefix(terminalType, "response."),
+					errors.New("OpenAI websocket prewarm did not complete successfully: "+terminalType),
+				)
+			}
 			break
 		}
 	}
@@ -166,7 +180,8 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	lease.MarkPrewarmed()
 	if prewarmResponseID != "" && stateStore != nil {
 		ttl := s.openAIWSResponseStickyTTL()
-		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, prewarmResponseID, stateStore.BindResponseAccount(ctx, groupID, prewarmResponseID, account.ID, ttl))
+		bindingID := strings.TrimSpace(lease.BindingID())
+		_ = bindOpenAIWSResponseRoutingPair(stateStore, ctx, groupID, prewarmResponseID, account.ID, bindingID, ttl)
 		stateStore.BindResponseConn(prewarmResponseID, lease.ConnID(), ttl)
 	}
 	logOpenAIWSModeInfo(
@@ -263,6 +278,70 @@ func markOpenAIWSClientVisibleFailure(c *gin.Context, eventType string, payload 
 		message = "upstream websocket request failed"
 	}
 	MarkOpsStreamFailure(c, errType, code, message, status)
+}
+
+// openAIWSTerminalHealthStatus maps the structured terminal payload to an
+// HTTP-equivalent status used only by the distributed health classifier. It
+// intentionally distinguishes request/auth/quota failures from account-scoped
+// server failures while avoiding retention of the full terminal event.
+func openAIWSTerminalHealthStatus(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	statusValues := gjson.GetManyBytes(payload,
+		"response.error.status_code",
+		"response.error.status",
+		"error.status_code",
+		"error.status",
+		"status_code",
+	)
+	for _, value := range statusValues {
+		if status := int(value.Int()); status >= 400 && status <= 599 {
+			return status
+		}
+	}
+	values := gjson.GetManyBytes(payload,
+		"response.error.code",
+		"response.error.type",
+		"response.error.message",
+		"error.code",
+		"error.type",
+		"error.message",
+		"response.incomplete_details.reason",
+		"response.status_details.reason",
+	)
+	var signal strings.Builder
+	for _, value := range values {
+		if text := strings.ToLower(strings.TrimSpace(value.String())); text != "" {
+			signal.WriteByte(' ')
+			signal.WriteString(text)
+		}
+	}
+	message := signal.String()
+	switch {
+	case strings.Contains(message, "rate_limit"), strings.Contains(message, "rate limit"),
+		strings.Contains(message, "usage_limit"), strings.Contains(message, "usage limit"),
+		strings.Contains(message, "insufficient_quota"), strings.Contains(message, "quota"),
+		strings.Contains(message, "overloaded"), strings.Contains(message, "slow_down"):
+		return http.StatusTooManyRequests
+	case strings.Contains(message, "invalid_api_key"), strings.Contains(message, "authentication"),
+		strings.Contains(message, "unauthorized"):
+		return http.StatusUnauthorized
+	case strings.Contains(message, "permission"), strings.Contains(message, "forbidden"):
+		return http.StatusForbidden
+	case strings.Contains(message, "invalid_request"), strings.Contains(message, "invalid request"),
+		strings.Contains(message, "bad_request"), strings.Contains(message, "bad request"),
+		strings.Contains(message, "unsupported"), strings.Contains(message, "cyber_policy"),
+		strings.Contains(message, "content_policy"), strings.Contains(message, "content filter"),
+		strings.Contains(message, "content_filter"), strings.Contains(message, "safety"),
+		strings.Contains(message, "max_output_tokens"):
+		return http.StatusBadRequest
+	case strings.Contains(message, "server_error"), strings.Contains(message, "internal_error"),
+		strings.Contains(message, "upstream_error"), strings.Contains(message, "stream_error"):
+		return http.StatusInternalServerError
+	default:
+		return 0
+	}
 }
 
 func openAIWSPayloadTransientStatus(payload []byte) int {
@@ -469,42 +548,214 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 	requiredCapability OpenAIEndpointCapability,
 	requireCompact bool,
 ) (*AccountSelectionResult, error) {
+	return s.selectAccountByPreviousResponseIDForCapabilityWithAccountFence(
+		ctx,
+		groupID,
+		previousResponseID,
+		requestedModel,
+		excludedIDs,
+		requiredCapability,
+		requireCompact,
+		false,
+	)
+}
+
+func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapabilityWithAccountFence(
+	ctx context.Context,
+	groupID *int64,
+	previousResponseID string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredCapability OpenAIEndpointCapability,
+	requireCompact bool,
+	requireAccountContinuation bool,
+) (*AccountSelectionResult, error) {
 	if s == nil {
 		return nil, nil
 	}
-	accountID, account, responseID, store := s.resolveAccountByPreviousResponseIDForCapability(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
-	if accountID <= 0 || account == nil || store == nil {
+	responseID := strings.TrimSpace(previousResponseID)
+	if responseID == "" {
 		return nil, nil
 	}
+	groupIDValue := derefGroupID(groupID)
+	store := s.getOpenAIWSStateStore()
+	if store == nil {
+		return nil, nil
+	}
+	// A durable response->egress marker is a hard continuation fence. Validate
+	// its account component before resolving the legacy response->account marker
+	// so a stale or cross-account marker can never fall through to normal
+	// scheduling.
+	requiredBindingID, hasResponseEgress, egressErr := getOpenAIWSResponseEgressWithError(store, ctx, groupIDValue, responseID)
+	requiredBindingID = strings.TrimSpace(requiredBindingID)
+	if egressErr != nil {
+		if errors.Is(egressErr, ErrAccountEgressNoRoute) || errors.Is(egressErr, ErrAccountEgressConfigStale) {
+			return nil, egressErr
+		}
+		return nil, fmt.Errorf("%w: read previous response egress binding: %v", ErrAccountEgressUnavailable, egressErr)
+	}
+	strictContinuation := hasResponseEgress && requiredBindingID != ""
+	hasResponseAccount := strictContinuation
+	if !strictContinuation {
+		markerState, markerErr := s.inspectOpenAIMovableResponseEgressMarkers(ctx, groupID, responseID)
+		if markerErr != nil {
+			return nil, markerErr
+		}
+		hasResponseAccount = markerState.HasAccountBinding
+		// The account half may belong to an enforced pool whose route write was
+		// interrupted. inspectOpenAIMovableResponseEgressMarkers fails that state
+		// closed, while preserving portable API-key/legacy account-only behavior.
+		// It may also observe a route committed after the first read; promote that
+		// observation to the hard continuation path.
+		if markerState.HasEgressBinding {
+			requiredBindingID = strings.TrimSpace(markerState.BindingID)
+			hasResponseEgress = requiredBindingID != ""
+			strictContinuation = hasResponseEgress
+		}
+	}
+	if requireAccountContinuation && !hasResponseAccount {
+		return nil, fmt.Errorf("%w: previous response %s has no account binding", ErrAccountEgressNoRoute, responseID)
+	}
+	if strictContinuation {
+		boundAccountID, _, validBinding := parseStableAccountEgressBindingID(requiredBindingID)
+		if !validBinding {
+			return nil, fmt.Errorf("%w: previous response %s has an invalid egress binding", ErrAccountEgressConfigStale, responseID)
+		}
+		responseAccountID, responseAccountFound, accountErr := getOpenAIWSResponseAccountWithError(store, ctx, groupIDValue, responseID)
+		if accountErr != nil {
+			if errors.Is(accountErr, ErrAccountEgressNoRoute) || errors.Is(accountErr, ErrAccountEgressConfigStale) {
+				return nil, accountErr
+			}
+			return nil, fmt.Errorf("%w: read previous response account binding: %v", ErrAccountEgressUnavailable, accountErr)
+		}
+		if !responseAccountFound || responseAccountID <= 0 {
+			return nil, fmt.Errorf("%w: previous response %s has no account binding", ErrAccountEgressNoRoute, responseID)
+		}
+		if responseAccountID != boundAccountID {
+			return nil, fmt.Errorf("%w: previous response %s account binding %d does not match egress account %d", ErrAccountEgressConfigStale, responseID, responseAccountID, boundAccountID)
+		}
+	}
+	hardContinuation := strictContinuation || requireAccountContinuation
+	accountID, account, responseID, store := s.resolveAccountByPreviousResponseIDForCapability(ctx, groupID, responseID, requestedModel, excludedIDs, requiredCapability, requireCompact, hardContinuation)
+	if accountID <= 0 || account == nil || store == nil {
+		if hardContinuation {
+			return nil, fmt.Errorf("%w: previous response %s account is unavailable", ErrAccountEgressNoRoute, responseID)
+		}
+		return nil, nil
+	}
+	poolEnforced := accountUsesEnforcedEgressPool(ctx, s.settingService, account)
+	if strictContinuation && !poolEnforced {
+		return nil, fmt.Errorf("%w: previous response %s egress pool is not currently enforced", ErrAccountEgressConfigStale, responseID)
+	}
+	if poolEnforced {
+		if !hasResponseEgress || strings.TrimSpace(requiredBindingID) == "" {
+			return nil, fmt.Errorf("%w: previous response %s has no egress binding", ErrAccountEgressNoRoute, responseID)
+		}
+		boundAccountID, _, validBinding := parseStableAccountEgressBindingID(requiredBindingID)
+		if !validBinding || boundAccountID != accountID {
+			return nil, fmt.Errorf("%w: previous response %s has an invalid egress binding", ErrAccountEgressConfigStale, responseID)
+		}
+		ctx = WithRequiredAccountEgressBinding(ctx, requiredBindingID)
+	}
 
-	result, acquireErr := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
-	if acquireErr == nil && result.Acquired {
-		logOpenAIWSBindResponseAccountWarn(
-			derefGroupID(groupID),
-			accountID,
+	result, acquireErr := s.acquirePreviousResponseAccountSlot(ctx, account, poolEnforced)
+	if acquireErr == nil && result != nil && result.Acquired {
+		selectedAccount := selectionAccount(result, account)
+		if !openAIProxyStreamQuarantineBypassed(ctx) && s.isOpenAIProxyStreamQuarantined(ctx, selectedAccount) {
+			if result.ReleaseFunc != nil {
+				result.ReleaseFunc()
+			}
+			return nil, fmt.Errorf("%w: previous response egress proxy is quarantined", ErrAccountEgressNoRoute)
+		}
+		selectedBindingID := ""
+		if selectedAccount != nil && selectedAccount.SelectedEgress != nil {
+			selectedBindingID = strings.TrimSpace(selectedAccount.SelectedEgress.BindingID)
+		}
+		if poolEnforced && selectedBindingID != requiredBindingID {
+			if result.ReleaseFunc != nil {
+				result.ReleaseFunc()
+			}
+			return nil, fmt.Errorf("%w: previous response %s acquired egress binding %q, want %q", ErrAccountEgressConfigStale, responseID, selectedBindingID, requiredBindingID)
+		}
+		_ = bindOpenAIWSResponseRoutingPair(
+			store,
+			ctx,
+			groupIDValue,
 			responseID,
-			store.BindResponseAccount(ctx, derefGroupID(groupID), responseID, accountID, s.openAIWSResponseStickyTTL()),
+			accountID,
+			selectedBindingID,
+			s.openAIWSResponseStickyTTL(),
 		)
-		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account:     account,
-			Acquired:    true,
-			ReleaseFunc: result.ReleaseFunc,
-		}), nil
+		return s.newAcquiredSelectionResult(ctx, selectedAccount, result.ReleaseFunc)
+	}
+	if isAccountEgressAdmissionError(acquireErr) {
+		return nil, acquireErr
 	}
 
 	cfg := s.schedulingConfig()
 	if s.concurrencyService != nil {
-		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
-			Account: account,
-			WaitPlan: &AccountWaitPlan{
-				AccountID:      accountID,
-				MaxConcurrency: account.Concurrency,
-				Timeout:        cfg.StickySessionWaitTimeout,
-				MaxWaiting:     cfg.StickySessionMaxWaiting,
-			},
-		}), nil
+		return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
+			AccountID:      accountID,
+			MaxConcurrency: account.Concurrency,
+			Timeout:        cfg.StickySessionWaitTimeout,
+			MaxWaiting:     cfg.StickySessionMaxWaiting,
+		})
 	}
 	return nil, nil
+}
+
+func (s *OpenAIGatewayService) acquirePreviousResponseAccountSlot(
+	ctx context.Context,
+	account *Account,
+	poolEnforced bool,
+) (*AcquireResult, error) {
+	result, err := s.tryAcquireAccountSlot(ctx, account)
+	if !poolEnforced || !errors.Is(err, ErrAccountEgressCapacityFull) || s.concurrencyService == nil {
+		return result, err
+	}
+
+	cfg := s.schedulingConfig()
+	if cfg.StickySessionMaxWaiting <= 0 || cfg.StickySessionWaitTimeout <= 0 {
+		return result, err
+	}
+	admitted, waitErr := s.concurrencyService.IncrementAccountWaitCount(
+		ctx,
+		account.ID,
+		cfg.StickySessionMaxWaiting,
+	)
+	if waitErr != nil {
+		return nil, fmt.Errorf("%w: continuation wait admission: %v", ErrAccountEgressUnavailable, waitErr)
+	}
+	if !admitted {
+		return result, err
+	}
+	defer s.concurrencyService.DecrementAccountWaitCount(ctx, account.ID)
+
+	waitCtx, cancel := context.WithTimeout(ctx, cfg.StickySessionWaitTimeout)
+	defer cancel()
+	for {
+		timer := time.NewTimer(accountEgressWaitPollInterval)
+		select {
+		case <-waitCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, fmt.Errorf("%w: required binding wait deadline exceeded", ErrAccountEgressCapacityFull)
+		case <-timer.C:
+		}
+
+		// Recovery admission belongs to the request, not this temporary wait.
+		result, err = acquireAccountSlotForSelection(waitCtx, s.concurrencyService, s.settingService, account)
+		if err == nil && result != nil && result.Acquired {
+			return result, nil
+		}
+		if !errors.Is(err, ErrAccountEgressCapacityFull) {
+			return result, err
+		}
+	}
 }
 
 func (s *OpenAIGatewayService) ResolveAccountIDByPreviousResponseIDForScheduler(
@@ -516,7 +767,7 @@ func (s *OpenAIGatewayService) ResolveAccountIDByPreviousResponseIDForScheduler(
 	requiredCapability OpenAIEndpointCapability,
 	requireCompact bool,
 ) int64 {
-	accountID, _, _, _ := s.resolveAccountByPreviousResponseIDForCapability(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
+	accountID, _, _, _ := s.resolveAccountByPreviousResponseIDForCapability(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact, false)
 	return accountID
 }
 
@@ -528,6 +779,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	excludedIDs map[int64]struct{},
 	requiredCapability OpenAIEndpointCapability,
 	requireCompact bool,
+	preserveRoutingFence bool,
 ) (int64, *Account, string, OpenAIWSStateStore) {
 	if s == nil {
 		return 0, nil, "", nil
@@ -539,6 +791,12 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	store := s.getOpenAIWSStateStore()
 	if store == nil {
 		return 0, nil, "", nil
+	}
+	clearRoutingFence := func() {
+		if preserveRoutingFence {
+			return
+		}
+		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
 	}
 
 	accountID, err := store.GetResponseAccount(ctx, derefGroupID(groupID), responseID)
@@ -553,7 +811,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 
 	account, err := s.getSchedulableAccount(ctx, accountID)
 	if err != nil || account == nil {
-		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+		clearRoutingFence()
 		return 0, nil, "", nil
 	}
 	// OAuth/SetupToken continuation state lives on the WSv2 session and cannot
@@ -564,11 +822,11 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		return 0, nil, "", nil
 	}
 	if shouldClearStickySession(account, requestedModel) || !account.IsOpenAI() || !account.IsSchedulable() {
-		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+		clearRoutingFence()
 		return 0, nil, "", nil
 	}
 	if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
-		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+		clearRoutingFence()
 		return 0, nil, "", nil
 	}
 	if requestedModel != "" && !account.IsModelSupported(requestedModel) {
@@ -593,11 +851,11 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	if s.schedulerSnapshot != nil && s.accountRepo != nil {
 		latest, latestErr := s.accountRepo.GetByID(ctx, account.ID)
 		if latestErr != nil || latest == nil {
-			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+			clearRoutingFence()
 			return 0, nil, "", nil
 		}
 		if shouldClearStickySession(latest, requestedModel) || !latest.IsOpenAI() || !latest.IsSchedulable() {
-			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+			clearRoutingFence()
 			return 0, nil, "", nil
 		}
 		if !s.openAIAccountMatchesSchedulingGroup(latest, groupID) {
@@ -607,7 +865,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			return 0, nil, "", nil
 		}
 		if !parentHealthyForShadow(latest, s.parentAccountLookup(ctx)) {
-			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+			clearRoutingFence()
 			return 0, nil, "", nil
 		}
 		if requestedModel != "" && !latest.IsModelSupported(requestedModel) {
@@ -624,13 +882,13 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			return 0, nil, "", nil
 		}
 		if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel, requireCompact) {
-			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+			clearRoutingFence()
 			return 0, nil, "", nil
 		}
 		account = latest
 	}
 	if requireCompact && openAICompactSupportTier(account) == 0 {
-		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+		clearRoutingFence()
 		return 0, nil, "", nil
 	}
 	return accountID, account, responseID, store

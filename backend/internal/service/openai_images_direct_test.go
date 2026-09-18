@@ -14,6 +14,7 @@ import (
 
 func directImagesTestAccount() *Account {
 	return &Account{ID: 35, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status:      StatusActive,
 		Credentials: map[string]any{"access_token": "test-token", "chatgpt_account_id": "test-account"}}
 }
 
@@ -126,11 +127,8 @@ func TestCodexDirectImagesMultipleOutputs(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {
 			body := []byte(fmt.Sprintf(`{"model":"gpt-image-2.5-flare","prompt":"draw","n":2,"stream":%t}`, stream))
-			c, _ := newOpenAIImagesTestContext(t, body)
+			c, rec := newOpenAIImagesTestContext(t, body)
 			response := `{"data":[{"b64_json":"AA=="},{"b64_json":"AQ=="}],"usage":{"input_tokens":10,"output_tokens":40}}`
-			if stream {
-				response = "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"AA==\"}\n\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"AQ==\",\"usage\":{\"input_tokens\":10,\"output_tokens\":40}}\n\n"
-			}
 			upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response))}}
 			svc := newOpenAIImagesTestService(upstream)
 			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
@@ -139,6 +137,14 @@ func TestCodexDirectImagesMultipleOutputs(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 2, result.ImageCount)
 			require.Equal(t, 40, result.Usage.ImageOutputTokens)
+			require.False(t, result.Stream)
+			require.False(t, parsed.EffectiveStream())
+			require.Len(t, upstream.requests, 1)
+			require.EqualValues(t, 2, gjson.GetBytes(upstream.lastBody, "n").Int())
+			require.False(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+			require.Equal(t, "application/json", upstream.lastReq.Header.Get("Accept"))
+			require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+			require.Len(t, gjson.GetBytes(rec.Body.Bytes(), "data").Array(), 2)
 		})
 	}
 }
@@ -177,6 +183,10 @@ func TestCodexDirectImagesStreaming(t *testing.T) {
 				fmt.Fprintf(&stream, "data: %s\n\n", frames[event])
 			}
 			upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream.String()))}}
+			if test.name == "partial_requested_multiple" {
+				upstream.resp.Header.Set("Content-Type", "application/json")
+				upstream.resp.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-image-2-codex","data":[{"b64_json":"aGVsbG8=","output_format":"webp"}],"usage":{"input_tokens":10,"output_tokens":20}}`))
+			}
 			svc := newOpenAIImagesTestService(upstream)
 			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 			require.NoError(t, err)
@@ -195,6 +205,13 @@ func TestCodexDirectImagesStreaming(t *testing.T) {
 				}
 			}
 			require.Equal(t, "/backend-api/codex/images/edits", upstream.lastReq.URL.Path)
+			if parsed.N > 1 {
+				require.False(t, result.Stream)
+				require.Equal(t, "application/json", upstream.lastReq.Header.Get("Accept"))
+				require.Len(t, gjson.GetBytes(rec.Body.Bytes(), "data").Array(), 1)
+				require.Equal(t, "data:image/webp;base64,aGVsbG8=", gjson.GetBytes(rec.Body.Bytes(), "data.0.url").String())
+				return
+			}
 			require.Equal(t, "text/event-stream", upstream.lastReq.Header.Get("Accept"))
 			if !test.disconnect && test.wantCount > 0 {
 				require.Contains(t, rec.Body.String(), "event: image_edit.completed")
@@ -202,6 +219,25 @@ func TestCodexDirectImagesStreaming(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodexDirectImagesStreamingReadErrorIsClassified(t *testing.T) {
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw","stream":true}`)
+	c, _ := newOpenAIImagesTestContext(t, body)
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       &openAIImagesReadErrorBody{err: io.ErrUnexpectedEOF},
+	}}
+	svc := newOpenAIImagesTestService(upstream)
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+
+	result, err := svc.ForwardImages(context.Background(), c, directImagesTestAccount(), body, parsed, "")
+	require.Nil(t, result)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	_, _, ok := OpenAIUpstreamStreamReadErrorDetails(err)
+	require.True(t, ok, "direct image stream read errors must use the shared ambiguous-read classification")
 }
 
 func TestCodexDirectImagesEmptyResponseFails(t *testing.T) {

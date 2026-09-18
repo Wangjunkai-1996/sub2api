@@ -104,6 +104,36 @@ func TestLockAndMergeAccountProbeExtraUsesCurrentDatabaseSnapshot(t *testing.T) 
 	}
 }
 
+func TestLockAndMergeAccountProbeExtraUsesLockedRuntimeExtra(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	t.Cleanup(func() { _ = client.Close() })
+
+	mock.ExpectQuery(`(?s)`+regexp.QuoteMeta("SELECT")+`.*`+regexp.QuoteMeta("FOR NO KEY UPDATE")).
+		WithArgs(int64(33), service.PlatformOpenAI, service.AccountTypeOAuth, `{}`, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "extra"}).
+			AddRow(true, false, true, nil, nil, nil, nil, nil, nil, []byte(`{"quota_used":9,"codex_primary_used_percent":0.25}`)))
+
+	account := &service.Account{
+		ID: 33, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Extra: map[string]any{
+			"quota_limit":                100.0,
+			"quota_used":                 1.0,
+			"model_rate_limits":          map[string]any{"stale": true},
+			"codex_primary_used_percent": 0.9,
+		},
+	}
+	got, err := lockAndMergeAccountProbeExtra(context.Background(), client, account, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, 9.0, got["quota_used"])
+	require.Equal(t, 0.25, got["codex_primary_used_percent"])
+	require.NotContains(t, got, "model_rate_limits")
+	require.Equal(t, 100.0, got["quota_limit"], "user-editable configuration remains request-owned")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func probeBoolPtr(value bool) *bool {
 	return &value
 }
@@ -476,7 +506,7 @@ func updatedAccountRows(id int64, extra string) *sqlmock.Rows {
 	now := time.Now()
 	return sqlmock.NewRows(dbaccount.Columns).AddRow(
 		id, now, now, nil, "test", nil, service.PlatformOpenAI, service.AccountTypeAPIKey,
-		[]byte(`{"api_key":"sk-test"}`), []byte(extra), nil, nil, 1, nil, 1, 1.0,
+		[]byte(`{"api_key":"sk-test"}`), int64(1), []byte(extra), nil, nil, "legacy", int64(1), 1, nil, 1, 1.0,
 		service.StatusActive, nil, nil, nil, false, true, nil, nil, nil, nil, nil, nil,
 		nil, nil, nil, service.QuotaDimensionGlobal,
 	)

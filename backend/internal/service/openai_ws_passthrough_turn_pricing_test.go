@@ -67,6 +67,8 @@ func TestPassthroughIngressFollowUpCallsBeforeTurnAfterBeforeRequest(t *testing.
 
 	upstream := newStagedPassthroughConn()
 	upstream.Send(`{"type":"response.completed","response":{"id":"resp_pricing_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
+	svc := newPassthroughLifecycleService(passthroughLifecycleConfig(), upstream)
+	account := passthroughLifecycleAccount()
 
 	var hooksMu sync.Mutex
 	var callbacks []string
@@ -94,8 +96,8 @@ func TestPassthroughIngressFollowUpCallsBeforeTurnAfterBeforeRequest(t *testing.
 	server, _ := startPassthroughHookRecordingServer(
 		t,
 		controlCtx,
-		newPassthroughLifecycleService(passthroughLifecycleConfig(), upstream),
-		passthroughLifecycleAccount(),
+		svc,
+		account,
 		hooks,
 	)
 	defer server.Close()
@@ -122,7 +124,7 @@ func TestPassthroughIngressFollowUpCallsBeforeTurnAfterBeforeRequest(t *testing.
 	gotAfter := afterTurnCalls
 	hooksMu.Unlock()
 
-	require.Equal(t, []string{"before_request", "before_turn"}, gotCallbacks)
+	require.Equal(t, []string{"before_request", "before_turn", "before_turn"}, gotCallbacks)
 	require.Equal(t, 2, gotAfter)
 }
 
@@ -210,6 +212,7 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 	}
 	turnStarts := make(chan turnStart, 2)
 	beforeRequestEntered := make(chan time.Time, 1)
+	beforeTurnEntered := make(chan int, 1)
 	releaseBeforeRequest := make(chan struct{})
 	hooks := &OpenAIWSIngressHooks{
 		InitialTurnStartedAt: time.Now(),
@@ -221,6 +224,10 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 				beforeRequestEntered <- time.Now()
 				<-releaseBeforeRequest
 			}
+			return nil
+		},
+		BeforeTurn: func(turn int) error {
+			beforeTurnEntered <- turn
 			return nil
 		},
 	}
@@ -259,6 +266,12 @@ func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T
 		t.Fatal("second turn did not enter BeforeRequest")
 	}
 	close(releaseBeforeRequest)
+	select {
+	case turn := <-beforeTurnEntered:
+		require.Equal(t, 2, turn, "后续 passthrough turn 必须在写上游前重新准入")
+	case <-time.After(time.Second):
+		t.Fatal("second turn did not enter BeforeTurn")
+	}
 	require.Equal(t, "response.create", gjson.GetBytes(requirePassthroughUpstreamWrite(t, upstream, 3*time.Second), "type").String())
 	upstream.Send(`{"type":"response.completed","response":{"id":"resp_second","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
 	secondCompleted, err := readPassthroughLifecycleFrame(t, clientConn, 3*time.Second)

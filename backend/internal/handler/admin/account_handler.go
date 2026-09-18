@@ -28,6 +28,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -66,7 +67,25 @@ type AccountHandler struct {
 	upstreamBillingProbe    *service.UpstreamBillingProbeService
 	ollamaCloudUsage        *service.OllamaCloudUsageService
 	codexTicketSettings     *service.SettingService
+	openAIWindowWarmup      *service.OpenAIWindowWarmupService
+	settingService          *service.SettingService
+	egressService           *service.EgressService
 	cfg                     *config.Config
+}
+
+const accountEgressMutationFrozenReason = "ACCOUNT_EGRESS_MUTATION_FROZEN"
+
+var errAccountEgressMutationFrozen = infraerrors.New(
+	http.StatusLocked,
+	accountEgressMutationFrozenReason,
+	"account egress mutation is temporarily unavailable",
+)
+
+func (h *AccountHandler) requireAccountEgressMutation() error {
+	if h == nil || h.egressService == nil {
+		return errAccountEgressMutationFrozen
+	}
+	return nil
 }
 
 // SetUpstreamBillingProbeService attaches the optional remote billing probe service.
@@ -81,6 +100,20 @@ func (h *AccountHandler) SetOllamaCloudUsageService(usage *service.OllamaCloudUs
 // SetCodexTicketSettings supplies the live policy without mutating shared config.
 func (h *AccountHandler) SetCodexTicketSettings(settings *service.SettingService) {
 	h.codexTicketSettings = settings
+}
+
+func (h *AccountHandler) SetOpenAIWindowWarmupService(warmup *service.OpenAIWindowWarmupService, settings *service.SettingService) {
+	h.openAIWindowWarmup = warmup
+	h.settingService = settings
+}
+
+// SetEgressService attaches the account egress mutation service.  It is kept
+// as a setter so focused account-handler tests can continue constructing the
+// handler with the historical constructor signature.
+func (h *AccountHandler) SetEgressService(egressService *service.EgressService) {
+	if h != nil {
+		h.egressService = egressService
+	}
 }
 
 // NewAccountHandler creates a new admin account handler
@@ -120,63 +153,90 @@ func NewAccountHandler(
 
 // CreateAccountRequest represents create account request
 type CreateAccountRequest struct {
-	Name                    string         `json:"name" binding:"required"`
-	Notes                   *string        `json:"notes"`
-	Platform                string         `json:"platform" binding:"required"`
-	Type                    string         `json:"type" binding:"required,oneof=oauth setup-token apikey upstream bedrock service_account"`
-	Credentials             map[string]any `json:"credentials" binding:"required"`
-	Extra                   map[string]any `json:"extra"`
-	ProxyID                 *int64         `json:"proxy_id"`
-	Concurrency             int            `json:"concurrency"`
-	Priority                int            `json:"priority"`
-	RateMultiplier          *float64       `json:"rate_multiplier"`
-	LoadFactor              *int           `json:"load_factor"`
-	GroupIDs                []int64        `json:"group_ids"`
-	ExpiresAt               *int64         `json:"expires_at"`
-	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
-	ProbeEnabled            *bool          `json:"upstream_billing_probe_enabled"`
-	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	Name                    string                    `json:"name" binding:"required"`
+	Notes                   *string                   `json:"notes"`
+	Platform                string                    `json:"platform" binding:"required"`
+	Type                    string                    `json:"type" binding:"required,oneof=oauth setup-token apikey upstream bedrock service_account"`
+	Credentials             map[string]any            `json:"credentials" binding:"required"`
+	Extra                   map[string]any            `json:"extra"`
+	ProxyID                 *int64                    `json:"proxy_id"`
+	EgressMode              *string                   `json:"egress_mode"`
+	EgressPool              *AccountEgressPoolRequest `json:"egress_pool"`
+	Concurrency             int                       `json:"concurrency"`
+	Priority                int                       `json:"priority"`
+	RateMultiplier          *float64                  `json:"rate_multiplier"`
+	LoadFactor              *int                      `json:"load_factor"`
+	GroupIDs                []int64                   `json:"group_ids"`
+	ExpiresAt               *int64                    `json:"expires_at"`
+	AutoPauseOnExpired      *bool                     `json:"auto_pause_on_expired"`
+	ProbeEnabled            *bool                     `json:"upstream_billing_probe_enabled"`
+	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	OpenAICodexWarmupPolicy *string                   `json:"openai_codex_warmup_policy"`
 }
 
 // UpdateAccountRequest represents update account request
 // 使用指针类型来区分"未提供"和"设置为0"
 type UpdateAccountRequest struct {
-	Name                    string         `json:"name"`
-	Notes                   *string        `json:"notes"`
-	Type                    string         `json:"type" binding:"omitempty,oneof=oauth setup-token apikey upstream bedrock service_account"`
-	Credentials             map[string]any `json:"credentials"`
-	Extra                   map[string]any `json:"extra"`
-	ProxyID                 *int64         `json:"proxy_id"`
-	Concurrency             *int           `json:"concurrency"`
-	Priority                *int           `json:"priority"`
-	RateMultiplier          *float64       `json:"rate_multiplier"`
-	LoadFactor              *int           `json:"load_factor"`
-	Status                  string         `json:"status" binding:"omitempty,oneof=active inactive error"`
-	GroupIDs                *[]int64       `json:"group_ids"`
-	ExpiresAt               *int64         `json:"expires_at"`
-	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
-	ProbeEnabled            *bool          `json:"upstream_billing_probe_enabled"`
-	RateSyncEnabled         *bool          `json:"upstream_billing_rate_sync_enabled"`
-	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
-}
-
-// BulkUpdateAccountsRequest represents the payload for bulk editing accounts
-type BulkUpdateAccountsRequest struct {
-	AccountIDs              []int64                   `json:"account_ids"`
-	Filters                 *BulkUpdateAccountFilters `json:"filters"`
 	Name                    string                    `json:"name"`
+	Notes                   *string                   `json:"notes"`
+	Type                    string                    `json:"type" binding:"omitempty,oneof=oauth setup-token apikey upstream bedrock service_account"`
+	Credentials             map[string]any            `json:"credentials"`
+	Extra                   map[string]any            `json:"extra"`
 	ProxyID                 *int64                    `json:"proxy_id"`
+	EgressMode              *string                   `json:"egress_mode"`
+	EgressPool              *AccountEgressPoolRequest `json:"egress_pool"`
 	Concurrency             *int                      `json:"concurrency"`
 	Priority                *int                      `json:"priority"`
 	RateMultiplier          *float64                  `json:"rate_multiplier"`
 	LoadFactor              *int                      `json:"load_factor"`
 	Status                  string                    `json:"status" binding:"omitempty,oneof=active inactive error"`
-	Schedulable             *bool                     `json:"schedulable"`
 	GroupIDs                *[]int64                  `json:"group_ids"`
-	Credentials             map[string]any            `json:"credentials"`
-	Extra                   map[string]any            `json:"extra"`
+	ExpiresAt               *int64                    `json:"expires_at"`
+	AutoPauseOnExpired      *bool                     `json:"auto_pause_on_expired"`
 	ProbeEnabled            *bool                     `json:"upstream_billing_probe_enabled"`
+	RateSyncEnabled         *bool                     `json:"upstream_billing_rate_sync_enabled"`
 	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	OpenAICodexWarmupPolicy *string                   `json:"openai_codex_warmup_policy"`
+}
+
+// BulkUpdateAccountsRequest represents the payload for bulk editing accounts
+type BulkUpdateAccountsRequest struct {
+	AccountIDs              []int64                       `json:"account_ids"`
+	Filters                 *BulkUpdateAccountFilters     `json:"filters"`
+	Name                    string                        `json:"name"`
+	ProxyID                 *int64                        `json:"proxy_id"`
+	EgressMode              *string                       `json:"egress_mode"`
+	EgressPool              *BulkAccountEgressPoolRequest `json:"egress_pool"`
+	Concurrency             *int                          `json:"concurrency"`
+	Priority                *int                          `json:"priority"`
+	RateMultiplier          *float64                      `json:"rate_multiplier"`
+	LoadFactor              *int                          `json:"load_factor"`
+	Status                  string                        `json:"status" binding:"omitempty,oneof=active inactive error"`
+	Schedulable             *bool                         `json:"schedulable"`
+	GroupIDs                *[]int64                      `json:"group_ids"`
+	Credentials             map[string]any                `json:"credentials"`
+	Extra                   map[string]any                `json:"extra"`
+	ProbeEnabled            *bool                         `json:"upstream_billing_probe_enabled"`
+	ConfirmMixedChannelRisk *bool                         `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+}
+
+// AccountEgressPoolRequest is the wire form for a complete single-account
+// pool replacement. Revision is a compare-and-swap fence on updates.
+type AccountEgressPoolRequest struct {
+	RouteIDs             []int64 `json:"route_ids"`
+	PrimaryRouteID       *int64  `json:"primary_route_id"`
+	ConcurrencyPerEgress *int    `json:"concurrency_per_egress"`
+	Revision             *int64  `json:"revision"`
+}
+
+// BulkAccountEgressPoolRequest is intentionally separate: bulk operations
+// mutate the latest locked binding set and therefore never accept a revision.
+type BulkAccountEgressPoolRequest struct {
+	Operation            string  `json:"operation"`
+	RouteIDs             []int64 `json:"route_ids"`
+	PrimaryRouteID       *int64  `json:"primary_route_id"`
+	ConcurrencyPerEgress *int    `json:"concurrency_per_egress"`
+	Revision             *int64  `json:"revision"`
 }
 
 type BulkUpdateAccountFilters struct {
@@ -203,9 +263,10 @@ type AccountWithConcurrency struct {
 	SchedulerScore     *AccountSchedulerScore       `json:"scheduler_score,omitempty"`
 	SchedulerScores    []AccountSchedulerGroupScore `json:"scheduler_scores,omitempty"`
 	// 以下字段仅对 Anthropic OAuth/SetupToken 账号有效，且仅在启用相应功能时返回
-	CurrentWindowCost *float64 `json:"current_window_cost,omitempty"` // 当前窗口费用
-	ActiveSessions    *int     `json:"active_sessions,omitempty"`     // 当前活跃会话数
-	CurrentRPM        *int     `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
+	CurrentWindowCost  *float64                          `json:"current_window_cost,omitempty"` // 当前窗口费用
+	ActiveSessions     *int                              `json:"active_sessions,omitempty"`     // 当前活跃会话数
+	CurrentRPM         *int                              `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
+	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
 }
 
 // AccountListItemWithConcurrency is the compact account-list envelope used
@@ -213,12 +274,13 @@ type AccountWithConcurrency struct {
 // so groups/account_groups never appear in the list payload.
 type AccountListItemWithConcurrency struct {
 	*dto.AccountListItem
-	CurrentConcurrency int                          `json:"current_concurrency"`
-	SchedulerScore     *AccountSchedulerScore       `json:"scheduler_score,omitempty"`
-	SchedulerScores    []AccountSchedulerGroupScore `json:"scheduler_scores,omitempty"`
-	CurrentWindowCost  *float64                     `json:"current_window_cost,omitempty"`
-	ActiveSessions     *int                         `json:"active_sessions,omitempty"`
-	CurrentRPM         *int                         `json:"current_rpm,omitempty"`
+	CurrentConcurrency int                               `json:"current_concurrency"`
+	SchedulerScore     *AccountSchedulerScore            `json:"scheduler_score,omitempty"`
+	SchedulerScores    []AccountSchedulerGroupScore      `json:"scheduler_scores,omitempty"`
+	CurrentWindowCost  *float64                          `json:"current_window_cost,omitempty"`
+	ActiveSessions     *int                              `json:"active_sessions,omitempty"`
+	CurrentRPM         *int                              `json:"current_rpm,omitempty"`
+	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
 }
 
 type simpleModeGroupReference struct {
@@ -391,6 +453,12 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 			item.CurrentConcurrency = counts[account.ID]
 		}
 	}
+	egressLoads := h.getAccountEgressRuntimeLoads(ctx, []service.Account{*account})
+	if load, ok := egressLoads[account.ID]; ok {
+		item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, account, item.CurrentConcurrency, &load)
+	} else {
+		item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, account, item.CurrentConcurrency, nil)
+	}
 
 	if account.IsAnthropicOAuthOrSetupToken() {
 		if h.accountUsageService != nil && account.GetWindowCostLimit() > 0 {
@@ -418,9 +486,11 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 		}
 	}
 
-	h.enrichShadowParents(ctx, []AccountWithConcurrency{item})
+	items := []AccountWithConcurrency{item}
+	h.enrichShadowParents(ctx, items)
+	h.enrichOpenAIWindowWarmup(ctx, []service.Account{*account}, items)
 
-	return item
+	return items[0]
 }
 
 // scoreOpenAIAccountSchedulerPool 对池内 OpenAI 账号计算调度分数快照。
@@ -710,6 +780,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	concurrencyCounts := make(map[int64]int)
+	egressLoads := make(map[int64]service.AccountEgressLoadInfo)
 	var windowCosts map[int64]float64
 	var activeSessions map[int64]int
 	var rpmCounts map[int64]int
@@ -733,6 +804,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 		if cc, ccErr := h.concurrencyService.GetAccountConcurrencyBatch(c.Request.Context(), accountIDs); ccErr == nil && cc != nil {
 			concurrencyCounts = cc
 		}
+		egressLoads = h.getAccountEgressRuntimeLoads(c.Request.Context(), accounts)
 	}
 
 	// 识别需要查询窗口费用、会话数和 RPM 的账号（Anthropic OAuth/SetupToken 且启用了相应功能）
@@ -818,6 +890,11 @@ func (h *AccountHandler) List(c *gin.Context) {
 			SchedulerScore:     schedulerScores[acc.ID],
 			SchedulerScores:    schedulerGroupScores[acc.ID],
 		}
+		if load, ok := egressLoads[acc.ID]; ok {
+			item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, acc, item.CurrentConcurrency, &load)
+		} else {
+			item.CurrentConcurrency = setAccountEgressRuntimeLoad(item.Account, acc, item.CurrentConcurrency, nil)
+		}
 
 		// 添加窗口费用（仅当启用时）
 		if windowCosts != nil {
@@ -844,6 +921,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	h.enrichShadowParents(c.Request.Context(), result)
+	h.enrichOpenAIWindowWarmup(c.Request.Context(), accounts, result)
 
 	if lite {
 		compact := make([]AccountListItemWithConcurrency, len(result))
@@ -857,6 +935,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 				CurrentWindowCost:  item.CurrentWindowCost,
 				ActiveSessions:     item.ActiveSessions,
 				CurrentRPM:         item.CurrentRPM,
+				OpenAIWindowWarmup: item.OpenAIWindowWarmup,
 			}
 		}
 		etag := buildAccountsListETag(compact, total, page, pageSize, platform, accountType, status, search, true)
@@ -883,6 +962,45 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	response.Paginated(c, result, total, page, pageSize)
+}
+
+func (h *AccountHandler) getAccountEgressRuntimeLoads(ctx context.Context, accounts []service.Account) map[int64]service.AccountEgressLoadInfo {
+	result := make(map[int64]service.AccountEgressLoadInfo)
+	if h == nil || h.concurrencyService == nil || len(accounts) == 0 {
+		return result
+	}
+	configs := make([]service.AccountEgressPoolConfig, 0, len(accounts))
+	for i := range accounts {
+		config, err := service.AccountEgressPoolConfigForRuntime(&accounts[i], 0)
+		if err == nil {
+			configs = append(configs, config)
+		}
+	}
+	if len(configs) == 0 {
+		return result
+	}
+	loads, err := h.concurrencyService.GetAccountEgressLoads(ctx, configs)
+	if err != nil {
+		return result
+	}
+	return loads
+}
+
+func setAccountEgressRuntimeLoad(account *dto.Account, source *service.Account, legacyCurrent int, load *service.AccountEgressLoadInfo) int {
+	if account == nil || account.EgressSummary == nil {
+		return legacyCurrent
+	}
+
+	current := legacyCurrent
+	if load != nil && load.Status != service.AccountEgressStatusConfigStale && load.Status != service.AccountEgressStatusConfigUnavailable {
+		if load.Status != service.AccountEgressStatusLegacyDraining {
+			current = load.ActiveTotal
+			account.EgressSummary.Bindings = dto.AccountEgressCapacityBindingsFromService(source, load.IdentityLoads)
+		}
+	}
+	value := current
+	account.EgressSummary.CurrentConcurrency = &value
+	return current
 }
 
 func buildAccountsListETag[T any](
@@ -1016,12 +1134,48 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	egressPool, egressErr := accountEgressPoolInput(req.EgressMode, req.EgressPool, true)
+	if egressErr != nil {
+		response.ErrorFrom(c, egressErr)
+		return
+	}
+	if egressPool != nil {
+		if err := h.requireAccountEgressMutation(); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		if err := validateOpenAIEgressWrite(req.Platform, req.Type, false); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+	}
+	if egressPool != nil && req.ProxyID != nil {
+		response.ErrorFrom(c, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool"))
+		return
+	}
+	if egressPool != nil && egressPool.ConcurrencyPerEgress != nil && req.Concurrency != 0 && req.Concurrency != *egressPool.ConcurrencyPerEgress {
+		response.ErrorFrom(c, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_CONCURRENCY_CONFLICT", "concurrency conflicts with egress_pool.concurrency_per_egress"))
+		return
+	}
 	if err := service.ValidateOpenAILongContextBillingExtra(req.Platform, req.Extra); err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
 	if req.RateMultiplier != nil && *req.RateMultiplier < 0 {
 		response.BadRequest(c, "rate_multiplier must be >= 0")
+		return
+	}
+	if req.Platform == service.PlatformOpenAI && req.Type == service.AccountTypeOAuth {
+		policy, policyErr := resolveOpenAIWindowWarmupImportPolicy(c.Request.Context(), req.OpenAICodexWarmupPolicy, h.settingService)
+		if policyErr != nil {
+			response.ErrorFrom(c, policyErr)
+			return
+		}
+		policyValue := string(policy)
+		req.OpenAICodexWarmupPolicy = &policyValue
+		req.Extra = withOpenAIWindowWarmupPolicy(req.Extra, policy)
+	} else if req.OpenAICodexWarmupPolicy != nil {
+		response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
 		return
 	}
 	// base_rpm 输入校验：负值归零，超过 10000 截断
@@ -1047,6 +1201,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 			Credentials:           req.Credentials,
 			Extra:                 req.Extra,
 			ProxyID:               req.ProxyID,
+			EgressPool:            egressPool,
 			Concurrency:           req.Concurrency,
 			Priority:              req.Priority,
 			RateMultiplier:        req.RateMultiplier,
@@ -1065,6 +1220,9 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		h.adminService.ForceAntigravityPrivacy(ctx, account)
 		// OpenAI OAuth: 新账号直接设置隐私
 		h.adminService.ForceOpenAIPrivacy(ctx, account)
+		if _, scheduleErr := h.scheduleOpenAIWindowWarmup(ctx, account, service.OpenAIWindowWarmupTriggerImport); scheduleErr != nil {
+			return nil, scheduleErr
+		}
 		return h.buildAccountResponseWithRuntime(ctx, account), nil
 	})
 	if err != nil {
@@ -1157,9 +1315,62 @@ func (h *AccountHandler) Update(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	egressPool, egressErr := accountEgressPoolInput(req.EgressMode, req.EgressPool, false)
+	if egressErr != nil {
+		response.ErrorFrom(c, egressErr)
+		return
+	}
+	if egressPool != nil {
+		if err := h.requireAccountEgressMutation(); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		current, currentErr := h.adminService.GetAccount(c.Request.Context(), accountID)
+		if currentErr != nil {
+			response.ErrorFrom(c, currentErr)
+			return
+		}
+		if err := validateOpenAIEgressWrite(current.Platform, current.Type, current.IsCredentialShadow()); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		if egressPool.Mode == service.EgressModeLegacy && egressPool.ExpectedRevision == nil {
+			revision := current.EgressRevision
+			egressPool.ExpectedRevision = &revision
+		}
+	}
+	if egressPool != nil && req.ProxyID != nil {
+		response.ErrorFrom(c, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool"))
+		return
+	}
+	if egressPool != nil && egressPool.ConcurrencyPerEgress != nil && req.Concurrency != nil && *req.Concurrency != *egressPool.ConcurrencyPerEgress {
+		response.ErrorFrom(c, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_CONCURRENCY_CONFLICT", "concurrency conflicts with egress_pool.concurrency_per_egress"))
+		return
+	}
 	if req.RateMultiplier != nil && *req.RateMultiplier < 0 {
 		response.BadRequest(c, "rate_multiplier must be >= 0")
 		return
+	}
+	if req.OpenAICodexWarmupPolicy != nil {
+		policy, policyErr := validateOpenAIWindowWarmupPolicy(*req.OpenAICodexWarmupPolicy)
+		if policyErr != nil {
+			response.ErrorFrom(c, policyErr)
+			return
+		}
+		current, currentErr := h.adminService.GetAccount(c.Request.Context(), accountID)
+		if currentErr != nil {
+			response.ErrorFrom(c, currentErr)
+			return
+		}
+		if !isOpenAIWindowWarmupAccount(current) {
+			response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
+			return
+		}
+		baseExtra := current.Extra
+		if req.Extra != nil {
+			baseExtra = req.Extra
+		}
+		req.Extra = withOpenAIWindowWarmupPolicy(baseExtra, policy)
 	}
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
@@ -1178,6 +1389,7 @@ func (h *AccountHandler) Update(c *gin.Context) {
 		Credentials:           req.Credentials,
 		Extra:                 req.Extra,
 		ProxyID:               req.ProxyID,
+		EgressPool:            egressPool,
 		Concurrency:           req.Concurrency, // 指针类型，nil 表示未提供
 		Priority:              req.Priority,    // 指针类型，nil 表示未提供
 		RateMultiplier:        req.RateMultiplier,
@@ -1210,6 +1422,10 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	// 异步执行，探测失败不影响账号更新响应。
 	if len(req.Credentials) > 0 {
 		h.scheduleOpenAIResponsesProbe(account)
+	}
+	if _, scheduleErr := h.scheduleOpenAIWindowWarmup(c.Request.Context(), account, service.OpenAIWindowWarmupTriggerImport); scheduleErr != nil {
+		response.ErrorFrom(c, scheduleErr)
+		return
 	}
 
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
@@ -2077,6 +2293,10 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 			return
 		}
 	}
+	if err := h.prepareOpenAIWindowWarmupBatchCreate(c.Request.Context(), req.Accounts); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 	groupIDs := make([]int64, 0)
 	for _, item := range req.Accounts {
 		groupIDs = append(groupIDs, item.GroupIDs...)
@@ -2203,6 +2423,48 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 	})
 }
 
+// prepareOpenAIWindowWarmupBatchCreate resolves the complete batch before the
+// idempotent write closure starts. Eligible requests that omit the field share
+// one settings read; explicit values are validated without consulting settings.
+func (h *AccountHandler) prepareOpenAIWindowWarmupBatchCreate(ctx context.Context, accounts []CreateAccountRequest) error {
+	policies := make(map[int]service.OpenAIWindowWarmupPolicy)
+	missing := make([]int, 0)
+	for i := range accounts {
+		eligible := accounts[i].Platform == service.PlatformOpenAI && accounts[i].Type == service.AccountTypeOAuth
+		if !eligible {
+			if accounts[i].OpenAICodexWarmupPolicy != nil {
+				return infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts")
+			}
+			continue
+		}
+		if accounts[i].OpenAICodexWarmupPolicy == nil {
+			missing = append(missing, i)
+			continue
+		}
+		policy, err := validateOpenAIWindowWarmupPolicy(*accounts[i].OpenAICodexWarmupPolicy)
+		if err != nil {
+			return err
+		}
+		policies[i] = policy
+	}
+
+	if len(missing) > 0 {
+		policy, err := resolveOpenAIWindowWarmupImportPolicy(ctx, nil, h.settingService)
+		if err != nil {
+			return err
+		}
+		for _, i := range missing {
+			policies[i] = policy
+		}
+	}
+	for i, policy := range policies {
+		policyValue := string(policy)
+		accounts[i].OpenAICodexWarmupPolicy = &policyValue
+		accounts[i].Extra = withOpenAIWindowWarmupPolicy(accounts[i].Extra, policy)
+	}
+	return nil
+}
+
 // BatchUpdateCredentialsRequest represents batch credentials update request
 type BatchUpdateCredentialsRequest struct {
 	AccountIDs []int64 `json:"account_ids" binding:"required,min=1"`
@@ -2308,6 +2570,20 @@ func (h *AccountHandler) BulkUpdate(c *gin.Context) {
 		response.BadRequest(c, "account_ids or filters is required")
 		return
 	}
+
+	// Egress mutations use a separate transaction owned by EgressService.  Do
+	// not let the legacy account bulk writer partially commit alongside them.
+	if hasAccountEgressFields(req.EgressMode, req.EgressPool) {
+		if bulkRequestHasNonEgressFields(&req) {
+			response.ErrorFrom(c, infraerrors.BadRequest(
+				"ACCOUNT_EGRESS_BULK_MIXED_FIELDS",
+				"egress pool updates must be sent separately from ordinary account fields",
+			))
+			return
+		}
+		h.bulkUpdateEgress(c, &req)
+		return
+	}
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 	if err := service.ValidateUpstreamRequestIDHeaderExtra(req.Extra); err != nil {
@@ -2373,6 +2649,179 @@ func (h *AccountHandler) BulkUpdate(c *gin.Context) {
 	}
 
 	response.Success(c, result)
+}
+
+func bulkRequestHasNonEgressFields(req *BulkUpdateAccountsRequest) bool {
+	if req == nil {
+		return false
+	}
+	return req.Name != "" ||
+		req.ProxyID != nil ||
+		req.Concurrency != nil ||
+		req.Priority != nil ||
+		req.RateMultiplier != nil ||
+		req.LoadFactor != nil ||
+		req.Status != "" ||
+		req.Schedulable != nil ||
+		req.GroupIDs != nil ||
+		len(req.Credentials) > 0 ||
+		len(req.Extra) > 0 ||
+		req.ProbeEnabled != nil
+}
+
+func (h *AccountHandler) bulkUpdateEgress(c *gin.Context, req *BulkUpdateAccountsRequest) {
+	if err := h.requireAccountEgressMutation(); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	input, err := bulkAccountEgressInput(req.EgressMode, req.EgressPool)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	accountIDs, err := h.resolveBulkEgressAccountIDs(c.Request.Context(), req)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := h.validateOpenAIEgressTargets(c.Request.Context(), accountIDs); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	if err := h.egressService.ApplyAccountPools(c.Request.Context(), accountIDs, *input); err != nil {
+		middleware.SetAuditExtra(c, map[string]any{
+			"requested_count": len(accountIDs),
+			"operation":       input.Operation,
+			"result":          "failed",
+			"error_code":      infraerrors.Reason(err),
+		})
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	results := make([]service.BulkUpdateAccountResult, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		results = append(results, service.BulkUpdateAccountResult{AccountID: accountID, Success: true})
+	}
+	middleware.SetAuditExtra(c, map[string]any{
+		"requested_count": len(accountIDs),
+		"operation":       input.Operation,
+		"result":          "success",
+	})
+	response.Success(c, &service.BulkUpdateAccountsResult{
+		Success:    len(accountIDs),
+		Failed:     0,
+		SuccessIDs: append([]int64(nil), accountIDs...),
+		FailedIDs:  []int64{},
+		Results:    results,
+	})
+}
+
+func (h *AccountHandler) resolveBulkEgressAccountIDs(ctx context.Context, req *BulkUpdateAccountsRequest) ([]int64, error) {
+	if req == nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_TARGETS_REQUIRED", "account_ids or filters is required")
+	}
+	if len(req.AccountIDs) > 0 {
+		return normalizeBulkEgressAccountIDs(req.AccountIDs)
+	}
+	if req.Filters == nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_TARGETS_REQUIRED", "account_ids or filters is required")
+	}
+	groupID, err := bulkEgressFilterGroupID(req.Filters.Group)
+	if err != nil {
+		return nil, err
+	}
+	accounts, total, err := h.adminService.ListAccounts(
+		ctx,
+		1,
+		service.MaxBulkAccountEgressAccounts,
+		req.Filters.Platform,
+		req.Filters.Type,
+		req.Filters.Status,
+		req.Filters.Search,
+		groupID,
+		req.Filters.PrivacyMode,
+		"id",
+		"asc",
+	)
+	if err != nil {
+		return nil, err
+	}
+	if total > int64(service.MaxBulkAccountEgressAccounts) || len(accounts) > service.MaxBulkAccountEgressAccounts {
+		return nil, infraerrors.BadRequest(
+			"ACCOUNT_EGRESS_TARGET_LIMIT",
+			"bulk egress updates are limited to 1000 accounts",
+		)
+	}
+	ids := make([]int64, 0, len(accounts))
+	for i := range accounts {
+		ids = append(ids, accounts[i].ID)
+	}
+	return normalizeBulkEgressAccountIDs(ids)
+}
+
+func normalizeBulkEgressAccountIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_TARGETS_EMPTY", "no accounts matched the bulk egress update")
+	}
+	if len(ids) > service.MaxBulkAccountEgressAccounts {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_TARGET_LIMIT", "bulk egress updates are limited to 1000 accounts")
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	result := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_TARGET_INVALID", "account_ids must contain positive integers")
+		}
+		if _, exists := seen[id]; exists {
+			return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_TARGET_DUPLICATE", "account_ids must not contain duplicates")
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result, nil
+}
+
+func bulkEgressFilterGroupID(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	if strings.EqualFold(raw, accountListGroupUngroupedQueryValue) {
+		return service.AccountListGroupUngrouped, nil
+	}
+	groupID, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || groupID < 0 {
+		return 0, infraerrors.BadRequest("INVALID_GROUP_FILTER", "invalid group filter")
+	}
+	return groupID, nil
+}
+
+func (h *AccountHandler) validateOpenAIEgressTargets(ctx context.Context, accountIDs []int64) error {
+	if h == nil || h.adminService == nil {
+		return service.ErrAccountNotFound
+	}
+	accounts, err := h.adminService.GetAccountsByIDs(ctx, accountIDs)
+	if err != nil {
+		return err
+	}
+	byID := make(map[int64]*service.Account, len(accounts))
+	for _, account := range accounts {
+		if account != nil {
+			byID[account.ID] = account
+		}
+	}
+	for _, accountID := range accountIDs {
+		account := byID[accountID]
+		if account == nil {
+			return service.ErrAccountNotFound
+		}
+		if err := validateOpenAIEgressWrite(account.Platform, account.Type, account.IsCredentialShadow()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func toServiceBulkUpdateAccountFilters(filters *BulkUpdateAccountFilters) *service.BulkUpdateAccountFilters {
@@ -2533,8 +2982,8 @@ func (h *OAuthHandler) SetupTokenCookieAuth(c *gin.Context) {
 	response.Success(c, tokenInfo)
 }
 
-// GetUsage handles getting account usage information
-// GET /api/v1/admin/accounts/:id/usage?source=passive|active&force=true
+// GetUsage handles getting account usage information.
+// GET /api/v1/admin/accounts/:id/usage?source=passive|cached|active&force=true
 func (h *AccountHandler) GetUsage(c *gin.Context) {
 	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -2546,10 +2995,16 @@ func (h *AccountHandler) GetUsage(c *gin.Context) {
 	force := c.Query("force") == "true"
 
 	var usage *service.UsageInfo
-	if source == "passive" {
+	switch source {
+	case "passive":
 		usage, err = h.accountUsageService.GetPassiveUsage(c.Request.Context(), accountID)
-	} else {
+	case "cached":
+		usage, err = h.accountUsageService.GetCachedUsage(c.Request.Context(), accountID)
+	case "active":
 		usage, err = h.accountUsageService.GetUsage(c.Request.Context(), accountID, force)
+	default:
+		response.BadRequest(c, "Invalid usage source")
+		return
 	}
 	if err != nil {
 		response.ErrorFrom(c, err)

@@ -33,6 +33,18 @@ func (f AccountFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, err
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AccountMutation", m)
 }
 
+// The AccountEgressBindingFunc type is an adapter to allow the use of ordinary
+// function as AccountEgressBinding mutator.
+type AccountEgressBindingFunc func(context.Context, *ent.AccountEgressBindingMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f AccountEgressBindingFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.AccountEgressBindingMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AccountEgressBindingMutation", m)
+}
+
 // The AccountGroupFunc type is an adapter to allow the use of ordinary
 // function as AccountGroup mutator.
 type AccountGroupFunc func(context.Context, *ent.AccountGroupMutation) (ent.Value, error)
@@ -187,6 +199,30 @@ func (f CompositeModelRouteFunc) Mutate(ctx context.Context, m ent.Mutation) (en
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.CompositeModelRouteMutation", m)
+}
+
+// The EgressIdentityFunc type is an adapter to allow the use of ordinary
+// function as EgressIdentity mutator.
+type EgressIdentityFunc func(context.Context, *ent.EgressIdentityMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f EgressIdentityFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.EgressIdentityMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.EgressIdentityMutation", m)
+}
+
+// The EgressRouteFunc type is an adapter to allow the use of ordinary
+// function as EgressRoute mutator.
+type EgressRouteFunc func(context.Context, *ent.EgressRouteMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f EgressRouteFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.EgressRouteMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.EgressRouteMutation", m)
 }
 
 // The ErrorPassthroughRuleFunc type is an adapter to allow the use of ordinary

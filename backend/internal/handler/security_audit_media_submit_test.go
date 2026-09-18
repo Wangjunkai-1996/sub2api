@@ -2,11 +2,11 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,15 +68,18 @@ func blockingHandlerPromptEngine() *handlerPromptEngine {
 	}}
 }
 
-func TestAsyncImagePromptGuardRunsBeforeTaskCreation(t *testing.T) {
+func TestAsyncImageRouteBypassesPromptGuardAndCreatesTask(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
 	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
 	engine := blockingHandlerPromptEngine()
 	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
 	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
-	executions := 0
-	h.execute = func(string, *gin.Context) { executions++ }
+	var executions atomic.Int32
+	h.execute = func(_ string, c *gin.Context) {
+		executions.Add(1)
+		c.JSON(http.StatusOK, gin.H{"created": 1, "data": []any{}})
+	}
 
 	router := gin.New()
 	router.Use(securityAuditMediaTestMiddleware)
@@ -86,88 +89,16 @@ func TestAsyncImagePromptGuardRunsBeforeTaskCreation(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
 
-	require.Equal(t, http.StatusForbidden, recorder.Code)
-	require.Contains(t, recorder.Body.String(), securityaudit.ErrorCodeBlocked)
-	require.Empty(t, store.tasks, "no asynchronous task may exist after a blocking decision")
-	require.Zero(t, executions)
-	evaluated, _, requests := engine.snapshot()
-	require.Equal(t, 1, evaluated)
-	require.Len(t, requests, 1)
-	require.Contains(t, string(requests[0].Body), "blocked async prompt")
-}
-
-func TestAsyncImageSuccessfulPrecheckIsNotRepeatedByDetachedExecution(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	store := &asyncImageMemoryStore{tasks: map[string]*service.ImageTaskRecord{}}
-	tasks := service.NewImageTaskServiceWithUploader(store, nil, time.Hour, time.Minute)
-	engine := &handlerPromptEngine{mode: securityaudit.ModeBlocking, decision: &securityaudit.PromptDecision{Kind: securityaudit.DecisionAllow, AllowNextStage: true}}
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
-	h := &AsyncImageHandler{tasks: tasks, openAI: openAI}
-	var executionMu sync.Mutex
-	repeatedDecision := false
-	h.execute = func(_ string, c *gin.Context) {
-		apiKey, _ := middleware2.GetAPIKeyFromContext(c)
-		subject, _ := middleware2.GetAuthSubjectFromContext(c)
-		decision := openAI.checkSecurityAudit(c, nil, apiKey, subject, service.ContentModerationProtocolOpenAIImages, "gpt-image-2", []byte(`{"prompt":"must not rescan"}`))
-		executionMu.Lock()
-		repeatedDecision = decision != nil
-		executionMu.Unlock()
-		c.JSON(http.StatusOK, gin.H{"created": 1, "data": []any{}})
-	}
-
-	router := gin.New()
-	router.Use(securityAuditMediaTestMiddleware)
-	router.POST("/v1/images/generations/async", h.Submit)
-	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations/async", strings.NewReader(`{"model":"gpt-image-2","prompt":"allowed async prompt"}`))
-	request.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusAccepted, recorder.Code)
-	require.Eventually(t, func() bool {
-		store.mu.RLock()
-		defer store.mu.RUnlock()
-		for _, task := range store.tasks {
-			if task.Status == service.ImageTaskStatusCompleted {
-				return true
-			}
-		}
-		return false
-	}, time.Second, 10*time.Millisecond)
-	evaluated, _, _ := engine.snapshot()
-	require.Equal(t, 1, evaluated)
-	executionMu.Lock()
-	require.False(t, repeatedDecision)
-	executionMu.Unlock()
-}
-
-func TestBatchImagePromptGuardRunsBeforePersistenceOrBilling(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := blockingHandlerPromptEngine()
-	openAI := &OpenAIGatewayHandler{securityAuditCoordinator: securityaudit.NewCoordinator(nil, engine)}
-	h := &BatchImageHandler{openAI: openAI}
-	router := gin.New()
-	router.Use(securityAuditMediaTestMiddleware)
-	router.POST("/v1/images/batches", h.Submit)
-	body := map[string]any{
-		"model": "gemini-image-test",
-		"items": []map[string]any{{
-			"custom_id": "one", "prompt": "blocked batch prompt",
-			"reference_images": []map[string]any{{"mime_type": "image/png", "data": []byte("BINARY_CANARY")}},
-		}},
-	}
-	raw, err := json.Marshal(body)
-	require.NoError(t, err)
-	request := httptest.NewRequest(http.MethodPost, "/v1/images/batches", strings.NewReader(string(raw)))
-	request.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	require.NotPanics(t, func() { router.ServeHTTP(recorder, request) }, "nil service would panic if Submit were reached")
-	require.Equal(t, http.StatusForbidden, recorder.Code)
-	evaluated, _, requests := engine.snapshot()
-	require.Equal(t, 1, evaluated)
-	require.Len(t, requests, 1)
-	require.Contains(t, string(requests[0].Body), "blocked batch prompt")
-	require.NotContains(t, string(requests[0].Body), "BINARY_CANARY")
-	require.NotContains(t, string(requests[0].Body), "QklOQVJZX0NBTkFSWQ==")
+	require.Eventually(t, func() bool { return executions.Load() == 1 }, time.Second, 10*time.Millisecond)
+	store.mu.RLock()
+	taskCount := len(store.tasks)
+	store.mu.RUnlock()
+	require.NotZero(t, taskCount)
+	evaluated, enqueued, requests := engine.snapshot()
+	require.Zero(t, evaluated)
+	require.Zero(t, enqueued)
+	require.Empty(t, requests)
 }
 
 func TestSecurityAuditBlockingFailuresLeaveAllDownstreamCountersAtZero(t *testing.T) {

@@ -371,7 +371,7 @@ func TestOpenAIGatewayService_PreviousResponseHonorsGroupAndRequiredPrivacy(t *t
 			selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
 				context.Background(), &groupID, responseID, "", codexAutoReviewModel,
 				nil, OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityResponses,
-				false, false, true,
+				false, true, true,
 			)
 			require.NoError(t, err)
 			require.NotNil(t, selection)
