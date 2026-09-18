@@ -536,12 +536,14 @@ export default {
         openaiCodexVersionAutoSyncHint: '每 6 小时从官方仓库获取最新稳定版客户端版本号，无需为了跟版本而升级本服务。关闭后仅使用上方手填版本或内置版本。',
         openaiCodexVersionSyncedValue: '当前同步到：{version}',
         codexHardeningTitle: 'Codex 设置',
-        codexTicketEnabled: '292 打票',
+        codexTicketEnabled: 'STATE 票据总开关',
         codexTicketEnabledDesc:
-          '关闭后不打票、不注入 x-codex-turn-state，按原链路转发。开启后后台打票，并在业务请求中覆盖该头。',
-        codexTicketHarvestProxy: '292 打票代理',
+          '仅允许手动开启的账号获取和使用 STATE。只打开总开关不会让其他账号参与；关闭后所有账号恢复普通请求流程。',
+        codexTicketAccountHint: '全局 IP 池保存后，在账号管理 → 编辑账号 → STATE 票据中选择套餐并手动开启需要的账号。',
+        codexTicketAccountsLink: '前往账号管理',
+        codexTicketHarvestProxy: '全局动态 IP 池',
         codexTicketHarvestProxyDesc:
-          '仅在门票功能开启时用于打票，保存后后续探测会使用新代理，无需重启。日常业务仍走账号自己的住宅代理。填写完整代理 URL（http 或 socks5h，含用户名和密码）。代理服务商需自行负责出口 IP 轮换。留空并保存表示不改已保存的值。',
+          "供已开启 STATE 的账号统一采集票据，日常请求仍走各账号的固定代理。粘贴完整 HTTP / SOCKS5h 代理 URL（含用户名和密码）。用户名里的 {'{'}sid{'}'} 或 1024proxy 的 SID 每次尝试会自动更换。更换池不清除有效票据；留空保存保留现有配置。",
         codexTicketHarvestProxyPlaceholder: "http://user:pass{'@'}proxy.example.com:1080",
         codexTicketHarvestProxyConfigured: '已配置（密码已隐藏）。要更换请整段粘贴新的代理 URL。',
         codexClientRestrictionTitle: 'Codex 客户端限制',
