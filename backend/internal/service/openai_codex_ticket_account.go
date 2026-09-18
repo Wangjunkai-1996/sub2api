@@ -447,7 +447,7 @@ func (s *OpenAIGatewayService) runCodexAccountTicketJob(ctx context.Context, id 
 				lastError = reason
 				return
 			}
-			if err == nil && status == 200 && !(len(replayState) == 312 && validCodexTicketState(replayState)) {
+			if err == nil && status == 200 && (len(replayState) != 312 || !validCodexTicketState(replayState)) {
 				// Serialize against account opt-out/source changes; reread persistent values immediately before publication.
 				s.openaiCodexAccountMu.Lock()
 				live, readErr := s.codexTicketAccountByID(ctx, id)
@@ -567,9 +567,9 @@ func validateCodexTicketCompletedModel(body io.Reader, model string) error {
 		}
 		if strings.HasPrefix(line, "data:") {
 			if data.Len() > 0 {
-				data.WriteByte('\n')
+				_ = data.WriteByte('\n')
 			}
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			_, _ = data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		}
 	}
 	if okay, err := validate(); err != nil || okay {

@@ -193,7 +193,7 @@ func TestCodexAccountTicketPrivateConfigPreservationAndRedaction(t *testing.T) {
 	require.Equal(t, codexAccountTicketConfigOf(account).Revision, codexAccountTicketConfigOf(next).Revision)
 	preserved := MergeOpenAICodexTicketExtra(map[string]any{codexAccountTicketConfigKey: "forged", "custom": true}, next.Extra)
 	require.Equal(t, next.Extra[codexAccountTicketConfigKey], preserved[codexAccountTicketConfigKey])
-	require.True(t, preserved["custom"].(bool))
+	require.Equal(t, true, preserved["custom"])
 	require.NotContains(t, MergeOpenAICodexTicketExtra(next.Extra, nil), codexAccountTicketConfigKey)
 	require.NotContains(t, RedactOpenAICodexTicketExtra(next.Extra), codexAccountTicketConfigKey)
 	_, err = svc.ConfigureCodexAccountTicket(context.Background(), 41, CodexAccountTicketUpdate{Enabled: true, ClearProxy: true})

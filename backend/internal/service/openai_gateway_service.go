@@ -507,7 +507,7 @@ type OpenAIGatewayService struct {
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
 	openaiCodexTurnStateWrites  atomic.Uint64
-	// openaiCodexTickets: accountID\x00model → *openAICodexTicket，292 长度门票。
+	// openaiCodexTickets: accountID\x00model → *openAICodexTicket，已验证的账号级 STATE 票据。
 	openaiCodexWatchdogRevoked   sync.Map // account/model -> revocation capture-time watermark
 	openaiCodexTickets           sync.Map
 	openaiCodexAccountMu         sync.Mutex
