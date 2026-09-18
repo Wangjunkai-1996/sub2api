@@ -40,6 +40,7 @@ const (
 	openAIImageBackendUserAgent            = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	openAIImageMaxDownloadBytes            = 20 << 20 // 20MB per image download
 	openAIImageMaxUploadPartSize           = 20 << 20 // 20MB per multipart upload part
+	openAIImagesMaxN                       = 4
 	openAIImagesResponsesMainModel         = "gpt-5.6-luna"
 	openAIImagesVerbatimPromptInstructions = "When invoking the image_generation tool, use the user's image prompt verbatim. Do not rewrite, expand, summarize, embellish, translate, normalize punctuation, or add or remove visual details or constraints. Preserve the original language, wording, capitalization, quotes, and punctuation exactly."
 )
@@ -100,6 +101,12 @@ type OpenAIImagesRequest struct {
 	MaskUpload         *OpenAIImagesUpload
 	Body               []byte
 	bodyHash           string
+}
+
+// EffectiveStream reports the downstream response mode. Multi-image requests
+// are buffered into one JSON response regardless of the selected account type.
+func (r *OpenAIImagesRequest) EffectiveStream() bool {
+	return r != nil && r.Stream && r.N == 1
 }
 
 func (r *OpenAIImagesRequest) ModerationBody() []byte {
@@ -253,10 +260,11 @@ func parseOpenAIImagesJSONRequest(body []byte, req *OpenAIImagesRequest) error {
 		if nResult.Type != gjson.Number {
 			return fmt.Errorf("invalid n field type")
 		}
-		req.N = int(nResult.Int())
-		if req.N <= 0 {
-			return fmt.Errorf("n must be greater than 0")
+		n, err := strconv.Atoi(nResult.Raw)
+		if err != nil || n < 1 || n > openAIImagesMaxN {
+			return fmt.Errorf("n must be an integer between 1 and %d", openAIImagesMaxN)
 		}
+		req.N = n
 	}
 
 	if sizeResult := gjson.GetBytes(body, "size"); sizeResult.Exists() {
@@ -399,8 +407,8 @@ func parseOpenAIImagesMultipartRequest(body []byte, contentType string, req *Ope
 			req.Stream = parsed
 		case "n":
 			n, err := strconv.Atoi(value)
-			if err != nil || n <= 0 {
-				return fmt.Errorf("n must be a positive integer")
+			if err != nil || n < 1 || n > openAIImagesMaxN {
+				return fmt.Errorf("n must be an integer between 1 and %d", openAIImagesMaxN)
 			}
 			req.N = n
 		case "quality":
@@ -571,6 +579,9 @@ func (s *OpenAIGatewayService) ForwardImages(
 	if parsed == nil {
 		return nil, fmt.Errorf("parsed images request is required")
 	}
+	if account == nil {
+		return nil, fmt.Errorf("images account is required")
+	}
 	switch account.Type {
 	case AccountTypeAPIKey:
 		return s.forwardOpenAIImagesAPIKey(ctx, c, account, body, parsed, channelMappedModel)
@@ -610,7 +621,8 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 		parsed.Endpoint,
 		account.Type,
 	)
-	forwardBody, forwardContentType, err := rewriteOpenAIImagesModel(body, parsed.ContentType, upstreamModel)
+	forceNonStreamingBatch := parsed.Stream && parsed.N > 1
+	forwardBody, forwardContentType, err := rewriteOpenAIImagesRequest(body, parsed.ContentType, upstreamModel, forceNonStreamingBatch)
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +634,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	defer releaseUpstreamCtx()
 
-	token, _, err := s.GetAccessToken(upstreamCtx, account)
+	token, _, err := s.getRequestCredential(upstreamCtx, c, account)
 	if err != nil {
 		return nil, err
 	}
@@ -630,15 +642,22 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	if err != nil {
 		return nil, err
 	}
+	if forceNonStreamingBatch {
+		upstreamReq.Header.Set("Accept", "application/json")
+	}
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
 	upstreamStart := time.Now()
+	upstreamReq, sendState := trackOpenAIUpstreamSend(upstreamReq)
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 	if err != nil {
+		if resp == nil && sendState.mayFailover(ctx, c, err) {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
 		setOpsUpstreamError(c, 0, safeErr, "")
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
@@ -691,7 +710,8 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	var usage OpenAIUsage
 	imageCount := parsed.N
 	var firstTokenMs *int
-	if parsed.Stream && isEventStreamResponse(resp.Header) {
+	upstreamStream := parsed.Stream && !forceNonStreamingBatch
+	if upstreamStream && isEventStreamResponse(resp.Header) {
 		streamUsage, streamCount, streamSizes, ttft, err := s.handleOpenAIImagesStreamingResponse(resp, c, startTime, nil)
 		if err != nil {
 			if streamCount > 0 {
@@ -701,7 +721,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 					Usage:            streamUsage,
 					Model:            requestModel,
 					UpstreamModel:    upstreamModel,
-					Stream:           parsed.Stream,
+					Stream:           upstreamStream,
 					ResponseHeaders:  resp.Header.Clone(),
 					Duration:         time.Since(startTime),
 					FirstTokenMs:     ttft,
@@ -723,7 +743,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			Usage:            usage,
 			Model:            requestModel,
 			UpstreamModel:    upstreamModel,
-			Stream:           parsed.Stream,
+			Stream:           upstreamStream,
 			ResponseHeaders:  resp.Header.Clone(),
 			Duration:         time.Since(startTime),
 			FirstTokenMs:     firstTokenMs,
@@ -747,7 +767,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			Usage:            usage,
 			Model:            requestModel,
 			UpstreamModel:    upstreamModel,
-			Stream:           parsed.Stream,
+			Stream:           upstreamStream,
 			ResponseHeaders:  resp.Header.Clone(),
 			Duration:         time.Since(startTime),
 			FirstTokenMs:     firstTokenMs,
@@ -819,24 +839,33 @@ func buildOpenAIImagesURL(base string, endpoint string) string {
 	return buildOpenAIEndpointURL(base, endpoint)
 }
 
-func rewriteOpenAIImagesModel(body []byte, contentType string, model string) ([]byte, string, error) {
+func rewriteOpenAIImagesRequest(body []byte, contentType string, model string, forceNonStreaming bool) ([]byte, string, error) {
 	model = strings.TrimSpace(model)
-	if model == "" {
+	if model == "" && !forceNonStreaming {
 		return body, contentType, nil
 	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
-		rewrittenBody, rewrittenType, rewriteErr := rewriteOpenAIImagesMultipartModel(body, contentType, model)
+		rewrittenBody, rewrittenType, rewriteErr := rewriteOpenAIImagesMultipartRequest(body, contentType, model, forceNonStreaming)
 		return rewrittenBody, rewrittenType, rewriteErr
 	}
-	rewritten, err := sjson.SetBytes(body, "model", model)
-	if err != nil {
-		return nil, "", fmt.Errorf("rewrite image request model: %w", err)
+	rewritten := body
+	if model != "" {
+		rewritten, err = sjson.SetBytes(rewritten, "model", model)
+		if err != nil {
+			return nil, "", fmt.Errorf("rewrite image request model: %w", err)
+		}
+	}
+	if forceNonStreaming {
+		rewritten, err = sjson.SetBytes(rewritten, "stream", false)
+		if err != nil {
+			return nil, "", fmt.Errorf("rewrite image request stream: %w", err)
+		}
 	}
 	return rewritten, contentType, nil
 }
 
-func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model string) ([]byte, string, error) {
+func rewriteOpenAIImagesMultipartRequest(body []byte, contentType string, model string, forceNonStreaming bool) ([]byte, string, error) {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return nil, "", fmt.Errorf("parse multipart content-type: %w", err)
@@ -850,6 +879,7 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 	var buffer bytes.Buffer
 	writer := multipart.NewWriter(&buffer)
 	modelWritten := false
+	streamWritten := false
 
 	for {
 		part, err := reader.NextPart()
@@ -868,12 +898,21 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 			return nil, "", fmt.Errorf("create multipart part: %w", err)
 		}
 
-		if formName == "model" && part.FileName() == "" {
+		if formName == "model" && part.FileName() == "" && model != "" {
 			if _, err := target.Write([]byte(model)); err != nil {
 				_ = part.Close()
 				return nil, "", fmt.Errorf("rewrite multipart model: %w", err)
 			}
 			modelWritten = true
+			_ = part.Close()
+			continue
+		}
+		if formName == "stream" && part.FileName() == "" && forceNonStreaming {
+			if _, err := target.Write([]byte("false")); err != nil {
+				_ = part.Close()
+				return nil, "", fmt.Errorf("rewrite multipart stream: %w", err)
+			}
+			streamWritten = true
 			_ = part.Close()
 			continue
 		}
@@ -884,9 +923,14 @@ func rewriteOpenAIImagesMultipartModel(body []byte, contentType string, model st
 		_ = part.Close()
 	}
 
-	if !modelWritten {
+	if model != "" && !modelWritten {
 		if err := writer.WriteField("model", model); err != nil {
 			return nil, "", fmt.Errorf("append multipart model field: %w", err)
+		}
+	}
+	if forceNonStreaming && !streamWritten {
+		if err := writer.WriteField("stream", "false"); err != nil {
+			return nil, "", fmt.Errorf("append multipart stream field: %w", err)
 		}
 	}
 	if err := writer.Close(); err != nil {
@@ -1102,6 +1146,9 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 			}
 			if err != nil {
 				flushSSEEvent()
+				if shouldClassifyOpenAIUpstreamStreamReadError(err, c.Request.Context()) {
+					err = newOpenAIUpstreamStreamReadError(err)
+				}
 				return usage, imageCounter.Count(), imageCounter.Sizes(), firstTokenMs, err
 			}
 		}
@@ -1178,6 +1225,9 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 			}
 			if ev.err != nil {
 				flushSSEEvent()
+				if shouldClassifyOpenAIUpstreamStreamReadError(ev.err, c.Request.Context()) {
+					ev.err = newOpenAIUpstreamStreamReadError(ev.err)
+				}
 				return usage, imageCounter.Count(), imageCounter.Sizes(), firstTokenMs, ev.err
 			}
 			processLine(ev.line)

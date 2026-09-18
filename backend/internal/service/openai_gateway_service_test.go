@@ -249,6 +249,7 @@ func (r groupAwareStubOpenAIAccountRepo) ListSchedulableUngroupedByPlatform(ctx 
 }
 
 type stubConcurrencyCache struct {
+	healthyOpenAI429TestCache
 	ConcurrencyCache
 	loadBatchErr    error
 	loadMap         map[int64]*AccountLoadInfo
@@ -589,6 +590,40 @@ func TestOpenAIGatewayService_BindHTTPResponseAccount(t *testing.T) {
 	require.False(t, owned)
 }
 
+func TestOpenAIGatewayService_BindHTTPResponseAccountPersistsSelectedEgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	groupID := int64(4202)
+	c.Set("api_key", &APIKey{ID: 502, GroupID: &groupID})
+
+	const accountID int64 = 37002
+	const routeID int64 = 42
+	bindingID := StableAccountEgressBindingID(accountID, routeID)
+	svc := &OpenAIGatewayService{}
+	account := &Account{
+		ID:       accountID,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		SelectedEgress: &ResolvedAccountEgress{
+			BindingID: bindingID,
+			RouteID:   routeID,
+		},
+	}
+
+	svc.bindHTTPResponseAccount(context.Background(), c, account, "resp_http_egress_001")
+
+	got, found := getOpenAIWSResponseEgress(
+		svc.getOpenAIWSStateStore(),
+		context.Background(),
+		groupID,
+		"resp_http_egress_001",
+	)
+	require.True(t, found)
+	require.Equal(t, bindingID, got)
+}
+
 func TestOpenAIGatewayService_GenerateExplicitSessionHash_SkipsContentFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &OpenAIGatewayService{}
@@ -714,7 +749,7 @@ func (c *stubGatewayCache) GetSessionAccountID(ctx context.Context, groupID int6
 	if id, ok := c.sessionBindings[sessionHash]; ok {
 		return id, nil
 	}
-	return 0, errors.New("not found")
+	return 0, ErrStickySessionNotFound
 }
 
 func (c *stubGatewayCache) SetSessionAccountID(ctx context.Context, groupID int64, sessionHash string, accountID int64, ttl time.Duration) error {
@@ -1928,7 +1963,7 @@ func TestOpenAIStreamingResponseFailedBeforeOutputRateLimitUsesPoolRetryPolicy(t
 
 // 流内 rate limit 进入 OAuth 同账号重试窗口，但不立即写账号级限流/封禁状态：
 // HTTP 200 流的 x-codex-* 头不能让窗口内的账号提前失去调度资格。
-func TestOpenAIStreamingResponseFailedRateLimitDoesNotBlockAccountScheduling(t *testing.T) {
+func TestOpenAIStreamingResponseFailedRateLimitWithoutAdmissionUsesFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{
 		Gateway: config.GatewayConfig{
@@ -1971,9 +2006,9 @@ func TestOpenAIStreamingResponseFailedRateLimitDoesNotBlockAccountScheduling(t *
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.False(t, failoverErr.SameAccountRetryDeadline.IsZero())
-	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
 func TestOpenAIStreamingResponseFailedAfterOutputSanitizesVerboseResponseForClient(t *testing.T) {

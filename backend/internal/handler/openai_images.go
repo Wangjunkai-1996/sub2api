@@ -73,6 +73,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	effectiveStream := parsed.EffectiveStream()
 	requestModel := parsed.Model
 	ensureCompositeTargetPlatform(c, apiKey, requestModel)
 	clientRequestModel := clientRequestedModel(c, requestModel)
@@ -88,7 +89,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	reqLog = reqLog.With(
 		zap.String("model", clientRequestModel),
 		zap.String("routing_model", routingModel),
-		zap.Bool("stream", parsed.Stream),
+		zap.Bool("stream", effectiveStream),
 		zap.Bool("multipart", parsed.Multipart),
 		zap.String("capability", string(parsed.RequiredCapability)),
 		zap.String("img_quality", parsed.Quality),
@@ -99,10 +100,6 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", service.ImageGenerationPermissionMessage())
 		return
 	}
-	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIImages, requestModel, parsed.ModerationBody()); decision != nil && !decision.AllowNextStage {
-		h.openAISecurityAuditError(c, decision)
-		return
-	}
 	imageReleaseFunc, acquired := h.acquireImageGenerationSlot(c, streamStarted)
 	if !acquired {
 		return
@@ -111,8 +108,8 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		defer imageReleaseFunc()
 	}
 
-	setOpsRequestContext(c, clientRequestModel, parsed.Stream)
-	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(parsed.Stream, false)))
+	setOpsRequestContext(c, clientRequestModel, effectiveStream)
+	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(effectiveStream, false)))
 
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, routingModel)
 
@@ -125,7 +122,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
 
-	userReleaseFunc, acquired := h.acquireResponsesUserSlot(c, subject.UserID, subject.Concurrency, parsed.Stream, &streamStarted, reqLog)
+	userReleaseFunc, acquired := h.acquireResponsesUserSlot(c, subject.UserID, subject.Concurrency, effectiveStream, &streamStarted, reqLog)
 	if !acquired {
 		return
 	}
@@ -145,6 +142,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 
 	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, body)
 	requestCtx := service.WithOpenAIImagesEndpoint(service.WithOpenAIImageGenerationIntent(c.Request.Context()))
+	c.Request = c.Request.WithContext(requestCtx)
 
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
@@ -172,20 +170,26 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 				reqLog.Info("openai.images.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
+			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
+				continue
+			}
+			if h.handleOpenAIDeferredSelection(c, err, streamStarted, false) {
+				return
+			}
 			reqLog.Warn("openai.images.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
 			if len(failedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, clientRequestModel, routingModel, service.PlatformOpenAI)
+				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
-				message := cls.Message
 				if !cls.ModelNotFound {
-					message = "No available compatible accounts"
+					cls.Message = "No available compatible accounts"
 				}
-				h.handleStreamingAwareError(c, cls.Status, cls.ErrType, message, streamStarted)
+				h.handleSelectionFailure(c, cls, streamStarted)
 				return
 			}
 			if lastFailoverErr != nil {
@@ -200,11 +204,10 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
 			}
-			message := cls.Message
 			if !cls.ModelNotFound {
-				message = "No available compatible accounts"
+				cls.Message = "No available compatible accounts"
 			}
-			h.handleStreamingAwareError(c, cls.Status, cls.ErrType, message, streamStarted)
+			h.handleSelectionFailure(c, cls, streamStarted)
 			return
 		}
 
@@ -222,7 +225,11 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		reqLog.Debug("openai.images.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, parsed.Stream, &streamStarted, reqLog)
+		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, effectiveStream, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquireReselect {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// Images 调度不装利润门，此分支实际不可达；防御性排除重选并受同一否决上限约束。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
@@ -234,9 +241,9 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
-
+		account = selection.Account
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
-		if !parsed.Stream && !jsonKeepaliveStarted {
+		if !effectiveStream && !jsonKeepaliveStarted {
 			stopJSONKeepalive = service.StartOpenAIImagesJSONKeepalive(c, h.openAIImagesJSONKeepaliveInterval())
 			jsonKeepaliveStarted = true
 		}
@@ -324,7 +331,9 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 								return
 							case <-time.After(retryDelay):
 							}
-							continue
+							if sameAccountRetryDeadlineAllows(failoverErr) {
+								continue
+							}
 						}
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()

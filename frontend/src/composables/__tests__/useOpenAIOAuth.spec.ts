@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/stores/app', () => ({
   useAppStore: () => ({
@@ -31,6 +31,67 @@ vi.mock('@/api/admin', () => ({
 
 import { useOpenAIOAuth } from '@/composables/useOpenAIOAuth'
 import { adminAPI } from '@/api/admin'
+
+beforeEach(() => {
+  vi.clearAllMocks()
+})
+
+describe('useOpenAIOAuth egress selection', () => {
+  it('sends only egress_route_id for a pool authorization flow', async () => {
+    vi.mocked(adminAPI.accounts.generateAuthUrl).mockResolvedValueOnce({
+      auth_url: 'https://auth.openai.test/authorize?state=pool-state',
+      session_id: 'pool-session'
+    })
+    const oauth = useOpenAIOAuth()
+
+    await expect(oauth.generateAuthUrl({ egressRouteId: 17 })).resolves.toBe(true)
+    expect(adminAPI.accounts.generateAuthUrl).toHaveBeenCalledWith(
+      '/admin/openai/generate-auth-url',
+      { egress_route_id: 17 }
+    )
+
+    vi.mocked(adminAPI.accounts.exchangeCode).mockResolvedValueOnce({ access_token: 'at' })
+    await oauth.exchangeAuthCode('code', 'pool-session', 'pool-state', { egressRouteId: 17 })
+    expect(adminAPI.accounts.exchangeCode).toHaveBeenCalledWith(
+      '/admin/openai/exchange-code',
+      expect.objectContaining({ egress_route_id: 17 })
+    )
+  })
+
+  it('keeps proxy_id for legacy authorization flows', async () => {
+    vi.mocked(adminAPI.accounts.generateAuthUrl).mockResolvedValueOnce({
+      auth_url: 'https://auth.openai.test/authorize?state=legacy-state',
+      session_id: 'legacy-session'
+    })
+    const oauth = useOpenAIOAuth()
+
+    await oauth.generateAuthUrl({ proxyId: 23 })
+    expect(adminAPI.accounts.generateAuthUrl).toHaveBeenCalledWith(
+      '/admin/openai/generate-auth-url',
+      { proxy_id: 23 }
+    )
+  })
+
+  it('uses the pool route when validating a refresh token', async () => {
+    vi.mocked(adminAPI.accounts.refreshOpenAIToken).mockResolvedValueOnce({ access_token: 'at' })
+    const oauth = useOpenAIOAuth()
+
+    await oauth.validateRefreshToken('rt', { egressRouteId: 31 }, 'client-id')
+    expect(adminAPI.accounts.refreshOpenAIToken).toHaveBeenCalledWith(
+      'rt',
+      { egress_route_id: 31 },
+      '/admin/openai/refresh-token',
+      'client-id'
+    )
+  })
+
+  it('rejects ambiguous proxy and route input before making a request', async () => {
+    const oauth = useOpenAIOAuth()
+
+    await expect(oauth.generateAuthUrl({ proxyId: 1, egressRouteId: 2 })).resolves.toBe(false)
+    expect(adminAPI.accounts.generateAuthUrl).not.toHaveBeenCalled()
+  })
+})
 
 describe('useOpenAIOAuth.buildCredentials', () => {
   it('should keep client_id when token response contains it', () => {

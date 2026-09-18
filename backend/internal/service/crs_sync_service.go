@@ -605,7 +605,6 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			result.Items = append(result.Items, item)
 			continue
 		}
-
 		credentials := sanitizeCredentialsMap(src.Credentials)
 		// Normalize token_type
 		if v, ok := credentials["token_type"].(string); !ok || strings.TrimSpace(v) == "" {
@@ -643,6 +642,18 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			result.Failed++
 			result.Items = append(result.Items, item)
 			continue
+		}
+		// Preserve an existing account's explicit proxy. The default is only an
+		// inheritance value for new accounts or CRS accounts that are unbound.
+		if proxyID == nil && (existing == nil || existing.ProxyID == nil) && s.openaiOAuthService != nil {
+			proxyID, err = s.openaiOAuthService.ResolveOpenAIOAuthDefaultProxyID(ctx)
+			if err != nil {
+				item.Action = "failed"
+				item.Error = "default proxy resolve failed: " + err.Error()
+				result.Failed++
+				result.Items = append(result.Items, item)
+				continue
+			}
 		}
 		var existingExtra map[string]any
 		if existing != nil {

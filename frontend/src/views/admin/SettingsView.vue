@@ -4910,6 +4910,105 @@
             </div>
           </div>
 
+          <!-- OpenAI Codex five-hour window warmup -->
+          <div class="card" data-testid="openai-window-warmup-settings">
+            <div class="border-b border-gray-100 px-6 py-4 dark:border-dark-700">
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+                    {{ t("admin.settings.openAIWindowWarmup.title") }}
+                  </h2>
+                  <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                    {{ t("admin.settings.openAIWindowWarmup.description") }}
+                  </p>
+                </div>
+                <Toggle
+                  v-model="form.openai_window_warmup_enabled"
+                  :aria-label="t('admin.settings.openAIWindowWarmup.enabled')"
+                  data-testid="openai-window-warmup-enabled"
+                />
+              </div>
+            </div>
+            <div class="space-y-5 p-6">
+              <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
+                <label class="block">
+                  <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t("admin.settings.openAIWindowWarmup.defaultPolicy") }}
+                  </span>
+                  <Select
+                    v-model="form.openai_window_warmup_default_policy"
+                    :options="openAIWindowWarmupPolicyOptions"
+                    class="mt-2"
+                    data-testid="openai-window-warmup-default-policy"
+                  />
+                </label>
+                <label class="block lg:col-span-2">
+                  <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t("admin.settings.openAIWindowWarmup.allowlist") }}
+                  </span>
+                  <input
+                    v-model.trim="openAIWindowWarmupAllowlistInput"
+                    type="text"
+                    inputmode="numeric"
+                    class="input mt-2 w-full"
+                    :placeholder="t('admin.settings.openAIWindowWarmup.allowlistPlaceholder')"
+                    data-testid="openai-window-warmup-allowlist"
+                  />
+                </label>
+              </div>
+
+              <label class="block">
+                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                  {{ t("admin.settings.openAIWindowWarmup.probeModel") }}
+                </span>
+                <input
+                  v-model.trim="form.openai_window_warmup_probe_model"
+                  type="text"
+                  class="input mt-2 w-full"
+                  required
+                  data-testid="openai-window-warmup-probe-model"
+                />
+              </label>
+
+              <div class="grid grid-cols-2 gap-4 md:grid-cols-4">
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.workerConcurrency") }}</span>
+                  <input v-model.number="form.openai_window_warmup_worker_concurrency" type="number" min="1" max="8" step="1" class="input mt-1" data-testid="openai-window-warmup-concurrency" />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.globalQPS") }}</span>
+                  <input v-model.number="form.openai_window_warmup_global_qps" type="number" min="0.01" max="0.2" step="0.01" class="input mt-1" data-testid="openai-window-warmup-qps" />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.batchSize") }}</span>
+                  <input v-model.number="form.openai_window_warmup_batch_size" type="number" min="1" max="100" step="1" class="input mt-1" data-testid="openai-window-warmup-batch" />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.scanSeconds") }}</span>
+                  <input v-model.number="form.openai_window_warmup_scan_seconds" type="number" min="5" max="3600" step="1" class="input mt-1" data-testid="openai-window-warmup-scan" />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.requestTimeoutSeconds") }}</span>
+                  <input v-model.number="form.openai_window_warmup_request_timeout_seconds" type="number" min="5" max="300" step="1" class="input mt-1" data-testid="openai-window-warmup-timeout" />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.leaseSeconds") }}</span>
+                  <input v-model.number="form.openai_window_warmup_lease_seconds" type="number" min="10" max="600" step="1" class="input mt-1" data-testid="openai-window-warmup-lease" />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.resetGraceSeconds") }}</span>
+                  <input v-model.number="form.openai_window_warmup_reset_grace_seconds" type="number" min="0" max="900" step="1" class="input mt-1" data-testid="openai-window-warmup-grace" />
+                </label>
+              </div>
+              <p
+                class="text-xs text-gray-500 dark:text-gray-400"
+                data-testid="openai-window-warmup-runtime-apply-hint"
+              >
+                {{ t("admin.settings.openAIWindowWarmup.runtimeApplyHint") }}
+              </p>
+            </div>
+          </div>
+
           <!-- Gateway Scheduling Settings -->
           <div class="card">
             <div
@@ -7323,30 +7422,143 @@
               </div>
               <Toggle v-model="form.risk_control_enabled" />
             </div>
+          </div>
+        </div>
 
-            <div class="flex items-center justify-between">
+        <div class="card" data-testid="openai-cyber-account-cooldown">
+          <div class="border-b border-gray-100 px-6 py-4 dark:border-dark-700">
+            <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+              {{ t('admin.settings.features.cyberAccountCooldown.title') }}
+            </h2>
+            <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+              {{ t('admin.settings.features.cyberAccountCooldown.description') }}
+            </p>
+          </div>
+          <div class="space-y-5 p-6">
+            <div class="flex items-center justify-between gap-4">
               <div>
                 <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  {{ t('admin.settings.features.riskControl.cyberSessionBlock') }}
+                  {{ t('admin.settings.features.cyberAccountCooldown.enabled') }}
                 </label>
-                <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-                  {{ t('admin.settings.features.riskControl.cyberSessionBlockHint') }}
+                <p class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400">
+                  {{ t('admin.settings.features.cyberAccountCooldown.enabledHint') }}
                 </p>
               </div>
-              <Toggle v-model="form.cyber_session_block_enabled" />
+              <Toggle
+                v-model="form.openai_cyber_account_cooldown_enabled"
+                data-testid="openai-cyber-account-cooldown-toggle"
+              />
             </div>
 
-            <div v-if="form.cyber_session_block_enabled">
-              <label class="input-label">
-                {{ t('admin.settings.features.riskControl.cyberSessionBlockTTL') }}
-                <span class="text-red-500">*</span>
-              </label>
-              <input
-                v-model.number="form.cyber_session_block_ttl_seconds"
-                type="number"
-                min="1"
-                class="input"
-              />
+            <div
+              v-if="form.openai_cyber_account_cooldown_enabled"
+              class="space-y-5 border-t border-gray-100 pt-5 dark:border-dark-700"
+            >
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.cyberAccountCooldown.windowSeconds') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_window_seconds"
+                    data-testid="openai-cyber-account-cooldown-window"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    step="1"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.cyberAccountCooldown.firstSeconds') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_first_seconds"
+                    data-testid="openai-cyber-account-cooldown-first"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    step="1"
+                    class="input"
+                  />
+                </div>
+                <div>
+                  <label class="input-label">
+                    {{ t('admin.settings.features.cyberAccountCooldown.escalatedSeconds') }}
+                  </label>
+                  <input
+                    v-model.number="form.openai_cyber_account_cooldown_escalated_seconds"
+                    data-testid="openai-cyber-account-cooldown-escalated"
+                    type="number"
+                    min="60"
+                    max="604800"
+                    step="1"
+                    class="input"
+                  />
+                </div>
+              </div>
+
+              <div class="space-y-3 border-t border-gray-100 pt-5 dark:border-dark-700">
+                <div>
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {{ t('admin.settings.features.cyberAccountCooldown.groupScope') }}
+                  </label>
+                  <p class="mt-0.5 max-w-3xl text-xs text-gray-500 dark:text-gray-400">
+                    {{ t('admin.settings.features.cyberAccountCooldown.groupScopeHint') }}
+                  </p>
+                </div>
+                <div class="relative">
+                  <Icon
+                    name="search"
+                    size="sm"
+                    class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  />
+                  <input
+                    v-model.trim="cyberAccountCooldownGroupSearch"
+                    type="search"
+                    data-testid="openai-cyber-account-cooldown-group-search"
+                    class="input pl-9"
+                    :placeholder="t('admin.settings.features.cyberAccountCooldown.searchGroups')"
+                  />
+                </div>
+                <div class="grid max-h-64 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+                  <label
+                    v-for="group in filteredCyberAccountCooldownGroups"
+                    :key="group.id"
+                    :data-testid="`openai-cyber-account-cooldown-group-${group.id}`"
+                    class="flex cursor-pointer items-center gap-3 rounded-md border border-gray-100 px-3 py-2.5 transition-colors hover:bg-gray-50 dark:border-dark-700 dark:hover:bg-dark-700/60"
+                  >
+                    <input
+                      type="checkbox"
+                      :value="group.id"
+                      :checked="form.openai_cyber_account_cooldown_group_ids.includes(group.id)"
+                      class="h-4 w-4 shrink-0 rounded border-gray-300 text-primary-500 focus:ring-primary-500 dark:border-dark-500"
+                      @change="toggleCyberAccountCooldownGroup(group.id, ($event.target as HTMLInputElement).checked)"
+                    />
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm font-medium text-gray-900 dark:text-white">
+                        {{ group.name }}
+                      </span>
+                      <span class="block truncate text-xs text-gray-500 dark:text-gray-400">
+                        #{{ group.id }} · {{ group.platform }} · {{ group.subscription_type }}
+                      </span>
+                    </span>
+                    <span
+                      v-if="group.status !== 'active'"
+                      class="shrink-0 text-xs text-gray-400"
+                    >
+                      {{ t('admin.settings.features.cyberAccountCooldown.disabledGroup') }}
+                    </span>
+                  </label>
+                  <p
+                    v-if="filteredCyberAccountCooldownGroups.length === 0"
+                    class="text-sm text-gray-500 dark:text-gray-400 sm:col-span-2"
+                  >
+                    {{ t('admin.settings.features.cyberAccountCooldown.noGroups') }}
+                  </p>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -9018,6 +9230,21 @@ const adminApiKeyMasked = ref("");
 const adminApiKeyOperating = ref(false);
 const newAdminApiKey = ref("");
 const subscriptionGroups = ref<AdminGroup[]>([]);
+const defaultOpenAICyberAccountCooldownGroupIDs = [12];
+const cyberAccountCooldownGroups = ref<AdminGroup[]>([]);
+const cyberAccountCooldownGroupSearch = ref("");
+
+const filteredCyberAccountCooldownGroups = computed(() => {
+  const query = cyberAccountCooldownGroupSearch.value.trim().toLowerCase();
+  if (!query) {
+    return cyberAccountCooldownGroups.value;
+  }
+  return cyberAccountCooldownGroups.value.filter((group) =>
+    [group.id, group.name, group.description, group.platform, group.subscription_type]
+      .filter((value) => value !== null && value !== undefined)
+      .some((value) => String(value).toLowerCase().includes(query)),
+  );
+});
 
 // Upstream billing probe state
 const upstreamBillingProbeLoading = ref(true);
@@ -9587,6 +9814,12 @@ type SettingsForm = Omit<
 };
 
 const schedulingThresholdPlatforms = SCHEDULING_THRESHOLD_PLATFORMS;
+const openAIWindowWarmupPolicyOptions = computed(() => [
+  { value: "off", label: t("admin.settings.openAIWindowWarmup.policyOff") },
+  { value: "initial_once", label: t("admin.settings.openAIWindowWarmup.policyOnce") },
+  { value: "continuous", label: t("admin.settings.openAIWindowWarmup.policyContinuous") },
+]);
+const openAIWindowWarmupAllowlistInput = ref("");
 
 const form = reactive<SettingsForm>({
   registration_enabled: true,
@@ -9633,8 +9866,13 @@ const form = reactive<SettingsForm>({
   hide_ccs_import_button: false,
   payment_enabled: false,
   risk_control_enabled: false,
-  cyber_session_block_enabled: false,
-  cyber_session_block_ttl_seconds: 3600,
+  openai_cyber_account_cooldown_enabled: false,
+  openai_cyber_account_cooldown_window_seconds: 86400,
+  openai_cyber_account_cooldown_first_seconds: 3600,
+  openai_cyber_account_cooldown_escalated_seconds: 86400,
+  openai_cyber_account_cooldown_group_ids: [
+    ...defaultOpenAICyberAccountCooldownGroupIDs,
+  ],
   payment_min_amount: 1,
   payment_max_amount: 10000,
   payment_daily_limit: 50000,
@@ -9848,6 +10086,17 @@ const form = reactive<SettingsForm>({
   codex_cli_only_whitelist: "",
   codex_cli_only_allow_app_server_clients: false,
   codex_cli_only_engine_fingerprint_signals: "",
+  openai_window_warmup_enabled: false,
+  openai_window_warmup_default_policy: "off",
+  openai_window_warmup_allowlist: [],
+  openai_window_warmup_probe_model: "codex-auto-review",
+  openai_window_warmup_worker_concurrency: 1,
+  openai_window_warmup_global_qps: 0.2,
+  openai_window_warmup_batch_size: 20,
+  openai_window_warmup_scan_seconds: 30,
+  openai_window_warmup_request_timeout_seconds: 45,
+  openai_window_warmup_lease_seconds: 120,
+  openai_window_warmup_reset_grace_seconds: 90,
   // 余额、订阅到期与账号限额通知
   balance_low_notify_enabled: false,
   balance_low_notify_threshold: 0,
@@ -10860,6 +11109,11 @@ async function loadSettings() {
     codexFingerprintRows.value = form.codex_cli_only_engine_fingerprint_signals
       ? parseFingerprintSignalsToRows(form.codex_cli_only_engine_fingerprint_signals)
       : defaultFingerprintSignalRows();
+    openAIWindowWarmupAllowlistInput.value = Array.isArray(
+      settings.openai_window_warmup_allowlist,
+    )
+      ? settings.openai_window_warmup_allowlist.join(", ")
+      : "";
     form.login_agreement_mode =
       settings.login_agreement_mode === "checkbox" ? "checkbox" : "modal";
     form.channel_monitor_mode =
@@ -10893,6 +11147,13 @@ async function loadSettings() {
     form.default_subscriptions = normalizeDefaultSubscriptionSettings(
       settings.default_subscriptions,
     );
+    const cooldownGroupIDs = normalizeCyberAccountCooldownGroupIDs(
+      form.openai_cyber_account_cooldown_group_ids,
+    );
+    form.openai_cyber_account_cooldown_group_ids =
+      cooldownGroupIDs.length > 0
+        ? cooldownGroupIDs
+        : [...defaultOpenAICyberAccountCooldownGroupIDs];
     registrationEmailSuffixWhitelistTags.value =
       normalizeRegistrationEmailSuffixDomains(
         settings.registration_email_suffix_whitelist,
@@ -11008,13 +11269,40 @@ async function loadSettings() {
 async function loadSubscriptionGroups() {
   try {
     const groups = await adminAPI.groups.getAll();
+    cyberAccountCooldownGroups.value = groups;
     subscriptionGroups.value = groups.filter(
       (group) =>
         group.subscription_type === "subscription" && group.status === "active",
     );
   } catch (_error: unknown) {
+    cyberAccountCooldownGroups.value = [];
     subscriptionGroups.value = [];
   }
+}
+
+function normalizeCyberAccountCooldownGroupIDs(groupIDs: unknown): number[] {
+  if (!Array.isArray(groupIDs)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      groupIDs.filter(
+        (groupID): groupID is number =>
+          typeof groupID === "number" &&
+          Number.isInteger(groupID) &&
+          groupID > 0,
+      ),
+    ),
+  ).sort((left, right) => left - right);
+}
+
+function toggleCyberAccountCooldownGroup(groupID: number, checked: boolean): void {
+  const selected = normalizeCyberAccountCooldownGroupIDs(
+    form.openai_cyber_account_cooldown_group_ids,
+  );
+  form.openai_cyber_account_cooldown_group_ids = checked
+    ? normalizeCyberAccountCooldownGroupIDs([...selected, groupID])
+    : selected.filter((selectedGroupID) => selectedGroupID !== groupID);
 }
 
 function findNextAvailableSubscriptionGroup(
@@ -11168,6 +11456,39 @@ async function saveSettings() {
       form.forwarded_client_ip_headers,
     );
 
+    form.openai_cyber_account_cooldown_group_ids =
+      normalizeCyberAccountCooldownGroupIDs(
+        form.openai_cyber_account_cooldown_group_ids,
+      );
+    if (form.openai_cyber_account_cooldown_group_ids.length === 0) {
+      appStore.showError(
+        t("admin.settings.features.cyberAccountCooldown.groupsRequired"),
+      );
+      return;
+    }
+
+    const cyberAccountCooldownValues = [
+      Number(form.openai_cyber_account_cooldown_window_seconds),
+      Number(form.openai_cyber_account_cooldown_first_seconds),
+      Number(form.openai_cyber_account_cooldown_escalated_seconds),
+    ];
+    if (
+      cyberAccountCooldownValues.some(
+        (value) => !Number.isInteger(value) || value < 60 || value > 604800,
+      )
+    ) {
+      appStore.showError(
+        t("admin.settings.features.cyberAccountCooldown.rangeError"),
+      );
+      return;
+    }
+    if (cyberAccountCooldownValues[2] < cyberAccountCooldownValues[1]) {
+      appStore.showError(
+        t("admin.settings.features.cyberAccountCooldown.orderError"),
+      );
+      return;
+    }
+
     const normalizedDefaultSubscriptions = normalizeDefaultSubscriptionSettings(
       form.default_subscriptions,
     );
@@ -11239,6 +11560,33 @@ async function saveSettings() {
       );
     form.claude_oauth_system_prompt_blocks =
       claudeOAuthSystemPromptBlocksJSON;
+
+    const warmupAllowlistTokens = openAIWindowWarmupAllowlistInput.value
+      .split(/[\s,]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const warmupAllowlist = Array.from(
+      new Set(warmupAllowlistTokens.map((value) => Number(value))),
+    );
+    if (
+      warmupAllowlist.some(
+        (value) => !Number.isSafeInteger(value) || value <= 0,
+      )
+    ) {
+      appStore.showError(
+        t("admin.settings.openAIWindowWarmup.allowlistInvalid"),
+      );
+      return;
+    }
+    if (
+      Number(form.openai_window_warmup_lease_seconds) <=
+      Number(form.openai_window_warmup_request_timeout_seconds)
+    ) {
+      appStore.showError(
+        t("admin.settings.openAIWindowWarmup.leaseInvalid"),
+      );
+      return;
+    }
 
     const payload: UpdateSettingsRequest = {
       registration_enabled: form.registration_enabled,
@@ -11460,12 +11808,46 @@ async function saveSettings() {
       codex_cli_only_whitelist: serializeCodexRowsToJSON(
         codexWhitelistRows.value,
       ),
+      openai_window_warmup_enabled: form.openai_window_warmup_enabled,
+      openai_window_warmup_default_policy:
+        form.openai_window_warmup_default_policy,
+      openai_window_warmup_allowlist: warmupAllowlist,
+      openai_window_warmup_probe_model:
+        form.openai_window_warmup_probe_model.trim(),
+      openai_window_warmup_worker_concurrency: Number(
+        form.openai_window_warmup_worker_concurrency,
+      ),
+      openai_window_warmup_global_qps: Number(
+        form.openai_window_warmup_global_qps,
+      ),
+      openai_window_warmup_batch_size: Number(
+        form.openai_window_warmup_batch_size,
+      ),
+      openai_window_warmup_scan_seconds: Number(
+        form.openai_window_warmup_scan_seconds,
+      ),
+      openai_window_warmup_request_timeout_seconds: Number(
+        form.openai_window_warmup_request_timeout_seconds,
+      ),
+      openai_window_warmup_lease_seconds: Number(
+        form.openai_window_warmup_lease_seconds,
+      ),
+      openai_window_warmup_reset_grace_seconds: Number(
+        form.openai_window_warmup_reset_grace_seconds,
+      ),
       // Payment configuration
       payment_enabled: form.payment_enabled,
       risk_control_enabled: form.risk_control_enabled,
-      cyber_session_block_enabled: form.cyber_session_block_enabled,
-      cyber_session_block_ttl_seconds:
-        Number(form.cyber_session_block_ttl_seconds) || 3600,
+      openai_cyber_account_cooldown_enabled:
+        form.openai_cyber_account_cooldown_enabled,
+      openai_cyber_account_cooldown_window_seconds:
+        Number(form.openai_cyber_account_cooldown_window_seconds),
+      openai_cyber_account_cooldown_first_seconds:
+        Number(form.openai_cyber_account_cooldown_first_seconds),
+      openai_cyber_account_cooldown_escalated_seconds:
+        Number(form.openai_cyber_account_cooldown_escalated_seconds),
+      openai_cyber_account_cooldown_group_ids:
+        form.openai_cyber_account_cooldown_group_ids,
       payment_min_amount: Number(form.payment_min_amount) || 0,
       payment_max_amount: Number(form.payment_max_amount) || 0,
       payment_daily_limit: Number(form.payment_daily_limit) || 0,
@@ -11612,6 +11994,11 @@ async function saveSettings() {
     form.account_scheduling_thresholds = normalizeAccountSchedulingThresholdsMap(
       updated.account_scheduling_thresholds,
     );
+    openAIWindowWarmupAllowlistInput.value = Array.isArray(
+      updated.openai_window_warmup_allowlist,
+    )
+      ? updated.openai_window_warmup_allowlist.join(", ")
+      : "";
     registrationEmailSuffixWhitelistTags.value =
       normalizeRegistrationEmailSuffixDomains(
         updated.registration_email_suffix_whitelist,

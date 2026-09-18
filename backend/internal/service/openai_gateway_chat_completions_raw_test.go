@@ -1099,7 +1099,7 @@ func TestForwardAsRawChatCompletions_UpstreamRequestIgnoresClientCancel(t *testi
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)).WithContext(reqCtx)
 	c.Request.Header.Set("Content-Type", "application/json")
-	cancel()
+	defer cancel()
 
 	upstreamBody := strings.Join([]string{
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
@@ -1107,7 +1107,7 @@ func TestForwardAsRawChatCompletions_UpstreamRequestIgnoresClientCancel(t *testi
 		"data: [DONE]",
 		"",
 	}, "\n")
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_raw_ctx"}},
 		Body:       io.NopCloser(strings.NewReader(upstreamBody)),

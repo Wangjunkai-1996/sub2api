@@ -249,6 +249,9 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 				h.errorResponse(c, http.StatusNotFound, "not_found_error", "Video request not found")
 				return
 			}
+			if h.handleOpenAIDeferredSelection(c, err, false, false) {
+				return
+			}
 			reqLog.Warn("grok_media.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
@@ -342,6 +345,10 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 		}
 		var slotResult openAISlotAcquireResult
 		accountReleaseFunc, slotResult = h.acquireResponsesAccountSlot(c, apiKey.GroupID, admissionSessionHash, selection, false, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquireReselect {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// 媒体路径已显式豁免利润门（suppress 标记），此分支仅防御性兜底，
 			// 同样受否决上限约束。
@@ -413,7 +420,9 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 							return
 						case <-time.After(retryDelay):
 						}
-						continue
+						if sameAccountRetryDeadlineAllows(failoverErr) {
+							continue
+						}
 					}
 				}
 				h.gatewayService.RecordOpenAIAccountSwitch()

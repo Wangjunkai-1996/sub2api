@@ -97,6 +97,53 @@ func (w *failWriteResponseWriter) WriteString(_ string) (int, error) {
 	return 0, errors.New("client disconnected")
 }
 
+func TestGatewayService_AnthropicAPIKeyNormalForward_PreservesLatestTrustedAssistantContentOnWire(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := []byte(`{"model":"claude-sonnet-4-5","messages":[` +
+		`{"role":"assistant","content":[` +
+		`{"type":"text","text":""},` +
+		`{"type":"server_tool_use","id":"srvtoolu_ws_old","name":"web_search","input":{}},` +
+		`{"type":"thinking","thinking":"old unsigned"},` +
+		`{"type":"text","text":"keep history"}]},` +
+		`{"role":"assistant","content":[` +
+		`{"meta":{"scale":1.0,"escaped":"\u4f60\u597d"},"data":"opaque","type":"redacted_thinking"},` +
+		`{"thinking":"unsigned sibling","type":"thinking"},` +
+		`{"text":"","type":"text"},` +
+		`{"input":{"limit":2.00},"name":"web_search","id":"srvtoolu_ws_latest","type":"server_tool_use"},` +
+		`{"text":"answer","type":"text"}]},` +
+		`{"role":"user","content":"continue"}]}`)
+	wantLatestRaw := gjson.GetBytes(body, "messages.1.content").Raw
+	parsed, err := ParseGatewayRequest(NewRequestBodyRef(body), PlatformAnthropic)
+	require.NoError(t, err)
+
+	upstream := &anthropicHTTPUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"msg_wire","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+		)),
+	}}
+	svc := newForwardPartialUsageServiceForTest(upstream)
+	account := newAnthropicAPIKeyAccountForTest()
+	account.Extra = nil // Exercise the normal Forward path, not API-key passthrough.
+	require.False(t, account.IsAnthropicAPIKeyPassthroughEnabled())
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotEmpty(t, upstream.lastBody)
+	require.Equal(t, wantLatestRaw, gjson.GetBytes(upstream.lastBody, "messages.1.content").Raw)
+
+	history := gjson.GetBytes(upstream.lastBody, "messages.0.content").Array()
+	require.Len(t, history, 1)
+	require.Equal(t, "keep history", history[0].Get("text").String())
+	require.Len(t, gjson.GetBytes(upstream.lastBody, "messages.1.content").Array(), 5)
+}
+
 func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardStreamPreservesBodyAndAuthReplacement(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

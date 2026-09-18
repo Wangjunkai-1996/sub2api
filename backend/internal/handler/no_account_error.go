@@ -2,11 +2,13 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,19 +30,67 @@ import (
 //     after a backoff can plausibly succeed (or, in the empty-pool case, the
 //     operator may be in the middle of adding accounts).
 type noAccountErrorClassification struct {
-	Status        int
-	ErrType       string
-	Message       string
-	ModelNotFound bool // true when this is a 404 model_not_found classification
+	Status            int
+	ErrType           string
+	ErrCode           string
+	Message           string
+	RetryAfterSeconds int
+	ModelNotFound     bool // true when this is a 404 model_not_found classification
 }
 
 var selectionModelRateLimitedPattern = regexp.MustCompile(`(?:model_rate_limited|rate_limited)=(\d+)`)
 
-// classifySelectionFailureError preserves the scheduler's compact reason when
-// every model-capable account is temporarily rate limited.
+// classifySelectionFailureError preserves typed admission failures before the
+// generic no-account diagnosis can collapse them into a model/pool response.
 func classifySelectionFailureError(err error, fallback noAccountErrorClassification) noAccountErrorClassification {
 	if err == nil {
 		return fallback
+	}
+	var cooldown *service.OpenAI429CooldownError
+	if errors.As(err, &cooldown) {
+		retryAfter := int(cooldown.RetryAfter / time.Second)
+		if cooldown.RetryAfter%time.Second > 0 {
+			retryAfter++
+		}
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		return noAccountErrorClassification{
+			Status:            http.StatusTooManyRequests,
+			ErrType:           "rate_limit_error",
+			ErrCode:           "account_pool_rate_limited",
+			Message:           "Account capacity is recovering from an upstream rate limit. Please retry later.",
+			RetryAfterSeconds: retryAfter,
+		}
+	}
+	if errors.Is(err, service.ErrOpenAI429RecoveryUnavailable) {
+		return noAccountErrorClassification{
+			Status:            http.StatusServiceUnavailable,
+			ErrType:           "api_error",
+			ErrCode:           "account_recovery_unavailable",
+			Message:           "Account recovery state is temporarily unavailable. Please retry later.",
+			RetryAfterSeconds: 2,
+		}
+	}
+	if errors.Is(err, service.ErrAccountEgressCapacityFull) {
+		return noAccountErrorClassification{
+			Status:            http.StatusTooManyRequests,
+			ErrType:           "rate_limit_error",
+			ErrCode:           "egress_capacity_exhausted",
+			Message:           "Account egress capacity is full. Please retry later.",
+			RetryAfterSeconds: 2,
+		}
+	}
+	if errors.Is(err, service.ErrAccountEgressUnavailable) ||
+		errors.Is(err, service.ErrAccountEgressNoRoute) ||
+		errors.Is(err, service.ErrAccountEgressConfigStale) {
+		return noAccountErrorClassification{
+			Status:            http.StatusServiceUnavailable,
+			ErrType:           "api_error",
+			ErrCode:           "egress_unavailable",
+			Message:           "Account egress is temporarily unavailable. Please retry later.",
+			RetryAfterSeconds: 2,
+		}
 	}
 	// A 404 model_not_found fallback is authoritative and must not be downgraded
 	// to a rate-limit verdict. classifyNoAccountError only reaches it through
@@ -59,6 +109,11 @@ func classifySelectionFailureError(err error, fallback noAccountErrorClassificat
 	if fallback.ModelNotFound {
 		return fallback
 	}
+	if !errors.Is(err, service.ErrNoAvailableAccounts) {
+		// Do not turn a repository/transport failure into a pool health signal.
+		fallback.ErrCode = ""
+		fallback.RetryAfterSeconds = 0
+	}
 	match := selectionModelRateLimitedPattern.FindStringSubmatch(strings.ToLower(err.Error()))
 	if len(match) != 2 {
 		return fallback
@@ -68,9 +123,11 @@ func classifySelectionFailureError(err error, fallback noAccountErrorClassificat
 		return fallback
 	}
 	return noAccountErrorClassification{
-		Status:  http.StatusTooManyRequests,
-		ErrType: "rate_limit_error",
-		Message: "All available accounts are currently rate-limited. Please retry later.",
+		Status:            http.StatusTooManyRequests,
+		ErrType:           "rate_limit_error",
+		ErrCode:           fallback.ErrCode,
+		Message:           "All available accounts are currently rate-limited. Please retry later.",
+		RetryAfterSeconds: fallback.RetryAfterSeconds,
 	}
 }
 
@@ -107,9 +164,11 @@ func classifyNoAccountError(
 	platform string,
 ) noAccountErrorClassification {
 	fallback := noAccountErrorClassification{
-		Status:  http.StatusServiceUnavailable,
-		ErrType: "api_error",
-		Message: "Service temporarily unavailable",
+		Status:            http.StatusServiceUnavailable,
+		ErrType:           "api_error",
+		ErrCode:           "account_pool_exhausted",
+		Message:           "Service temporarily unavailable",
+		RetryAfterSeconds: 2,
 	}
 
 	routingModel = strings.TrimSpace(routingModel)
@@ -126,11 +185,61 @@ func classifyNoAccountError(
 		return noAccountErrorClassification{
 			Status:        http.StatusNotFound,
 			ErrType:       "model_not_found",
+			ErrCode:       "model_not_found",
 			Message:       fmt.Sprintf("Model %q is not supported by any configured account in this group", displayModel),
 			ModelNotFound: true,
 		}
 	}
 	return fallback
+}
+
+func (h *OpenAIGatewayHandler) handleSelectionFailure(c *gin.Context, classification noAccountErrorClassification, streamStarted bool) {
+	classification = openAIDeferredSelectionFailure(c, classification)
+	// Stop the compact heartbeat before inspecting or changing response headers.
+	if service.StopOpenAICompactSSEKeepaliveCommitted(c) {
+		streamStarted = true
+	}
+	if !streamStarted && !c.Writer.Written() && classification.RetryAfterSeconds > 0 {
+		c.Header("Retry-After", strconv.Itoa(classification.RetryAfterSeconds))
+	}
+	h.handleStreamingAwareErrorWithCode(c, classification.Status, classification.ErrType,
+		classification.ErrCode, classification.Message, streamStarted, false)
+}
+
+func (h *OpenAIGatewayHandler) handleAnthropicSelectionFailure(c *gin.Context, classification noAccountErrorClassification, streamStarted bool) {
+	classification = openAIDeferredSelectionFailure(c, classification)
+	if !streamStarted && !c.Writer.Written() && classification.RetryAfterSeconds > 0 {
+		c.Header("Retry-After", strconv.Itoa(classification.RetryAfterSeconds))
+	}
+	h.anthropicStreamingAwareError(c, classification.Status, classification.ErrType,
+		classification.Message, streamStarted, classification.ErrCode)
+}
+
+// Only a shared admission decision with a near recovery time permits one
+// selection retry. Empty pools, unknown failures and long quota resets do not.
+func waitForOpenAI429Selection(c *gin.Context, err error, excludedAccounts int) bool {
+	const waitedKey = "openai_429_selection_waited"
+	const maxWait = 3 * time.Second
+	if c == nil || c.Request == nil || excludedAccounts != 0 ||
+		service.OpenAICompactKeepaliveAdjustedWrittenSize(c) > 0 || c.GetBool(waitedKey) {
+		return false
+	}
+	var cooldown *service.OpenAI429CooldownError
+	if !errors.As(err, &cooldown) || cooldown.RetryAfter <= 0 || cooldown.RetryAfter > maxWait {
+		return false
+	}
+	ctx := c.Request.Context()
+	if ctx.Err() != nil {
+		return false
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= cooldown.RetryAfter {
+		return false
+	}
+	if deadline, ok := openAIRequestBudgetDeadline(c); ok && time.Until(deadline) <= cooldown.RetryAfter {
+		return false
+	}
+	c.Set(waitedKey, true)
+	return sleepWithContext(ctx, cooldown.RetryAfter)
 }
 
 // classifyNoAccountErrorFromGin is a thin wrapper that forwards the gin

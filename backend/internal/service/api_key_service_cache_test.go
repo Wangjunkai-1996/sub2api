@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,6 +128,7 @@ func (s *authRepoStub) GetRateLimitData(ctx context.Context, id int64) (*APIKeyR
 type authCacheStub struct {
 	getAuthCache   func(ctx context.Context, key string) (*APIKeyAuthCacheEntry, error)
 	setAuthKeys    []string
+	setAuthValues  []*APIKeyAuthCacheEntry
 	deleteAuthKeys []string
 }
 
@@ -159,6 +161,7 @@ func (s *authCacheStub) GetAuthCache(ctx context.Context, key string) (*APIKeyAu
 
 func (s *authCacheStub) SetAuthCache(ctx context.Context, key string, entry *APIKeyAuthCacheEntry, ttl time.Duration) error {
 	s.setAuthKeys = append(s.setAuthKeys, key)
+	s.setAuthValues = append(s.setAuthValues, entry)
 	return nil
 }
 
@@ -230,6 +233,101 @@ func TestAPIKeyService_GetByKey_UsesL2Cache(t *testing.T) {
 	require.Equal(t, groupID, apiKey.Group.ID)
 	require.True(t, apiKey.Group.ModelRoutingEnabled)
 	require.Equal(t, map[string][]int64{"claude-opus-*": {1, 2}}, apiKey.Group.ModelRouting)
+}
+
+func TestAPIKeyService_GetByKey_RejectsPreMergeSnapshotsAndReloads(t *testing.T) {
+	for _, version := range []int{22, 23} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			cache := &authCacheStub{}
+			var repoCalls atomic.Int32
+			groupID := int64(9)
+			repo := &authRepoStub{
+				getByKeyForAuth: func(ctx context.Context, key string) (*APIKey, error) {
+					repoCalls.Add(1)
+					return &APIKey{
+						ID: 1, UserID: 2, GroupID: &groupID, Key: key, Status: StatusActive,
+						User: &User{ID: 2, Status: StatusActive, Role: RoleUser, RestrictPublicGroups: true},
+						Group: &Group{
+							ID: groupID, Name: "database", Platform: PlatformOpenAI, Status: StatusActive,
+							SchedulerType: GroupSchedulerTypeAdvanced, ForceOpenAIFast: true,
+						},
+					}, nil
+				},
+			}
+			svc := NewAPIKeyService(repo, nil, nil, nil, nil, cache, &config.Config{
+				APIKeyAuth: config.APIKeyAuthCacheConfig{L2TTLSeconds: 60},
+			})
+			cache.getAuthCache = func(ctx context.Context, key string) (*APIKeyAuthCacheEntry, error) {
+				return &APIKeyAuthCacheEntry{Snapshot: &APIKeyAuthSnapshot{
+					Version:  version,
+					APIKeyID: 1,
+					UserID:   2,
+					GroupID:  &groupID,
+					Status:   StatusActive,
+					User:     APIKeyAuthUserSnapshot{ID: 2, Status: StatusActive},
+				}}, nil
+			}
+
+			apiKey, err := svc.GetByKey(context.Background(), "k-pre-merge")
+			require.NoError(t, err)
+			require.EqualValues(t, 1, repoCalls.Load())
+			require.True(t, apiKey.User.RestrictPublicGroups)
+			require.True(t, apiKey.Group.ForceOpenAIFast)
+			require.Equal(t, GroupSchedulerTypeAdvanced, apiKey.Group.SchedulerType)
+			require.Len(t, cache.setAuthKeys, 1, "the incomplete snapshot must be replaced from the database")
+		})
+	}
+}
+
+func TestAPIKeyService_GetByKey_RepairsLegacyL2SnapshotOnce(t *testing.T) {
+	cache := &authCacheStub{}
+	var repoCalls atomic.Int32
+	groupID := int64(9)
+	repo := &authRepoStub{
+		getByKeyForAuth: func(ctx context.Context, key string) (*APIKey, error) {
+			repoCalls.Add(1)
+			return &APIKey{
+				ID: 1, UserID: 2, GroupID: &groupID, Key: key, Status: StatusActive,
+				User: &User{ID: 2, Status: StatusActive, RestrictPublicGroups: true},
+				Group: &Group{
+					ID: groupID, Name: "database", Platform: PlatformOpenAI, Status: StatusActive,
+					SchedulerType: GroupSchedulerTypeAdvanced, ForceOpenAIFast: true,
+				},
+			}, nil
+		},
+	}
+	svc := NewAPIKeyService(repo, nil, nil, nil, nil, cache, &config.Config{
+		APIKeyAuth: config.APIKeyAuthCacheConfig{L2TTLSeconds: 60},
+	})
+
+	l2Entry := &APIKeyAuthCacheEntry{Snapshot: &APIKeyAuthSnapshot{
+		Version:  23,
+		APIKeyID: 1,
+		UserID:   2,
+		GroupID:  &groupID,
+		Status:   StatusActive,
+		User:     APIKeyAuthUserSnapshot{ID: 2, Status: StatusActive},
+	}}
+	cache.getAuthCache = func(ctx context.Context, key string) (*APIKeyAuthCacheEntry, error) {
+		return l2Entry, nil
+	}
+
+	first, err := svc.GetByKey(context.Background(), "k-repair-once")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, repoCalls.Load())
+	require.True(t, first.User.RestrictPublicGroups)
+	require.Len(t, cache.setAuthValues, 1)
+	require.Equal(t, apiKeyAuthSnapshotBridgeWireVersion, cache.setAuthValues[0].Snapshot.Version)
+	require.Equal(t, apiKeyAuthSnapshotVersion, cache.setAuthValues[0].Snapshot.CompletenessVersion)
+
+	// Simulate Redis returning the repaired value written by the first request.
+	l2Entry = cache.setAuthValues[0]
+	second, err := svc.GetByKey(context.Background(), "k-repair-once")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, repoCalls.Load(), "the repaired bridge must hit without another database lookup")
+	require.Len(t, cache.setAuthValues, 1, "the repaired bridge must not be rewritten on every read")
+	require.True(t, second.User.RestrictPublicGroups)
+	require.Equal(t, GroupSchedulerTypeAdvanced, second.Group.SchedulerType)
 }
 
 func TestAPIKeyService_SnapshotRoundTrip_PreservesMessagesDispatchModelConfig(t *testing.T) {
