@@ -778,6 +778,27 @@ describe("admin SettingsView payment visible method controls", () => {
     wrapper.unmount();
   });
 
+  it("keeps the 292 and 332 ticket modes mutually exclusive", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      openai_codex_ticket_enabled: true,
+      openai_codex_ticket_332_enabled: false,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get("#codex-ticket-332-enabled").setValue(true);
+    expect(wrapper.get("#codex-ticket-enabled").element.checked).toBe(false);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+    expect(updateSettings.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        openai_codex_ticket_enabled: false,
+        openai_codex_ticket_332_enabled: true,
+      }),
+    );
+    wrapper.unmount();
+  });
+
   it("loads the masked Codex harvest proxy and submits a replacement URL", async () => {
     getSettings.mockResolvedValueOnce({
       ...baseSettingsResponse,

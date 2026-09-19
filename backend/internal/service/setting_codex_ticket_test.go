@@ -23,6 +23,53 @@ func (r *codexTicketSettingRepo) GetValue(ctx context.Context, key string) (stri
 	return r.codexPolicyMigrationRepoStub.GetValue(ctx, key)
 }
 
+func (r *codexTicketSettingRepo) GetMultiple(ctx context.Context, keys []string) (map[string]string, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if value, ok := r.values[key]; ok {
+			values[key] = value
+		}
+	}
+	return values, nil
+}
+
+func TestResolveOpenAICodexTicketConfigReadsBothModesTogether(t *testing.T) {
+	repo := &codexTicketSettingRepo{codexPolicyMigrationRepoStub: &codexPolicyMigrationRepoStub{values: map[string]string{
+		SettingKeyOpenAICodexTicket332Enabled: "true",
+	}}}
+	settings := NewSettingService(repo, &config.Config{})
+	resolved := settings.ResolveOpenAICodexTicketConfig(nil, config.OpenAICodexTicketConfig{
+		TargetLength: 292,
+	})
+	require.False(t, resolved.Enabled)
+	require.True(t, resolved.Enabled332)
+	require.Equal(t, 292, resolved.TargetLength)
+}
+
+func TestResolveOpenAICodexTicketConfigDatabasePairOverridesYamlFallback(t *testing.T) {
+	repo := &codexTicketSettingRepo{codexPolicyMigrationRepoStub: &codexPolicyMigrationRepoStub{values: map[string]string{
+		SettingKeyOpenAICodexTicketEnabled: "true",
+	}}}
+	settings := NewSettingService(repo, &config.Config{})
+	resolved := settings.ResolveOpenAICodexTicketConfig(nil, config.OpenAICodexTicketConfig{Enabled332: true})
+	require.True(t, resolved.Enabled)
+	require.False(t, resolved.Enabled332)
+}
+
+func TestResolveOpenAICodexTicketConfigDisablesLegacyDoubleEnable(t *testing.T) {
+	repo := &codexTicketSettingRepo{codexPolicyMigrationRepoStub: &codexPolicyMigrationRepoStub{values: map[string]string{
+		SettingKeyOpenAICodexTicketEnabled:    "true",
+		SettingKeyOpenAICodexTicket332Enabled: "true",
+	}}}
+	settings := NewSettingService(repo, &config.Config{})
+	resolved := settings.ResolveOpenAICodexTicketConfig(nil, config.OpenAICodexTicketConfig{})
+	require.False(t, resolved.Enabled)
+	require.False(t, resolved.Enabled332)
+}
+
 func TestCodexTicketEnabledRuntimeSettingOverridesYaml(t *testing.T) {
 	repo := &codexTicketSettingRepo{codexPolicyMigrationRepoStub: &codexPolicyMigrationRepoStub{values: map[string]string{}}}
 	settings := NewSettingService(repo, &config.Config{})

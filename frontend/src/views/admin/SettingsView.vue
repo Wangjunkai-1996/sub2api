@@ -4514,6 +4514,22 @@
                   <Toggle
                     id="codex-ticket-enabled"
                     v-model="form.openai_codex_ticket_enabled"
+                    @update:model-value="onCodex292Toggle"
+                  />
+                </div>
+                <div class="flex items-center justify-between gap-4">
+                  <div class="min-w-0">
+                    <h3 class="text-base font-semibold text-gray-900 dark:text-white">
+                      {{ t("admin.settings.gatewayForwarding.codexTicket332Enabled") }}
+                    </h3>
+                    <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                      {{ t("admin.settings.gatewayForwarding.codexTicket332EnabledDesc") }}
+                    </p>
+                  </div>
+                  <Toggle
+                    id="codex-ticket-332-enabled"
+                    v-model="form.openai_codex_ticket_332_enabled"
+                    @update:model-value="onCodex332Toggle"
                   />
                 </div>
                 <div>
@@ -10116,6 +10132,7 @@ const form = reactive<SettingsForm>({
   openai_codex_client_version_synced: "",
   openai_codex_version_auto_sync_enabled: true,
   openai_codex_ticket_enabled: false,
+  openai_codex_ticket_332_enabled: false,
   openai_codex_ticket_harvest_proxy_url: "",
   openai_codex_ticket_harvest_proxy_configured: false,
   // codex_cli_only 加固
@@ -11116,6 +11133,18 @@ const codexSyncedVersionLabel = computed(() => {
   });
 });
 
+function onCodex292Toggle(enabled: boolean): void {
+  if (enabled) {
+    form.openai_codex_ticket_332_enabled = false;
+  }
+}
+
+function onCodex332Toggle(enabled: boolean): void {
+  if (enabled) {
+    form.openai_codex_ticket_enabled = false;
+  }
+}
+
 async function loadSettings() {
   loading.value = true;
   loadFailed.value = false;
@@ -11128,6 +11157,9 @@ async function loadSettings() {
       if (value !== null && value !== undefined) {
         (form as Record<string, unknown>)[key] = value;
       }
+    }
+    if (form.openai_codex_ticket_332_enabled) {
+      form.openai_codex_ticket_enabled = false;
     }
     syncCaptchaProviderSelection();
     if (!form.claude_oauth_system_prompt_blocks?.trim()) {
@@ -11835,6 +11867,7 @@ async function saveSettings() {
       openai_codex_version_auto_sync_enabled:
         form.openai_codex_version_auto_sync_enabled,
       openai_codex_ticket_enabled: form.openai_codex_ticket_enabled,
+      openai_codex_ticket_332_enabled: form.openai_codex_ticket_332_enabled,
       openai_codex_ticket_harvest_proxy_url:
         form.openai_codex_ticket_harvest_proxy_url?.trim() || "",
       min_codex_version: form.min_codex_version?.trim() || "",

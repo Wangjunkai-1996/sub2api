@@ -258,6 +258,7 @@ type UpdateSettingsRequest struct {
 	OpenAICodexClientVersion               *string `json:"openai_codex_client_version"`
 	OpenAICodexVersionAutoSyncEnabled      *bool   `json:"openai_codex_version_auto_sync_enabled"`
 	OpenAICodexTicketEnabled               *bool   `json:"openai_codex_ticket_enabled"`
+	OpenAICodexTicket332Enabled            *bool   `json:"openai_codex_ticket_332_enabled"`
 	OpenAICodexTicketHarvestProxyURL       string  `json:"openai_codex_ticket_harvest_proxy_url"`
 
 	// codex_cli_only 加固（global-only）
@@ -1784,6 +1785,12 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAICodexTicketEnabled
 		}(),
+		OpenAICodexTicket332Enabled: func() bool {
+			if req.OpenAICodexTicket332Enabled != nil {
+				return *req.OpenAICodexTicket332Enabled
+			}
+			return previousSettings.OpenAICodexTicket332Enabled
+		}(),
 		OpenAICodexTicketHarvestProxyURL: func() string {
 			next := strings.TrimSpace(req.OpenAICodexTicketHarvestProxyURL)
 			if service.IsMaskedProxyURL(next) {
@@ -2394,6 +2401,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAICodexClientVersionSynced:                         updatedSettings.OpenAICodexClientVersionSynced,
 		OpenAICodexVersionAutoSyncEnabled:                      updatedSettings.OpenAICodexVersionAutoSyncEnabled,
 		OpenAICodexTicketEnabled:                               updatedSettings.OpenAICodexTicketEnabled,
+		OpenAICodexTicket332Enabled:                            updatedSettings.OpenAICodexTicket332Enabled,
 		OpenAICodexTicketHarvestProxyURL:                       service.MaskProxyURL(updatedSettings.OpenAICodexTicketHarvestProxyURL),
 		OpenAICodexTicketHarvestProxyConfigured:                strings.TrimSpace(updatedSettings.OpenAICodexTicketHarvestProxyURL) != "",
 		MinCodexVersion:                                        updatedSettings.MinCodexVersion,

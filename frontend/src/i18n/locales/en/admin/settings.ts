@@ -582,9 +582,12 @@ export default {
         codexTicketEnabled: "292 ticket harvest",
         codexTicketEnabledDesc:
           "When off, the gateway neither harvests nor injects x-codex-turn-state and forwards traffic as usual. When on, it harvests tickets in the background and overwrites that header on production requests.",
-        codexTicketHarvestProxy: "292 harvest proxy",
+        codexTicket332Enabled: "332 ticket harvest",
+        codexTicket332EnabledDesc:
+          "Shares the proxy, cache, and injection path with 292 tickets. The two modes are mutually exclusive; enabling 332 turns 292 off.",
+        codexTicketHarvestProxy: "292/332 harvest proxy",
         codexTicketHarvestProxyDesc:
-          "Used only for minting 292 tickets when the ticket feature is enabled. Changes apply to subsequent probes without a restart. Production traffic still uses each account's residential proxy. Paste a full HTTP or SOCKS5h proxy URL including username and password. The proxy provider must handle IP rotation. Leave blank when saving to keep the stored value.",
+          "Used only for minting 292 or 332 tickets when either mode is enabled. Changes apply to subsequent probes without a restart. Production traffic still uses each account's residential proxy. Paste a full HTTP or SOCKS5h proxy URL including username and password. The proxy provider must handle IP rotation. Leave blank when saving to keep the stored value.",
         codexTicketHarvestProxyPlaceholder: "http://user:pass{'@'}proxy.example.com:1080",
         codexTicketHarvestProxyConfigured: "Configured (password hidden). Paste a full new proxy URL to replace it.",
         codexClientRestrictionTitle: "Codex client restriction",

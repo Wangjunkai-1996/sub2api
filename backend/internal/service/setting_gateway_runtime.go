@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"golang.org/x/sync/singleflight"
@@ -192,75 +193,115 @@ func (s *SettingService) GetAntigravityUserAgentVersion(ctx context.Context) str
 	return fallback
 }
 
-type cachedOpenAICodexTicketEnabled struct {
-	value     bool
-	expiresAt int64
+type cachedOpenAICodexTicketSettings struct {
+	enabled    bool
+	enabled332 bool
+	expiresAt  int64
+}
+
+func normalizeOpenAICodexTicketModes(enabled, enabled332 bool) (bool, bool) {
+	if enabled && enabled332 {
+		return false, false
+	}
+	return enabled, enabled332
 }
 
 const openAICodexTicketEnabledCacheTTL = 5 * time.Second
 
-// GetOpenAICodexTicketEnabled 返回后台 292 打票总开关。
-// 设置键存在时以后台为准；缺失则回退 yaml/env。
-func (s *SettingService) GetOpenAICodexTicketEnabled(ctx context.Context, fallback bool) bool {
+// getOpenAICodexTicketSettings reads both mutually-exclusive mode switches as
+// one cached snapshot so a live settings update cannot expose a mixed pair.
+func (s *SettingService) getOpenAICodexTicketSettings(ctx context.Context, fallback, fallback332 bool) (bool, bool) {
+	fallback, fallback332 = normalizeOpenAICodexTicketModes(fallback, fallback332)
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil {
-		return fallback
+		return fallback, fallback332
 	}
 	if s == nil || s.settingRepo == nil {
-		return fallback
+		return fallback, fallback332
 	}
-	if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketEnabled); ok && cached != nil {
+	if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
 		if time.Now().UnixNano() < cached.expiresAt {
-			return cached.value
+			return cached.enabled, cached.enabled332
 		}
 	}
-	resultCh := s.openAICodexTicketEnabledSF.DoChan(SettingKeyOpenAICodexTicketEnabled, func() (any, error) {
-		if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketEnabled); ok && cached != nil {
+	resultCh := s.openAICodexTicketEnabledSF.DoChan("openai_codex_ticket_modes", func() (any, error) {
+		if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
-				return cached.value, nil
+				return cached, nil
 			}
 		}
 		dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		value, err := s.settingRepo.GetValue(dbCtx, SettingKeyOpenAICodexTicketEnabled)
+		values, err := s.settingRepo.GetMultiple(dbCtx, []string{SettingKeyOpenAICodexTicketEnabled, SettingKeyOpenAICodexTicket332Enabled})
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if err != nil && !errors.Is(err, ErrSettingNotFound) {
-			if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketEnabled); ok && cached != nil {
-				return cached.value, nil
+		if err != nil {
+			if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
+				return cached, nil
 			}
-			return fallback, nil
+			return &cachedOpenAICodexTicketSettings{enabled: fallback, enabled332: fallback332}, nil
 		}
-		enabled := fallback
-		if err == nil && strings.TrimSpace(value) != "" {
+		enabled, enabled332 := fallback, fallback332
+		dbModesConfigured := false
+		dbEnabledConfigured := false
+		dbEnabled332Configured := false
+		if value, ok := values[SettingKeyOpenAICodexTicketEnabled]; ok && strings.TrimSpace(value) != "" {
+			dbModesConfigured = true
+			dbEnabledConfigured = true
 			enabled = value == "true"
 		}
-		s.openAICodexTicketEnabledCache.Store(&cachedOpenAICodexTicketEnabled{
-			value:     enabled,
-			expiresAt: time.Now().Add(openAICodexTicketEnabledCacheTTL).UnixNano(),
-		})
-		return enabled, nil
+		if value, ok := values[SettingKeyOpenAICodexTicket332Enabled]; ok && strings.TrimSpace(value) != "" {
+			dbModesConfigured = true
+			dbEnabled332Configured = true
+			enabled332 = value == "true"
+		}
+		if dbModesConfigured {
+			if !dbEnabledConfigured {
+				enabled = false
+			}
+			if !dbEnabled332Configured {
+				enabled332 = false
+			}
+		}
+		enabled, enabled332 = normalizeOpenAICodexTicketModes(enabled, enabled332)
+		cached := &cachedOpenAICodexTicketSettings{enabled: enabled, enabled332: enabled332, expiresAt: time.Now().Add(openAICodexTicketEnabledCacheTTL).UnixNano()}
+		s.openAICodexTicketEnabledCache.Store(cached)
+		return cached, nil
 	})
 	select {
 	case <-ctx.Done():
-		return fallback
+		return fallback, fallback332
 	case result := <-resultCh:
-		if v, ok := result.Val.(bool); ok && result.Err == nil {
-			return v
+		if v, ok := result.Val.(*cachedOpenAICodexTicketSettings); ok && result.Err == nil && v != nil {
+			return v.enabled, v.enabled332
 		}
-		return fallback
+		return fallback, fallback332
 	}
+}
+
+// GetOpenAICodexTicketEnabled 返回后台 292 打票总开关。
+// 设置键存在时以后台为准；缺失则回退 yaml/env。
+func (s *SettingService) GetOpenAICodexTicketEnabled(ctx context.Context, fallback bool) bool {
+	enabled, _ := s.getOpenAICodexTicketSettings(ctx, fallback, false)
+	return enabled
+}
+
+// ResolveOpenAICodexTicketConfig applies both live mode switches while
+// preserving all other startup configuration, including TargetLength.
+func (s *SettingService) ResolveOpenAICodexTicketConfig(ctx context.Context, cfg config.OpenAICodexTicketConfig) config.OpenAICodexTicketConfig {
+	cfg.Enabled, cfg.Enabled332 = s.getOpenAICodexTicketSettings(ctx, cfg.Enabled, cfg.Enabled332)
+	return cfg
 }
 
 func (s *SettingService) InvalidateOpenAICodexTicketEnabledCache() {
 	if s == nil {
 		return
 	}
-	s.openAICodexTicketEnabledSF.Forget(SettingKeyOpenAICodexTicketEnabled)
-	s.openAICodexTicketEnabledCache.Store(&cachedOpenAICodexTicketEnabled{expiresAt: 0})
+	s.openAICodexTicketEnabledSF.Forget("openai_codex_ticket_modes")
+	s.openAICodexTicketEnabledCache.Store(&cachedOpenAICodexTicketSettings{expiresAt: 0})
 }
 
 type cachedOpenAICodexTicketHarvestProxy struct {
@@ -270,7 +311,7 @@ type cachedOpenAICodexTicketHarvestProxy struct {
 
 const openAICodexTicketHarvestProxyCacheTTL = 5 * time.Second
 
-// GetOpenAICodexTicketHarvestProxyURL 返回后台配置的 292 打票代理。空则调用方回退 yaml/env。
+// GetOpenAICodexTicketHarvestProxyURL 返回后台配置的 292/332 打票代理。空则调用方回退 yaml/env。
 func (s *SettingService) GetOpenAICodexTicketHarvestProxyURL(ctx context.Context) string {
 	if ctx == nil {
 		ctx = context.Background()

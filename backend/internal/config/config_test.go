@@ -1641,6 +1641,14 @@ func TestValidateConfigErrors(t *testing.T) {
 		wantErr string
 	}{
 		{
+			name: "codex ticket modes are mutually exclusive",
+			mutate: func(c *Config) {
+				c.Gateway.OpenAICodexTicket.Enabled = true
+				c.Gateway.OpenAICodexTicket.Enabled332 = true
+			},
+			wantErr: "gateway.openai_codex_ticket.enabled and enabled_332",
+		},
+		{
 			name:    "server read header timeout",
 			mutate:  func(c *Config) { c.Server.ReadHeaderTimeout = 0 },
 			wantErr: "server.read_header_timeout",

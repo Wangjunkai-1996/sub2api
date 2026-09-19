@@ -1266,9 +1266,11 @@ func (c *UserMessageQueueConfig) GetEffectiveMode() string {
 
 // OpenAICodexTicketConfig 控制 ChatGPT OAuth 的 x-codex-turn-state 门票。
 // 打票走 harvest_proxy_url（SOCKS），业务出站仍用账号住宅 proxy_id，只替换该请求头。
+// Enabled 与 Enabled332 互斥，分别对应 292 与 332 长度门票。
 // 门票默认有效 3600 秒，临近过期前 refresh_before_seconds 重新打票。
 type OpenAICodexTicketConfig struct {
 	Enabled                      bool     `mapstructure:"enabled"`
+	Enabled332                   bool     `mapstructure:"enabled_332"`
 	TargetLength                 int      `mapstructure:"target_length"`
 	TTLSeconds                   int      `mapstructure:"ttl_seconds"`
 	RefreshBeforeSeconds         int      `mapstructure:"refresh_before_seconds"`
@@ -2452,6 +2454,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
 	viper.SetDefault("gateway.openai_compact_model", "gpt-5.5")
 	viper.SetDefault("gateway.openai_codex_ticket.enabled", false)
+	viper.SetDefault("gateway.openai_codex_ticket.enabled_332", false)
 	viper.SetDefault("gateway.openai_codex_ticket.target_length", 292)
 	viper.SetDefault("gateway.openai_codex_ticket.ttl_seconds", 3600)
 	viper.SetDefault("gateway.openai_codex_ticket.refresh_before_seconds", 600)
@@ -2734,6 +2737,9 @@ func setEnvReachableDefaults() {
 }
 
 func (c *Config) Validate() error {
+	if c.Gateway.OpenAICodexTicket.Enabled && c.Gateway.OpenAICodexTicket.Enabled332 {
+		return fmt.Errorf("gateway.openai_codex_ticket.enabled and enabled_332 are mutually exclusive")
+	}
 	forwardedClientIPHeaders, err := NormalizeForwardedClientIPHeaders(c.Security.ForwardedClientIPHeaders)
 	if err != nil {
 		return fmt.Errorf("security.forwarded_client_ip_headers: %w", err)

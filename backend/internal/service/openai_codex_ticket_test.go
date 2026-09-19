@@ -66,6 +66,31 @@ func TestApplyOpenAICodexTicket_ReplacesHeader(t *testing.T) {
 	require.Equal(t, 292, len(h.Get(openAICodexTurnStateHeader)))
 }
 
+func TestApplyOpenAICodexTicket332_ReplacesOnly332Header(t *testing.T) {
+	state := fakeCodexTicketState(332)
+	svc := ticketTestService(t, config.OpenAICodexTicketConfig{
+		Enabled332:   true,
+		TargetLength: 292,
+		TTLSeconds:   3600,
+		FailClosed:   true,
+	}, nil)
+	account := ticketTestAccount(41)
+	svc.storeOpenAICodexTicket(context.Background(), account, &openAICodexTicket{
+		AccountID:  41,
+		Model:      "gpt-6-astra",
+		State:      state,
+		Length:     332,
+		CapturedAt: time.Now(),
+		ExpiresAt:  time.Now().Add(time.Hour),
+	})
+
+	h := http.Header{}
+	h.Set(openAICodexTurnStateHeader, fakeCodexTicketState(292))
+	require.NoError(t, svc.applyOpenAICodexTicket(context.Background(), account, "gpt-6-astra", h))
+	require.Equal(t, state, h.Get(openAICodexTurnStateHeader))
+	require.Equal(t, 332, len(h.Get(openAICodexTurnStateHeader)))
+}
+
 func TestApplyOpenAICodexTicket_DoesNotReuseOtherModelOrAccount(t *testing.T) {
 	svc := ticketTestService(t, config.OpenAICodexTicketConfig{
 		Enabled:         true,
@@ -122,7 +147,7 @@ func TestLookupOpenAICodexTicket_PrefersNewerExtra(t *testing.T) {
 		ExpiresAt:  time.Now().Add(time.Hour),
 	},
 	}
-	got := svc.lookupOpenAICodexTicket(account, "gpt-6-astra")
+	got := svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292)
 	require.NotNil(t, got)
 	require.Equal(t, newState, got.State)
 	require.True(t, got.valid(time.Now(), 292))
@@ -227,9 +252,9 @@ func TestHarvestOpenAICodexTicket_StopsAt292AndUsesHarvestProxy(t *testing.T) {
 	account := ticketTestAccount(41)
 
 	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
-	require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra"))
+	require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292))
 	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
-	ticket := svc.lookupOpenAICodexTicket(account, "gpt-6-astra")
+	ticket := svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292)
 	require.NotNil(t, ticket)
 	require.Equal(t, state292, ticket.State)
 	h := http.Header{}
@@ -271,9 +296,9 @@ func TestHarvestOpenAICodexTicket_HTTP503DoesNotAbortHunt(t *testing.T) {
 	}, upstream)
 	account := ticketTestAccount(41)
 	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
-	require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra"))
+	require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292))
 	svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
-	ticket := svc.lookupOpenAICodexTicket(account, "gpt-6-astra")
+	ticket := svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292)
 	require.NotNil(t, ticket)
 	require.Equal(t, state292, ticket.State)
 	require.Len(t, upstream.requests, 2)
@@ -292,7 +317,7 @@ func TestLookupOpenAICodexTicket_HydratesFromExtra(t *testing.T) {
 			"expires_at":  time.Now().Add(time.Hour),
 		},
 	}
-	got := svc.lookupOpenAICodexTicket(account, "gpt-6-astra")
+	got := svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292)
 	require.NotNil(t, got)
 	require.Equal(t, state, got.State)
 	require.True(t, got.valid(time.Now(), 292))
@@ -381,7 +406,7 @@ func TestRefreshOpenAICodexTickets_ConcurrentModelsPreserveAccountSnapshot(t *te
 	require.Equal(t, map[string]any{"existing": true}, account.Extra)
 	require.Len(t, repo.updates, 2)
 	for _, model := range []string{openAICodexTicketDefaultModel, openAICodexTicketDefaultSolModel} {
-		ticket := svc.lookupOpenAICodexTicket(account, model)
+		ticket := svc.lookupOpenAICodexTicket(account, model, 292)
 		require.NotNil(t, ticket)
 		require.True(t, ticket.valid(time.Now(), 292))
 	}
@@ -408,7 +433,7 @@ func TestProbeOpenAICodexTicket_RejectsInvalidState(t *testing.T) {
 		svc := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: true, HarvestProxyURL: "http://proxy.example.com:8080"}, upstream)
 		account := ticketTestAccount(41)
 		svc.probeOnceOpenAICodexTicket(context.Background(), account, "gpt-6-astra")
-		require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra"))
+		require.Nil(t, svc.lookupOpenAICodexTicket(account, "gpt-6-astra", 292))
 	}
 }
 func TestOpenAICodexTicket_RequiresActualLengthAndExpiry(t *testing.T) {

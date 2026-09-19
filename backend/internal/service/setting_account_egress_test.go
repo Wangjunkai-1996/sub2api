@@ -29,6 +29,17 @@ func (s accountEgressSettingRepoStub) GetValue(context.Context, string) (string,
 	return s.value, s.err
 }
 
+func (s accountEgressSettingRepoStub) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		values[key] = s.value
+	}
+	return values, nil
+}
+
 func TestAccountEgressPoolRolloutModeFailClosed(t *testing.T) {
 	tests := []struct {
 		name  string
