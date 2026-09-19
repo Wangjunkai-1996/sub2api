@@ -338,10 +338,12 @@ func TestOpenAICodexTicketStatuses_ReportsRemainingTTL(t *testing.T) {
 	got := OpenAICodexTicketStatuses(account, config.OpenAICodexTicketConfig{Enabled: true, FailClosed: true}, now)
 	require.Len(t, got, 2)
 	require.Equal(t, "gpt-6-astra", got[0].Model)
+	require.Equal(t, 292, got[0].TargetLength)
 	require.True(t, got[0].Ready)
 	require.Greater(t, got[0].RemainingSeconds, int64(40*60))
 	require.LessOrEqual(t, got[0].RemainingSeconds, int64(50*60))
 	require.Equal(t, "gpt-5.6-sol", got[1].Model)
+	require.Equal(t, 292, got[1].TargetLength)
 	require.False(t, got[1].Ready)
 }
 
@@ -424,6 +426,11 @@ func TestOpenAICodexTicketStatuses_RespectRuntimeConfiguration(t *testing.T) {
 	require.False(t, status[0].Blocked)
 	cfg.FailClosed = true
 	require.True(t, OpenAICodexTicketStatuses(account, cfg, time.Now())[0].Blocked)
+	cfg = config.OpenAICodexTicketConfig{Enabled332: true, FailClosed: true}
+	status = OpenAICodexTicketStatuses(account, cfg, time.Now())
+	require.Len(t, status, 2)
+	require.Equal(t, 332, status[0].TargetLength)
+	require.True(t, status[0].Blocked)
 }
 func TestProbeOpenAICodexTicket_RejectsInvalidState(t *testing.T) {
 	for _, state := range []string{fakeCodexTicketState(312), strings.Repeat("X", 292), ""} {

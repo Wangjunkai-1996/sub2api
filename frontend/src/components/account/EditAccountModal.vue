@@ -2307,7 +2307,7 @@
         </div>
       </div>
 
-      <!-- Codex 292 门票状态（仅 OpenAI OAuth） -->
+      <!-- Codex 门票状态（仅 OpenAI OAuth） -->
       <div
         v-if="account?.platform === 'openai' && (account?.type === 'oauth' || account?.type === 'setup-token') && codexTurnTickets.length"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -2323,9 +2323,9 @@
               {{ t('admin.accounts.openai.codexTurnTicketReady', { time: formatCodexTicketRemaining(ticket.remaining_seconds) }) }}
             </span>
             <span v-else-if="ticket.blocked" class="text-amber-600 dark:text-amber-400">
-              {{ t('admin.accounts.openai.codexTurnTicketPaused') }}
+              {{ formatCodexTicketStatus(ticket, 'paused') }}
             </span>
-            <span v-else class="text-gray-500">{{ t('admin.accounts.openai.codexTurnTicketMissing') }}</span>
+            <span v-else class="text-gray-500">{{ formatCodexTicketStatus(ticket, 'missing') }}</span>
           </div>
         </div>
       </div>
@@ -3252,6 +3252,14 @@ function formatCodexTicketRemaining(seconds: number) {
   const m = Math.floor(total / 60)
   const s = total % 60
   return `${m}m${String(s).padStart(2, '0')}s`
+}
+
+function formatCodexTicketStatus(ticket: { target_length?: number }, state: 'paused' | 'missing') {
+  const targetLength = Number(ticket.target_length)
+  if (Number.isFinite(targetLength) && targetLength > 0) {
+    return t(state === 'paused' ? 'admin.accounts.openai.codexTurnTicketPaused' : 'admin.accounts.openai.codexTurnTicketMissing', { length: targetLength })
+  }
+  return t(state === 'paused' ? 'admin.accounts.openai.codexTurnTicketPausedGeneric' : 'admin.accounts.openai.codexTurnTicketMissingGeneric')
 }
 
 const hideAccountLongContextBilling = computed(() => {

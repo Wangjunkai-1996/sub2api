@@ -165,6 +165,60 @@ func TestAccountTestService_OpenAIOAuthTestNormalizesGPT56Alias(t *testing.T) {
 	require.Equal(t, "gpt-5.6-sol", gjson.GetBytes(body, "model").String())
 }
 
+func TestAccountTestService_OpenAICodexTicket332(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		model        string
+		ticketLength int
+		shadow       bool
+		wantBlocked  bool
+	}{
+		{name: "valid ticket is sent", model: "gpt-5.6-sol", ticketLength: 332},
+		{name: "missing ticket blocks upstream", model: "gpt-5.6-sol", wantBlocked: true},
+		{name: "292 ticket cannot satisfy 332 mode", model: "gpt-5.6-sol", ticketLength: 292, wantBlocked: true},
+		{name: "ungated model remains allowed", model: "gpt-5.5"},
+		{name: "credential shadow preserves forwarding policy", model: "gpt-5.6-sol", shadow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, recorder := newTestContext()
+			resp := newJSONResponse(http.StatusOK, "data: {\"type\":\"response.completed\"}\n\n")
+			upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
+			gateway := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled332: true, FailClosed: true}, nil)
+			account := ticketTestAccount(91)
+			if tc.ticketLength > 0 {
+				account.Extra = map[string]any{
+					openAICodexTicketExtraKey(tc.model): &openAICodexTicket{
+						State: fakeCodexTicketState(tc.ticketLength), Length: tc.ticketLength,
+						CapturedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+					},
+				}
+			}
+			svc := &AccountTestService{httpUpstream: upstream, openaiGatewayService: gateway}
+			if tc.shadow {
+				parent := *account
+				account = &Account{ID: 92, Platform: PlatformOpenAI, Type: AccountTypeOAuth, ParentAccountID: &parent.ID}
+				svc.accountRepo = &snapshotUpdateAccountRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{parent}}}
+			}
+
+			err := svc.testOpenAIAccountConnection(ctx, account, tc.model, "", "")
+			if tc.wantBlocked {
+				require.ErrorContains(t, err, "未打到 332 门票")
+				require.Empty(t, upstream.requests)
+				require.Contains(t, recorder.Body.String(), "未打到 332 门票")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, upstream.requests, 1)
+			if tc.ticketLength > 0 {
+				require.Equal(t, fakeCodexTicketState(332), upstream.requests[0].Header.Get(openAICodexTurnStateHeader))
+			} else {
+				require.Empty(t, upstream.requests[0].Header.Get(openAICodexTurnStateHeader))
+			}
+			require.Contains(t, recorder.Body.String(), `"success":true`)
+		})
+	}
+}
+
 func TestAccountTestService_OpenAIShadowUsesParentCredentialsAndShadowModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, recorder := newTestContext()

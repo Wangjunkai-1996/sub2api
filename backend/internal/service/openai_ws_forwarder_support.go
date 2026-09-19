@@ -881,11 +881,14 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		if vetoed, _ := openAIProfitControlVetoReason(ctx, latest); vetoed {
 			return 0, nil, "", nil
 		}
-		if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel, requireCompact) {
-			clearRoutingFence()
-			return 0, nil, "", nil
-		}
 		account = latest
+	}
+	// The previous-response path can run without a scheduler snapshot (for
+	// example when advanced scheduling is disabled). Keep the same model-scoped
+	// runtime gates as ordinary account selection in that mode too.
+	if s.isOpenAIAccountRequestRuntimeBlocked(account, requestedModel, requireCompact) {
+		clearRoutingFence()
+		return 0, nil, "", nil
 	}
 	if requireCompact && openAICompactSupportTier(account) == 0 {
 		clearRoutingFence()

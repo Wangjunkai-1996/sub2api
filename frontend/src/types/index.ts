@@ -1339,6 +1339,7 @@ export interface Account {
   ollama_cloud_usage?: OllamaCloudUsageState
   codex_turn_tickets?: Array<{
     model: string
+    target_length?: number
     length?: number
     ready: boolean
     remaining_seconds: number
