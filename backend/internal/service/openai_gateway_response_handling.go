@@ -669,7 +669,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		recordStreamError(nil, "stream_read_error", readMessage)
 		s.recordOpenAIProxyStreamDisconnect(account, scanErr, upstreamRequestID)
 		sendErrorEvent("stream_read_error")
-		return resultWithUsage(), fmt.Errorf("stream read error: %w", scanErr), true
+		return resultWithUsage(), newOpenAIUpstreamStreamReadError(scanErr), true
 	}
 	processSSELine := func(line string, queueDrained bool, releaseGuardedRead func()) {
 		if streamEarlyErr != nil {

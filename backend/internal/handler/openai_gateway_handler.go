@@ -941,7 +941,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				submitResponsesUsage(result)
 				return
 			}
-			if failoverClientGone(c) {
+			// A client may close after receiving the upstream stream error. Keep
+			// that failure attributable to the account for scheduling feedback.
+			_, _, upstreamReadFailed := service.OpenAIUpstreamStreamReadErrorDetails(err)
+			if !upstreamReadFailed && failoverClientGone(c) {
 				reqLog.Info("openai.client_disconnected",
 					zap.Int64("account_id", account.ID),
 					zap.Error(err),

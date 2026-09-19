@@ -18,6 +18,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/cespare/xxhash/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -1762,6 +1763,9 @@ func TestOpenAIStreamingPostOutputDisconnectQuarantinesSharedProxyWithoutSameStr
 
 		_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "gpt-5.6-sol", "gpt-5.6-sol")
 		require.Error(t, err)
+		assert.ErrorIs(t, err, readErr)
+		_, _, classified := OpenAIUpstreamStreamReadErrorDetails(err)
+		assert.True(t, classified, "upstream failure attribution must survive a later client cancellation")
 		var failoverErr *UpstreamFailoverError
 		require.False(t, errors.As(err, &failoverErr), "post-output disconnect must not fail over inside the same stream")
 		require.Contains(t, rec.Body.String(), "partial")
@@ -1813,6 +1817,8 @@ func TestOpenAIStreamingTerminalAndClientCancellationDoNotQuarantineProxy(t *tes
 		}
 		_, err = svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
 		require.Error(t, err)
+		_, _, classified := OpenAIUpstreamStreamReadErrorDetails(err)
+		assert.False(t, classified, "client cancellation must not count as an upstream failure")
 	}
 
 	scheduler := &defaultOpenAIAccountScheduler{service: svc}
@@ -2547,6 +2553,9 @@ func TestOpenAIStreamingPassthroughPostOutputDisconnectQuarantinesSharedProxy(t 
 
 		_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
 		require.Error(t, err)
+		assert.ErrorIs(t, err, readErr)
+		_, _, classified := OpenAIUpstreamStreamReadErrorDetails(err)
+		assert.True(t, classified, "passthrough must preserve the same upstream failure attribution")
 		var failoverErr *UpstreamFailoverError
 		require.False(t, errors.As(err, &failoverErr), "post-output disconnect must not fail over inside the same stream")
 		require.Contains(t, rec.Body.String(), "partial")
