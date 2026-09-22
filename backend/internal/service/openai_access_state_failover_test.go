@@ -405,7 +405,7 @@ func TestOpenAIStreamPairedFailureAppliesAccountSideEffectsOnce(t *testing.T) {
 	})
 }
 
-func TestOpenAIStreamOAuthLike429GetsDeadlineWithoutImmediateRuntimeBlock(t *testing.T) {
+func TestOpenAIStreamOAuthLike429WithoutAdmissionUsesFallbackAndSwitches(t *testing.T) {
 	for _, accountType := range []string{AccountTypeOAuth, AccountTypeSetupToken} {
 		t.Run(accountType, func(t *testing.T) {
 			svc := &OpenAIGatewayService{}
@@ -416,9 +416,9 @@ func TestOpenAIStreamOAuthLike429GetsDeadlineWithoutImmediateRuntimeBlock(t *tes
 
 			require.Equal(t, http.StatusTooManyRequests, status)
 			require.False(t, disabled)
-			require.True(t, err.RetryableOnSameAccount)
-			require.False(t, err.SameAccountRetryDeadline.IsZero())
-			require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+			require.False(t, err.RetryableOnSameAccount)
+			require.True(t, err.SameAccountRetryDeadline.IsZero())
+			require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 		})
 	}
 }

@@ -20,6 +20,8 @@ const (
 	openAILockWarnThresholdMs = 250
 )
 
+var errOpenAITokenRefreshInProgress = errors.New("openai oauth refresh is already in progress")
+
 // OpenAITokenRuntimeMetrics is a snapshot of refresh and lock contention metrics.
 type OpenAITokenRuntimeMetrics struct {
 	RefreshRequests    int64
@@ -133,6 +135,9 @@ func (p *OpenAITokenProvider) ensureMetrics() {
 // GetAccessToken returns a valid access_token.
 func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
 	p.ensureMetrics()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if account == nil {
 		return "", errors.New("account is nil")
 	}
@@ -168,6 +173,7 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		needsRefresh = false
 	}
 	refreshFailed := false
+	var refreshErr error
 
 	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		p.metrics.refreshRequests.Add(1)
@@ -175,12 +181,28 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
 		if err != nil {
+			// Preserve cancellation and account-level credential failures. The
+			// request caller uses these errors to exclude this account and retry
+			// with another one; returning an old bearer would defeat that path.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
+			p.metrics.refreshFailure.Add(1)
+			if isOpenAIAccountCredentialFailure(err) {
+				return "", err
+			}
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
 				return "", err
 			}
+			if result != nil && result.Account != nil {
+				account = result.Account
+				expiresAt = account.GetCredentialAsTime("expires_at")
+			}
 			slog.Warn("openai_token_refresh_failed", "account_id", account.ID, "error", err)
-			p.metrics.refreshFailure.Add(1)
 			refreshFailed = true
+			refreshErr = err
+		} else if result == nil {
+			return "", errors.New("openai oauth refresh returned no result")
 		} else if result.LockHeld {
 			if p.refreshPolicy.OnLockHeld == ProviderLockHeldWaitForCache {
 				p.metrics.lockContention.Add(1)
@@ -194,12 +216,17 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 					return token, nil
 				}
 			}
-		} else if result.Refreshed {
-			p.metrics.refreshSuccess.Add(1)
-			account = result.Account
-			expiresAt = account.GetCredentialAsTime("expires_at")
 		} else {
+			if result.Account == nil {
+				return "", errors.New("openai oauth refresh returned no account")
+			}
 			account = result.Account
+			if isOAuthRefreshRequestPath(ctx) && !account.IsActive() {
+				return "", errOAuthRefreshAccountStateChanged
+			}
+			if result.Refreshed {
+				p.metrics.refreshSuccess.Add(1)
+			}
 			expiresAt = account.GetCredentialAsTime("expires_at")
 		}
 	} else if needsRefresh && p.tokenCache != nil {
@@ -229,12 +256,24 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 	accessToken := account.GetCredential("access_token")
 	if strings.TrimSpace(accessToken) == "" {
+		if refreshErr != nil {
+			return "", refreshErr
+		}
 		return "", errors.New("access_token not found in credentials")
+	}
+	if refreshFailed && expiresAt != nil && !time.Now().Before(*expiresAt) {
+		// An expired bearer cannot be a useful transient fallback. Returning the
+		// refresh error lets the request path classify permanent OAuth failures,
+		// while avoiding a guaranteed upstream 401 for temporary outages.
+		return "", refreshErr
 	}
 
 	// 3) Populate cache with TTL.
 	if p.tokenCache != nil {
 		latestAccount, isStale := CheckTokenVersion(ctx, account, p.accountRepo)
+		if isOAuthRefreshRequestPath(ctx) && latestAccount != nil && !latestAccount.IsActive() {
+			return "", errOAuthRefreshAccountStateChanged
+		}
 		if isStale && latestAccount != nil {
 			slog.Debug("openai_token_version_stale_use_latest", "account_id", account.ID)
 			accessToken = latestAccount.GetOpenAIAccessToken()
@@ -268,6 +307,131 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	return accessToken, nil
+}
+
+// RefreshAfterUnauthorized invalidates the cached bearer and performs one
+// force-refresh through the same local/distributed locks and durable credential
+// persistence used by proactive refresh. It is intentionally unavailable for
+// PAT and access-token-only accounts because replaying the same rejected token
+// would only create another upstream request.
+func (p *OpenAITokenProvider) RefreshAfterUnauthorized(ctx context.Context, account *Account, rejectedAccessToken string) (string, error) {
+	if p == nil {
+		return "", errors.New("openai token provider is nil")
+	}
+	p.ensureMetrics()
+	if account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return "", errors.New("not an openai oauth account")
+	}
+	if account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+		return "", errors.New("openai oauth account cannot refresh after unauthorized")
+	}
+	if p.refreshAPI == nil || p.executor == nil {
+		return "", errors.New("openai oauth refresh is not configured")
+	}
+	rejectedAccessToken = strings.TrimSpace(rejectedAccessToken)
+	if rejectedAccessToken == "" {
+		return "", errors.New("openai rejected access token is required")
+	}
+
+	cacheKey := OpenAITokenCacheKey(account)
+	if p.tokenCache != nil {
+		cachedToken, cacheErr := p.tokenCache.GetAccessToken(ctx, cacheKey)
+		cachedToken = strings.TrimSpace(cachedToken)
+		if cacheErr == nil && cachedToken != "" && cachedToken != rejectedAccessToken {
+			return cachedToken, nil
+		}
+		if cachedToken == rejectedAccessToken {
+			if err := p.tokenCache.DeleteAccessToken(ctx, cacheKey); err != nil {
+				slog.Warn("openai_unauthorized_token_cache_delete_failed", "account_id", account.ID, "error", err)
+			}
+		}
+	}
+	p.metrics.refreshRequests.Add(1)
+	p.metrics.touchNow()
+	result, err := p.refreshAPI.RefreshAfterUnauthorized(withOAuthRefreshRequestPath(ctx), account, p.executor, rejectedAccessToken)
+	if err != nil {
+		p.metrics.refreshFailure.Add(1)
+		return "", err
+	}
+	if result == nil {
+		return "", errors.New("openai oauth refresh returned no result")
+	}
+	if result.LockHeld {
+		p.metrics.lockContention.Add(1)
+		accessToken, waitErr := p.waitForTokenReplacement(ctx, account.ID, cacheKey, rejectedAccessToken)
+		if waitErr != nil {
+			return "", waitErr
+		}
+		return accessToken, nil
+	}
+	if result.Account == nil {
+		return "", errors.New("openai oauth refresh returned no account")
+	}
+	accessToken := strings.TrimSpace(result.Account.GetOpenAIAccessToken())
+	if accessToken == "" {
+		return "", errors.New("openai oauth refresh returned no access token")
+	}
+	if result.Refreshed {
+		p.metrics.refreshSuccess.Add(1)
+	}
+	account.Credentials = shallowCopyMap(result.Account.Credentials)
+	if p.tokenCache != nil {
+		// The retry uses the returned token directly. A short cache publication
+		// prevents concurrent requests from reading the rejected bearer while the
+		// durable account update propagates through scheduler snapshots.
+		if err := p.tokenCache.SetAccessToken(ctx, cacheKey, accessToken, 5*time.Minute); err != nil {
+			slog.Warn("openai_unauthorized_token_cache_set_failed", "account_id", account.ID, "error", err)
+		}
+	}
+	return accessToken, nil
+}
+
+// waitForTokenReplacement handles cross-instance refresh contention. A cache
+// publication is preferred, while the durable account row is also checked so
+// correctness does not depend on cache timing or availability.
+func (p *OpenAITokenProvider) waitForTokenReplacement(ctx context.Context, accountID int64, cacheKey, rejectedAccessToken string) (string, error) {
+	wait := openAILockInitialWait
+	for i := 0; i < openAILockMaxAttempts; i++ {
+		timer := time.NewTimer(jitterLockWait(wait))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+
+		if p.tokenCache != nil {
+			if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil {
+				token = strings.TrimSpace(token)
+				if token != "" && token != rejectedAccessToken {
+					return token, nil
+				}
+			}
+		}
+		if p.accountRepo != nil {
+			if latest, err := p.accountRepo.GetByID(ctx, accountID); err == nil && latest != nil {
+				token := strings.TrimSpace(latest.GetOpenAIAccessToken())
+				if token != "" && token != rejectedAccessToken {
+					if p.tokenCache != nil {
+						_ = p.tokenCache.SetAccessToken(ctx, cacheKey, token, 5*time.Minute)
+					}
+					return token, nil
+				}
+			}
+		}
+		if wait < openAILockMaxWait {
+			wait *= 2
+			if wait > openAILockMaxWait {
+				wait = openAILockMaxWait
+			}
+		}
+	}
+	return "", errOpenAITokenRefreshInProgress
 }
 
 // disableAccountMissingRefreshToken 在请求路径上发现 OpenAI OAuth 账号

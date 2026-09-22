@@ -218,15 +218,26 @@ gateway:
   # Grok text Responses first-byte timeout (seconds, 0=disabled; default 120)
   # Grok 文本 Responses 首字节超时时间（秒，0=禁用；默认 120）
   grok_response_header_timeout: 120
-  # Native OpenAI HTTP Responses first semantic output timeout (seconds, 0=disabled)
+  # Native OpenAI HTTP Responses first semantic output timeout (seconds, 0=disabled; default 120)
   # Includes response-header wait; does not apply to passthrough or WebSocket transports.
   # A timed-out request may already have incurred upstream usage; account failover can therefore duplicate upstream billing.
   # 超时请求可能已产生上游用量；切换账号重试可能导致上游重复计费。
   # Pre-output attempt staging is capped at 8 MiB; overflow fails over without exposing partial SSE data.
   # 首次输出前的单次尝试暂存上限为 8 MiB；溢出时切号且不暴露不完整 SSE 数据。
-  openai_first_output_timeout_seconds: 0
-  # Optional high/xhigh/max override (seconds, 0=use the standard timeout)
-  openai_high_effort_first_output_timeout_seconds: 0
+  openai_first_output_timeout_seconds: 120
+  # Optional high/xhigh/max override (seconds, 0=use the standard timeout; default 600).
+  # High-effort reasoning may wait up to 10 minutes for its first semantic output.
+  openai_high_effort_first_output_timeout_seconds: 600
+  # End-to-end hard budget shared by queueing, upstream attempts, and retries (seconds; default 900).
+  # A value of 0 uses the safe 900-second default and cannot disable this limit.
+  openai_request_budget_seconds: 900
+  # Error retry/account failover eligibility window from request entry (seconds).
+  # 0 derives min(300, effective request budget); set 300 for the normal five-minute retry window.
+  # An attempt that started before this window may continue until the 900-second hard budget.
+  openai_retry_budget_seconds: 300
+  # Buffer native HTTP Responses SSE until a successful terminal event so late upstream failures can retry/fail over atomically.
+  # Disabled by default to keep real-time streaming; enable only when strict atomic failover is required.
+  openai_atomic_stream_failover: false
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456
@@ -311,6 +322,34 @@ gateway:
   # Use this to avoid compact failures when newer models are not yet supported by the compact endpoint.
   # 当 compact 端点暂未支持更新模型时，可通过这里降级规避失败。
   openai_compact_model: "gpt-5.5"
+  # ChatGPT OAuth x-codex-turn-state ticket: harvest a 292-length header via a
+  # dedicated HTTP(S)/SOCKS proxy, store it for ttl_seconds (default 3600), then inject
+  # it on residential-IP production requests. Off by default.
+  # ChatGPT OAuth 门票：用独立 HTTP(S)/SOCKS 代理打到 292 长度的 x-codex-turn-state，默认缓存 1 小时，
+  # 再在住宅 IP 业务请求中覆盖该头。默认关闭。
+  # Env: GATEWAY_OPENAI_CODEX_TICKET_ENABLED=true
+  #      GATEWAY_OPENAI_CODEX_TICKET_ENABLED_332=true (mutually exclusive)
+  #      GATEWAY_OPENAI_CODEX_TICKET_HARVEST_PROXY_URL=socks5h://user:pass@host:port
+  # Admin UI 开关（系统设置 → 网关 → Codex 设置 → 292/332 打票）可覆盖 enabled，无需重启。
+  # Off: do not harvest or inject. On: harvest in the background and inject on production requests.
+  # The harvest proxy should rotate egress IPs itself (fresh CONNECT per request).
+  # Credential shadow accounts retain their existing forwarding policy and are not ticket-gated.
+  openai_codex_ticket:
+    enabled: false
+    # 332-length ticket mode; mutually exclusive with enabled.
+    enabled_332: false
+    target_length: 292
+    ttl_seconds: 3600
+    refresh_before_seconds: 600
+    # 后台「系统设置 → 网关 → Codex 设置」可覆盖此值，无需重启。
+    # 后台值的读取缓存为 5 秒，下个探测周期使用新代理；代理服务商自行负责轮换 IP。
+    harvest_proxy_url: ""
+    harvest_probe_interval_seconds: 6
+    harvest_attempt_timeout_seconds: 25
+    fail_closed: true
+    models:
+      - gpt-6-astra
+      - gpt-5.6-sol
   # ChatGPT Frameless Live 单会话硬上限（秒）。
   live:
     max_session_duration_seconds: 3600

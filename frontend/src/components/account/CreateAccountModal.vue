@@ -2998,7 +2998,27 @@
         </div>
       </div>
 
-      <div>
+      <div v-if="usesEgressPool">
+        <div class="mb-1 flex items-center gap-2">
+          <label class="input-label mb-0">{{ t('admin.accounts.egressPool.title') }}</label>
+        </div>
+        <p class="mb-2 text-xs text-gray-500 dark:text-gray-400">
+          {{ t('admin.accounts.egressPool.description') }}
+        </p>
+        <EgressPoolSelector
+          :routes="egressRoutes"
+          :selected-route-ids="egressRouteIds"
+          :primary-route-id="primaryEgressRouteId"
+          :require-primary="true"
+          :disabled="!egressMutationEnabled"
+          :verifying-route-id="egressVerifyingRouteId"
+          :verify-errors="egressVerifyErrors"
+          @update:selected-route-ids="handleEgressRouteIdsUpdate"
+          @update:primary-route-id="handlePrimaryEgressRouteUpdate"
+          @verify="emit('verify-egress-route', $event)"
+        />
+      </div>
+      <div v-else>
         <div class="mb-1 flex items-center gap-2">
           <label class="input-label mb-0">{{ t('admin.accounts.proxy') }}</label>
           <ProxyAdBanner />
@@ -3014,9 +3034,11 @@
 
       <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div>
-          <label class="input-label">{{ t('admin.accounts.concurrency') }}</label>
+          <label class="input-label">{{ usesEgressPool ? t('admin.accounts.egressPool.perEgressConcurrency') : t('admin.accounts.concurrency') }}</label>
           <input v-model.number="form.concurrency" type="number" min="1" class="input"
-            @input="form.concurrency = Math.max(1, form.concurrency || 1)" />
+            :data-testid="usesEgressPool ? 'egress-concurrency-per-route' : undefined"
+            @input="handleEgressConcurrencyInput" />
+          <p v-if="usesEgressPool" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
           <label class="input-label">{{ t('admin.accounts.loadFactor') }}</label>
@@ -3240,6 +3262,40 @@
               ]"
             />
           </button>
+        </div>
+      </div>
+
+      <!-- OpenAI Codex five-hour window warmup policy (OAuth imports and OAuth create). -->
+      <div
+        v-if="form.platform === 'openai' && accountCategory === 'oauth-based'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        data-testid="openai-codex-warmup-policy"
+      >
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.codexWarmupPolicy') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.codexWarmupPolicyDesc') }}
+            </p>
+          </div>
+          <div class="flex shrink-0 rounded-lg bg-gray-100 p-1 dark:bg-dark-700" role="group" :aria-label="t('admin.accounts.openai.codexWarmupPolicy')">
+            <button
+              v-for="option in codexWarmupPolicyOptions"
+              :key="option.value"
+              type="button"
+              :data-testid="`create-codex-warmup-${option.value}`"
+              :aria-pressed="openAICodexWarmupPolicy === option.value"
+              :class="[
+                'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                openAICodexWarmupPolicy === option.value
+                  ? 'bg-white text-primary-700 shadow-sm dark:bg-dark-600 dark:text-primary-300'
+                  : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-200'
+              ]"
+              @click="selectOpenAICodexWarmupPolicy(option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -3544,7 +3600,7 @@
         :loading="currentOAuthLoading"
         :error="currentOAuthError"
         :show-help="form.platform === 'anthropic'"
-        :show-proxy-warning="form.platform !== 'openai' && form.platform !== 'grok' && !!form.proxy_id"
+        :show-proxy-warning="form.platform !== 'openai' && form.platform !== 'grok' && form.proxy_id != null"
         :allow-multiple="form.platform === 'anthropic'"
         :show-cookie-option="form.platform === 'anthropic'"
         :show-refresh-token-option="form.platform === 'openai' || form.platform === 'antigravity' || form.platform === 'grok'"
@@ -3911,13 +3967,16 @@ import { useGeminiOAuth } from '@/composables/useGeminiOAuth'
 import { useAntigravityOAuth } from '@/composables/useAntigravityOAuth'
 import { useGrokOAuth } from '@/composables/useGrokOAuth'
 import type {
-  Proxy,
+  ProxyOption,
+  AssignableEgressRoute,
+  AccountEgressPoolWrite,
   AdminGroup,
   AccountPlatform,
   AccountType,
   CheckMixedChannelResponse,
   CreateAccountRequest,
   CodexSessionImportMessage,
+  OpenAICodexWarmupPolicy,
   OpenAICompactMode,
   OpenAIResponsesMode,
   OpenAIEndpointCapability
@@ -3929,6 +3988,7 @@ import HelpTooltip from '@/components/common/HelpTooltip.vue'
 import UpstreamRequestIdHeaderField from '@/components/account/UpstreamRequestIdHeaderField.vue'
 import PlatformIcon from '@/components/common/PlatformIcon.vue'
 import Icon from '@/components/icons/Icon.vue'
+import EgressPoolSelector from '@/components/account/EgressPoolSelector.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
@@ -3969,6 +4029,10 @@ import {
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
 import { getAccountExpiryTimestamp } from '@/components/account/accountExpiry'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
+import {
+  AccountEgressPolicyError,
+  buildCreateAccountEgressPatch
+} from '@/components/account/accountEgressPolicy'
 import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
@@ -4072,14 +4136,29 @@ const apiKeyValuePlaceholder = computed(() => {
 
 interface Props {
   show: boolean
-  proxies: Proxy[]
+  proxies?: ProxyOption[]
+  egressRoutes?: AssignableEgressRoute[]
+  defaultEgressRouteId?: number | null
+  defaultEgressConcurrency?: number | null
+  egressMutationEnabled?: boolean
+  egressVerifyingRouteId?: number | null
+  egressVerifyErrors?: Record<number, string>
   groups: AdminGroup[]
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  proxies: () => [],
+  egressRoutes: () => [],
+  defaultEgressRouteId: null,
+  defaultEgressConcurrency: null,
+  egressMutationEnabled: true,
+  egressVerifyingRouteId: null,
+  egressVerifyErrors: () => ({})
+})
 const emit = defineEmits<{
   close: []
   created: []
+  'verify-egress-route': [route: AssignableEgressRoute]
 }>()
 
 const appStore = useAppStore()
@@ -4446,6 +4525,43 @@ const codexFingerprintModeOptions = computed(() => [
   { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
   { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
 ])
+const openAICodexWarmupPolicy = ref<OpenAICodexWarmupPolicy>()
+const openAICodexWarmupPolicyTouched = ref(false)
+let openAICodexWarmupPolicyLoadGeneration = 0
+const codexWarmupPolicyOptions = computed(() => [
+  { value: 'off' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyOff') },
+  { value: 'initial_once' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyInitialOnce') },
+  { value: 'continuous' as OpenAICodexWarmupPolicy, label: t('admin.accounts.openai.codexWarmupPolicyContinuous') }
+])
+const isOpenAICodexWarmupPolicy = (value: unknown): value is OpenAICodexWarmupPolicy => {
+  return value === 'off' || value === 'initial_once' || value === 'continuous'
+}
+const selectOpenAICodexWarmupPolicy = (policy: OpenAICodexWarmupPolicy) => {
+  openAICodexWarmupPolicyTouched.value = true
+  openAICodexWarmupPolicy.value = policy
+}
+const buildOpenAICodexWarmupPolicyPayload = () => {
+  return openAICodexWarmupPolicy.value
+    ? { openai_codex_warmup_policy: openAICodexWarmupPolicy.value }
+    : {}
+}
+const loadOpenAICodexWarmupDefaultPolicy = async () => {
+  const generation = ++openAICodexWarmupPolicyLoadGeneration
+  try {
+    const settings = await adminAPI.settings.getSettings()
+    const policy = settings?.openai_window_warmup_default_policy
+    if (
+      generation === openAICodexWarmupPolicyLoadGeneration &&
+      props.show &&
+      !openAICodexWarmupPolicyTouched.value &&
+      isOpenAICodexWarmupPolicy(policy)
+    ) {
+      openAICodexWarmupPolicy.value = policy
+    }
+  } catch {
+    // Omit the request field so the backend remains the source of truth.
+  }
+}
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
 const anthropicPassthroughEnabled = ref(false)
 const anthropicAPIKeyAuthScheme = ref<AnthropicAPIKeyAuthScheme>('x_api_key')
@@ -4731,6 +4847,83 @@ const form = reactive({
   expires_at: null as number | null
 })
 
+const egressRouteIds = ref<number[]>([])
+const primaryEgressRouteId = ref<number | null>(null)
+const egressDefaultsInitialized = ref(false)
+const egressDefaultsTouched = ref(false)
+const legacyConcurrencyBeforeEgress = ref(10)
+const usesEgressPool = computed(() => form.platform === 'openai' && form.type === 'oauth')
+
+const initializeOpenAIEgressDefaults = () => {
+  if (!props.show || !usesEgressPool.value || egressDefaultsTouched.value) return
+  const routeIds = Array.from(new Set(
+    props.egressRoutes
+      .filter((route) => route.kind === 'proxy' && route.eligible)
+      .map((route) => route.id)
+  ))
+  if (routeIds.length === 0) return
+
+  if (!egressDefaultsInitialized.value) {
+    legacyConcurrencyBeforeEgress.value = form.concurrency
+  }
+  egressRouteIds.value = routeIds
+  primaryEgressRouteId.value = props.defaultEgressRouteId != null && routeIds.includes(props.defaultEgressRouteId)
+    ? props.defaultEgressRouteId
+    : null
+  form.concurrency = props.defaultEgressConcurrency != null
+    && Number.isSafeInteger(props.defaultEgressConcurrency)
+    && props.defaultEgressConcurrency > 0
+    ? props.defaultEgressConcurrency
+    : 3
+  egressDefaultsInitialized.value = true
+}
+
+const handleEgressRouteIdsUpdate = (routeIds: number[]) => {
+  egressDefaultsTouched.value = true
+  egressRouteIds.value = routeIds
+}
+
+const handlePrimaryEgressRouteUpdate = (routeId: number | null) => {
+  egressDefaultsTouched.value = true
+  primaryEgressRouteId.value = routeId
+}
+
+const handleEgressConcurrencyInput = () => {
+  if (usesEgressPool.value) egressDefaultsTouched.value = true
+  form.concurrency = Math.max(1, form.concurrency || 1)
+}
+
+const buildEgressPool = (): AccountEgressPoolWrite => buildCreateAccountEgressPatch({
+  routeIds: egressRouteIds.value,
+  primaryRouteId: primaryEgressRouteId.value,
+  concurrencyPerEgress: form.concurrency
+}, props.egressRoutes).egress_pool
+
+const withEgressPool = <T extends object>(payload: T): T & {
+  egress_mode: 'pool'
+  egress_pool: AccountEgressPoolWrite
+} => {
+  const normalized = { ...payload } as T & { proxy_id?: unknown; concurrency?: unknown }
+  delete normalized.proxy_id
+  delete normalized.concurrency
+  return {
+    ...normalized,
+    egress_mode: 'pool',
+    egress_pool: buildEgressPool()
+  }
+}
+
+const createAccountWithEgress = (payload: CreateAccountRequest) => {
+  if (payload.platform === 'openai' && payload.type === 'oauth') {
+    return adminAPI.accounts.create(withEgressPool(payload))
+  }
+  return adminAPI.accounts.create({
+    ...payload,
+    proxy_id: payload.proxy_id ?? form.proxy_id,
+    concurrency: payload.concurrency ?? form.concurrency
+  })
+}
+
 // Helper to check if current type needs OAuth flow
 const isOAuthFlow = computed(() => {
   // Antigravity upstream 类型不需要 OAuth 流程
@@ -4774,11 +4967,13 @@ const canExchangeCode = computed(() => {
   return authCode.trim() && oauth.sessionId.value && !oauth.loading.value
 })
 
-// Watchers
+// Keep resetForm hoisted: this watcher runs immediately while AccountsView mounts
+// the initially closed dialog.
 watch(
   () => props.show,
   (newVal) => {
     if (newVal) {
+      void loadOpenAICodexWarmupDefaultPolicy()
       // Load TLS fingerprint profiles
       adminAPI.tlsFingerprintProfiles.list()
         .then(profiles => { tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name })) })
@@ -4800,7 +4995,8 @@ watch(
     } else {
       resetForm()
     }
-  }
+  },
+  { immediate: true }
 )
 
 // Sync form.type based on accountCategory, addMethod, and platform-specific type
@@ -4824,6 +5020,30 @@ watch(
     } else {
       form.type = 'apikey'
     }
+  },
+  { immediate: true }
+)
+
+watch(
+  [
+    () => props.show,
+    usesEgressPool,
+    () => props.egressRoutes,
+    () => props.defaultEgressRouteId,
+    () => props.defaultEgressConcurrency
+  ],
+  ([show, usesPool], previous) => {
+    const previouslyUsedPool = previous?.[1] === true
+    if (!show) return
+    if (!usesPool) {
+      if (previouslyUsedPool && egressDefaultsInitialized.value) {
+        form.concurrency = legacyConcurrencyBeforeEgress.value
+        egressDefaultsInitialized.value = false
+        egressDefaultsTouched.value = false
+      }
+      return
+    }
+    initializeOpenAIEgressDefaults()
   },
   { immediate: true }
 )
@@ -5176,7 +5396,7 @@ const buildMixedChannelDetails = (resp?: CheckMixedChannelResponse) => {
   }
 }
 
-const clearMixedChannelDialog = () => {
+function clearMixedChannelDialog() {
   showMixedChannelWarning.value = false
   mixedChannelWarningDetails.value = null
   mixedChannelWarningRawMessage.value = ''
@@ -5240,7 +5460,7 @@ const ensureAntigravityMixedChannelConfirmed = async (onConfirm: () => Promise<v
 const submitCreateAccount = async (payload: CreateAccountRequest) => {
   submitting.value = true
   try {
-    const account = await adminAPI.accounts.create(withAntigravityConfirmFlag(payload))
+    const account = await createAccountWithEgress(withAntigravityConfirmFlag(payload))
     const modelMapping = payload.credentials.model_mapping
     const hasConcreteMappedTarget = payload.type === 'apikey' &&
       typeof modelMapping === 'object' &&
@@ -5275,6 +5495,12 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
     emit('created')
     handleClose()
   } catch (error: any) {
+    if (error instanceof AccountEgressPolicyError) {
+      appStore.showError(t(error.code === 'no_selection'
+        ? 'admin.accounts.egressPool.noSelection'
+        : 'admin.accounts.egressPool.catalogUnavailable'))
+      return
+    }
     if (error.response?.status === 409 && error.response?.data?.error === 'mixed_channel_warning' && needsMixedChannelCheck(form.platform)) {
       openMixedChannelDialog({
         message: error.response?.data?.message,
@@ -5292,7 +5518,7 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
 }
 
 // Methods
-const resetForm = () => {
+function resetForm() {
   step.value = 1
   form.name = ''
   form.notes = ''
@@ -5300,6 +5526,11 @@ const resetForm = () => {
   form.type = 'oauth'
   form.credentials = {}
   form.proxy_id = null
+  egressRouteIds.value = []
+  primaryEgressRouteId.value = null
+  egressDefaultsInitialized.value = false
+  egressDefaultsTouched.value = false
+  legacyConcurrencyBeforeEgress.value = 10
   form.concurrency = 10
   form.load_factor = null
   form.priority = 1
@@ -5361,6 +5592,9 @@ const resetForm = () => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  openAICodexWarmupPolicy.value = undefined
+  openAICodexWarmupPolicyTouched.value = false
+  openAICodexWarmupPolicyLoadGeneration++
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
   webSearchEmulationMode.value = 'default'
@@ -5443,6 +5677,8 @@ const buildOpenAIExtra = (base?: Record<string, unknown>): Record<string, unknow
   } else {
     delete extra.openai_responses_flatten_namespaces
   }
+  // The backend resolves the global default from the top-level request field.
+  delete extra.openai_codex_warmup_policy
   extra.openai_long_context_billing_enabled = openAILongContextBillingEnabled.value
 
   if (accountCategory.value === 'oauth-based' && codexCLIOnlyEnabled.value) {
@@ -5619,6 +5855,21 @@ const handleVertexServiceAccountDrop = async (event: DragEvent) => {
 }
 
 const handleSubmit = async () => {
+  if (usesEgressPool.value && !props.egressMutationEnabled) {
+    appStore.showError(t('admin.accounts.egressPool.catalogUnavailable'))
+    return
+  }
+  if (usesEgressPool.value && egressRouteIds.value.length === 0) {
+    appStore.showError(t('admin.accounts.egressPool.noSelection'))
+    return
+  }
+  if (usesEgressPool.value && (
+    primaryEgressRouteId.value == null
+    || !egressRouteIds.value.includes(primaryEgressRouteId.value)
+  )) {
+    appStore.showError(t('admin.accounts.egressPool.primaryRequired'))
+    return
+  }
   // For OAuth-based type, handle OAuth flow (goes to step 2)
   if (isOAuthFlow.value) {
     if (!isGrokSSOInputMethod.value && !form.name.trim()) {
@@ -5889,7 +6140,7 @@ const goBackToBasicInfo = () => {
 
 const handleGenerateUrl = async () => {
   if (form.platform === 'openai') {
-    await openaiOAuth.generateAuthUrl(form.proxy_id)
+    await openaiOAuth.generateAuthUrl({ egressRouteId: primaryEgressRouteId.value })
   } else if (form.platform === 'gemini') {
     await geminiOAuth.generateAuthUrl(
       form.proxy_id,
@@ -5994,8 +6245,6 @@ const createAccountAndFinish = async (
     type,
     credentials,
     extra: finalExtra,
-    proxy_id: form.proxy_id,
-    concurrency: form.concurrency,
     load_factor: form.load_factor ?? undefined,
     priority: form.priority,
     rate_multiplier: form.rate_multiplier,
@@ -6004,7 +6253,10 @@ const createAccountAndFinish = async (
     // 上游倍率探测对全部 API-key 平台开放（antigravity upstream 走本 helper）；
     // 非 apikey 类型（bedrock/oauth）不传，后端不动作。
     upstream_billing_probe_enabled: type === 'apikey' ? upstreamBillingAutoProbeEnabled.value : undefined,
-    auto_pause_on_expired: autoPauseOnExpired.value
+    auto_pause_on_expired: autoPauseOnExpired.value,
+    ...(platform === 'openai' && type === 'oauth'
+      ? buildOpenAICodexWarmupPolicyPayload()
+      : {})
   })
 }
 
@@ -6054,15 +6306,13 @@ const handleGrokValidateRT = async (refreshTokenInput: string) => {
           return
         }
 
-        await adminAPI.accounts.create({
+        await createAccountWithEgress({
           name: accountName,
           notes: form.notes,
           platform: 'grok',
           type: 'oauth',
           credentials,
-          extra: withUpstreamRequestIdHeader(extra),
-          proxy_id: form.proxy_id,
-          concurrency: form.concurrency,
+	          extra: withUpstreamRequestIdHeader(extra),
           load_factor: form.load_factor ?? undefined,
           priority: form.priority,
           rate_multiplier: form.rate_multiplier,
@@ -6128,9 +6378,9 @@ const handleGrokImportSSO = async (ssoInput: string) => {
       name: form.name || undefined,
       notes: form.notes || undefined,
       proxy_id: form.proxy_id,
+      concurrency: form.concurrency,
       group_ids: form.group_ids,
       credentials,
-      concurrency: form.concurrency,
       load_factor: form.load_factor ?? undefined,
       priority: form.priority,
       rate_multiplier: form.rate_multiplier,
@@ -6231,15 +6481,13 @@ const handleGrokAuthorizePassword = async (emailPasswordInput: string) => {
           return
         }
 
-        await adminAPI.accounts.create({
+        await createAccountWithEgress({
           name: accountName,
           notes: form.notes,
           platform: 'grok',
           type: 'oauth',
           credentials,
-          extra: withUpstreamRequestIdHeader(extra),
-          proxy_id: form.proxy_id,
-          concurrency: form.concurrency,
+	          extra: withUpstreamRequestIdHeader(extra),
           load_factor: form.load_factor ?? undefined,
           priority: form.priority,
           rate_multiplier: form.rate_multiplier,
@@ -6301,7 +6549,7 @@ const handleOpenAIExchange = async (authCode: string) => {
       authCode.trim(),
       oauthClient.sessionId.value,
       stateToUse,
-      form.proxy_id
+      { egressRouteId: primaryEgressRouteId.value }
     )
     if (!tokenInfo) return
 
@@ -6330,21 +6578,20 @@ const handleOpenAIExchange = async (authCode: string) => {
     }
 
     if (shouldCreateOpenAI) {
-      await adminAPI.accounts.create({
+      await createAccountWithEgress({
         name: form.name,
         notes: form.notes,
         platform: 'openai',
         type: 'oauth',
         credentials,
-        extra: withUpstreamRequestIdHeader(extra),
-        proxy_id: form.proxy_id,
-        concurrency: form.concurrency,
+	        extra: withUpstreamRequestIdHeader(extra),
         load_factor: form.load_factor ?? undefined,
         priority: form.priority,
         rate_multiplier: form.rate_multiplier,
         group_ids: form.group_ids,
         expires_at: form.expires_at,
-        auto_pause_on_expired: autoPauseOnExpired.value
+        auto_pause_on_expired: autoPauseOnExpired.value,
+        ...buildOpenAICodexWarmupPolicyPayload()
       })
       appStore.showSuccess(t('admin.accounts.accountCreated'))
     }
@@ -6442,8 +6689,8 @@ const handleOpenAIImportCodexSession = async (content: string) => {
       content: trimmed,
       name: form.name,
       notes: form.notes || null,
-      proxy_id: form.proxy_id,
-      concurrency: form.concurrency,
+      egress_mode: 'pool',
+      egress_pool: buildEgressPool(),
       load_factor: form.load_factor ?? undefined,
       priority: form.priority,
       rate_multiplier: form.rate_multiplier,
@@ -6451,8 +6698,9 @@ const handleOpenAIImportCodexSession = async (content: string) => {
       expires_at: form.expires_at,
       auto_pause_on_expired: autoPauseOnExpired.value,
       credential_extras: Object.keys(credentialExtras).length > 0 ? credentialExtras : undefined,
-      extra: withUpstreamRequestIdHeader(extra),
-      update_existing: true
+	      extra: withUpstreamRequestIdHeader(extra),
+	      update_existing: true,
+	      ...buildOpenAICodexWarmupPolicyPayload()
     })
 
     const successCount = result.created + result.updated
@@ -6520,8 +6768,8 @@ const handleOpenAIImportCodexPAT = async (accessToken: string) => {
       access_token: trimmed,
       name: form.name,
       notes: form.notes || null,
-      proxy_id: form.proxy_id,
-      concurrency: form.concurrency,
+      egress_mode: 'pool',
+      egress_pool: buildEgressPool(),
       load_factor: form.load_factor ?? undefined,
       priority: form.priority,
       rate_multiplier: form.rate_multiplier,
@@ -6529,7 +6777,8 @@ const handleOpenAIImportCodexPAT = async (accessToken: string) => {
       expires_at: form.expires_at,
       auto_pause_on_expired: autoPauseOnExpired.value,
       credential_extras: Object.keys(credentialExtras).length > 0 ? credentialExtras : undefined,
-      extra: withUpstreamRequestIdHeader(extra)
+	      extra: withUpstreamRequestIdHeader(extra),
+	      ...buildOpenAICodexWarmupPolicyPayload()
     })
 
     appStore.showSuccess(t('admin.accounts.accountCreated'))
@@ -6575,7 +6824,7 @@ const handleOpenAIBatchRT = async (refreshTokenInput: string, clientId?: string)
       try {
         const tokenInfo = await oauthClient.validateRefreshToken(
           refreshTokens[i],
-          form.proxy_id,
+          { egressRouteId: primaryEgressRouteId.value },
           clientId
         )
         if (!tokenInfo) {
@@ -6611,21 +6860,20 @@ const handleOpenAIBatchRT = async (refreshTokenInput: string, clientId?: string)
         const accountName = refreshTokens.length > 1 ? `${baseName} #${i + 1}` : baseName
 
         if (shouldCreateOpenAI) {
-          await adminAPI.accounts.create({
+          await createAccountWithEgress({
             name: accountName,
             notes: form.notes,
             platform: 'openai',
             type: 'oauth',
             credentials,
-            extra: withUpstreamRequestIdHeader(extra),
-            proxy_id: form.proxy_id,
-            concurrency: form.concurrency,
+	            extra: withUpstreamRequestIdHeader(extra),
             load_factor: form.load_factor ?? undefined,
             priority: form.priority,
             rate_multiplier: form.rate_multiplier,
             group_ids: form.group_ids,
             expires_at: form.expires_at,
-            auto_pause_on_expired: autoPauseOnExpired.value
+            auto_pause_on_expired: autoPauseOnExpired.value,
+            ...buildOpenAICodexWarmupPolicyPayload()
           })
         }
 
@@ -6716,9 +6964,7 @@ const handleAntigravityValidateRT = async (refreshTokenInput: string) => {
           platform: 'antigravity',
           type: 'oauth',
           credentials,
-          extra: withUpstreamRequestIdHeader({}),
-          proxy_id: form.proxy_id,
-          concurrency: form.concurrency,
+	          extra: withUpstreamRequestIdHeader({}),
           load_factor: form.load_factor ?? undefined,
           priority: form.priority,
           rate_multiplier: form.rate_multiplier,
@@ -6726,7 +6972,7 @@ const handleAntigravityValidateRT = async (refreshTokenInput: string) => {
           expires_at: form.expires_at,
           auto_pause_on_expired: autoPauseOnExpired.value
         })
-        await adminAPI.accounts.create(createPayload)
+        await createAccountWithEgress(createPayload)
         successCount++
       } catch (error: any) {
         failedCount++
@@ -7091,15 +7337,13 @@ const handleCookieAuth = async (sessionKey: string) => {
           credentials.temp_unschedulable_rules = tempUnschedPayload
         }
 
-        await adminAPI.accounts.create({
+        await createAccountWithEgress({
           name: accountName,
           notes: form.notes,
           platform: form.platform,
           type: addMethod.value, // Use addMethod as type: 'oauth' or 'setup-token'
           credentials,
-          extra: withUpstreamRequestIdHeader(extra),
-          proxy_id: form.proxy_id,
-          concurrency: form.concurrency,
+	          extra: withUpstreamRequestIdHeader(extra),
           load_factor: form.load_factor ?? undefined,
           priority: form.priority,
           rate_multiplier: form.rate_multiplier,

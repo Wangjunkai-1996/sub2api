@@ -768,7 +768,7 @@ func TestProxyOpenAIWSHTTPBridgeTurnTransportErrorFailoverSafety(t *testing.T) {
 		wantWrites   int
 	}{
 		{name: "first_turn_fails_over_before_downstream_event", turn: 1, wantFailover: true},
-		{name: "later_turn_does_not_replay_completed_turns", turn: 2, wantWrites: 1},
+		{name: "later_turn_returns_failover_for_ingress_replay_gate", turn: 2, wantFailover: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -831,7 +831,7 @@ func TestProxyOpenAIWSHTTPBridgeTurnHTTPStatusFailoverSafety(t *testing.T) {
 		{name: "first_turn_401", turn: 1, status: http.StatusUnauthorized, wantFailover: true},
 		{name: "first_turn_429", turn: 1, status: http.StatusTooManyRequests, wantFailover: true},
 		{name: "first_turn_500", turn: 1, status: http.StatusInternalServerError, wantFailover: true},
-		{name: "later_turn_500_does_not_replay", turn: 2, status: http.StatusInternalServerError, wantWrites: 1},
+		{name: "later_turn_500_returns_failover_for_ingress_replay_gate", turn: 2, status: http.StatusInternalServerError, wantFailover: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -968,16 +968,18 @@ func TestProxyOpenAIWSHTTPBridgeTurnRewritesCapacityShedCodeForClient(t *testing
 		wantErr bool
 	}{
 		{
-			name:    "turn2_error_frame",
-			turn:    2,
-			body:    "data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+			name: "after_output_error_frame",
+			turn: 2,
+			body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
+				"data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
 			wantErr: true,
 		},
 		{
 			// 后续 turn 不允许 replay，容量错误必须改写后交给客户端重试。
-			name: "turn2_bare_response_failed",
+			name: "after_output_bare_response_failed",
 			turn: 2,
-			body: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_shed\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n",
+			body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_shed\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n",
 		},
 	}
 	for _, tt := range tests {
@@ -1009,10 +1011,10 @@ func TestProxyOpenAIWSHTTPBridgeTurnRewritesCapacityShedCodeForClient(t *testing
 			} else {
 				require.NoError(t, err)
 			}
-			require.Len(t, writes, 1)
-			require.Contains(t, string(writes[0]), `"code":"server_error"`)
-			require.NotContains(t, string(writes[0]), "server_is_overloaded")
-			require.Contains(t, string(writes[0]), "Our servers are currently overloaded")
+			require.Len(t, writes, 2)
+			require.Contains(t, string(writes[1]), `"code":"server_error"`)
+			require.NotContains(t, string(writes[1]), "server_is_overloaded")
+			require.Contains(t, string(writes[1]), "Our servers are currently overloaded")
 		})
 	}
 }
@@ -1192,6 +1194,13 @@ func TestProxyOpenAIWSHTTPBridgeTurnStagesMetadataBeforeCapacityFailover(t *test
 		`data: {"type":"response.created","response":{"id":"resp_shed"}}`,
 		"",
 		`data: {"type":"response.in_progress","response":{"id":"resp_shed"}}`,
+		"",
+		`data: {"type":"keepalive"}`,
+		"",
+		`data: {"type":"ping"}`,
+		"",
+		`event: keepalive`,
+		`data: {}`,
 		"",
 		`data: {"type":"response.failed","response":{"id":"resp_shed","status":"failed","error":{"message":"Our servers are currently overloaded. Please try again later."}}}`,
 		"",

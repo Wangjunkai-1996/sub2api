@@ -639,6 +639,10 @@ export interface SystemSettings {
   openai_codex_client_version: string;
   openai_codex_client_version_synced: string;
   openai_codex_version_auto_sync_enabled: boolean;
+  openai_codex_ticket_enabled: boolean;
+  openai_codex_ticket_332_enabled: boolean;
+  openai_codex_ticket_harvest_proxy_url: string;
+  openai_codex_ticket_harvest_proxy_configured: boolean;
   // codex_cli_only 加固
   min_codex_version: string;
   max_codex_version: string;
@@ -646,15 +650,29 @@ export interface SystemSettings {
   codex_cli_only_whitelist: string;
   codex_cli_only_allow_app_server_clients: boolean;
   codex_cli_only_engine_fingerprint_signals: string;
+  openai_window_warmup_enabled: boolean;
+  openai_window_warmup_default_policy: "off" | "initial_once" | "continuous";
+  openai_window_warmup_allowlist: number[];
+  openai_window_warmup_probe_model: string;
+  openai_window_warmup_worker_concurrency: number;
+  openai_window_warmup_global_qps: number;
+  openai_window_warmup_batch_size: number;
+  openai_window_warmup_scan_seconds: number;
+  openai_window_warmup_request_timeout_seconds: number;
+  openai_window_warmup_lease_seconds: number;
+  openai_window_warmup_reset_grace_seconds: number;
   web_search_emulation_enabled?: boolean;
 
   // Payment configuration
   payment_enabled: boolean;
   risk_control_enabled: boolean;
 
-  // Cyber session block
-  cyber_session_block_enabled: boolean;
-  cyber_session_block_ttl_seconds: number;
+  // OpenAI Cyber account cooldown
+  openai_cyber_account_cooldown_enabled: boolean;
+  openai_cyber_account_cooldown_window_seconds: number;
+  openai_cyber_account_cooldown_first_seconds: number;
+  openai_cyber_account_cooldown_escalated_seconds: number;
+  openai_cyber_account_cooldown_group_ids: number[];
 
   payment_min_amount: number;
   payment_max_amount: number;
@@ -958,6 +976,9 @@ export interface UpdateSettingsRequest {
   openai_codex_user_agent?: string;
   openai_codex_client_version?: string;
   openai_codex_version_auto_sync_enabled?: boolean;
+  openai_codex_ticket_enabled?: boolean;
+  openai_codex_ticket_332_enabled?: boolean;
+  openai_codex_ticket_harvest_proxy_url?: string;
   // codex_cli_only 加固
   min_codex_version?: string;
   max_codex_version?: string;
@@ -965,13 +986,27 @@ export interface UpdateSettingsRequest {
   codex_cli_only_whitelist?: string;
   codex_cli_only_allow_app_server_clients?: boolean;
   codex_cli_only_engine_fingerprint_signals?: string;
+  openai_window_warmup_enabled?: boolean;
+  openai_window_warmup_default_policy?: "off" | "initial_once" | "continuous";
+  openai_window_warmup_allowlist?: number[];
+  openai_window_warmup_probe_model?: string;
+  openai_window_warmup_worker_concurrency?: number;
+  openai_window_warmup_global_qps?: number;
+  openai_window_warmup_batch_size?: number;
+  openai_window_warmup_scan_seconds?: number;
+  openai_window_warmup_request_timeout_seconds?: number;
+  openai_window_warmup_lease_seconds?: number;
+  openai_window_warmup_reset_grace_seconds?: number;
   // Payment configuration
   payment_enabled?: boolean;
   risk_control_enabled?: boolean;
 
-  // Cyber session block
-  cyber_session_block_enabled?: boolean;
-  cyber_session_block_ttl_seconds?: number;
+  // OpenAI Cyber account cooldown
+  openai_cyber_account_cooldown_enabled?: boolean;
+  openai_cyber_account_cooldown_window_seconds?: number;
+  openai_cyber_account_cooldown_first_seconds?: number;
+  openai_cyber_account_cooldown_escalated_seconds?: number;
+  openai_cyber_account_cooldown_group_ids?: number[];
 
   payment_min_amount?: number;
   payment_max_amount?: number;

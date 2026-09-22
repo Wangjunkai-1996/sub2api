@@ -24,6 +24,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -272,19 +273,24 @@ type OpenAIForwardResult struct {
 	// UpstreamTerminalEvent is the normalized terminal event observed on an
 	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
 	UpstreamTerminalEvent string
-	ResponseHeaders       http.Header
-	Duration              time.Duration
-	FirstTokenMs          *int
-	ClientDisconnect      bool
-	ImageCount            int
-	ImageSize             string
-	ImageInputSize        string
-	ImageOutputSize       string
-	ImageOutputSizes      []string
-	ImageSizeSource       string
-	ImageSizeBreakdown    map[string]int
-	VideoCount            int
-	VideoResolution       string
+	// UpstreamTerminalStatusCode is a synthetic HTTP-equivalent status derived
+	// from a WebSocket terminal payload. It lets health classification preserve
+	// request, auth, quota, and server-error semantics without retaining the
+	// complete upstream event body.
+	UpstreamTerminalStatusCode int
+	ResponseHeaders            http.Header
+	Duration                   time.Duration
+	FirstTokenMs               *int
+	ClientDisconnect           bool
+	ImageCount                 int
+	ImageSize                  string
+	ImageInputSize             string
+	ImageOutputSize            string
+	ImageOutputSizes           []string
+	ImageSizeSource            string
+	ImageSizeBreakdown         map[string]int
+	VideoCount                 int
+	VideoResolution            string
 	// VideoDurationSeconds 是提交时请求的生成时长（xAI 按输出秒数计费），已归一化到 1-15 秒。
 	VideoDurationSeconds int
 	// WebSearchCalls 是 Codex alpha/search 网页搜索调用次数（每次成功请求为 1）。
@@ -473,6 +479,7 @@ type OpenAIGatewayService struct {
 	openaiWSPoolOnce               sync.Once
 	openaiWSStateStoreOnce         sync.Once
 	openaiSchedulerOnce            sync.Once
+	openaiSchedulerMu              sync.RWMutex
 	openaiProxyStreamCircuitOnce   sync.Once
 	openaiWSPassthroughDialerOnce  sync.Once
 	openaiModelTransientOnce       sync.Once
@@ -491,8 +498,9 @@ type OpenAIGatewayService struct {
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockLocks      sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiAccountRuntimeBlockGeneration sync.Map // key: int64(accountID), value: uint64
+	openaiCyberCooldownPending          sync.Map // key: int64(accountID), value: int reference count
+	openaiLocalCooldownRuntimeUntil     sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockSequence   atomic.Uint64
-	openaiOAuth429RetryStartedAt        sync.Map // key: int64(accountID), value: time.Time
 	grokCredentialMutationLocks         sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiOAuth429WindowStartUnixNano   atomic.Int64
 	openaiOAuth429WindowCount           atomic.Int64
@@ -502,11 +510,22 @@ type OpenAIGatewayService struct {
 	openAIModelsCache                   openAIModelsCache
 	openaiCompatSessionResponses        sync.Map
 	openaiCompatAnthropicDigestSessions sync.Map
+	// liveEgressLeases tracks which claimed controllers own each process-local
+	// Live egress lease. Redis remains the source of truth across processes.
+	liveEgressLeaseMu sync.Mutex
+	liveEgressLeases  map[string]*liveEgressLeaseState
 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
 	openaiCodexTurnStateWrites  atomic.Uint64
+	// openaiCodexTickets: accountID\x00model → *openAICodexTicket，292 长度门票。
+	openaiCodexTickets           sync.Map
+	openaiCodexTicketFlight      singleflight.Group
+	openaiCodexTicketLifecycleMu sync.Mutex
+	openaiCodexTicketCancel      context.CancelFunc
+	openaiCodexTicketDone        chan struct{}
+	openaiCodexTicketStopped     bool
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService
@@ -584,6 +603,7 @@ func NewOpenAIGatewayService(
 		openAITokenProvider.SetAccountRuntimeBlocker(svc)
 	}
 	svc.logOpenAIWSModeBootstrap()
+	svc.StartOpenAICodexTicketHarvester()
 	return svc
 }
 

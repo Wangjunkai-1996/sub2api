@@ -77,6 +77,7 @@ const props = withDefaults(
     windowStats?: WindowStats | null
     estimatedTotalCost?: number | null
     showNowWhenIdle?: boolean
+    unknownResetLabel?: string
     remainingCapacity?: boolean
     /** fixed: 定宽居中徽章（账号页纵向对齐）；auto: 限宽截断左对齐（监控页组合标签） */
     labelWidth?: 'fixed' | 'auto'
@@ -183,17 +184,19 @@ const displayPercent = computed(() => {
 
 const shouldShowResetTime = computed(() => {
   if (props.resetsAt) return true
+  if (props.unknownResetLabel) return true
   return Boolean(props.showNowWhenIdle && props.utilization <= 0)
 })
 
 // Format reset time
 const formatResetTime = computed(() => {
-  // For rolling windows, when utilization is 0%, treat as immediately available.
-  if (props.showNowWhenIdle && props.utilization <= 0) {
-    return t('usage.resetNow')
+  // An absent reset on an idle rolling window means immediately available. A
+  // future authoritative reset still represents an armed/active window even
+  // when upstream rounds its tiny utilization to 0%, so show its countdown.
+  if (!props.resetsAt) {
+    if (props.unknownResetLabel) return props.unknownResetLabel
+    return props.showNowWhenIdle && props.utilization <= 0 ? t('usage.resetNow') : '-'
   }
-
-  if (!props.resetsAt) return '-'
 
   const date = new Date(props.resetsAt)
   const diffMs = date.getTime() - now.value.getTime()
@@ -201,11 +204,15 @@ const formatResetTime = computed(() => {
   // resetsAt 已过期：utilization>0 说明后端窗口数据还没刷新（active poll 没回写），
   // 显示「待刷新」以区别于真正可用的「现在」。
   if (diffMs <= 0) {
+    if (props.utilization <= 0 && props.unknownResetLabel) return props.unknownResetLabel
     return props.utilization > 0 ? t('usage.resetPending') : t('usage.resetNow')
   }
 
-  const diffHours = Math.floor(diffMs / (1000 * 60 * 60))
-  const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60))
+  // Round up the displayed minute so a freshly armed five-hour window does
+  // not immediately appear to have lost a minute to sub-minute precision.
+  const totalMinutes = Math.ceil(diffMs / (1000 * 60))
+  const diffHours = Math.floor(totalMinutes / 60)
+  const diffMins = totalMinutes % 60
 
   if (diffHours >= 24) {
     const days = Math.floor(diffHours / 24)

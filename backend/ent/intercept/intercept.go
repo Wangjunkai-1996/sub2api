@@ -9,6 +9,7 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/account"
+	"github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	"github.com/Wei-Shaw/sub2api/ent/announcement"
 	"github.com/Wei-Shaw/sub2api/ent/announcementread"
@@ -23,6 +24,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/egressidentity"
+	"github.com/Wei-Shaw/sub2api/ent/egressroute"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
@@ -158,6 +161,33 @@ func (f TraverseAccount) Traverse(ctx context.Context, q ent.Query) error {
 		return f(ctx, q)
 	}
 	return fmt.Errorf("unexpected query type %T. expect *ent.AccountQuery", q)
+}
+
+// The AccountEgressBindingFunc type is an adapter to allow the use of ordinary function as a Querier.
+type AccountEgressBindingFunc func(context.Context, *ent.AccountEgressBindingQuery) (ent.Value, error)
+
+// Query calls f(ctx, q).
+func (f AccountEgressBindingFunc) Query(ctx context.Context, q ent.Query) (ent.Value, error) {
+	if q, ok := q.(*ent.AccountEgressBindingQuery); ok {
+		return f(ctx, q)
+	}
+	return nil, fmt.Errorf("unexpected query type %T. expect *ent.AccountEgressBindingQuery", q)
+}
+
+// The TraverseAccountEgressBinding type is an adapter to allow the use of ordinary function as Traverser.
+type TraverseAccountEgressBinding func(context.Context, *ent.AccountEgressBindingQuery) error
+
+// Intercept is a dummy implementation of Intercept that returns the next Querier in the pipeline.
+func (f TraverseAccountEgressBinding) Intercept(next ent.Querier) ent.Querier {
+	return next
+}
+
+// Traverse calls f(ctx, q).
+func (f TraverseAccountEgressBinding) Traverse(ctx context.Context, q ent.Query) error {
+	if q, ok := q.(*ent.AccountEgressBindingQuery); ok {
+		return f(ctx, q)
+	}
+	return fmt.Errorf("unexpected query type %T. expect *ent.AccountEgressBindingQuery", q)
 }
 
 // The AccountGroupFunc type is an adapter to allow the use of ordinary function as a Querier.
@@ -509,6 +539,60 @@ func (f TraverseCompositeModelRoute) Traverse(ctx context.Context, q ent.Query) 
 		return f(ctx, q)
 	}
 	return fmt.Errorf("unexpected query type %T. expect *ent.CompositeModelRouteQuery", q)
+}
+
+// The EgressIdentityFunc type is an adapter to allow the use of ordinary function as a Querier.
+type EgressIdentityFunc func(context.Context, *ent.EgressIdentityQuery) (ent.Value, error)
+
+// Query calls f(ctx, q).
+func (f EgressIdentityFunc) Query(ctx context.Context, q ent.Query) (ent.Value, error) {
+	if q, ok := q.(*ent.EgressIdentityQuery); ok {
+		return f(ctx, q)
+	}
+	return nil, fmt.Errorf("unexpected query type %T. expect *ent.EgressIdentityQuery", q)
+}
+
+// The TraverseEgressIdentity type is an adapter to allow the use of ordinary function as Traverser.
+type TraverseEgressIdentity func(context.Context, *ent.EgressIdentityQuery) error
+
+// Intercept is a dummy implementation of Intercept that returns the next Querier in the pipeline.
+func (f TraverseEgressIdentity) Intercept(next ent.Querier) ent.Querier {
+	return next
+}
+
+// Traverse calls f(ctx, q).
+func (f TraverseEgressIdentity) Traverse(ctx context.Context, q ent.Query) error {
+	if q, ok := q.(*ent.EgressIdentityQuery); ok {
+		return f(ctx, q)
+	}
+	return fmt.Errorf("unexpected query type %T. expect *ent.EgressIdentityQuery", q)
+}
+
+// The EgressRouteFunc type is an adapter to allow the use of ordinary function as a Querier.
+type EgressRouteFunc func(context.Context, *ent.EgressRouteQuery) (ent.Value, error)
+
+// Query calls f(ctx, q).
+func (f EgressRouteFunc) Query(ctx context.Context, q ent.Query) (ent.Value, error) {
+	if q, ok := q.(*ent.EgressRouteQuery); ok {
+		return f(ctx, q)
+	}
+	return nil, fmt.Errorf("unexpected query type %T. expect *ent.EgressRouteQuery", q)
+}
+
+// The TraverseEgressRoute type is an adapter to allow the use of ordinary function as Traverser.
+type TraverseEgressRoute func(context.Context, *ent.EgressRouteQuery) error
+
+// Intercept is a dummy implementation of Intercept that returns the next Querier in the pipeline.
+func (f TraverseEgressRoute) Intercept(next ent.Querier) ent.Querier {
+	return next
+}
+
+// Traverse calls f(ctx, q).
+func (f TraverseEgressRoute) Traverse(ctx context.Context, q ent.Query) error {
+	if q, ok := q.(*ent.EgressRouteQuery); ok {
+		return f(ctx, q)
+	}
+	return fmt.Errorf("unexpected query type %T. expect *ent.EgressRouteQuery", q)
 }
 
 // The ErrorPassthroughRuleFunc type is an adapter to allow the use of ordinary function as a Querier.
@@ -1166,6 +1250,8 @@ func NewQuery(q ent.Query) (Query, error) {
 		return &query[*ent.APIKeyQuery, predicate.APIKey, apikey.OrderOption]{typ: ent.TypeAPIKey, tq: q}, nil
 	case *ent.AccountQuery:
 		return &query[*ent.AccountQuery, predicate.Account, account.OrderOption]{typ: ent.TypeAccount, tq: q}, nil
+	case *ent.AccountEgressBindingQuery:
+		return &query[*ent.AccountEgressBindingQuery, predicate.AccountEgressBinding, accountegressbinding.OrderOption]{typ: ent.TypeAccountEgressBinding, tq: q}, nil
 	case *ent.AccountGroupQuery:
 		return &query[*ent.AccountGroupQuery, predicate.AccountGroup, accountgroup.OrderOption]{typ: ent.TypeAccountGroup, tq: q}, nil
 	case *ent.AnnouncementQuery:
@@ -1192,6 +1278,10 @@ func NewQuery(q ent.Query) (Query, error) {
 		return &query[*ent.ChannelMonitorRequestTemplateQuery, predicate.ChannelMonitorRequestTemplate, channelmonitorrequesttemplate.OrderOption]{typ: ent.TypeChannelMonitorRequestTemplate, tq: q}, nil
 	case *ent.CompositeModelRouteQuery:
 		return &query[*ent.CompositeModelRouteQuery, predicate.CompositeModelRoute, compositemodelroute.OrderOption]{typ: ent.TypeCompositeModelRoute, tq: q}, nil
+	case *ent.EgressIdentityQuery:
+		return &query[*ent.EgressIdentityQuery, predicate.EgressIdentity, egressidentity.OrderOption]{typ: ent.TypeEgressIdentity, tq: q}, nil
+	case *ent.EgressRouteQuery:
+		return &query[*ent.EgressRouteQuery, predicate.EgressRoute, egressroute.OrderOption]{typ: ent.TypeEgressRoute, tq: q}, nil
 	case *ent.ErrorPassthroughRuleQuery:
 		return &query[*ent.ErrorPassthroughRuleQuery, predicate.ErrorPassthroughRule, errorpassthroughrule.OrderOption]{typ: ent.TypeErrorPassthroughRule, tq: q}, nil
 	case *ent.GroupQuery:

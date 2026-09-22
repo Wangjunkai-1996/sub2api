@@ -900,6 +900,12 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	credentialAccount.ApplyHeaderOverrides(req.Header)
+	if isOAuth && s.openaiGatewayService != nil {
+		if err := s.openaiGatewayService.applyOpenAICodexTicket(ctx, account, upstreamTestModelID, req.Header); err != nil {
+			ticketConfig := s.openaiGatewayService.openAICodexTicketConfigContext(ctx)
+			return s.sendErrorAndEnd(c, fmt.Sprintf("未打到 %d 门票，该模型已暂停，请等待后台打票成功后重试", ticketConfig.TargetLength))
+		}
+	}
 
 	// Get proxy URL
 	proxyURL := ""

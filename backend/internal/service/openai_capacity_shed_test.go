@@ -125,12 +125,22 @@ func TestOpenAIStreamErrorFrameDoesNotStartClientOutput(t *testing.T) {
 		{`{"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}`, "response.failed", false},
 		{`{"type":"response.created","response":{"id":"resp_1"}}`, "response.created", false},
 		{`{"type":"response.in_progress","response":{"id":"resp_1"}}`, "response.in_progress", false},
+		{`{"type":"codex.rate_limits","rate_limits":{}}`, "codex.rate_limits", false},
 		{`{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`, "response.output_item.added", false},
 		{`{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"ciphertext"}}`, "response.output_item.added", true},
 		{`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`, "response.reasoning_summary_part.added", false},
 		{`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":"thinking"}}`, "response.reasoning_summary_part.added", true},
 		{`{"type":"response.content_part.added","part":{"type":"output_text","text":""}}`, "response.content_part.added", false},
 		{`{"type":"response.output_text.delta","delta":"hi"}`, "response.output_text.delta", true},
+		{`{"type":"response.output_text.delta","delta":""}`, "response.output_text.delta", false},
+		{`{"type":"response.function_call_arguments.delta","delta":""}`, "response.function_call_arguments.delta", false},
+		{`{"type":"response.custom_tool_call_input.delta","delta":""}`, "response.custom_tool_call_input.delta", false},
+		{`{"type":"response.output_text.done","text":""}`, "response.output_text.done", false},
+		{`{"type":"response.function_call_arguments.done","arguments":"{}"}`, "response.function_call_arguments.done", true},
+		{`{"type":"response.output_item.done","item":{"type":"reasoning","summary":[]}}`, "response.output_item.done", false},
+		{`{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"ciphertext"}}`, "response.output_item.done", true},
+		{`{"type":"response.content_part.done","part":{"type":"output_text","text":""}}`, "response.content_part.done", false},
+		{`{"type":"response.content_part.done","part":{"type":"refusal","refusal":"blocked"}}`, "response.content_part.done", true},
 		{`[DONE]`, "", true},
 	}
 	for _, tc := range cases {
@@ -145,11 +155,17 @@ func TestOpenAIStreamMetadataPreambleAndMessageOnlyOverloadFailOver(t *testing.T
 		"event: response.created",
 		`data: {"type":"response.created","response":{"id":"resp_1","metadata":{"padding":"` + largeMetadata + `"}}}`,
 		"",
+		"event: codex.rate_limits",
+		`data: {"type":"codex.rate_limits","rate_limits":{}}`,
+		"",
 		"event: response.output_item.added",
 		`data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
 		"",
 		"event: response.reasoning_summary_part.added",
 		`data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
+		"",
+		"event: response.output_text.delta",
+		`data: {"type":"response.output_text.delta","delta":""}`,
 		"",
 		"event: error",
 		`data: {"type":"error","error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later."}}`,
@@ -241,8 +257,58 @@ func TestOpenAIStreamCapacityShedErrorFramePrecedingFailedStillFailsOver(t *test
 	require.ErrorAs(t, err, &failoverErr)
 	require.True(t, failoverErr.RetryableOnSameAccount)
 	require.True(t, failoverErr.RequestScopedTransient)
+	require.False(t, failoverErr.SafeToFailoverAfterWrite, "an unwritten default-timeout response must retain normal multi-account failover")
 	require.False(t, c.Writer.Written())
 	require.Empty(t, rec.Body.String())
+}
+
+// A large response.created event must remain attempt-private even when the
+// first-output timeout is disabled. Otherwise bufio's small transport buffer
+// can commit the preamble before response.failed arrives and suppress failover.
+func TestOpenAIStreamCapacityShedAfterLargePreambleStillFailsOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			OpenAIFirstOutputTimeoutSeconds: 0,
+			MaxLineSize:                     defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	largePreamble := strings.Repeat("p", 8*1024)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			"event: response.created",
+			`data: {"type":"response.created","response":{"id":"resp_large","instructions":"` + largePreamble + `"},"sequence_number":0}`,
+			"",
+			"event: error",
+			`data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."},"sequence_number":1}`,
+			"",
+			"event: response.failed",
+			`data: {"type":"response.failed","response":{"id":"resp_large","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}},"sequence_number":2}`,
+			"",
+		}, "\n"))),
+		Header: http.Header{
+			"X-Request-Id":                   []string{"rid-shed-large-preamble"},
+			"X-Ratelimit-Remaining-Requests": []string{"7"},
+		},
+	}
+
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Name: "acc"}, time.Now(), "model", "model")
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.True(t, failoverErr.RetryableOnSameAccount)
+	require.True(t, failoverErr.RequestScopedTransient)
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String())
+	require.Empty(t, rec.Header().Values("X-Request-Id"))
+	require.Empty(t, rec.Header().Values("X-Ratelimit-Remaining-Requests"))
 }
 
 // 流中途（已有真实输出）降载时无法再 failover，此时必须把降载码改写为客户端

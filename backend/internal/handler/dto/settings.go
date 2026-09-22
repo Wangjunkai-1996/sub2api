@@ -202,21 +202,25 @@ type SystemSettings struct {
 	BackendModeEnabled bool `json:"backend_mode_enabled"`
 
 	// Gateway forwarding behavior
-	OpenAITTFTMode                         string `json:"openai_ttft_mode"`
-	EnableFingerprintUnification           bool   `json:"enable_fingerprint_unification"`
-	EnableMetadataPassthrough              bool   `json:"enable_metadata_passthrough"`
-	EnableCCHSigning                       bool   `json:"enable_cch_signing"`
-	EnableClaudeOAuthSystemPromptInjection bool   `json:"enable_claude_oauth_system_prompt_injection"`
-	ClaudeOAuthSystemPrompt                string `json:"claude_oauth_system_prompt"`
-	ClaudeOAuthSystemPromptBlocks          string `json:"claude_oauth_system_prompt_blocks"`
-	EnableAnthropicCacheTTL1hInjection     bool   `json:"enable_anthropic_cache_ttl_1h_injection"`
-	RewriteMessageCacheControl             bool   `json:"rewrite_message_cache_control"`
-	EnableClientDatelineNormalization      bool   `json:"enable_client_dateline_normalization"`
-	AntigravityUserAgentVersion            string `json:"antigravity_user_agent_version"`
-	OpenAICodexUserAgent                   string `json:"openai_codex_user_agent"`
-	OpenAICodexClientVersion               string `json:"openai_codex_client_version"`
-	OpenAICodexClientVersionSynced         string `json:"openai_codex_client_version_synced"`
-	OpenAICodexVersionAutoSyncEnabled      bool   `json:"openai_codex_version_auto_sync_enabled"`
+	OpenAITTFTMode                          string `json:"openai_ttft_mode"`
+	EnableFingerprintUnification            bool   `json:"enable_fingerprint_unification"`
+	EnableMetadataPassthrough               bool   `json:"enable_metadata_passthrough"`
+	EnableCCHSigning                        bool   `json:"enable_cch_signing"`
+	EnableClaudeOAuthSystemPromptInjection  bool   `json:"enable_claude_oauth_system_prompt_injection"`
+	ClaudeOAuthSystemPrompt                 string `json:"claude_oauth_system_prompt"`
+	ClaudeOAuthSystemPromptBlocks           string `json:"claude_oauth_system_prompt_blocks"`
+	EnableAnthropicCacheTTL1hInjection      bool   `json:"enable_anthropic_cache_ttl_1h_injection"`
+	RewriteMessageCacheControl              bool   `json:"rewrite_message_cache_control"`
+	EnableClientDatelineNormalization       bool   `json:"enable_client_dateline_normalization"`
+	AntigravityUserAgentVersion             string `json:"antigravity_user_agent_version"`
+	OpenAICodexUserAgent                    string `json:"openai_codex_user_agent"`
+	OpenAICodexClientVersion                string `json:"openai_codex_client_version"`
+	OpenAICodexClientVersionSynced          string `json:"openai_codex_client_version_synced"`
+	OpenAICodexVersionAutoSyncEnabled       bool   `json:"openai_codex_version_auto_sync_enabled"`
+	OpenAICodexTicketEnabled                bool   `json:"openai_codex_ticket_enabled"`
+	OpenAICodexTicket332Enabled             bool   `json:"openai_codex_ticket_332_enabled"`
+	OpenAICodexTicketHarvestProxyURL        string `json:"openai_codex_ticket_harvest_proxy_url"`
+	OpenAICodexTicketHarvestProxyConfigured bool   `json:"openai_codex_ticket_harvest_proxy_configured"`
 
 	// codex_cli_only 加固
 	MinCodexVersion                      string `json:"min_codex_version"`
@@ -225,6 +229,18 @@ type SystemSettings struct {
 	CodexCLIOnlyWhitelist                string `json:"codex_cli_only_whitelist"`
 	CodexCLIOnlyAllowAppServerClients    bool   `json:"codex_cli_only_allow_app_server_clients"`
 	CodexCLIOnlyEngineFingerprintSignals string `json:"codex_cli_only_engine_fingerprint_signals"`
+
+	OpenAIWindowWarmupEnabled               bool    `json:"openai_window_warmup_enabled"`
+	OpenAIWindowWarmupDefaultPolicy         string  `json:"openai_window_warmup_default_policy"`
+	OpenAIWindowWarmupAllowlist             []int64 `json:"openai_window_warmup_allowlist"`
+	OpenAIWindowWarmupProbeModel            string  `json:"openai_window_warmup_probe_model"`
+	OpenAIWindowWarmupWorkerConcurrency     int     `json:"openai_window_warmup_worker_concurrency"`
+	OpenAIWindowWarmupGlobalQPS             float64 `json:"openai_window_warmup_global_qps"`
+	OpenAIWindowWarmupBatchSize             int     `json:"openai_window_warmup_batch_size"`
+	OpenAIWindowWarmupScanSeconds           int     `json:"openai_window_warmup_scan_seconds"`
+	OpenAIWindowWarmupRequestTimeoutSeconds int     `json:"openai_window_warmup_request_timeout_seconds"`
+	OpenAIWindowWarmupLeaseSeconds          int     `json:"openai_window_warmup_lease_seconds"`
+	OpenAIWindowWarmupResetGraceSeconds     int     `json:"openai_window_warmup_reset_grace_seconds"`
 
 	// Web Search Emulation
 	WebSearchEmulationEnabled bool `json:"web_search_emulation_enabled"`
@@ -331,9 +347,11 @@ type SystemSettings struct {
 	// 风控中心功能开关
 	RiskControlEnabled bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    bool `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds int  `json:"cyber_session_block_ttl_seconds"`
+	OpenAICyberAccountCooldownEnabled          bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         []int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// Affiliate (邀请返利) feature switch
 	AffiliateEnabled bool `json:"affiliate_enabled"`

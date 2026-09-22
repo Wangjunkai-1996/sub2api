@@ -24,31 +24,71 @@ import (
 )
 
 func TestHTTPUpstreamDoCanDisableRedirectsPerRequest(t *testing.T) {
-	var redirectedCalls atomic.Int64
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		redirectedCalls.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(target.Close)
-	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL, http.StatusFound)
-	}))
-	t.Cleanup(redirector.Close)
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var redirectedCalls atomic.Int64
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				redirectedCalls.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(target.Close)
+			redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL, status)
+			}))
+			t.Cleanup(redirector.Close)
 
-	upstream := NewHTTPUpstream(nil)
-	req, err := http.NewRequestWithContext(
-		service.WithHTTPUpstreamRedirectsDisabled(t.Context()),
-		http.MethodGet,
-		redirector.URL,
-		nil,
-	)
+			upstream := NewHTTPUpstream(nil)
+			req, err := http.NewRequestWithContext(
+				service.WithHTTPUpstreamRedirectsDisabled(t.Context()),
+				http.MethodPost,
+				redirector.URL,
+				strings.NewReader(`{"model":"gpt-5","input":"test"}`),
+			)
+			require.NoError(t, err)
+
+			resp, err := upstream.Do(req, "", 1, 1)
+			require.NoError(t, err)
+			require.Equal(t, status, resp.StatusCode)
+			require.NoError(t, resp.Body.Close())
+			require.Zero(t, redirectedCalls.Load())
+		})
+	}
+}
+
+func TestHTTPUpstreamMarksSetupFailuresAsNotSent(t *testing.T) {
+	client := NewHTTPUpstream(nil)
+	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
 	require.NoError(t, err)
 
-	resp, err := upstream.Do(req, "", 1, 1)
+	_, err = client.Do(req, "http://[invalid-proxy", 1, 1)
+
+	require.Error(t, err)
+	require.True(t, service.IsHTTPUpstreamRequestNotSent(err))
+}
+
+func TestHTTPUpstreamPoolRouteUsesBindingIsolationKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	upstream := NewHTTPUpstream(nil).(*httpUpstreamService)
+	ctx := service.WithHTTPUpstreamEgress(t.Context(), service.HTTPUpstreamEgress{
+		BindingID:    "44:9",
+		RouteID:      9,
+		IdentityID:   "17",
+		PoolRevision: 3,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
 	require.NoError(t, err)
-	require.Equal(t, http.StatusFound, resp.StatusCode)
+	resp, err := upstream.Do(req, "", 44, 4)
+	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	require.Zero(t, redirectedCalls.Load())
+
+	upstream.mu.RLock()
+	_, exists := upstream.clients["account:44|egress:44:9"]
+	upstream.mu.RUnlock()
+	require.True(t, exists)
 }
 
 func TestHTTPUpstreamDoWithTLSPlainHTTPUsesConfiguredHTTPProxy(t *testing.T) {
@@ -690,6 +730,18 @@ func (s *HTTPUpstreamSuite) TestOpenAIProfileHTTP2DisabledUsesHTTP1Transport() {
 	require.False(s.T(), transport.ForceAttemptHTTP2, "OpenAI HTTP/2 disabled should not force H2")
 	require.NotNil(s.T(), transport.TLSNextProto, "HTTP/1 mode should disable automatic H2 negotiation")
 	require.Equal(s.T(), upstreamProtocolModeOpenAIH1, entry.protocolMode)
+}
+
+func (s *HTTPUpstreamSuite) TestOpenAIHarvestProfileDisablesKeepAlives() {
+	svc := s.newService()
+	entry, err := svc.getClientEntry("socks5h://user:pass@harvest.example:31", 41, 5, service.HTTPUpstreamProfileOpenAIHarvest, false, false)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), upstreamProtocolModeOpenAIH1NoReuse, entry.protocolMode)
+	transport, ok := entry.client.Transport.(*http.Transport)
+	require.True(s.T(), ok, "expected *http.Transport")
+	require.True(s.T(), transport.DisableKeepAlives)
+	require.False(s.T(), transport.ForceAttemptHTTP2)
+	require.Equal(s.T(), 0, transport.MaxIdleConns)
 }
 
 func (s *HTTPUpstreamSuite) TestOpenAIHeaderTimeoutChangeRebuildsClient() {

@@ -103,6 +103,39 @@ func (r *refreshAPIAccountRepo) UpdateGrokOAuthCredentialsIfUnchanged(
 	return true, nil
 }
 
+func (r *refreshAPIAccountRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	_ context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	r.successCASCalls++
+	r.lastExpectedCredentials = shallowCopyMap(expectedCredentials)
+	if expectedProxyID != nil {
+		proxyID := *expectedProxyID
+		r.lastExpectedProxyID = &proxyID
+	} else {
+		r.lastExpectedProxyID = nil
+	}
+	if r.beforeSuccessCAS != nil {
+		r.beforeSuccessCAS(r)
+	}
+	if r.updateErr != nil {
+		return false, r.updateErr
+	}
+	if r.account == nil || r.account.ID != id || r.account.Platform != PlatformOpenAI ||
+		r.account.Type != AccountTypeOAuth ||
+		!reflect.DeepEqual(r.account.Credentials, expectedCredentials) ||
+		!reflect.DeepEqual(r.account.ProxyID, expectedProxyID) {
+		return false, nil
+	}
+	r.updateCalls++
+	r.updateCredentialsCalls++
+	r.account.Credentials = shallowCopyMap(credentials)
+	return true, nil
+}
+
 // refreshAPIExecutorStub implements OAuthRefreshExecutor for tests.
 type refreshAPIExecutorStub struct {
 	needsRefresh  bool
@@ -390,6 +423,123 @@ func TestRefreshIfNeeded_GrokSuccessCASLetsConcurrentReauthorizationWin(t *testi
 	require.NotNil(t, repo.lastExpectedProxyID)
 	require.Equal(t, proxyID, *repo.lastExpectedProxyID)
 	require.Zero(t, repo.updateCredentialsCalls, "the provider result must not overwrite a concurrent repair")
+}
+
+func TestRefreshIfNeeded_OpenAISuccessCASLetsConcurrentReauthorizationWin(t *testing.T) {
+	proxyID := int64(31)
+	account := &Account{
+		ID:       73,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		ProxyID:  &proxyID,
+		Credentials: map[string]any{
+			"access_token":       "attempted-access",
+			"refresh_token":      "attempted-refresh",
+			"chatgpt_account_id": "attempted-account",
+			"_token_version":     int64(1),
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+	repo.beforeSuccessCAS = func(r *refreshAPIAccountRepo) {
+		reauthorizedProxyID := int64(37)
+		r.account.ProxyID = &reauthorizedProxyID
+		r.account.Credentials = map[string]any{
+			"access_token":       "reauthorized-access",
+			"refresh_token":      "reauthorized-refresh",
+			"chatgpt_account_id": "reauthorized-account",
+			"_token_version":     int64(2),
+		}
+	}
+	executor := &refreshAPIExecutorStub{
+		needsRefresh: true,
+		credentials: map[string]any{
+			"access_token":       "provider-access",
+			"refresh_token":      "provider-refresh",
+			"chatgpt_account_id": "attempted-account",
+		},
+	}
+
+	result, err := NewOAuthRefreshAPI(repo, nil).RefreshIfNeeded(context.Background(), account, executor, time.Hour)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.Refreshed, "a lost success CAS is an already-refreshed skip")
+	require.Nil(t, result.NewCredentials)
+	require.Equal(t, "reauthorized-refresh", result.Account.GetOpenAIRefreshToken())
+	require.Equal(t, "reauthorized-account", result.Account.GetCredential("chatgpt_account_id"))
+	require.NotNil(t, result.Account.ProxyID)
+	require.Equal(t, int64(37), *result.Account.ProxyID)
+	require.Equal(t, 1, repo.successCASCalls)
+	require.Equal(t, "attempted-refresh", repo.lastExpectedCredentials["refresh_token"])
+	require.NotNil(t, repo.lastExpectedProxyID)
+	require.Equal(t, proxyID, *repo.lastExpectedProxyID)
+	require.Zero(t, repo.updateCredentialsCalls, "the provider result must not overwrite a concurrent reauthorization")
+}
+
+func TestRefreshIfNeeded_OpenAISuccessCASMergesConcurrentNonAuthChanges(t *testing.T) {
+	proxyID := int64(41)
+	account := &Account{
+		ID:       74,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		ProxyID:  &proxyID,
+		Credentials: map[string]any{
+			"access_token":       "attempted-access",
+			"refresh_token":      "attempted-refresh",
+			"chatgpt_account_id": "stable-account",
+			"routing_hint":       "before-refresh",
+			"_token_version":     int64(1),
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+	var firstExpectedCredentials map[string]any
+	var firstExpectedProxyID *int64
+	repo.beforeSuccessCAS = func(r *refreshAPIAccountRepo) {
+		if r.successCASCalls != 1 {
+			return
+		}
+		firstExpectedCredentials = shallowCopyMap(r.lastExpectedCredentials)
+		if r.lastExpectedProxyID != nil {
+			value := *r.lastExpectedProxyID
+			firstExpectedProxyID = &value
+		}
+		concurrentProxyID := int64(43)
+		r.account.ProxyID = &concurrentProxyID
+		credentials := shallowCopyMap(r.account.Credentials)
+		credentials["routing_hint"] = "changed-concurrently"
+		r.account.Credentials = credentials
+	}
+	executor := &refreshAPIExecutorStub{
+		needsRefresh: true,
+		credentials: map[string]any{
+			"access_token":       "provider-access",
+			"refresh_token":      "provider-refresh",
+			"chatgpt_account_id": "stable-account",
+		},
+	}
+
+	result, err := NewOAuthRefreshAPI(repo, nil).RefreshIfNeeded(context.Background(), account, executor, time.Hour)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Refreshed)
+	require.Equal(t, 2, repo.successCASCalls, "the first miss must be retried against the current non-auth configuration")
+	require.Equal(t, 1, repo.updateCredentialsCalls)
+	require.Equal(t, "attempted-refresh", firstExpectedCredentials["refresh_token"])
+	require.NotNil(t, firstExpectedProxyID)
+	require.Equal(t, proxyID, *firstExpectedProxyID)
+	require.Equal(t, "changed-concurrently", repo.lastExpectedCredentials["routing_hint"])
+	require.NotNil(t, repo.lastExpectedProxyID)
+	require.Equal(t, int64(43), *repo.lastExpectedProxyID)
+	require.Equal(t, "provider-access", repo.account.GetOpenAIAccessToken())
+	require.Equal(t, "provider-refresh", repo.account.GetOpenAIRefreshToken())
+	require.Equal(t, "stable-account", repo.account.GetCredential("chatgpt_account_id"))
+	require.Equal(t, "changed-concurrently", repo.account.GetCredential("routing_hint"))
+	require.NotNil(t, repo.account.ProxyID)
+	require.Equal(t, int64(43), *repo.account.ProxyID)
+	require.Positive(t, repo.account.GetCredentialAsInt64("_token_version"))
 }
 
 func TestRefreshIfNeeded_GrokSuccessPersistenceFailureIsProviderContainment(t *testing.T) {

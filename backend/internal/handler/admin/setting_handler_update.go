@@ -257,6 +257,9 @@ type UpdateSettingsRequest struct {
 	OpenAICodexUserAgent                   *string `json:"openai_codex_user_agent"`
 	OpenAICodexClientVersion               *string `json:"openai_codex_client_version"`
 	OpenAICodexVersionAutoSyncEnabled      *bool   `json:"openai_codex_version_auto_sync_enabled"`
+	OpenAICodexTicketEnabled               *bool   `json:"openai_codex_ticket_enabled"`
+	OpenAICodexTicket332Enabled            *bool   `json:"openai_codex_ticket_332_enabled"`
+	OpenAICodexTicketHarvestProxyURL       string  `json:"openai_codex_ticket_harvest_proxy_url"`
 
 	// codex_cli_only 加固（global-only）
 	MinCodexVersion                      string `json:"min_codex_version"`
@@ -265,6 +268,18 @@ type UpdateSettingsRequest struct {
 	CodexCLIOnlyWhitelist                string `json:"codex_cli_only_whitelist"`
 	CodexCLIOnlyAllowAppServerClients    *bool  `json:"codex_cli_only_allow_app_server_clients"`
 	CodexCLIOnlyEngineFingerprintSignals string `json:"codex_cli_only_engine_fingerprint_signals"`
+
+	OpenAIWindowWarmupEnabled               *bool    `json:"openai_window_warmup_enabled"`
+	OpenAIWindowWarmupDefaultPolicy         *string  `json:"openai_window_warmup_default_policy"`
+	OpenAIWindowWarmupAllowlist             *[]int64 `json:"openai_window_warmup_allowlist"`
+	OpenAIWindowWarmupProbeModel            *string  `json:"openai_window_warmup_probe_model"`
+	OpenAIWindowWarmupWorkerConcurrency     *int     `json:"openai_window_warmup_worker_concurrency"`
+	OpenAIWindowWarmupGlobalQPS             *float64 `json:"openai_window_warmup_global_qps"`
+	OpenAIWindowWarmupBatchSize             *int     `json:"openai_window_warmup_batch_size"`
+	OpenAIWindowWarmupScanSeconds           *int     `json:"openai_window_warmup_scan_seconds"`
+	OpenAIWindowWarmupRequestTimeoutSeconds *int     `json:"openai_window_warmup_request_timeout_seconds"`
+	OpenAIWindowWarmupLeaseSeconds          *int     `json:"openai_window_warmup_lease_seconds"`
+	OpenAIWindowWarmupResetGraceSeconds     *int     `json:"openai_window_warmup_reset_grace_seconds"`
 
 	// Payment visible method routing
 	PaymentVisibleMethodAlipaySource  *string `json:"payment_visible_method_alipay_source"`
@@ -361,9 +376,11 @@ type UpdateSettingsRequest struct {
 	// 风控中心功能开关
 	RiskControlEnabled *bool `json:"risk_control_enabled"`
 
-	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    *bool `json:"cyber_session_block_enabled"`
-	CyberSessionBlockTTLSeconds *int  `json:"cyber_session_block_ttl_seconds"`
+	OpenAICyberAccountCooldownEnabled          *bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    *int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     *int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds *int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         *[]int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// OpenAI fast/flex policy (optional, only updated when provided)
 	OpenAIFastPolicySettings *dto.OpenAIFastPolicySettings `json:"openai_fast_policy_settings,omitempty"`
@@ -1492,12 +1509,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
-	// cyber 会话屏蔽 TTL 校验：提供时必须 > 0
-	if req.CyberSessionBlockTTLSeconds != nil && *req.CyberSessionBlockTTLSeconds <= 0 {
-		response.BadRequest(c, "cyber_session_block_ttl_seconds must be > 0")
-		return
-	}
-
 	settings := &service.SystemSettings{
 		// 系统全局 platform quota 默认值（整体替换语义）
 		DefaultPlatformQuotas:       req.DefaultPlatformQuotas,
@@ -1768,6 +1779,25 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAICodexVersionAutoSyncEnabled
 		}(),
+		OpenAICodexTicketEnabled: func() bool {
+			if req.OpenAICodexTicketEnabled != nil {
+				return *req.OpenAICodexTicketEnabled
+			}
+			return previousSettings.OpenAICodexTicketEnabled
+		}(),
+		OpenAICodexTicket332Enabled: func() bool {
+			if req.OpenAICodexTicket332Enabled != nil {
+				return *req.OpenAICodexTicket332Enabled
+			}
+			return previousSettings.OpenAICodexTicket332Enabled
+		}(),
+		OpenAICodexTicketHarvestProxyURL: func() string {
+			next := strings.TrimSpace(req.OpenAICodexTicketHarvestProxyURL)
+			if service.IsMaskedProxyURL(next) {
+				return previousSettings.OpenAICodexTicketHarvestProxyURL
+			}
+			return next
+		}(),
 		MinCodexVersion:       strings.TrimSpace(req.MinCodexVersion),
 		MaxCodexVersion:       strings.TrimSpace(req.MaxCodexVersion),
 		CodexCLIOnlyBlacklist: strings.TrimSpace(req.CodexCLIOnlyBlacklist),
@@ -1779,6 +1809,54 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			return previousSettings.CodexCLIOnlyAllowAppServerClients
 		}(),
 		CodexCLIOnlyEngineFingerprintSignals: strings.TrimSpace(req.CodexCLIOnlyEngineFingerprintSignals),
+		OpenAIWindowWarmupEnabled: func() bool {
+			if req.OpenAIWindowWarmupEnabled != nil {
+				return *req.OpenAIWindowWarmupEnabled
+			}
+			return previousSettings.OpenAIWindowWarmupEnabled
+		}(),
+		OpenAIWindowWarmupDefaultPolicy: stringSetting(
+			req.OpenAIWindowWarmupDefaultPolicy,
+			previousSettings.OpenAIWindowWarmupDefaultPolicy,
+		),
+		OpenAIWindowWarmupAllowlist: func() []int64 {
+			if req.OpenAIWindowWarmupAllowlist != nil {
+				return append([]int64(nil), (*req.OpenAIWindowWarmupAllowlist)...)
+			}
+			return append([]int64(nil), previousSettings.OpenAIWindowWarmupAllowlist...)
+		}(),
+		OpenAIWindowWarmupProbeModel: stringSetting(
+			req.OpenAIWindowWarmupProbeModel,
+			previousSettings.OpenAIWindowWarmupProbeModel,
+		),
+		OpenAIWindowWarmupWorkerConcurrency: intValueOrDefault(
+			req.OpenAIWindowWarmupWorkerConcurrency,
+			previousSettings.OpenAIWindowWarmupWorkerConcurrency,
+		),
+		OpenAIWindowWarmupGlobalQPS: float64ValueOrDefault(
+			req.OpenAIWindowWarmupGlobalQPS,
+			previousSettings.OpenAIWindowWarmupGlobalQPS,
+		),
+		OpenAIWindowWarmupBatchSize: intValueOrDefault(
+			req.OpenAIWindowWarmupBatchSize,
+			previousSettings.OpenAIWindowWarmupBatchSize,
+		),
+		OpenAIWindowWarmupScanSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupScanSeconds,
+			previousSettings.OpenAIWindowWarmupScanSeconds,
+		),
+		OpenAIWindowWarmupRequestTimeoutSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupRequestTimeoutSeconds,
+			previousSettings.OpenAIWindowWarmupRequestTimeoutSeconds,
+		),
+		OpenAIWindowWarmupLeaseSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupLeaseSeconds,
+			previousSettings.OpenAIWindowWarmupLeaseSeconds,
+		),
+		OpenAIWindowWarmupResetGraceSeconds: intValueOrDefault(
+			req.OpenAIWindowWarmupResetGraceSeconds,
+			previousSettings.OpenAIWindowWarmupResetGraceSeconds,
+		),
 		PaymentVisibleMethodAlipaySource: func() string {
 			if req.PaymentVisibleMethodAlipaySource != nil {
 				return strings.TrimSpace(*req.PaymentVisibleMethodAlipaySource)
@@ -1982,17 +2060,29 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.RiskControlEnabled
 		}(),
-		CyberSessionBlockEnabled: func() bool {
-			if req.CyberSessionBlockEnabled != nil {
-				return *req.CyberSessionBlockEnabled
+		OpenAICyberAccountCooldownEnabled: func() bool {
+			if req.OpenAICyberAccountCooldownEnabled != nil {
+				return *req.OpenAICyberAccountCooldownEnabled
 			}
-			return previousSettings.CyberSessionBlockEnabled
+			return previousSettings.OpenAICyberAccountCooldownEnabled
 		}(),
-		CyberSessionBlockTTLSeconds: func() int {
-			if req.CyberSessionBlockTTLSeconds != nil {
-				return *req.CyberSessionBlockTTLSeconds
+		OpenAICyberAccountCooldownWindowSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownWindowSeconds,
+			previousSettings.OpenAICyberAccountCooldownWindowSeconds,
+		),
+		OpenAICyberAccountCooldownFirstSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownFirstSeconds,
+			previousSettings.OpenAICyberAccountCooldownFirstSeconds,
+		),
+		OpenAICyberAccountCooldownEscalatedSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownEscalatedSeconds,
+			previousSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		),
+		OpenAICyberAccountCooldownGroupIDs: func() []int64 {
+			if req.OpenAICyberAccountCooldownGroupIDs != nil {
+				return append([]int64(nil), (*req.OpenAICyberAccountCooldownGroupIDs)...)
 			}
-			return previousSettings.CyberSessionBlockTTLSeconds
+			return append([]int64(nil), previousSettings.OpenAICyberAccountCooldownGroupIDs...)
 		}(),
 	}
 
@@ -2310,12 +2400,27 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAICodexClientVersion:                               updatedSettings.OpenAICodexClientVersion,
 		OpenAICodexClientVersionSynced:                         updatedSettings.OpenAICodexClientVersionSynced,
 		OpenAICodexVersionAutoSyncEnabled:                      updatedSettings.OpenAICodexVersionAutoSyncEnabled,
+		OpenAICodexTicketEnabled:                               updatedSettings.OpenAICodexTicketEnabled,
+		OpenAICodexTicket332Enabled:                            updatedSettings.OpenAICodexTicket332Enabled,
+		OpenAICodexTicketHarvestProxyURL:                       service.MaskProxyURL(updatedSettings.OpenAICodexTicketHarvestProxyURL),
+		OpenAICodexTicketHarvestProxyConfigured:                strings.TrimSpace(updatedSettings.OpenAICodexTicketHarvestProxyURL) != "",
 		MinCodexVersion:                                        updatedSettings.MinCodexVersion,
 		MaxCodexVersion:                                        updatedSettings.MaxCodexVersion,
 		CodexCLIOnlyBlacklist:                                  updatedSettings.CodexCLIOnlyBlacklist,
 		CodexCLIOnlyWhitelist:                                  updatedSettings.CodexCLIOnlyWhitelist,
 		CodexCLIOnlyAllowAppServerClients:                      updatedSettings.CodexCLIOnlyAllowAppServerClients,
 		CodexCLIOnlyEngineFingerprintSignals:                   updatedSettings.CodexCLIOnlyEngineFingerprintSignals,
+		OpenAIWindowWarmupEnabled:                              updatedSettings.OpenAIWindowWarmupEnabled,
+		OpenAIWindowWarmupDefaultPolicy:                        updatedSettings.OpenAIWindowWarmupDefaultPolicy,
+		OpenAIWindowWarmupAllowlist:                            updatedSettings.OpenAIWindowWarmupAllowlist,
+		OpenAIWindowWarmupProbeModel:                           updatedSettings.OpenAIWindowWarmupProbeModel,
+		OpenAIWindowWarmupWorkerConcurrency:                    updatedSettings.OpenAIWindowWarmupWorkerConcurrency,
+		OpenAIWindowWarmupGlobalQPS:                            updatedSettings.OpenAIWindowWarmupGlobalQPS,
+		OpenAIWindowWarmupBatchSize:                            updatedSettings.OpenAIWindowWarmupBatchSize,
+		OpenAIWindowWarmupScanSeconds:                          updatedSettings.OpenAIWindowWarmupScanSeconds,
+		OpenAIWindowWarmupRequestTimeoutSeconds:                updatedSettings.OpenAIWindowWarmupRequestTimeoutSeconds,
+		OpenAIWindowWarmupLeaseSeconds:                         updatedSettings.OpenAIWindowWarmupLeaseSeconds,
+		OpenAIWindowWarmupResetGraceSeconds:                    updatedSettings.OpenAIWindowWarmupResetGraceSeconds,
 		PaymentVisibleMethodAlipaySource:                       updatedSettings.PaymentVisibleMethodAlipaySource,
 		PaymentVisibleMethodWxpaySource:                        updatedSettings.PaymentVisibleMethodWxpaySource,
 		PaymentVisibleMethodAlipayEnabled:                      updatedSettings.PaymentVisibleMethodAlipayEnabled,
@@ -2398,11 +2503,14 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 
 		AffiliateEnabled: updatedSettings.AffiliateEnabled,
 
-		RiskControlEnabled:          updatedSettings.RiskControlEnabled,
-		CyberSessionBlockEnabled:    updatedSettings.CyberSessionBlockEnabled,
-		CyberSessionBlockTTLSeconds: updatedSettings.CyberSessionBlockTTLSeconds,
-		AccountSchedulingThresholds: updatedSettings.AccountSchedulingThresholds,
-		AllowUserViewErrorRequests:  updatedSettings.AllowUserViewErrorRequests,
+		RiskControlEnabled:                         updatedSettings.RiskControlEnabled,
+		OpenAICyberAccountCooldownEnabled:          updatedSettings.OpenAICyberAccountCooldownEnabled,
+		OpenAICyberAccountCooldownWindowSeconds:    updatedSettings.OpenAICyberAccountCooldownWindowSeconds,
+		OpenAICyberAccountCooldownFirstSeconds:     updatedSettings.OpenAICyberAccountCooldownFirstSeconds,
+		OpenAICyberAccountCooldownEscalatedSeconds: updatedSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		OpenAICyberAccountCooldownGroupIDs:         updatedSettings.OpenAICyberAccountCooldownGroupIDs,
+		AccountSchedulingThresholds:                updatedSettings.AccountSchedulingThresholds,
+		AllowUserViewErrorRequests:                 updatedSettings.AllowUserViewErrorRequests,
 	}
 	if fastPolicy, err := h.settingService.GetOpenAIFastPolicySettings(c.Request.Context()); err != nil {
 		slog.Error("openai_fast_policy_settings_get_failed", "error", err)

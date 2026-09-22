@@ -2,6 +2,7 @@
 package dto
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -153,6 +154,8 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 		ProfitControlEnabled:        g.ProfitControlEnabled,
 		ProfitMinMargin:             g.ProfitMinMargin,
 		ProfitSafetyBuffer:          g.ProfitSafetyBuffer,
+		SchedulerType:               g.SchedulerType,
+		AdvancedSchedulerOverrides:  g.AdvancedSchedulerOverrides.Clone(),
 		ModelPricing:                g.ModelPricing,
 		ModelRouting:                g.ModelRouting,
 		ModelRoutingEnabled:         g.ModelRoutingEnabled,
@@ -241,6 +244,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	if state := service.OllamaCloudUsageStateFromAccount(a); state.Eligible {
 		ollamaCloudUsage = state
 	}
+	egressMode, egressPool, egressSummary := AccountEgressViewsFromService(a)
 	out := &Account{
 		ID:                      a.ID,
 		Name:                    a.Name,
@@ -254,6 +258,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		ProxyID:                 a.ProxyID,
 		ProxyFallbackOriginID:   a.ProxyFallbackOriginID,
 		ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		EgressMode:              egressMode,
+		EgressRevision:          a.EgressRevision,
+		EgressPool:              egressPool,
+		EgressSummary:           egressSummary,
 		Concurrency:             a.Concurrency,
 		LoadFactor:              a.LoadFactor,
 		Priority:                a.Priority,
@@ -277,6 +285,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		GroupIDs:                a.GroupIDs,
 		ParentAccountID:         a.ParentAccountID,
 		QuotaDimension:          a.QuotaDimension,
+	}
+	if a.Platform == service.PlatformOpenAI && a.Type == service.AccountTypeOAuth && !a.IsShadow() &&
+		a.QuotaDimensionOrDefault() == service.QuotaDimensionGlobal {
+		out.OpenAICodexWarmupPolicy = string(service.OpenAIWindowWarmupPolicyForAccount(a))
 	}
 
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
@@ -414,10 +426,12 @@ func redactAccountManagedExtra(extra map[string]any) map[string]any {
 	}
 	redacted := make(map[string]any, len(extra))
 	for key, value := range extra {
-		switch key {
-		case service.OllamaCloudUsageSessionExtraKey,
-			service.OllamaCloudUsageAutoRefreshExtraKey,
-			service.OllamaCloudUsageSnapshotExtraKey:
+		switch {
+		case key == service.OllamaCloudUsageSessionExtraKey,
+			key == service.OllamaCloudUsageAutoRefreshExtraKey,
+			key == service.OllamaCloudUsageSnapshotExtraKey:
+			continue
+		case service.IsOpenAICodexTicketPrivateExtraKey(key):
 			continue
 		default:
 			redacted[key] = value
@@ -458,8 +472,9 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 	return &AccountListItem{
 		ID: a.ID, Name: a.Name, Notes: a.Notes, Platform: a.Platform, Type: a.Type,
 		Credentials: a.Credentials, CredentialsStatus: a.CredentialsStatus, Extra: a.Extra,
-		OllamaCloudUsage: a.OllamaCloudUsage,
-		ProxyID:          a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		OllamaCloudUsage: a.OllamaCloudUsage, CodexTurnTickets: a.CodexTurnTickets,
+		ProxyID: a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		EgressMode: a.EgressMode, EgressRevision: a.EgressRevision, EgressPool: a.EgressPool, EgressSummary: a.EgressSummary,
 		Concurrency: a.Concurrency, LoadFactor: a.LoadFactor, Priority: a.Priority, RateMultiplier: a.RateMultiplier,
 		Status: a.Status, ErrorMessage: a.ErrorMessage, LastUsedAt: a.LastUsedAt, ExpiresAt: a.ExpiresAt,
 		AutoPauseOnExpired: a.AutoPauseOnExpired, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
@@ -485,7 +500,8 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 		QuotaNotifyTotalThreshold: a.QuotaNotifyTotalThreshold, ParentAccountID: a.ParentAccountID,
 		QuotaDimension: a.QuotaDimension, ParentEmail: a.ParentEmail, ParentPlanType: a.ParentPlanType,
 		ParentPrivacyMode: a.ParentPrivacyMode, ParentSubscriptionExpiresAt: a.ParentSubscriptionExpiresAt,
-		ParentChatGPTAccountID: a.ParentChatGPTAccountID, Proxy: a.Proxy, GroupIDs: a.GroupIDs,
+		ParentChatGPTAccountID: a.ParentChatGPTAccountID, OpenAICodexWarmupPolicy: a.OpenAICodexWarmupPolicy,
+		Proxy: a.Proxy, GroupIDs: a.GroupIDs,
 	}
 }
 
@@ -552,6 +568,30 @@ func ProxyWithAccountCountFromService(p *service.ProxyWithAccountCount) *ProxyWi
 		QualityGrade:   p.QualityGrade,
 		QualitySummary: p.QualitySummary,
 		QualityChecked: p.QualityChecked,
+	}
+}
+
+func ProxyOptionFromService(p *service.ProxyWithAccountCount, now time.Time) *ProxyOption {
+	if p == nil {
+		return nil
+	}
+	status := p.Status
+	selectable := p.Status == service.StatusActive && !p.IsExpired(now)
+	disabledReason := ""
+	if p.IsExpired(now) {
+		status = "expired"
+		disabledReason = "proxy_expired"
+	} else if p.Status != service.StatusActive {
+		disabledReason = "proxy_inactive"
+	}
+	return &ProxyOption{
+		ID:              p.ID,
+		Name:            p.Name,
+		DisplayEndpoint: strings.ToLower(strings.TrimSpace(p.Protocol)) + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port)),
+		Status:          status,
+		Selectable:      selectable,
+		DisabledReason:  disabledReason,
+		AccountCount:    p.AccountCount,
 	}
 }
 

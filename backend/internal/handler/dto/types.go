@@ -174,10 +174,12 @@ type AdminGroup struct {
 	// 分组利润控制（五个 token 平台分组可启用；margin/buffer 为小数存储）。
 	// 仅管理员可见：这三个字段与同响应中的 rate_multiplier 相乘即可反推出
 	// 运营方的上游成本上限，属于内部经营信息，不得下放到 dto.Group。
-	ProfitControlEnabled bool                          `json:"profit_control_enabled"`
-	ProfitMinMargin      float64                       `json:"profit_min_margin"`
-	ProfitSafetyBuffer   float64                       `json:"profit_safety_buffer"`
-	ModelPricing         []service.ChannelModelPricing `json:"model_pricing"`
+	ProfitControlEnabled       bool                               `json:"profit_control_enabled"`
+	ProfitMinMargin            float64                            `json:"profit_min_margin"`
+	ProfitSafetyBuffer         float64                            `json:"profit_safety_buffer"`
+	SchedulerType              string                             `json:"scheduler_type"`
+	AdvancedSchedulerOverrides service.AdvancedSchedulerOverrides `json:"advanced_scheduler_overrides"`
+	ModelPricing               []service.ChannelModelPricing      `json:"model_pricing"`
 
 	// 模型路由配置（仅 anthropic 平台使用）
 	ModelRouting        map[string][]int64 `json:"model_routing"`
@@ -212,24 +214,29 @@ type Account struct {
 	Type     string  `json:"type"`
 	// Credentials 经 RedactCredentials 处理后只含非敏感子键；敏感 token / api_key / 私钥
 	// 的存在性通过 CredentialsStatus（has_<key>）暴露，原始值不返回前端。
-	Credentials             map[string]any                 `json:"credentials"`
-	CredentialsStatus       map[string]bool                `json:"credentials_status,omitempty"`
-	Extra                   map[string]any                 `json:"extra"`
-	OllamaCloudUsage        *service.OllamaCloudUsageState `json:"ollama_cloud_usage,omitempty"`
-	ProxyID                 *int64                         `json:"proxy_id"`
-	ProxyFallbackOriginID   *int64                         `json:"proxy_fallback_origin_id"`
-	ProxyFallbackOriginName *string                        `json:"proxy_fallback_origin_name,omitempty"`
-	Concurrency             int                            `json:"concurrency"`
-	LoadFactor              *int                           `json:"load_factor,omitempty"`
-	Priority                int                            `json:"priority"`
-	RateMultiplier          float64                        `json:"rate_multiplier"`
-	Status                  string                         `json:"status"`
-	ErrorMessage            string                         `json:"error_message"`
-	LastUsedAt              *time.Time                     `json:"last_used_at"`
-	ExpiresAt               *int64                         `json:"expires_at"`
-	AutoPauseOnExpired      bool                           `json:"auto_pause_on_expired"`
-	CreatedAt               time.Time                      `json:"created_at"`
-	UpdatedAt               time.Time                      `json:"updated_at"`
+	Credentials             map[string]any                    `json:"credentials"`
+	CredentialsStatus       map[string]bool                   `json:"credentials_status,omitempty"`
+	Extra                   map[string]any                    `json:"extra"`
+	OllamaCloudUsage        *service.OllamaCloudUsageState    `json:"ollama_cloud_usage,omitempty"`
+	CodexTurnTickets        []service.OpenAICodexTicketStatus `json:"codex_turn_tickets,omitempty"`
+	ProxyID                 *int64                            `json:"proxy_id"`
+	ProxyFallbackOriginID   *int64                            `json:"proxy_fallback_origin_id"`
+	ProxyFallbackOriginName *string                           `json:"proxy_fallback_origin_name,omitempty"`
+	EgressMode              string                            `json:"egress_mode,omitempty"`
+	EgressRevision          int64                             `json:"egress_revision,omitempty"`
+	EgressPool              *AccountEgressPool                `json:"egress_pool,omitempty"`
+	EgressSummary           *AccountEgressSummary             `json:"egress_summary,omitempty"`
+	Concurrency             int                               `json:"concurrency"`
+	LoadFactor              *int                              `json:"load_factor,omitempty"`
+	Priority                int                               `json:"priority"`
+	RateMultiplier          float64                           `json:"rate_multiplier"`
+	Status                  string                            `json:"status"`
+	ErrorMessage            string                            `json:"error_message"`
+	LastUsedAt              *time.Time                        `json:"last_used_at"`
+	ExpiresAt               *int64                            `json:"expires_at"`
+	AutoPauseOnExpired      bool                              `json:"auto_pause_on_expired"`
+	CreatedAt               time.Time                         `json:"created_at"`
+	UpdatedAt               time.Time                         `json:"updated_at"`
 
 	Schedulable bool `json:"schedulable"`
 
@@ -316,6 +323,7 @@ type Account struct {
 	ParentPrivacyMode           string `json:"parent_privacy_mode,omitempty"`
 	ParentSubscriptionExpiresAt string `json:"parent_subscription_expires_at,omitempty"`
 	ParentChatGPTAccountID      string `json:"parent_chatgpt_account_id,omitempty"`
+	OpenAICodexWarmupPolicy     string `json:"openai_codex_warmup_policy,omitempty"`
 
 	Proxy         *Proxy         `json:"proxy,omitempty"`
 	AccountGroups []AccountGroup `json:"account_groups,omitempty"`
@@ -336,25 +344,30 @@ type AccountListItem struct {
 	Platform string  `json:"platform"`
 	Type     string  `json:"type"`
 
-	Credentials       map[string]any                 `json:"credentials,omitempty"`
-	CredentialsStatus map[string]bool                `json:"credentials_status,omitempty"`
-	Extra             map[string]any                 `json:"extra,omitempty"`
-	OllamaCloudUsage  *service.OllamaCloudUsageState `json:"ollama_cloud_usage,omitempty"`
+	Credentials       map[string]any                    `json:"credentials,omitempty"`
+	CredentialsStatus map[string]bool                   `json:"credentials_status,omitempty"`
+	Extra             map[string]any                    `json:"extra,omitempty"`
+	OllamaCloudUsage  *service.OllamaCloudUsageState    `json:"ollama_cloud_usage,omitempty"`
+	CodexTurnTickets  []service.OpenAICodexTicketStatus `json:"codex_turn_tickets,omitempty"`
 
-	ProxyID                 *int64     `json:"proxy_id"`
-	ProxyFallbackOriginID   *int64     `json:"proxy_fallback_origin_id"`
-	ProxyFallbackOriginName *string    `json:"proxy_fallback_origin_name,omitempty"`
-	Concurrency             int        `json:"concurrency"`
-	LoadFactor              *int       `json:"load_factor,omitempty"`
-	Priority                int        `json:"priority"`
-	RateMultiplier          float64    `json:"rate_multiplier"`
-	Status                  string     `json:"status"`
-	ErrorMessage            string     `json:"error_message"`
-	LastUsedAt              *time.Time `json:"last_used_at"`
-	ExpiresAt               *int64     `json:"expires_at"`
-	AutoPauseOnExpired      bool       `json:"auto_pause_on_expired"`
-	CreatedAt               time.Time  `json:"created_at"`
-	UpdatedAt               time.Time  `json:"updated_at"`
+	ProxyID                 *int64                `json:"proxy_id"`
+	ProxyFallbackOriginID   *int64                `json:"proxy_fallback_origin_id"`
+	ProxyFallbackOriginName *string               `json:"proxy_fallback_origin_name,omitempty"`
+	EgressMode              string                `json:"egress_mode,omitempty"`
+	EgressRevision          int64                 `json:"egress_revision,omitempty"`
+	EgressPool              *AccountEgressPool    `json:"egress_pool,omitempty"`
+	EgressSummary           *AccountEgressSummary `json:"egress_summary,omitempty"`
+	Concurrency             int                   `json:"concurrency"`
+	LoadFactor              *int                  `json:"load_factor,omitempty"`
+	Priority                int                   `json:"priority"`
+	RateMultiplier          float64               `json:"rate_multiplier"`
+	Status                  string                `json:"status"`
+	ErrorMessage            string                `json:"error_message"`
+	LastUsedAt              *time.Time            `json:"last_used_at"`
+	ExpiresAt               *int64                `json:"expires_at"`
+	AutoPauseOnExpired      bool                  `json:"auto_pause_on_expired"`
+	CreatedAt               time.Time             `json:"created_at"`
+	UpdatedAt               time.Time             `json:"updated_at"`
 
 	Schedulable bool `json:"schedulable"`
 
@@ -415,6 +428,7 @@ type AccountListItem struct {
 	ParentPrivacyMode           string `json:"parent_privacy_mode,omitempty"`
 	ParentSubscriptionExpiresAt string `json:"parent_subscription_expires_at,omitempty"`
 	ParentChatGPTAccountID      string `json:"parent_chatgpt_account_id,omitempty"`
+	OpenAICodexWarmupPolicy     string `json:"openai_codex_warmup_policy,omitempty"`
 
 	Proxy    *Proxy  `json:"proxy,omitempty"`
 	GroupIDs []int64 `json:"group_ids,omitempty"`
@@ -464,6 +478,17 @@ type ProxyWithAccountCount struct {
 	QualityGrade   string `json:"quality_grade,omitempty"`
 	QualitySummary string `json:"quality_summary,omitempty"`
 	QualityChecked *int64 `json:"quality_checked,omitempty"`
+}
+
+// ProxyOption is the credential-free projection used by assignment controls.
+type ProxyOption struct {
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	DisplayEndpoint string `json:"display_endpoint"`
+	Status          string `json:"status"`
+	Selectable      bool   `json:"selectable"`
+	DisabledReason  string `json:"disabled_reason,omitempty"`
+	AccountCount    int64  `json:"account_count"`
 }
 
 // AdminProxy 是管理员接口使用的 proxy DTO（包含密码等敏感字段）。

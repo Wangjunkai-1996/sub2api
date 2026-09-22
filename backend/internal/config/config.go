@@ -96,14 +96,19 @@ type Config struct {
 	UsageCleanup            UsageCleanupConfig            `mapstructure:"usage_cleanup"`
 	Concurrency             ConcurrencyConfig             `mapstructure:"concurrency"`
 	TokenRefresh            TokenRefreshConfig            `mapstructure:"token_refresh"`
-	RunMode                 string                        `mapstructure:"run_mode" yaml:"run_mode"`
-	Timezone                string                        `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
-	Gemini                  GeminiConfig                  `mapstructure:"gemini"`
-	Update                  UpdateConfig                  `mapstructure:"update"`
-	Idempotency             IdempotencyConfig             `mapstructure:"idempotency"`
-	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
-	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
-	Plugins                 PluginConfig                  `mapstructure:"plugins"`
+	// OpenAIWindowWarmupWorkerEnabled controls whether this process runs the
+	// durable Codex five-hour warmup worker. Text/API slots keep the default
+	// enabled; image-only slots must set OPENAI_WINDOW_WARMUP_WORKER_ENABLED=false
+	// so they cannot compete for shared warmup jobs.
+	OpenAIWindowWarmupWorkerEnabled bool               `mapstructure:"openai_window_warmup_worker_enabled"`
+	RunMode                         string             `mapstructure:"run_mode" yaml:"run_mode"`
+	Timezone                        string             `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
+	Gemini                          GeminiConfig       `mapstructure:"gemini"`
+	Update                          UpdateConfig       `mapstructure:"update"`
+	Idempotency                     IdempotencyConfig  `mapstructure:"idempotency"`
+	BatchImage                      BatchImageConfig   `mapstructure:"batch_image"`
+	ImageStorage                    ImageStorageConfig `mapstructure:"image_storage"`
+	Plugins                         PluginConfig       `mapstructure:"plugins"`
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -944,6 +949,12 @@ const (
 	ImageConcurrencyOverflowModeWait   = "wait"
 )
 
+const (
+	DefaultOpenAIRequestBudgetSeconds                = 900
+	DefaultOpenAIHighEffortFirstOutputTimeoutSeconds = 600
+	DefaultOpenAIRetryBudgetSeconds                  = 300
+)
+
 // GatewayConfig API网关相关配置
 type GatewayConfig struct {
 	// 等待上游响应头的超时时间（秒），0表示无超时
@@ -960,6 +971,16 @@ type GatewayConfig struct {
 	// OpenAIHighEffortFirstOutputTimeoutSeconds: high/xhigh/max 推理的首个语义输出超时（秒）。
 	// 0 表示回退到 OpenAIFirstOutputTimeoutSeconds。
 	OpenAIHighEffortFirstOutputTimeoutSeconds int `mapstructure:"openai_high_effort_first_output_timeout_seconds"`
+	// OpenAIRequestBudgetSeconds: native HTTP Responses 从入口、排队到全部重试共用的总预算（秒）。
+	// 0 使用安全默认值 900 秒；0 不能禁用硬预算。
+	OpenAIRequestBudgetSeconds int `mapstructure:"openai_request_budget_seconds"`
+	// OpenAIRetryBudgetSeconds: 请求入口后的错误重试/换号资格窗口（秒）。
+	// 0 自动使用 min(300, OpenAIRequestBudgetSeconds 的有效值)，不会禁用重试窗口。
+	OpenAIRetryBudgetSeconds int `mapstructure:"openai_retry_budget_seconds"`
+	// OpenAIAtomicStreamFailover: native HTTP Responses 流式请求在最终成功事件前
+	// 是否暂存整段 SSE，以便上游晚到的失败可以安全重试或切换账号。
+	// 通过 Load 加载时默认关闭；仅在明确需要原子 failover 时开启。
+	OpenAIAtomicStreamFailover bool `mapstructure:"openai_atomic_stream_failover"`
 	// 请求体最大字节数，用于网关请求体大小限制
 	MaxBodySize int64 `mapstructure:"max_body_size"`
 	// TextMaxBodySize limits endpoints that cannot carry inline image/video payloads.
@@ -1004,6 +1025,9 @@ type GatewayConfig struct {
 	// OpenAICompactModel: /responses/compact 上游使用的模型。
 	// compact 端点支持模型滞后于普通 /responses 时，可用该配置降级规避上游错误。
 	OpenAICompactModel string `mapstructure:"openai_compact_model"`
+	// OpenAICodexTicket: ChatGPT OAuth 账号按 (账号, 模型) 捕获 292 长度
+	// x-codex-turn-state，并在住宅 IP 业务请求中注入该头。默认关闭。
+	OpenAICodexTicket OpenAICodexTicketConfig `mapstructure:"openai_codex_ticket"`
 	// OpenAIWS: OpenAI Responses WebSocket 配置（默认开启，可按需回滚到 HTTP）
 	OpenAIWS GatewayOpenAIWSConfig `mapstructure:"openai_ws"`
 	// Live: ChatGPT Frameless Live 会话配置。
@@ -1099,6 +1123,28 @@ type GatewayConfig struct {
 	// CNProviders: 国产 OpenAI 兼容供应商（kimi/zhipu/deepseek）的余额检测配置。
 	// 仅作用于 payg（按量付费）账号：周期探测余额，低于阈值则临时停调。
 	CNProviders GatewayCNProvidersConfig `mapstructure:"cn_providers"`
+}
+
+// EffectiveOpenAIRequestBudgetSeconds returns the non-zero hard budget used by
+// the Responses gateway. Zero is retained as a compatibility-safe default.
+func (c GatewayConfig) EffectiveOpenAIRequestBudgetSeconds() int {
+	if c.OpenAIRequestBudgetSeconds == 0 {
+		return DefaultOpenAIRequestBudgetSeconds
+	}
+	return c.OpenAIRequestBudgetSeconds
+}
+
+// EffectiveOpenAIRetryBudgetSeconds returns the error retry/failover window.
+// Zero derives the smaller of the default retry window and hard budget.
+func (c GatewayConfig) EffectiveOpenAIRetryBudgetSeconds() int {
+	budget := c.EffectiveOpenAIRequestBudgetSeconds()
+	if c.OpenAIRetryBudgetSeconds == 0 {
+		if budget < DefaultOpenAIRetryBudgetSeconds {
+			return budget
+		}
+		return DefaultOpenAIRetryBudgetSeconds
+	}
+	return c.OpenAIRetryBudgetSeconds
 }
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
@@ -1216,6 +1262,23 @@ func (c *UserMessageQueueConfig) GetEffectiveMode() string {
 		return UMQModeSerialize // 向后兼容
 	}
 	return ""
+}
+
+// OpenAICodexTicketConfig 控制 ChatGPT OAuth 的 x-codex-turn-state 门票。
+// 打票走 harvest_proxy_url（SOCKS），业务出站仍用账号住宅 proxy_id，只替换该请求头。
+// Enabled 与 Enabled332 互斥，分别对应 292 与 332 长度门票。
+// 门票默认有效 3600 秒，临近过期前 refresh_before_seconds 重新打票。
+type OpenAICodexTicketConfig struct {
+	Enabled                      bool     `mapstructure:"enabled"`
+	Enabled332                   bool     `mapstructure:"enabled_332"`
+	TargetLength                 int      `mapstructure:"target_length"`
+	TTLSeconds                   int      `mapstructure:"ttl_seconds"`
+	RefreshBeforeSeconds         int      `mapstructure:"refresh_before_seconds"`
+	HarvestProxyURL              string   `mapstructure:"harvest_proxy_url"`
+	HarvestProbeIntervalSeconds  int      `mapstructure:"harvest_probe_interval_seconds"`
+	HarvestAttemptTimeoutSeconds int      `mapstructure:"harvest_attempt_timeout_seconds"`
+	FailClosed                   bool     `mapstructure:"fail_closed"`
+	Models                       []string `mapstructure:"models"`
 }
 
 // DefaultOpenAIWSClientFirstMessageTimeoutSeconds preserves the legacy ingress deadline.
@@ -1800,6 +1863,9 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if err := viper.BindEnv("server.enable_server_timing", "ENABLE_SERVER_TIMING"); err != nil {
 		return nil, fmt.Errorf("bind ENABLE_SERVER_TIMING: %w", err)
 	}
+	if err := viper.BindEnv("openai_window_warmup_worker_enabled", "OPENAI_WINDOW_WARMUP_WORKER_ENABLED"); err != nil {
+		return nil, fmt.Errorf("bind OPENAI_WINDOW_WARMUP_WORKER_ENABLED: %w", err)
+	}
 
 	// 默认值
 	setDefaults()
@@ -2367,8 +2433,14 @@ func setDefaults() {
 	viper.SetDefault("gateway.response_header_timeout", 600) // 600秒(10分钟)等待上游响应头，LLM高负载时可能排队较久
 	viper.SetDefault("gateway.openai_response_header_timeout", 0)
 	viper.SetDefault("gateway.grok_response_header_timeout", 120)
-	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 0)
-	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 0)
+	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 120)
+	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", DefaultOpenAIHighEffortFirstOutputTimeoutSeconds)
+	viper.SetDefault("gateway.openai_request_budget_seconds", DefaultOpenAIRequestBudgetSeconds)
+	// Zero preserves compatibility with older configs and derives min(300, effective hard budget).
+	viper.SetDefault("gateway.openai_retry_budget_seconds", 0)
+	// Keep real-time SSE as the default. Strict atomic replay remains opt-in for
+	// operators who prefer late-failure retry over first-token latency.
+	viper.SetDefault("gateway.openai_atomic_stream_failover", false)
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
@@ -2381,6 +2453,16 @@ func setDefaults() {
 	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
 	viper.SetDefault("gateway.openai_compact_model", "gpt-5.5")
+	viper.SetDefault("gateway.openai_codex_ticket.enabled", false)
+	viper.SetDefault("gateway.openai_codex_ticket.enabled_332", false)
+	viper.SetDefault("gateway.openai_codex_ticket.target_length", 292)
+	viper.SetDefault("gateway.openai_codex_ticket.ttl_seconds", 3600)
+	viper.SetDefault("gateway.openai_codex_ticket.refresh_before_seconds", 600)
+	viper.SetDefault("gateway.openai_codex_ticket.harvest_proxy_url", "")
+	viper.SetDefault("gateway.openai_codex_ticket.harvest_probe_interval_seconds", 6)
+	viper.SetDefault("gateway.openai_codex_ticket.harvest_attempt_timeout_seconds", 25)
+	viper.SetDefault("gateway.openai_codex_ticket.fail_closed", true)
+	viper.SetDefault("gateway.openai_codex_ticket.models", []string{"gpt-6-astra", "gpt-5.6-sol"})
 	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.openai_ws.enabled", true)
@@ -2587,6 +2669,10 @@ func setDefaults() {
 // environment. Any subsystem that wants a richer default still applies it after
 // unmarshal, exactly as before.
 func setEnvReachableDefaults() {
+	// This is an effective true default: existing single-container and text
+	// deployments must continue to run the worker unless they opt into the
+	// image-only role explicitly.
+	viper.SetDefault("openai_window_warmup_worker_enabled", true)
 	viper.SetDefault("gateway.forced_codex_instructions_template_file", "")
 	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
 	viper.SetDefault("gateway.user_message_queue.mode", "")
@@ -2651,6 +2737,9 @@ func setEnvReachableDefaults() {
 }
 
 func (c *Config) Validate() error {
+	if c.Gateway.OpenAICodexTicket.Enabled && c.Gateway.OpenAICodexTicket.Enabled332 {
+		return fmt.Errorf("gateway.openai_codex_ticket.enabled and enabled_332 are mutually exclusive")
+	}
 	forwardedClientIPHeaders, err := NormalizeForwardedClientIPHeaders(c.Security.ForwardedClientIPHeaders)
 	if err != nil {
 		return fmt.Errorf("security.forwarded_client_ip_headers: %w", err)
@@ -3304,6 +3393,21 @@ func (c *Config) Validate() error {
 	if c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds < 0 || c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds > 1800 ||
 		(c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds > 0 && c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds < 30) {
 		return fmt.Errorf("gateway.openai_high_effort_first_output_timeout_seconds must be 0 or between 30-1800 seconds")
+	}
+	if c.Gateway.OpenAIRequestBudgetSeconds < 0 || c.Gateway.OpenAIRequestBudgetSeconds > DefaultOpenAIRequestBudgetSeconds ||
+		(c.Gateway.OpenAIRequestBudgetSeconds > 0 && c.Gateway.OpenAIRequestBudgetSeconds < 60) {
+		return fmt.Errorf("gateway.openai_request_budget_seconds must be 0 or between 60-900 seconds")
+	}
+	effectiveOpenAIRequestBudget := c.Gateway.OpenAIRequestBudgetSeconds
+	if effectiveOpenAIRequestBudget == 0 {
+		effectiveOpenAIRequestBudget = DefaultOpenAIRequestBudgetSeconds
+	}
+	if c.Gateway.OpenAIRetryBudgetSeconds < 0 || c.Gateway.OpenAIRetryBudgetSeconds > 600 ||
+		(c.Gateway.OpenAIRetryBudgetSeconds > 0 && c.Gateway.OpenAIRetryBudgetSeconds < 60) {
+		return fmt.Errorf("gateway.openai_retry_budget_seconds must be 0 or between 60-600 seconds")
+	}
+	if c.Gateway.OpenAIRetryBudgetSeconds > effectiveOpenAIRequestBudget {
+		return fmt.Errorf("gateway.openai_retry_budget_seconds must not exceed effective gateway.openai_request_budget_seconds (%d)", effectiveOpenAIRequestBudget)
 	}
 	if c.Gateway.Live.MaxSessionDurationSeconds <= 0 {
 		c.Gateway.Live.MaxSessionDurationSeconds = 3600

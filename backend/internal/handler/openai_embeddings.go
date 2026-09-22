@@ -79,11 +79,6 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 	reqLog = reqLog.With(zap.String("model", reqModel))
 	setOpsRequestContext(c, reqModel, false)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeSync))
-	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, "openai_embeddings", reqModel, body); decision != nil && !decision.AllowNextStage {
-		h.openAISecurityAuditError(c, decision)
-		return
-	}
-
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
 	forwardModel := openAIChannelForwardModel(channelMapping, reqModel)
 
@@ -141,16 +136,23 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 				reqLog.Info("openai_embeddings.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
+			if waitForOpenAI429Selection(c, err, len(failedAccountIDs)) {
+				continue
+			}
+			if h.handleOpenAIDeferredSelection(c, err, streamStarted, false) {
+				return
+			}
 			reqLog.Warn("openai_embeddings.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
 			if len(failedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformOpenAI)
+				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 				}
-				h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+				h.handleSelectionFailure(c, cls, false)
 				return
 			}
 			if lastFailoverErr != nil {
@@ -165,13 +167,17 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
 			}
-			h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			h.handleSelectionFailure(c, cls, false)
 			return
 		}
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, "", selection, false, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquireReselect {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// 利润终检否决：排除该账号重新选号；否决次数达上限则按无可用账号终止。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
@@ -183,6 +189,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
+		account = selection.Account
 
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		forwardStart := time.Now()

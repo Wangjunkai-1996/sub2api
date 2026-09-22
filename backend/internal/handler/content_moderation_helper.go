@@ -19,10 +19,6 @@ func contentModerationStatus(decision *service.ContentModerationDecision) int {
 	return decision.StatusCode
 }
 
-func contentModerationErrorCode(decision *service.ContentModerationDecision) string {
-	return "content_policy_violation"
-}
-
 func clientRequestedModel(c *gin.Context, fallback string) string {
 	fallback = strings.TrimSpace(fallback)
 	if c == nil || c.Request == nil {

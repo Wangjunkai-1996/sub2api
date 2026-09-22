@@ -21,6 +21,7 @@ import (
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	dbaccount "github.com/Wei-Shaw/sub2api/ent/account"
+	dbaccountegressbinding "github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	dbaccountgroup "github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	dbgroup "github.com/Wei-Shaw/sub2api/ent/group"
 	dbpredicate "github.com/Wei-Shaw/sub2api/ent/predicate"
@@ -57,6 +58,10 @@ var schedulerNeutralExtraKeyPrefixes = []string{
 	"codex_5h_",
 	"codex_7d_",
 	"codex_reset_credit_",
+	// 292 门票是纯运行态凭据：它不在 filterSchedulerExtra 的投影白名单里，
+	// 因此 bucket 重建事件永远搬不动门票状态，续期时开事务+发 outbox 是白干。
+	// 归为观测型后仍会同步单账号快照（见 UpdateExtra），不丢任何新鲜度。
+	"codex_turn_ticket:",
 	"passive_usage_",
 	"upstream_billing_probe",
 	"upstream_billing_rate_sync",
@@ -69,7 +74,38 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"session_window_utilization": {},
 }
 
+// These keys are written by billing, quota and scheduling hot paths. Account
+// edits start from a potentially stale snapshot, so the locked database row is
+// authoritative for them. User-editable configuration keys are intentionally
+// excluded.
+var accountRuntimeManagedExtraKeyPrefixes = []string{
+	"codex_primary_",
+	"codex_secondary_",
+	"codex_5h_",
+	"codex_7d_",
+	"codex_reset_credit_",
+	"passive_usage_",
+}
+
+var accountRuntimeManagedExtraKeys = map[string]struct{}{
+	"quota_used":                               {},
+	"quota_daily_used":                         {},
+	"quota_daily_start":                        {},
+	"quota_weekly_used":                        {},
+	"quota_weekly_start":                       {},
+	"model_rate_limits":                        {},
+	"grok_billing_snapshot":                    {},
+	service.OpenAIAutoResetCreditStateExtraKey: {},
+	"session_window_utilization":               {},
+	"codex_usage_updated_at":                   {},
+}
+
 const postgresParameterBatchSize = 50000
+
+// Eager-loading egress routes adds a second IN query for route IDs. Keep this
+// batch comfortably below the PostgreSQL parameter limit even when an account
+// uses the maximum configured route count.
+const accountEgressHydrationBatchSize = 1000
 
 const codexFingerprintSeedCanonicalPattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 const codexFingerprintNilSeed = "00000000-0000-0000-0000-000000000000"
@@ -150,6 +186,12 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 		SetErrorMessage(account.ErrorMessage).
 		SetSchedulable(account.Schedulable).
 		SetAutoPauseOnExpired(account.AutoPauseOnExpired)
+	if account.EgressMode != "" {
+		builder.SetEgressMode(dbaccount.EgressMode(account.EgressMode))
+	}
+	if account.EgressRevision > 0 {
+		builder.SetEgressRevision(account.EgressRevision)
+	}
 
 	if account.RateMultiplier != nil {
 		builder.SetRateMultiplier(*account.RateMultiplier)
@@ -199,6 +241,9 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	account.ID = created.ID
 	account.CreatedAt = created.CreatedAt
 	account.UpdatedAt = created.UpdatedAt
+	account.OpenAIWarmupIdentityGeneration = created.OpenaiWarmupIdentityGeneration
+	account.EgressMode = string(created.EgressMode)
+	account.EgressRevision = created.EgressRevision
 	return nil
 }
 
@@ -248,6 +293,9 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 	}
 	account.GroupIDs = groupIDs
 	account.AccountGroups = append([]service.AccountGroup(nil), groups...)
+	if err := applyAccountEgressWrite(ctx, txClient, account); err != nil {
+		return err
+	}
 	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(groupIDs)); err != nil {
 		return err
 	}
@@ -321,6 +369,10 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 	if err != nil {
 		return nil, err
 	}
+	egressBindingsByAccount, egressSourcesByAccount, err := r.loadAccountEgressHydration(ctx, entAccounts)
+	if err != nil {
+		return nil, err
+	}
 
 	outByID := make(map[int64]*service.Account, len(entAccounts))
 	for _, entAcc := range entAccounts {
@@ -333,6 +385,7 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		if entAcc.Edges.Proxy != nil {
 			out.Proxy = proxyEntityToService(entAcc.Edges.Proxy)
 		}
+		applyAccountEgressHydration(out, entAcc, egressBindingsByAccount, egressSourcesByAccount)
 
 		if groups, ok := groupsByAccount[entAcc.ID]; ok {
 			out.Groups = groups
@@ -494,6 +547,9 @@ func (r *accountRepository) updateAccount(
 	if err != nil {
 		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
 	}
+	if err := applyAccountEgressWrite(ctx, client, account); err != nil {
+		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
+	}
 	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(account.GroupIDs)); err != nil {
 		return err
 	}
@@ -646,7 +702,8 @@ func lockAndMergeAccountProbeExtra(
 			extra -> 'upstream_billing_probe',
 			extra -> 'ollama_cloud_usage_session',
 			extra -> 'ollama_cloud_usage_auto_refresh',
-			extra -> 'ollama_cloud_usage_snapshot'
+			extra -> 'ollama_cloud_usage_snapshot',
+			COALESCE(extra, '{}'::jsonb)
 		FROM accounts
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -672,6 +729,7 @@ func lockAndMergeAccountProbeExtra(
 		currentOllamaSession         []byte
 		currentOllamaAutoRefresh     []byte
 		currentOllamaSnapshot        []byte
+		currentExtraJSON             []byte
 	)
 	if err := rows.Scan(
 		&identityUnchanged,
@@ -683,6 +741,7 @@ func lockAndMergeAccountProbeExtra(
 		&currentOllamaSession,
 		&currentOllamaAutoRefresh,
 		&currentOllamaSnapshot,
+		&currentExtraJSON,
 	); err != nil {
 		return nil, err
 	}
@@ -690,7 +749,34 @@ func lockAndMergeAccountProbeExtra(
 		return nil, err
 	}
 
-	extra := copyJSONMap(normalizeJSONMap(account.Extra))
+	// extra 理论上恒为 JSON 对象，但历史数据若存成非对象（数组/标量），在此硬失败
+	// 会让该账号的任何编辑都保存不了——而这条路径覆盖所有平台的账号更新。
+	// 门票是 1 小时 TTL 的临时凭据，下个打票周期会自动补回，因此解析失败时降级为
+	// 「无门票可保留」继续完成编辑，不要把整个账号更新拖垮。
+	var currentExtra map[string]any
+	if len(currentExtraJSON) > 0 {
+		if err := json.Unmarshal(currentExtraJSON, &currentExtra); err != nil {
+			logger.LegacyPrintf("repository.account",
+				"[Account] current extra unmarshal failed, codex ticket preservation skipped: id=%d err=%v",
+				account.ID, err)
+			currentExtra = nil
+		}
+	}
+	extra := service.MergeOpenAICodexTicketExtra(copyJSONMap(normalizeJSONMap(account.Extra)), currentExtra)
+	// Runtime quota and scheduler fields are authoritative in the locked row.
+	// Preserve them alongside Codex ticket material so a stale account edit
+	// cannot overwrite either class of server-managed state.
+	lockedExtra := currentExtra
+	for key := range extra {
+		if isAccountRuntimeManagedExtraKey(key) {
+			delete(extra, key)
+		}
+	}
+	for key, value := range lockedExtra {
+		if isAccountRuntimeManagedExtraKey(key) {
+			extra[key] = value
+		}
+	}
 	for _, key := range []string{
 		service.UpstreamBillingProbeEnabledExtraKey,
 		service.UpstreamBillingRateSyncEnabledExtraKey,
@@ -776,6 +862,18 @@ func lockAndMergeAccountProbeExtra(
 		}
 	}
 	return extra, nil
+}
+
+func isAccountRuntimeManagedExtraKey(key string) bool {
+	if _, ok := accountRuntimeManagedExtraKeys[key]; ok {
+		return true
+	}
+	for _, prefix := range accountRuntimeManagedExtraKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeAccountExtraJSON(raw []byte) (any, bool, error) {
@@ -1387,6 +1485,60 @@ func (r *accountRepository) SetError(ctx context.Context, id int64, errorMsg str
 	return nil
 }
 
+// SetOpenAIAuthErrorIfCredentialsUnchanged quarantines an OpenAI OAuth account
+// only when the complete credential document still matches the request-time
+// snapshot. The account mutation and scheduler outbox event are atomic.
+func (r *accountRepository) SetOpenAIAuthErrorIfCredentialsUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	errorMsg string,
+) (bool, error) {
+	if r == nil || r.sql == nil {
+		return false, errors.New("account repository SQL executor is not configured")
+	}
+	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
+	if err != nil {
+		return false, err
+	}
+	result, err := r.sql.ExecContext(ctx, `
+		WITH updated AS (
+		UPDATE accounts AS a
+		SET status = $1,
+			error_message = $2,
+			schedulable = FALSE,
+			updated_at = NOW()
+		WHERE a.id = $3
+			AND a.deleted_at IS NULL
+			AND a.platform = $4
+			AND a.type = $5
+			AND a.status = $6
+			AND a.credentials = $7::jsonb
+		RETURNING a.id
+		)
+		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
+		SELECT $8, updated.id, NULL, NULL FROM updated
+	`,
+		service.StatusError,
+		errorMsg,
+		id,
+		service.PlatformOpenAI,
+		service.AccountTypeOAuth,
+		service.StatusActive,
+		string(expectedJSON),
+		service.SchedulerOutboxEventAccountChanged,
+	)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil || rowsAffected == 0 {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
 func (r *accountRepository) SetGrokCredentialErrorIfMatch(
 	ctx context.Context,
 	id int64,
@@ -1554,6 +1706,210 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	}
 	r.syncSchedulerAccountSnapshotDetached(ctx, id)
 	return true, nil
+}
+
+// UpdateOpenAIOAuthCredentialsIfUnchanged is the OpenAI counterpart to the
+// Grok refresh CAS. It is also used for Agent Identity task_id persistence, so
+// a delayed provider response cannot overwrite a concurrent reauthorization.
+func (r *accountRepository) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	if r == nil || r.sql == nil {
+		return false, errors.New("account repository SQL executor is not configured")
+	}
+	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
+	if err != nil {
+		return false, err
+	}
+	credentialsJSON, err := json.Marshal(normalizeJSONMap(credentials))
+	if err != nil {
+		return false, err
+	}
+	result, err := r.sql.ExecContext(ctx, `
+		WITH updated AS (
+		UPDATE accounts AS a
+		SET credentials = $1::jsonb,
+			updated_at = NOW()
+		WHERE a.id = $2
+			AND a.deleted_at IS NULL
+			AND a.platform = $3
+			AND a.type = $4
+			AND a.credentials = $5::jsonb
+			AND a.proxy_id IS NOT DISTINCT FROM $6
+		RETURNING a.id
+		)
+		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
+		SELECT $7, updated.id, NULL, NULL FROM updated
+	`,
+		string(credentialsJSON),
+		id,
+		service.PlatformOpenAI,
+		service.AccountTypeOAuth,
+		string(expectedJSON),
+		expectedProxyID,
+		service.SchedulerOutboxEventAccountChanged,
+	)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rowsAffected == 0 {
+		return false, nil
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
+// AcquireOpenAIWindowWarmupIdentityLease holds a PostgreSQL row-share lock for
+// the exact durable snapshot used by a synthetic send. It locks the proxy row
+// before the account row, matching proxy update lock order, so route, credential,
+// policy, and business-use changes cannot cross the final read-to-POST boundary.
+func (r *accountRepository) AcquireOpenAIWindowWarmupIdentityLease(
+	ctx context.Context,
+	id int64,
+	identityGeneration int64,
+	expectedPolicy service.OpenAIWindowWarmupPolicy,
+	expectedLastUsedAt *time.Time,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	expectedProxy *service.Proxy,
+) (func(), bool, error) {
+	if r == nil || r.sql == nil {
+		return nil, false, errors.New("account repository SQL executor is not configured")
+	}
+	expectedPolicy = service.NormalizeOpenAIWindowWarmupPolicy(string(expectedPolicy))
+	if id <= 0 || identityGeneration <= 0 || !expectedPolicy.Enabled() {
+		return nil, false, nil
+	}
+	var expectedProxyIdentity proxyProbeIdentity
+	if expectedProxyID == nil {
+		if expectedProxy != nil {
+			return nil, false, nil
+		}
+	} else {
+		if expectedProxy == nil || expectedProxy.ID != *expectedProxyID || !expectedProxy.IsActive() {
+			return nil, false, nil
+		}
+		expectedProxyIdentity = proxyProbeIdentityFromService(expectedProxy)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	beginner, ok := r.sql.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return nil, false, errors.New("account repository transaction executor is not configured")
+	}
+	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
+	if err != nil {
+		return nil, false, err
+	}
+	// The acquisition query still honors the request deadline, but the lock's
+	// transaction must outlive that context until the transport actually
+	// returns. A plugin that is slow to observe cancellation must not release
+	// the reauthorization barrier early.
+	leaseCtx, cancelLease := context.WithCancel(context.WithoutCancel(ctx))
+	tx, err := beginner.BeginTx(leaseCtx, nil)
+	if err != nil {
+		cancelLease()
+		return nil, false, err
+	}
+	release := func() {
+		_ = tx.Rollback()
+		cancelLease()
+	}
+	if expectedProxyID != nil {
+		var (
+			currentProxyIdentity proxyProbeIdentity
+			currentExpiresAt     sql.NullTime
+		)
+		err = tx.QueryRowContext(ctx, `
+			SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''),
+			       status, expires_at
+			FROM proxies
+			WHERE id = $1 AND deleted_at IS NULL
+			  AND status = $2
+			  AND (expires_at IS NULL OR expires_at > NOW())
+			FOR SHARE`, *expectedProxyID, service.StatusActive).Scan(
+			&currentProxyIdentity.protocol,
+			&currentProxyIdentity.host,
+			&currentProxyIdentity.port,
+			&currentProxyIdentity.username,
+			&currentProxyIdentity.password,
+			&currentProxyIdentity.status,
+			&currentExpiresAt,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			release()
+			return nil, false, nil
+		}
+		if err != nil {
+			release()
+			return nil, false, err
+		}
+		expiresAtMatches := expectedProxy.ExpiresAt == nil && !currentExpiresAt.Valid
+		if expectedProxy.ExpiresAt != nil && currentExpiresAt.Valid {
+			expiresAtMatches = expectedProxy.ExpiresAt.Equal(currentExpiresAt.Time)
+		}
+		if currentProxyIdentity != expectedProxyIdentity || !expiresAtMatches {
+			release()
+			return nil, false, nil
+		}
+	}
+	var matchedID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT a.id
+		FROM accounts AS a
+		WHERE a.id = $1
+		  AND a.deleted_at IS NULL
+		  AND a.platform = $2
+		  AND a.type = $3
+		  AND a.parent_account_id IS NULL
+		  AND COALESCE(a.quota_dimension::text, 'global') = 'global'
+		  AND a.status::text = 'active'
+		  AND a.schedulable
+		  AND (a.expires_at IS NULL OR a.expires_at > NOW())
+		  AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
+		  AND lower(trim(COALESCE(
+		      CASE WHEN jsonb_typeof(a.extra -> 'openai_codex_warmup_policy') = 'string'
+		          THEN NULLIF(trim(a.extra ->> 'openai_codex_warmup_policy'), '') END,
+		      CASE WHEN jsonb_typeof(a.extra -> 'codex_warmup_policy') = 'string'
+		          THEN NULLIF(trim(a.extra ->> 'codex_warmup_policy'), '') END,
+		      CASE WHEN jsonb_typeof(a.extra -> 'openai_window_warmup_policy') = 'string'
+		          THEN NULLIF(trim(a.extra ->> 'openai_window_warmup_policy'), '') END,
+		      'off'
+		  ))) = $5
+		  AND a.openai_warmup_identity_generation = $4
+		  AND a.last_used_at IS NOT DISTINCT FROM $6::timestamptz
+		  AND a.credentials = $7::jsonb
+		  AND a.proxy_id IS NOT DISTINCT FROM $8
+		FOR SHARE`,
+		id,
+		service.PlatformOpenAI,
+		service.AccountTypeOAuth,
+		identityGeneration,
+		string(expectedPolicy),
+		nullWarmupTime(expectedLastUsedAt),
+		string(expectedJSON),
+		expectedProxyID,
+	).Scan(&matchedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		release()
+		return nil, false, nil
+	}
+	if err != nil {
+		release()
+		return nil, false, err
+	}
+	return release, matchedID == id, nil
 }
 
 // SetGrokOAuthRefreshErrorIfCredentialsUnchanged is the background-refresh
@@ -2584,18 +2940,50 @@ func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64
 }
 
 func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetSchedulable(schedulable).
-		Save(ctx)
+	if r == nil || r.sql == nil {
+		return errors.New("account repository SQL executor is not configured")
+	}
+	// Commit the routing change and its propagation event together, including
+	// when the caller disconnects immediately after the statement completes.
+	dedupKey := schedulerOutboxDedupKey(service.SchedulerOutboxEventAccountChanged, &id, nil, nil)
+	rows, err := r.sql.QueryContext(ctx, `
+		WITH updated AS (
+			UPDATE accounts
+			SET schedulable = $1, updated_at = NOW()
+			WHERE id = $2 AND deleted_at IS NULL
+			RETURNING id
+			), enqueued AS (
+			INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload, dedup_key)
+			SELECT $3, updated.id, NULL, NULL, $4 FROM updated
+			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+			RETURNING account_id
+		)
+		SELECT id FROM updated
+	`, schedulable, id, service.SchedulerOutboxEventAccountChanged, dedupKey)
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
-		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue schedulable change failed: account=%d err=%v", id, err)
+	var updatedID int64
+	if !rows.Next() {
+		rowsErr := rows.Err()
+		closeErr := rows.Close()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return service.ErrAccountNotFound
+	}
+	if err := rows.Scan(&updatedID); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if !schedulable {
-		r.syncSchedulerAccountSnapshot(ctx, id)
+		r.syncSchedulerAccountSnapshotDetached(ctx, id)
 	}
 	return nil
 }
@@ -3230,6 +3618,10 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 	if err != nil {
 		return nil, err
 	}
+	egressBindingsByAccount, egressSourcesByAccount, err := r.loadAccountEgressHydration(ctx, accounts)
+	if err != nil {
+		return nil, err
+	}
 
 	outAccounts := make([]service.Account, 0, len(accounts))
 	for _, acc := range accounts {
@@ -3249,6 +3641,7 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 				out.ProxyFallbackOriginName = &n
 			}
 		}
+		applyAccountEgressHydration(out, acc, egressBindingsByAccount, egressSourcesByAccount)
 		if groups, ok := groupsByAccount[acc.ID]; ok {
 			out.Groups = groups
 		}
@@ -3450,6 +3843,146 @@ func buildSchedulerGroupPayload(groupIDs []int64) any {
 	return map[string]any{"group_ids": groupIDs}
 }
 
+// loadAccountEgressHydration loads every source account and binding set in two
+// batched queries. Linked shadows read their parent's routes, but the bindings
+// are rewritten to the shadow account ID so concurrency remains isolated.
+func (r *accountRepository) loadAccountEgressHydration(
+	ctx context.Context,
+	accounts []*dbent.Account,
+) (map[int64][]service.AccountEgressBinding, map[int64]*dbent.Account, error) {
+	bindingsByRuntimeAccount := make(map[int64][]service.AccountEgressBinding, len(accounts))
+	sourcesByRuntimeAccount := make(map[int64]*dbent.Account, len(accounts))
+	if len(accounts) == 0 {
+		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+	}
+
+	allSourceIDs := make([]int64, 0, len(accounts))
+	sourceIDsToLoad := make([]int64, 0, len(accounts))
+	seenSourceIDs := make(map[int64]struct{}, len(accounts))
+	sourceByID := make(map[int64]*dbent.Account, len(accounts))
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		sourceID := account.ID
+		if account.ParentAccountID != nil {
+			sourceID = *account.ParentAccountID
+		} else {
+			// The caller already loaded this entity and accountsToService loaded
+			// its proxy separately. Only shadows require another account query.
+			sourceByID[sourceID] = account
+		}
+		if _, exists := seenSourceIDs[sourceID]; exists {
+			continue
+		}
+		seenSourceIDs[sourceID] = struct{}{}
+		allSourceIDs = append(allSourceIDs, sourceID)
+		if account.ParentAccountID != nil {
+			sourceIDsToLoad = append(sourceIDsToLoad, sourceID)
+		}
+	}
+	if len(allSourceIDs) == 0 {
+		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+	}
+
+	// Keep each IN list below PostgreSQL's bind-parameter limit. This path is
+	// used by scheduler pages as well as admin bulk reads, so a large page must
+	// not fail merely because parent/shadow source IDs were accumulated into a
+	// single query.
+	for start := 0; start < len(sourceIDsToLoad); start += accountEgressHydrationBatchSize {
+		end := start + accountEgressHydrationBatchSize
+		if end > len(sourceIDsToLoad) {
+			end = len(sourceIDsToLoad)
+		}
+		sources, err := r.client.Account.Query().
+			Where(dbaccount.IDIn(sourceIDsToLoad[start:end]...)).
+			WithProxy().
+			All(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, source := range sources {
+			sourceByID[source.ID] = source
+		}
+	}
+
+	poolSourceIDs := make([]int64, 0, len(sourceByID))
+	for _, sourceID := range allSourceIDs {
+		if source := sourceByID[sourceID]; source != nil && string(source.EgressMode) == service.EgressModePool {
+			poolSourceIDs = append(poolSourceIDs, sourceID)
+		}
+	}
+
+	bindingsBySource := make(map[int64][]*dbent.AccountEgressBinding, len(poolSourceIDs))
+	for start := 0; start < len(poolSourceIDs); start += accountEgressHydrationBatchSize {
+		end := start + accountEgressHydrationBatchSize
+		if end > len(poolSourceIDs) {
+			end = len(poolSourceIDs)
+		}
+		bindings, err := r.client.AccountEgressBinding.Query().
+			Where(dbaccountegressbinding.AccountIDIn(poolSourceIDs[start:end]...)).
+			Order(
+				dbent.Asc(dbaccountegressbinding.FieldAccountID),
+				dbent.Asc(dbaccountegressbinding.FieldPosition),
+				dbent.Asc(dbaccountegressbinding.FieldRouteID),
+			).
+			WithRoute(func(q *dbent.EgressRouteQuery) {
+				q.WithExpectedIdentity().WithProxy()
+			}).
+			All(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, binding := range bindings {
+			bindingsBySource[binding.AccountID] = append(bindingsBySource[binding.AccountID], binding)
+		}
+	}
+
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		sourceID := account.ID
+		if account.ParentAccountID != nil {
+			sourceID = *account.ParentAccountID
+		}
+		source := sourceByID[sourceID]
+		if source == nil {
+			continue
+		}
+		sourcesByRuntimeAccount[account.ID] = source
+		runtimeBindings := make([]service.AccountEgressBinding, 0, len(bindingsBySource[sourceID]))
+		for _, binding := range bindingsBySource[sourceID] {
+			runtimeBindings = append(runtimeBindings, accountEgressBindingEntityToService(binding, account.ID))
+		}
+		bindingsByRuntimeAccount[account.ID] = runtimeBindings
+	}
+	return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+}
+
+func applyAccountEgressHydration(
+	out *service.Account,
+	entity *dbent.Account,
+	bindingsByAccount map[int64][]service.AccountEgressBinding,
+	sourcesByAccount map[int64]*dbent.Account,
+) {
+	if out == nil || entity == nil {
+		return
+	}
+	if source := sourcesByAccount[entity.ID]; source != nil {
+		out.EgressMode = string(source.EgressMode)
+		out.ProxyID = source.ProxyID
+		if source.Edges.Proxy != nil {
+			out.Proxy = proxyEntityToService(source.Edges.Proxy)
+		} else if source.ProxyID == nil {
+			out.Proxy = nil
+		}
+	}
+	if bindings, exists := bindingsByAccount[entity.ID]; exists {
+		out.EgressBindings = bindings
+	}
+}
+
 func accountEntityToService(m *dbent.Account) *service.Account {
 	if m == nil {
 		return nil
@@ -3458,37 +3991,40 @@ func accountEntityToService(m *dbent.Account) *service.Account {
 	rateMultiplier := m.RateMultiplier
 
 	return &service.Account{
-		ID:                      m.ID,
-		Name:                    m.Name,
-		Notes:                   m.Notes,
-		Platform:                m.Platform,
-		Type:                    m.Type,
-		Credentials:             copyJSONMap(m.Credentials),
-		Extra:                   copyJSONMap(m.Extra),
-		ProxyID:                 m.ProxyID,
-		ProxyFallbackOriginID:   m.ProxyFallbackOriginID,
-		Concurrency:             m.Concurrency,
-		Priority:                m.Priority,
-		RateMultiplier:          &rateMultiplier,
-		LoadFactor:              m.LoadFactor,
-		Status:                  m.Status,
-		ErrorMessage:            derefString(m.ErrorMessage),
-		LastUsedAt:              m.LastUsedAt,
-		ExpiresAt:               m.ExpiresAt,
-		AutoPauseOnExpired:      m.AutoPauseOnExpired,
-		CreatedAt:               m.CreatedAt,
-		UpdatedAt:               m.UpdatedAt,
-		Schedulable:             m.Schedulable,
-		RateLimitedAt:           m.RateLimitedAt,
-		RateLimitResetAt:        m.RateLimitResetAt,
-		OverloadUntil:           m.OverloadUntil,
-		TempUnschedulableUntil:  m.TempUnschedulableUntil,
-		TempUnschedulableReason: derefString(m.TempUnschedulableReason),
-		SessionWindowStart:      m.SessionWindowStart,
-		SessionWindowEnd:        m.SessionWindowEnd,
-		SessionWindowStatus:     derefString(m.SessionWindowStatus),
-		ParentAccountID:         m.ParentAccountID,
-		QuotaDimension:          string(m.QuotaDimension),
+		ID:                             m.ID,
+		Name:                           m.Name,
+		Notes:                          m.Notes,
+		Platform:                       m.Platform,
+		Type:                           m.Type,
+		Credentials:                    copyJSONMap(m.Credentials),
+		OpenAIWarmupIdentityGeneration: m.OpenaiWarmupIdentityGeneration,
+		Extra:                          copyJSONMap(m.Extra),
+		ProxyID:                        m.ProxyID,
+		ProxyFallbackOriginID:          m.ProxyFallbackOriginID,
+		EgressMode:                     string(m.EgressMode),
+		EgressRevision:                 m.EgressRevision,
+		Concurrency:                    m.Concurrency,
+		Priority:                       m.Priority,
+		RateMultiplier:                 &rateMultiplier,
+		LoadFactor:                     m.LoadFactor,
+		Status:                         m.Status,
+		ErrorMessage:                   derefString(m.ErrorMessage),
+		LastUsedAt:                     m.LastUsedAt,
+		ExpiresAt:                      m.ExpiresAt,
+		AutoPauseOnExpired:             m.AutoPauseOnExpired,
+		CreatedAt:                      m.CreatedAt,
+		UpdatedAt:                      m.UpdatedAt,
+		Schedulable:                    m.Schedulable,
+		RateLimitedAt:                  m.RateLimitedAt,
+		RateLimitResetAt:               m.RateLimitResetAt,
+		OverloadUntil:                  m.OverloadUntil,
+		TempUnschedulableUntil:         m.TempUnschedulableUntil,
+		TempUnschedulableReason:        derefString(m.TempUnschedulableReason),
+		SessionWindowStart:             m.SessionWindowStart,
+		SessionWindowEnd:               m.SessionWindowEnd,
+		SessionWindowStatus:            derefString(m.SessionWindowStatus),
+		ParentAccountID:                m.ParentAccountID,
+		QuotaDimension:                 string(m.QuotaDimension),
 	}
 }
 

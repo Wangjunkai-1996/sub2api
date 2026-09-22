@@ -2,16 +2,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 import { mount } from '@vue/test-utils'
 
-const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode } = vi.hoisted(() => ({
+const { updateAccountMock, checkMixedChannelRiskMock, showErrorMock, showSuccessMock, authIsSimpleMode } = vi.hoisted(() => ({
   updateAccountMock: vi.fn(),
   checkMixedChannelRiskMock: vi.fn(),
+  showErrorMock: vi.fn(),
+  showSuccessMock: vi.fn(),
   authIsSimpleMode: { value: true }
 }))
 
 vi.mock('@/stores/app', () => ({
   useAppStore: () => ({
-    showError: vi.fn(),
-    showSuccess: vi.fn(),
+    showError: showErrorMock,
+    showSuccess: showSuccessMock,
     showInfo: vi.fn()
   })
 }))
@@ -302,13 +304,42 @@ function buildOpenAIOAuthParentAccount() {
   } as any
 }
 
-function mountModal(account = buildAccount(), renderGroupSelector = false) {
+const defaultEgressRoute = {
+  id: 1,
+  kind: 'direct',
+  name: 'Local',
+  state: 'active',
+  eligible: true
+}
+
+function withDefaultOpenAIOAuthEgress(account: any) {
+  if (
+    account.platform !== 'openai' ||
+    account.type !== 'oauth' ||
+    account.parent_account_id != null ||
+    account.egress_pool
+  ) {
+    return account
+  }
+  return {
+    ...account,
+    egress_pool: {
+      route_ids: [defaultEgressRoute.id],
+      primary_route_id: defaultEgressRoute.id,
+      concurrency_per_egress: account.concurrency,
+      routes: [defaultEgressRoute]
+    }
+  }
+}
+
+function mountModal(account = buildAccount(), extraProps: Record<string, unknown> = {}, renderGroupSelector = false) {
   return mount(EditAccountModal, {
     props: {
       show: true,
-      account,
+      account: withDefaultOpenAIOAuthEgress(account),
       proxies: [],
-      groups: []
+      groups: [],
+      ...extraProps
     },
     global: {
       stubs: {
@@ -326,6 +357,8 @@ function mountModal(account = buildAccount(), renderGroupSelector = false) {
 describe('EditAccountModal', () => {
   beforeEach(() => {
     authIsSimpleMode.value = true
+    showErrorMock.mockReset()
+    showSuccessMock.mockReset()
   })
 
   afterEach(() => vi.useRealTimers())
@@ -396,7 +429,7 @@ describe('EditAccountModal', () => {
     checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
     updateAccountMock.mockResolvedValue(account)
 
-    const wrapper = mountModal(account, true)
+    const wrapper = mountModal(account, {}, true)
     await wrapper.setProps({ groups: [activeGroup] as any })
     const selector = wrapper.get('[data-tour="account-form-groups"]')
     expect(selector.findAll('input[type="checkbox"]').map(input => input.attributes('value')))
@@ -1076,6 +1109,182 @@ describe('EditAccountModal', () => {
         'gpt-5.3-codex-spark': 'gpt-5.3-codex-spark-compact'
       }
     })
+    expect(payload).not.toHaveProperty('openai_codex_warmup_policy')
+    expect(payload?.extra).not.toHaveProperty('openai_codex_warmup_policy')
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
+    expect(wrapper.get('[data-testid="egress-inherited-notice"]').exists()).toBe(true)
+  })
+
+  it('updates the versioned egress pool without legacy proxy or concurrency fields', async () => {
+    const account = {
+      ...buildAccount(),
+      type: 'oauth',
+      credentials: { access_token: 'oauth-token' },
+      egress_revision: 7,
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3,
+        revision: 7
+      }
+    }
+    const routes = [
+      { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account as any, { egressRoutes: routes })
+
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="egress-concurrency-per-route"]').setValue(5)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [2],
+        primary_route_id: 2,
+        concurrency_per_egress: 5,
+        revision: 7
+      }
+    })
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
+    expect(payload).not.toHaveProperty('group_ids')
+  })
+
+  it('keeps an embedded selected route visible when the fresh catalog is unavailable', () => {
+    const embeddedRoute = {
+      id: 9,
+      kind: 'proxy',
+      name: 'bound-route',
+      state: 'inactive',
+      eligible: false
+    }
+    const account = {
+      ...buildOpenAIOAuthParentAccount(),
+      egress_mode: 'pool',
+      egress_revision: 3,
+      egress_pool: {
+        route_ids: [9],
+        primary_route_id: 9,
+        concurrency_per_egress: 2,
+        revision: 3,
+        routes: [embeddedRoute]
+      }
+    }
+
+    const wrapper = mountModal(account as any, {
+      egressRoutes: [],
+      egressMutationEnabled: false
+    })
+
+    expect(wrapper.get('[data-testid="egress-route-9"]').text()).toContain('bound-route')
+    expect(wrapper.get('#egress-route-9').attributes()).toHaveProperty('disabled')
+  })
+
+  it('updates changed egress and groups atomically', async () => {
+    authIsSimpleMode.value = false
+    const account = {
+      ...buildOpenAIOAuthParentAccount(),
+      group_ids: [3],
+      egress_mode: 'pool',
+      egress_revision: 7,
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 3,
+        revision: 7
+      }
+    }
+    const routes = [
+      { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    updateAccountMock.mockReset().mockResolvedValue({ ...account, group_ids: [7] })
+    const wrapper = mountModal(account as any, { egressRoutes: routes })
+
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="set-shadow-group"]').trigger('click')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: { route_ids: [1, 2] },
+      group_ids: [7]
+    })
+    expect(showSuccessMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report success when the atomic egress and group update fails', async () => {
+    authIsSimpleMode.value = false
+    const account = {
+      ...buildOpenAIOAuthParentAccount(),
+      group_ids: [3],
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [1],
+        primary_route_id: 1,
+        concurrency_per_egress: 1,
+        revision: 1
+      }
+    }
+    const routes = [
+      { id: 1, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
+      { id: 2, kind: 'proxy', name: 'RN-104', proxy_id: 104, state: 'active', eligible: true }
+    ]
+    updateAccountMock.mockReset().mockRejectedValueOnce(new Error('atomic update failed'))
+    const wrapper = mountModal(account as any, { egressRoutes: routes })
+
+    await wrapper.get('#egress-route-2').setValue(true)
+    await wrapper.get('[data-testid="set-shadow-group"]').trigger('click')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]).toMatchObject({
+      egress_mode: 'pool',
+      egress_pool: { route_ids: [1, 2] },
+      group_ids: [7]
+    })
+    expect(showSuccessMock).not.toHaveBeenCalled()
+    expect(showErrorMock).toHaveBeenCalledWith('atomic update failed')
+    expect(wrapper.emitted('updated')).toBeUndefined()
+  })
+
+  it('omits unchanged legacy proxy and concurrency fields for non-OpenAI accounts', async () => {
+    const account = buildGrokAPIKeyAccount()
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
+  })
+
+  it('omits unchanged legacy proxy and concurrency fields for OpenAI API key accounts', async () => {
+    const account = { ...buildAccount(), proxy_id: 9, concurrency: 4 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+
+    expect(wrapper.find('[data-testid="egress-pool-selector"]').exists()).toBe(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload).not.toHaveProperty('proxy_id')
+    expect(payload).not.toHaveProperty('concurrency')
+    expect(payload).not.toHaveProperty('egress_mode')
+    expect(payload).not.toHaveProperty('egress_pool')
   })
 
   it('submits OpenAI APIKey Responses support override mode', async () => {

@@ -665,7 +665,7 @@
         </div>
       </div>
 
-      <!-- Proxy -->
+      <!-- Proxy / OpenAI egress pool -->
       <div class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
           <label
@@ -673,7 +673,7 @@
             class="input-label mb-0"
             for="bulk-edit-proxy-enabled"
           >
-            {{ t('admin.accounts.proxy') }}
+            {{ allOpenAIOAuthOnly ? t('admin.accounts.egressPool.title') : t('admin.accounts.proxy') }}
           </label>
           <input
             v-model="enableProxy"
@@ -683,7 +683,39 @@
             class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
           />
         </div>
-        <div id="bulk-edit-proxy-body" :class="!enableProxy && 'pointer-events-none opacity-50'">
+        <div v-if="allOpenAIOAuthOnly" id="bulk-edit-proxy-body" class="space-y-3" :class="!enableProxy && 'pointer-events-none opacity-50'">
+          <div class="inline-flex w-full rounded-md border border-gray-200 p-1 dark:border-dark-600" role="group" :aria-label="t('admin.accounts.egressPool.bulk.operation')">
+            <button
+              v-for="operation in egressOperationOptions"
+              :key="operation.value"
+              type="button"
+              class="min-w-0 flex-1 rounded px-2 py-1.5 text-xs font-medium transition-colors"
+              :class="egressOperation === operation.value
+                ? 'bg-primary-600 text-white'
+                : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-dark-700'"
+              :disabled="!enableProxy"
+              :data-testid="`bulk-egress-operation-${operation.value}`"
+              @click="handleEgressOperationChange(operation.value)"
+            >
+              {{ operation.label }}
+            </button>
+          </div>
+          <p class="text-xs text-gray-500 dark:text-gray-400">{{ egressOperationHint }}</p>
+          <EgressPoolSelector
+            :routes="egressRoutes"
+            :selected-route-ids="egressRouteIds"
+            :primary-route-id="primaryEgressRouteId"
+            :require-primary="egressOperation === 'replace'"
+            :disabled="!enableProxy || !egressMutationEnabled"
+            :verifying-route-id="egressVerifyingRouteId"
+            :verify-errors="egressVerifyErrors"
+            aria-labelledby="bulk-edit-proxy-label"
+            @update:selected-route-ids="handleEgressRouteIdsUpdate"
+            @update:primary-route-id="handlePrimaryEgressRouteUpdate"
+            @verify="emit('verify-egress-route', $event)"
+          />
+        </div>
+        <div v-else id="bulk-edit-proxy-body" :class="!enableProxy && 'pointer-events-none opacity-50'">
           <ProxySelector
             v-model="proxyId"
             :proxies="proxies"
@@ -701,7 +733,7 @@
               class="input-label mb-0"
               for="bulk-edit-concurrency-enabled"
             >
-              {{ t('admin.accounts.concurrency') }}
+              {{ allOpenAIOAuthOnly ? t('admin.accounts.egressPool.perEgressConcurrency') : t('admin.accounts.concurrency') }}
             </label>
             <input
               v-model="enableConcurrency"
@@ -720,8 +752,9 @@
             class="input"
             :class="!enableConcurrency && 'cursor-not-allowed opacity-50'"
             aria-labelledby="bulk-edit-concurrency-label"
-            @input="concurrency = Math.max(1, concurrency || 1)"
+            @input="handleConcurrencyInput"
           />
+          <p v-if="allOpenAIOAuthOnly" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
           <div class="mb-3 flex items-center justify-between">
@@ -1478,7 +1511,9 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
 import type {
-  Proxy as ProxyConfig,
+  ProxyOption,
+  AssignableEgressRoute,
+  AccountEgressPoolOperation,
   AdminGroup,
   AccountPlatform,
   AccountType,
@@ -1489,6 +1524,7 @@ import type {
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
+import EgressPoolSelector from '@/components/account/EgressPoolSelector.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
@@ -1507,6 +1543,10 @@ import {
   type HeaderOverrideRow
 } from '@/components/account/credentialsBuilder'
 import GrokBaseUrlPresets from '@/components/account/GrokBaseUrlPresets.vue'
+import {
+  AccountEgressPolicyError,
+  buildBulkAccountEgressPatch
+} from '@/components/account/accountEgressPolicy'
 import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
@@ -1528,14 +1568,33 @@ interface Props {
     selectedPlatforms?: AccountPlatform[]
     selectedTypes?: AccountType[]
   }
-  proxies: ProxyConfig[]
+  proxies?: ProxyOption[]
+  egressRoutes?: AssignableEgressRoute[]
+  defaultEgressRouteId?: number | null
+  defaultEgressConcurrency?: number | null
+  egressMutationEnabled?: boolean
+  egressVerifyingRouteId?: number | null
+  egressVerifyErrors?: Record<number, string>
   groups: AdminGroup[]
 }
 
-const props = defineProps<Props>()
+type BulkUpdateTargetSnapshot =
+  | { mode: 'selected'; accountIds: number[] }
+  | { mode: 'filtered'; filters: Record<string, unknown> }
+
+const props = withDefaults(defineProps<Props>(), {
+  proxies: () => [],
+  egressRoutes: () => [],
+  defaultEgressRouteId: null,
+  defaultEgressConcurrency: null,
+  egressMutationEnabled: true,
+  egressVerifyingRouteId: null,
+  egressVerifyErrors: () => ({})
+})
 const emit = defineEmits<{
   close: []
   updated: []
+  'verify-egress-route': [route: AssignableEgressRoute]
 }>()
 
 const { t } = useI18n()
@@ -1553,7 +1612,6 @@ const allTargetsGrok = computed(
     targetSelectedPlatforms.value.every((p) => p === 'grok')
 )
 const isMixedPlatform = computed(() => targetSelectedPlatforms.value.length > 1)
-
 const allOpenAIPassthroughCapable = computed(() => {
   return (
     targetSelectedPlatforms.value.length === 1 &&
@@ -1676,6 +1734,8 @@ const submitting = ref(false)
 const showMixedChannelWarning = ref(false)
 const mixedChannelWarningMessage = ref('')
 const pendingUpdatesForConfirm = ref<Record<string, unknown> | null>(null)
+const pendingTargetForConfirm = ref<BulkUpdateTargetSnapshot | null>(null)
+const pendingEgressSavedForConfirm = ref(false)
 const baseUrl = ref('')
 const modelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const allowedModels = ref<string[]>([])
@@ -1686,12 +1746,78 @@ const interceptWarmupRequests = ref(false)
 const headerOverrideEnabled = ref(false)
 const headerOverrideRows = ref<HeaderOverrideRow[]>([])
 const proxyId = ref<number | null>(null)
+const egressRouteIds = ref<number[]>([])
+const primaryEgressRouteId = ref<number | null>(null)
+const egressOperation = ref<AccountEgressPoolOperation>('replace')
 const concurrency = ref(1)
+const egressRouteDefaultsTouched = ref(false)
+const egressConcurrencyDefaultTouched = ref(false)
 const loadFactor = ref<number | null>(null)
 const priority = ref(1)
 const rateMultiplier = ref(1)
 const status = ref<'active' | 'inactive'>('active')
 const groupIds = ref<number[]>([])
+
+const egressOperationOptions = computed(() => [
+  { value: 'replace' as const, label: t('admin.accounts.egressPool.bulk.replace') },
+  { value: 'append' as const, label: t('admin.accounts.egressPool.bulk.append') },
+  { value: 'remove' as const, label: t('admin.accounts.egressPool.bulk.remove') }
+])
+const egressOperationHint = computed(() =>
+  t(`admin.accounts.egressPool.bulk.${egressOperation.value}Hint`)
+)
+
+const initializeOpenAIEgressDefaults = () => {
+  if (!props.show || !allOpenAIOAuthOnly.value) return
+
+  const routeIds = Array.from(new Set(
+    props.egressRoutes
+      .filter((route) => route.kind === 'proxy' && route.eligible)
+      .map((route) => route.id)
+  ))
+  if (!egressRouteDefaultsTouched.value) {
+    egressRouteIds.value = routeIds
+    primaryEgressRouteId.value = props.defaultEgressRouteId != null
+      && routeIds.includes(props.defaultEgressRouteId)
+      ? props.defaultEgressRouteId
+      : null
+  }
+  if (!egressConcurrencyDefaultTouched.value) {
+    concurrency.value = props.defaultEgressConcurrency != null
+      && Number.isSafeInteger(props.defaultEgressConcurrency)
+      && props.defaultEgressConcurrency > 0
+      ? props.defaultEgressConcurrency
+      : 3
+  }
+}
+
+const handleEgressRouteIdsUpdate = (routeIds: number[]) => {
+  egressRouteDefaultsTouched.value = true
+  egressRouteIds.value = routeIds
+}
+
+const handlePrimaryEgressRouteUpdate = (routeId: number | null) => {
+  egressRouteDefaultsTouched.value = true
+  primaryEgressRouteId.value = routeId
+}
+
+const handleEgressOperationChange = (operation: AccountEgressPoolOperation) => {
+  if (operation === egressOperation.value) return
+  egressOperation.value = operation
+  if (operation === 'replace') {
+    egressRouteDefaultsTouched.value = false
+    initializeOpenAIEgressDefaults()
+    return
+  }
+  egressRouteDefaultsTouched.value = true
+  egressRouteIds.value = []
+  primaryEgressRouteId.value = null
+}
+
+const handleConcurrencyInput = () => {
+  egressConcurrencyDefaultTouched.value = true
+  concurrency.value = Math.max(1, concurrency.value || 1)
+}
 const openaiPassthroughEnabled = ref(false)
 // Codex namespace 工具摊平兼容开关（仅 OAuth），缺省关闭即原样保留
 const openaiFlattenNamespacesEnabled = ref(false)
@@ -1937,13 +2063,22 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     return updates.extra as Record<string, unknown>
   }
 
-  if (enableProxy.value) {
-    // 后端期望 proxy_id: 0 表示清除代理，而不是 null
-    updates.proxy_id = proxyId.value === null ? 0 : proxyId.value
-  }
-
-  if (enableConcurrency.value) {
-    updates.concurrency = concurrency.value
+  if (allOpenAIOAuthOnly.value && (enableProxy.value || enableConcurrency.value)) {
+    Object.assign(updates, buildBulkAccountEgressPatch({
+      operation: enableProxy.value ? egressOperation.value : 'append',
+      routeMutation: enableProxy.value,
+      routeIds: egressRouteIds.value,
+      primaryRouteId: primaryEgressRouteId.value,
+      concurrencyPerEgress: enableConcurrency.value ? concurrency.value : undefined,
+      routes: props.egressRoutes
+    }))
+  } else {
+    if (enableProxy.value) {
+      updates.proxy_id = proxyId.value === null ? 0 : proxyId.value
+    }
+    if (enableConcurrency.value) {
+      updates.concurrency = concurrency.value
+    }
   }
 
   if (enableLoadFactor.value) {
@@ -2165,15 +2300,25 @@ const canPreCheck = () =>
   (targetSelectedPlatforms.value[0] === 'antigravity' || targetSelectedPlatforms.value[0] === 'anthropic')
 
 const handleClose = () => {
+  const egressWasSaved = pendingEgressSavedForConfirm.value
   showMixedChannelWarning.value = false
   mixedChannelWarningMessage.value = ''
   pendingUpdatesForConfirm.value = null
+  pendingTargetForConfirm.value = null
+  pendingEgressSavedForConfirm.value = false
   mixedChannelConfirmed.value = false
+  if (egressWasSaved) {
+    appStore.showError(t('admin.accounts.bulkEdit.egressSavedOtherFieldsCancelled'))
+    emit('updated')
+  }
   emit('close')
 }
 
 // 预检查：提交前调接口检测，有风险就弹窗阻止，返回 false 表示需要用户确认
-const preCheckMixedChannelRisk = async (built: Record<string, unknown>): Promise<boolean> => {
+const preCheckMixedChannelRisk = async (
+  built: Record<string, unknown>,
+  target: BulkUpdateTargetSnapshot
+): Promise<boolean> => {
   if (!canPreCheck()) return true
   if (mixedChannelConfirmed.value) return true
 
@@ -2185,6 +2330,8 @@ const preCheckMixedChannelRisk = async (built: Record<string, unknown>): Promise
     if (!result.has_risk) return true
 
     pendingUpdatesForConfirm.value = built
+    pendingTargetForConfirm.value = target
+    pendingEgressSavedForConfirm.value = false
     mixedChannelWarningMessage.value = result.message || t('admin.accounts.bulkEdit.failed')
     showMixedChannelWarning.value = true
     return false
@@ -2194,7 +2341,32 @@ const preCheckMixedChannelRisk = async (built: Record<string, unknown>): Promise
   }
 }
 
+const captureBulkUpdateTarget = (): BulkUpdateTargetSnapshot => {
+  if (targetMode.value === 'filtered' && props.target?.filters) {
+    return { mode: 'filtered', filters: { ...props.target.filters } }
+  }
+  return { mode: 'selected', accountIds: [...props.accountIds] }
+}
+
 const handleSubmit = async () => {
+  if (allOpenAIOAuthOnly.value && (enableProxy.value || enableConcurrency.value) && !props.egressMutationEnabled) {
+    appStore.showError(t('admin.accounts.egressPool.catalogUnavailable'))
+    return
+  }
+  if (allOpenAIOAuthOnly.value && enableProxy.value && egressRouteIds.value.length === 0) {
+    appStore.showError(t('admin.accounts.egressPool.noSelection'))
+    return
+  }
+  if (allOpenAIOAuthOnly.value && enableProxy.value && egressOperation.value === 'replace' && (
+    primaryEgressRouteId.value == null
+    || !egressRouteIds.value.includes(primaryEgressRouteId.value)
+    || !props.egressRoutes.some((route) =>
+      route.id === primaryEgressRouteId.value && route.kind === 'proxy' && route.eligible
+    )
+  )) {
+    appStore.showError(t('admin.accounts.egressPool.primaryRequired'))
+    return
+  }
   if (targetMode.value === 'selected' && props.accountIds.length === 0) {
     appStore.showError(t('admin.accounts.bulkEdit.noSelection'))
     return
@@ -2258,74 +2430,174 @@ const handleSubmit = async () => {
     }
   }
 
-  const built = buildUpdatePayload()
+  let built: Record<string, unknown> | null
+  try {
+    built = buildUpdatePayload()
+  } catch (error: unknown) {
+    if (error instanceof AccountEgressPolicyError) {
+      appStore.showError(t(error.code === 'no_selection'
+        ? 'admin.accounts.egressPool.noSelection'
+        : 'admin.accounts.egressPool.catalogUnavailable'))
+      return
+    }
+    console.error('Failed to build bulk account update:', error)
+    appStore.showError(error instanceof Error ? error.message : t('admin.accounts.bulkEdit.failed'))
+    return
+  }
   if (!built) {
     appStore.showError(t('admin.accounts.bulkEdit.noFieldsSelected'))
     return
   }
 
-  const canContinue = await preCheckMixedChannelRisk(built)
+  const target = captureBulkUpdateTarget()
+  const canContinue = await preCheckMixedChannelRisk(built, target)
   if (!canContinue) return
 
-  await submitBulkUpdate(built)
+  await submitBulkUpdate(built, target)
 }
 
-const submitBulkUpdate = async (baseUpdates: Record<string, unknown>) => {
-  // 无论是预检查确认还是 409 兜底确认，只要 mixedChannelConfirmed 为 true 就带上 flag
-  const updates = mixedChannelConfirmed.value
-    ? { ...baseUpdates, confirm_mixed_channel_risk: true }
-    : baseUpdates
+type BulkUpdateResult = Awaited<ReturnType<typeof adminAPI.accounts.bulkUpdate>>
+
+const requestBulkUpdate = (
+  target: BulkUpdateTargetSnapshot,
+  updates: Record<string, unknown>
+): Promise<BulkUpdateResult> => target.mode === 'filtered'
+  ? adminAPI.accounts.bulkUpdate({ filters: target.filters, ...updates })
+  : adminAPI.accounts.bulkUpdate(target.accountIds, updates)
+
+const finishBulkUpdate = (result: BulkUpdateResult) => {
+  const success = result.success || 0
+  const failed = result.failed || 0
+  const inherited = result.long_context_inherited_count || 0
+
+  if (success > 0 && failed === 0) {
+    if (inherited > 0) {
+      appStore.showSuccess(t('admin.accounts.bulkEdit.successWithInherited', {
+        count: success,
+        inherited
+      }))
+    } else {
+      appStore.showSuccess(t('admin.accounts.bulkEdit.success', { count: success }))
+    }
+  } else if (success > 0) {
+    const key = inherited > 0
+      ? 'admin.accounts.bulkEdit.partialSuccessWithInherited'
+      : 'admin.accounts.bulkEdit.partialSuccess'
+    appStore.showError(t(key, { success, failed, inherited }))
+  } else {
+    appStore.showError(t('admin.accounts.bulkEdit.failed'))
+  }
+
+  if (success > 0) {
+    pendingUpdatesForConfirm.value = null
+    pendingTargetForConfirm.value = null
+    pendingEgressSavedForConfirm.value = false
+    emit('updated')
+    handleClose()
+  }
+}
+
+const bulkUpdateErrorMessage = (error: any): string => {
+  if (error?.reason === 'UPSTREAM_BILLING_RATE_SYNC_BULK_CONFLICT') {
+    return t('admin.accounts.bulkEdit.rateSyncConflict', {
+      count: error.metadata?.count ?? 1
+    })
+  }
+  if (error?.reason === 'OPENAI_LONG_CONTEXT_PARENT_REQUIRED') {
+    return t('admin.accounts.bulkEdit.longContextParentRequired')
+  }
+  return error?.message || t('admin.accounts.bulkEdit.failed')
+}
+
+const closeAfterPartialEgressUpdate = (reason: string) => {
+  appStore.showError(t('admin.accounts.bulkEdit.egressSavedOtherFieldsFailed', { reason }))
+  emit('updated')
+  handleClose()
+}
+
+const submitBulkUpdate = async (
+  baseUpdates: Record<string, unknown>,
+  target: BulkUpdateTargetSnapshot = captureBulkUpdateTarget(),
+  egressAlreadySaved = false
+) => {
+  const egressUpdates = baseUpdates.egress_pool == null
+    ? null
+    : {
+        egress_mode: baseUpdates.egress_mode,
+        egress_pool: baseUpdates.egress_pool
+      }
+  const ordinaryBaseUpdates = Object.fromEntries(
+    Object.entries(baseUpdates).filter(([key]) => key !== 'egress_mode' && key !== 'egress_pool')
+  )
+  const ordinaryUpdates = mixedChannelConfirmed.value
+    ? { ...ordinaryBaseUpdates, confirm_mixed_channel_risk: true }
+    : ordinaryBaseUpdates
+  const hasOrdinaryUpdates = Object.keys(ordinaryBaseUpdates).length > 0
+  let activeTarget = target
+  let ordinaryRequestFollowsSavedEgress = egressAlreadySaved
 
   submitting.value = true
 
   try {
-    const res = targetMode.value === 'filtered' && props.target?.filters
-      ? await adminAPI.accounts.bulkUpdate({
-        filters: props.target.filters,
-        ...updates
-      })
-      : await adminAPI.accounts.bulkUpdate(props.accountIds, updates)
-    const success = res.success || 0
-    const failed = res.failed || 0
-    const inherited = res.long_context_inherited_count || 0
+    let result: BulkUpdateResult
 
-    if (success > 0 && failed === 0) {
-      if (inherited > 0) {
-        appStore.showSuccess(t('admin.accounts.bulkEdit.successWithInherited', {
-          count: success,
-          inherited
-        }))
-      } else {
-        appStore.showSuccess(t('admin.accounts.bulkEdit.success', { count: success }))
+    if (egressUpdates && hasOrdinaryUpdates) {
+      const egressResult = await requestBulkUpdate(target, egressUpdates)
+      if ((egressResult.success || 0) === 0 || (egressResult.failed || 0) > 0) {
+        finishBulkUpdate(egressResult)
+        return
       }
-    } else if (success > 0) {
-      const key = inherited > 0
-        ? 'admin.accounts.bulkEdit.partialSuccessWithInherited'
-        : 'admin.accounts.bulkEdit.partialSuccess'
-      appStore.showError(t(key, { success, failed, inherited }))
+
+      ordinaryRequestFollowsSavedEgress = true
+      if (target.mode === 'filtered') {
+        if (!egressResult.success_ids?.length) {
+          closeAfterPartialEgressUpdate(t('admin.accounts.bulkEdit.failed'))
+          return
+        }
+        activeTarget = { mode: 'selected', accountIds: [...egressResult.success_ids] }
+      }
+      result = await requestBulkUpdate(activeTarget, ordinaryUpdates)
+    } else if (egressUpdates) {
+      result = await requestBulkUpdate(target, egressUpdates)
     } else {
-      appStore.showError(t('admin.accounts.bulkEdit.failed'))
+      result = await requestBulkUpdate(target, ordinaryUpdates)
     }
 
-    if (success > 0) {
-      pendingUpdatesForConfirm.value = null
-      emit('updated')
-      handleClose()
+    const ordinarySuccess = result.success || 0
+    const ordinaryFailed = result.failed || 0
+    if (ordinaryRequestFollowsSavedEgress && (ordinarySuccess === 0 || ordinaryFailed > 0)) {
+      closeAfterPartialEgressUpdate(ordinarySuccess > 0
+        ? t('admin.accounts.bulkEdit.partialSuccess', {
+            success: ordinarySuccess,
+            failed: ordinaryFailed
+          })
+        : t('admin.accounts.bulkEdit.failed'))
+      return
     }
+    finishBulkUpdate(result)
   } catch (error: any) {
-    // 兜底：多平台混合场景下，预检查跳过，由后端 409 触发确认框
-    if (error.status === 409 && error.error === 'mixed_channel_warning') {
-      pendingUpdatesForConfirm.value = baseUpdates
-      mixedChannelWarningMessage.value = error.message
+    // 兜底：多平台混合场景下，预检查跳过，由后端 409 触发确认框。
+    if (error?.status === 409 && error?.error === 'mixed_channel_warning') {
+      pendingUpdatesForConfirm.value = ordinaryRequestFollowsSavedEgress
+        ? ordinaryBaseUpdates
+        : baseUpdates
+      pendingTargetForConfirm.value = activeTarget
+      pendingEgressSavedForConfirm.value = ordinaryRequestFollowsSavedEgress
+      mixedChannelWarningMessage.value = ordinaryRequestFollowsSavedEgress
+        ? t('admin.accounts.bulkEdit.egressSavedConfirmOtherFields', { message: error.message })
+        : error.message
       showMixedChannelWarning.value = true
-    } else if (error.reason === 'UPSTREAM_BILLING_RATE_SYNC_BULK_CONFLICT') {
+    } else if (ordinaryRequestFollowsSavedEgress) {
+      closeAfterPartialEgressUpdate(bulkUpdateErrorMessage(error))
+      console.error('Error updating account fields after egress update:', error)
+    } else if (error?.reason === 'UPSTREAM_BILLING_RATE_SYNC_BULK_CONFLICT') {
       appStore.showError(t('admin.accounts.bulkEdit.rateSyncConflict', {
         count: error.metadata?.count ?? 1
       }))
-    } else if (error.reason === 'OPENAI_LONG_CONTEXT_PARENT_REQUIRED') {
+    } else if (error?.reason === 'OPENAI_LONG_CONTEXT_PARENT_REQUIRED') {
       appStore.showError(t('admin.accounts.bulkEdit.longContextParentRequired'))
     } else {
-      appStore.showError(error.message || t('admin.accounts.bulkEdit.failed'))
+      appStore.showError(error?.message || t('admin.accounts.bulkEdit.failed'))
       console.error('Error bulk updating accounts:', error)
     }
   } finally {
@@ -2336,15 +2608,43 @@ const submitBulkUpdate = async (baseUpdates: Record<string, unknown>) => {
 const handleMixedChannelConfirm = async () => {
   showMixedChannelWarning.value = false
   mixedChannelConfirmed.value = true
-  if (pendingUpdatesForConfirm.value) {
-    await submitBulkUpdate(pendingUpdatesForConfirm.value)
+  const updates = pendingUpdatesForConfirm.value
+  const target = pendingTargetForConfirm.value ?? captureBulkUpdateTarget()
+  const egressWasSaved = pendingEgressSavedForConfirm.value
+  pendingUpdatesForConfirm.value = null
+  pendingTargetForConfirm.value = null
+  pendingEgressSavedForConfirm.value = false
+  if (updates) {
+    await submitBulkUpdate(
+      updates,
+      target,
+      egressWasSaved
+    )
   }
 }
 
 const handleMixedChannelCancel = () => {
-  showMixedChannelWarning.value = false
-  pendingUpdatesForConfirm.value = null
+  if (pendingEgressSavedForConfirm.value) handleClose()
+  else {
+    showMixedChannelWarning.value = false
+    pendingUpdatesForConfirm.value = null
+    pendingTargetForConfirm.value = null
+  }
 }
+
+watch(
+  [
+    () => props.show,
+    allOpenAIOAuthOnly,
+    () => props.egressRoutes,
+    () => props.defaultEgressRouteId,
+    () => props.defaultEgressConcurrency
+  ],
+  ([show]) => {
+    if (show) initializeOpenAIEgressDefaults()
+  },
+  { immediate: true }
+)
 
 // Reset form when modal closes
 watch(
@@ -2396,7 +2696,12 @@ watch(
       headerOverrideEnabled.value = false
       headerOverrideRows.value = []
       proxyId.value = null
+      egressRouteIds.value = []
+      primaryEgressRouteId.value = null
+      egressOperation.value = 'replace'
       concurrency.value = 1
+      egressRouteDefaultsTouched.value = false
+      egressConcurrencyDefaultTouched.value = false
       loadFactor.value = null
       priority.value = 1
       rateMultiplier.value = 1
@@ -2419,6 +2724,8 @@ watch(
       showMixedChannelWarning.value = false
       mixedChannelWarningMessage.value = ''
       pendingUpdatesForConfirm.value = null
+      pendingTargetForConfirm.value = null
+      pendingEgressSavedForConfirm.value = false
       mixedChannelConfirmed.value = false
     }
   }
