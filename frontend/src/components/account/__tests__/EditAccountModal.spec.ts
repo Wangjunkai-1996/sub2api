@@ -347,6 +347,7 @@ function mountModal(account = buildAccount(), extraProps: Record<string, unknown
         Select: SelectStub,
         Icon: true,
         ProxySelector: true,
+        CodexAccountTicketSettings: true,
         GroupSelector: renderGroupSelector ? false : GroupSelectorStub,
         ModelWhitelistSelector: ModelWhitelistSelectorStub
       }
@@ -1137,7 +1138,10 @@ describe('EditAccountModal', () => {
     checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
     const wrapper = mountModal(account as any, { egressRoutes: routes })
 
+    const ticketSettings = wrapper.findComponent({ name: 'CodexAccountTicketSettings' })
+    expect(ticketSettings.props('proxyChanged')).toBe(false)
     await wrapper.get('#egress-route-2').setValue(true)
+    expect(ticketSettings.props('proxyChanged')).toBe(true)
     await wrapper.get('[data-testid="egress-concurrency-per-route"]').setValue(5)
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 

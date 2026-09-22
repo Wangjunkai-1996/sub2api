@@ -150,6 +150,48 @@ func TestAuditSensitiveKeys_CoverCredentialTable(t *testing.T) {
 	}
 }
 
+// General account edits and imports are audited before their managed fields
+// are stripped. Both v1 and v2 ticket material must be redacted at that boundary.
+func TestRedactAuditBody_CodexPrivateExtraInAccountEditsAndImports(t *testing.T) {
+	account := map[string]any{
+		"name": "account-visible",
+		"extra": map[string]any{
+			"ordinary":                         "kept",
+			"codex_turn_ticket:gpt-6-astra":    map[string]any{"state": "canary-v1-state"},
+			"codex_turn_ticket:v2:gpt-6-astra": map[string]any{"state": "canary-v2-state", "egress_binding_id": "canary-binding"},
+			"codex_turn_ticket:v2:config":      map[string]any{"proxy_url": "http://canary-user:canary-password@example.test:8080", "revision": "canary-revision"},
+			"codex_turn_ticket:v2:watchdog":    map[string]any{"receipt": "canary-receipt"},
+			"codex_turn_ticket:v2:lease":       map[string]any{"owner": "canary-lease"},
+			"codex_ticket_config":              map[string]any{"proxy_url": "http://canary-legacy:canary-password@example.test:8080"},
+			"codex_ticket_watchdog":            map[string]any{"receipt": "canary-legacy-receipt"},
+			"codex_harvest_proxy_url":          "http://canary-proxy:canary-password@example.test:8080",
+		},
+	}
+	for name, body := range map[string]any{
+		"edit":   account,
+		"import": map[string]any{"accounts": []any{account}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := RedactAuditBody(raw, "application/json")
+			if strings.Contains(out, "canary-") || strings.Contains(out, "example.test") {
+				t.Fatalf("audit body leaked ticket material: %s", out)
+			}
+			for key := range account["extra"].(map[string]any) {
+				if key != "ordinary" && !strings.Contains(out, `"`+key+`":"***"`) {
+					t.Fatalf("managed key %q was not fully redacted: %s", key, out)
+				}
+			}
+			if !strings.Contains(out, `"ordinary":"kept"`) || !strings.Contains(out, "account-visible") {
+				t.Fatalf("audit body lost non-secret operation context: %s", out)
+			}
+		})
+	}
+}
+
 func TestRedactAuditBody_NonJSONOmitted(t *testing.T) {
 	out := RedactAuditBody([]byte("username=admin&password=secret"), "application/x-www-form-urlencoded")
 	if strings.Contains(out, "secret") {

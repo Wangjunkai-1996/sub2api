@@ -1231,7 +1231,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				return nil, ErrNoAvailableAccounts
 			}
 
-			result, acquireErr := s.tryAcquireAccountSlot(ctx, account)
+			result, acquireErr := s.tryAcquireAccountSlot(ctx, account, requestedModel, requireCompact)
 			if acquireErr == nil && result != nil && result.Acquired {
 				selection, selectionErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
 				if selectionErr != nil {
@@ -1333,7 +1333,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					} else if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 					} else {
-						result, err := s.tryAcquireAccountSlot(ctx, account)
+						result, err := s.tryAcquireAccountSlot(ctx, account, requestedModel, requireCompact)
 						if err == nil && result != nil && result.Acquired {
 							selection, selectErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, account), result.ReleaseFunc)
 							if selectErr != nil {
@@ -1499,7 +1499,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 				continue
 			}
-			result, err := s.tryAcquireAccountSlot(ctx, fresh)
+			result, err := s.tryAcquireAccountSlot(ctx, fresh, requestedModel, requireCompact)
 			if err == nil && result != nil && result.Acquired {
 				selection, selectErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 				if selectErr != nil {
@@ -1545,7 +1545,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 				continue
 			}
-			result, err := s.tryAcquireAccountSlot(ctx, fresh)
+			result, err := s.tryAcquireAccountSlot(ctx, fresh, requestedModel, requireCompact)
 			if err == nil && result != nil && result.Acquired {
 				selection, selectErr := s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 				if selectErr != nil {
@@ -1606,7 +1606,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			continue
 		}
 		if accountUsesEnforcedEgressPool(ctx, s.settingService, fresh) {
-			result, acquireErr := s.tryAcquireAccountSlot(ctx, fresh)
+			result, acquireErr := s.tryAcquireAccountSlot(ctx, fresh, requestedModel, requireCompact)
 			if acquireErr == nil && result != nil && result.Acquired {
 				return s.newAcquiredSelectionResult(ctx, selectionAccount(result, fresh), result.ReleaseFunc)
 			}
@@ -1668,7 +1668,11 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 	return accounts, nil
 }
 
-func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, account *Account) (*AcquireResult, error) {
+func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, account *Account, requestedModel string, requireCompact bool) (*AcquireResult, error) {
+	ctx, err := s.codexTicketSelectionContext(ctx, account, requestedModel, requireCompact)
+	if err != nil {
+		return nil, err
+	}
 	result, err := acquireAccountSlotForSelection(ctx, s.concurrencyService, s.settingService, account)
 	if err != nil || result == nil || !result.Acquired {
 		return result, err

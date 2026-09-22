@@ -46,3 +46,21 @@ func TestSettingsCodexTicketRejectInvalidProxyWithoutLeakingPassword(t *testing.
 	require.NotContains(t, rec.Body.String(), "invalid-secret")
 	require.Equal(t, "http://previous.example.com:8080", repo.values[key])
 }
+
+func TestSettingsCodexTicketMasterPreservesRollbackModes(t *testing.T) {
+	h, repo := newStepUpSwitchTestHandler(t, map[string]string{
+		service.SettingKeyOpenAICodexTicketEnabled:    "false",
+		service.SettingKeyOpenAICodexTicket332Enabled: "true",
+	})
+	rec := doUpdateSettings(t, h, map[string]any{"openai_codex_ticket_enabled": false}, nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, "false", repo.values[service.SettingKeyOpenAICodexTicketV2Enabled])
+	require.Equal(t, "false", repo.values[service.SettingKeyOpenAICodexTicketEnabled])
+	require.Equal(t, "true", repo.values[service.SettingKeyOpenAICodexTicket332Enabled])
+	require.False(t, h.settingService.GetOpenAICodexTicketEnabled(context.Background(), true))
+	require.NotContains(t, rec.Body.String(), `"openai_codex_ticket_332_enabled"`)
+
+	rec = doUpdateSettings(t, h, map[string]any{"openai_codex_ticket_332_enabled": true}, nil)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "false", repo.values[service.SettingKeyOpenAICodexTicketV2Enabled])
+}

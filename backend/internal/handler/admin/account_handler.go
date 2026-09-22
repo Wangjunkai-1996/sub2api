@@ -70,6 +70,7 @@ type AccountHandler struct {
 	openAIWindowWarmup      *service.OpenAIWindowWarmupService
 	settingService          *service.SettingService
 	egressService           *service.EgressService
+	codexAccountTickets     codexAccountTicketManager
 	cfg                     *config.Config
 }
 

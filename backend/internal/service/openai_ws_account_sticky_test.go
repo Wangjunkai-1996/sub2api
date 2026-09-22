@@ -398,27 +398,19 @@ func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_Codex332RuntimeG
 
 	newService := func(t *testing.T) (*OpenAIGatewayService, OpenAIWSStateStore, Account) {
 		t.Helper()
-		account := Account{
-			ID:          332,
-			Platform:    PlatformOpenAI,
-			Type:        AccountTypeOAuth,
-			Status:      StatusActive,
-			Schedulable: true,
-			Concurrency: 1,
-			Credentials: map[string]any{
-				"access_token":       "tok",
-				"chatgpt_account_id": "acc-332",
-			},
-			Extra: map[string]any{
-				"responses_websockets_v2_enabled": true,
-			},
-		}
+		account := *ticketTestAccount(332)
+		account.Schedulable = true
+		account.Concurrency = 1
+		ac := codexAccountTicketConfigOf(&account)
+		ac.TicketPlan = codexTicketPlanTeam
+		account.Extra[codexAccountTicketConfigKey] = ac
+		account.Extra["responses_websockets_v2_enabled"] = true
 		cache := &stubGatewayCache{}
 		store := NewOpenAIWSStateStore(cache)
 		cfg := newOpenAIWSV2TestConfig()
 		cfg.Gateway.OpenAICodexTicket = config.OpenAICodexTicketConfig{
-			Enabled332:   true,
-			TargetLength: 292, // Enabled332 normalizes this to 332 at runtime.
+			Enabled:      true,
+			TargetLength: 292, // Account Team plan determines the required length.
 			FailClosed:   true,
 			Models:       []string{"gpt-6-astra"},
 		}
@@ -447,14 +439,7 @@ func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_Codex332RuntimeG
 
 	t.Run("valid 332 ticket succeeds", func(t *testing.T) {
 		service, _, account := newService(t)
-		service.openaiCodexTickets.Store(openAICodexTicketKey(account.ID, "gpt-6-astra"), &openAICodexTicket{
-			AccountID:  account.ID,
-			Model:      "gpt-6-astra",
-			State:      fakeCodexTicketState(332),
-			Length:     332,
-			CapturedAt: time.Now(),
-			ExpiresAt:  time.Now().Add(time.Hour),
-		})
+		account.Extra[openAICodexTicketExtraKey("gpt-6-astra")] = verifiedTestTicket(&account, 332)
 
 		selection, err := service.SelectAccountByPreviousResponseID(ctx, &groupID, responseID, "gpt-6-astra", nil, false)
 		require.NoError(t, err)

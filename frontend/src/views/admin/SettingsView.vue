@@ -4514,46 +4514,18 @@
                   <Toggle
                     id="codex-ticket-enabled"
                     v-model="form.openai_codex_ticket_enabled"
-                    @update:model-value="onCodex292Toggle"
-                  />
-                </div>
-                <div class="flex items-center justify-between gap-4">
-                  <div class="min-w-0">
-                    <h3 class="text-base font-semibold text-gray-900 dark:text-white">
-                      {{ t("admin.settings.gatewayForwarding.codexTicket332Enabled") }}
-                    </h3>
-                    <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                      {{ t("admin.settings.gatewayForwarding.codexTicket332EnabledDesc") }}
-                    </p>
-                  </div>
-                  <Toggle
-                    id="codex-ticket-332-enabled"
-                    v-model="form.openai_codex_ticket_332_enabled"
-                    @update:model-value="onCodex332Toggle"
                   />
                 </div>
                 <div>
-                  <h3 class="text-base font-semibold text-gray-900 dark:text-white">
-                    {{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxy") }}
-                  </h3>
-                  <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                    {{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxyDesc") }}
-                  </p>
-                  <input
-                    id="codex-ticket-harvest-proxy"
-                    v-model="form.openai_codex_ticket_harvest_proxy_url"
-                    type="text"
-                    class="input mt-3 w-full font-mono text-sm"
-                    :placeholder="t('admin.settings.gatewayForwarding.codexTicketHarvestProxyPlaceholder')"
-                    autocomplete="off"
-                  />
-                  <p
-                    v-if="form.openai_codex_ticket_harvest_proxy_configured"
-                    class="mt-1.5 text-xs text-gray-500 dark:text-gray-400"
-                  >
-                    {{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxyConfigured") }}
-                  </p>
+                  <label for="codex-ticket-harvest-proxy" class="input-label">{{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxy") }}</label>
+                  <input id="codex-ticket-harvest-proxy" v-model="form.openai_codex_ticket_harvest_proxy_url" type="password" class="input w-full font-mono text-sm" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore="true" :placeholder="t('admin.settings.gatewayForwarding.codexTicketHarvestProxyPlaceholder')" />
+                  <p v-if="form.openai_codex_ticket_harvest_proxy_configured" class="mt-1 text-xs text-emerald-600 dark:text-emerald-400" data-testid="codex-ticket-global-pool-configured">{{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxyConfigured") }}</p>
+                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxyDesc") }}</p>
                 </div>
+                <p class="text-sm text-gray-500 dark:text-gray-400">
+                  {{ t("admin.settings.gatewayForwarding.codexTicketAccountHint") }}
+                  <a href="/admin/accounts" class="font-medium text-primary-600 underline dark:text-primary-400">{{ t("admin.settings.gatewayForwarding.codexTicketAccountsLink") }}</a>
+                </p>
                 <div>
                   <h3 class="text-base font-semibold text-gray-900 dark:text-white">
                     {{ t("admin.settings.gatewayForwarding.codexClientRestrictionTitle") }}
@@ -9198,7 +9170,7 @@ type SettingsTab =
   | "payment"
   | "email"
   | "backup";
-const activeTab = ref<SettingsTab>("general");
+const activeTab = ref<SettingsTab>(new URLSearchParams(window.location.search).get("tab") === "gateway" ? "gateway" : "general");
 const settingsTabs = [
   { key: "general" as SettingsTab, icon: "home" as const },
   { key: "agreement" as SettingsTab, icon: "document" as const },
@@ -10132,7 +10104,6 @@ const form = reactive<SettingsForm>({
   openai_codex_client_version_synced: "",
   openai_codex_version_auto_sync_enabled: true,
   openai_codex_ticket_enabled: false,
-  openai_codex_ticket_332_enabled: false,
   openai_codex_ticket_harvest_proxy_url: "",
   openai_codex_ticket_harvest_proxy_configured: false,
   // codex_cli_only 加固
@@ -11133,18 +11104,6 @@ const codexSyncedVersionLabel = computed(() => {
   });
 });
 
-function onCodex292Toggle(enabled: boolean): void {
-  if (enabled) {
-    form.openai_codex_ticket_332_enabled = false;
-  }
-}
-
-function onCodex332Toggle(enabled: boolean): void {
-  if (enabled) {
-    form.openai_codex_ticket_enabled = false;
-  }
-}
-
 async function loadSettings() {
   loading.value = true;
   loadFailed.value = false;
@@ -11158,9 +11117,7 @@ async function loadSettings() {
         (form as Record<string, unknown>)[key] = value;
       }
     }
-    if (form.openai_codex_ticket_332_enabled) {
-      form.openai_codex_ticket_enabled = false;
-    }
+    form.openai_codex_ticket_harvest_proxy_url = "";
     syncCaptchaProviderSelection();
     if (!form.claude_oauth_system_prompt_blocks?.trim()) {
       form.claude_oauth_system_prompt_blocks =
@@ -11867,9 +11824,7 @@ async function saveSettings() {
       openai_codex_version_auto_sync_enabled:
         form.openai_codex_version_auto_sync_enabled,
       openai_codex_ticket_enabled: form.openai_codex_ticket_enabled,
-      openai_codex_ticket_332_enabled: form.openai_codex_ticket_332_enabled,
-      openai_codex_ticket_harvest_proxy_url:
-        form.openai_codex_ticket_harvest_proxy_url?.trim() || "",
+      openai_codex_ticket_harvest_proxy_url: form.openai_codex_ticket_harvest_proxy_url.trim() || undefined,
       min_codex_version: form.min_codex_version?.trim() || "",
       max_codex_version: form.max_codex_version?.trim() || "",
       codex_cli_only_allow_app_server_clients:
@@ -12064,6 +12019,7 @@ async function saveSettings() {
         (form as Record<string, unknown>)[key] = value;
       }
     }
+    form.openai_codex_ticket_harvest_proxy_url = "";
     Object.assign(authSourceDefaults, buildAuthSourceDefaultsState(updated));
     form.default_platform_quotas = normalizePlatformQuotasMap(updated.default_platform_quotas);
     form.account_scheduling_thresholds = normalizeAccountSchedulingThresholdsMap(

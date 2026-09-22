@@ -1266,7 +1266,7 @@ func (c *UserMessageQueueConfig) GetEffectiveMode() string {
 
 // OpenAICodexTicketConfig 控制 ChatGPT OAuth 的 x-codex-turn-state 门票。
 // 打票走 harvest_proxy_url（SOCKS），业务出站仍用账号住宅 proxy_id，只替换该请求头。
-// Enabled 与 Enabled332 互斥，分别对应 292 与 332 长度门票。
+// Enabled 是主开关；Enabled332 仅用于读取旧配置。票据长度由账号 Pro/Team 控制。
 // 门票默认有效 3600 秒，临近过期前 refresh_before_seconds 重新打票。
 type OpenAICodexTicketConfig struct {
 	Enabled                      bool     `mapstructure:"enabled"`
@@ -1275,6 +1275,7 @@ type OpenAICodexTicketConfig struct {
 	TTLSeconds                   int      `mapstructure:"ttl_seconds"`
 	RefreshBeforeSeconds         int      `mapstructure:"refresh_before_seconds"`
 	HarvestProxyURL              string   `mapstructure:"harvest_proxy_url"`
+	HarvestDialProxyURL          string   `mapstructure:"harvest_dial_proxy_url"`
 	HarvestProbeIntervalSeconds  int      `mapstructure:"harvest_probe_interval_seconds"`
 	HarvestAttemptTimeoutSeconds int      `mapstructure:"harvest_attempt_timeout_seconds"`
 	FailClosed                   bool     `mapstructure:"fail_closed"`
@@ -2459,6 +2460,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_codex_ticket.ttl_seconds", 3600)
 	viper.SetDefault("gateway.openai_codex_ticket.refresh_before_seconds", 600)
 	viper.SetDefault("gateway.openai_codex_ticket.harvest_proxy_url", "")
+	viper.SetDefault("gateway.openai_codex_ticket.harvest_dial_proxy_url", "")
 	viper.SetDefault("gateway.openai_codex_ticket.harvest_probe_interval_seconds", 6)
 	viper.SetDefault("gateway.openai_codex_ticket.harvest_attempt_timeout_seconds", 25)
 	viper.SetDefault("gateway.openai_codex_ticket.fail_closed", true)

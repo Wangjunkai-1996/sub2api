@@ -732,6 +732,10 @@ const (
 	// 关闭：不打票、不注入 x-codex-turn-state，按原链路转发。
 	// 开启：后台打票并在业务请求中覆盖该头。
 	SettingKeyOpenAICodexTicketEnabled = "openai_codex_ticket_enabled"
+	// SettingKeyOpenAICodexTicketV2Enabled is the single live master switch used
+	// by account-level Pro/Team ticket controls. The old mode keys remain read
+	// only during upgrade and are never written by the settings API.
+	SettingKeyOpenAICodexTicketV2Enabled = "openai_codex_ticket_v2_enabled"
 	// SettingKeyOpenAICodexTicket332Enabled Codex 332 打票总开关（与 292 互斥）。
 	SettingKeyOpenAICodexTicket332Enabled = "openai_codex_ticket_332_enabled"
 	// SettingKeyOpenAICodexTicketHarvestProxyURL Codex 292 打票出口（socks5h/http），后台可改、热更新。

@@ -389,7 +389,7 @@ func TestPreviousResponseRequiredBindingWaitsWithoutSpilling(t *testing.T) {
 	}
 
 	ctx := WithRequiredAccountEgressBinding(context.Background(), candidate.BindingID)
-	result, err := service.acquirePreviousResponseAccountSlot(ctx, account, true)
+	result, err := service.acquirePreviousResponseAccountSlot(ctx, account, true, "gpt-6-astra", false)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, result.Acquired)

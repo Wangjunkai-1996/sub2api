@@ -194,47 +194,46 @@ func (s *SettingService) GetAntigravityUserAgentVersion(ctx context.Context) str
 }
 
 type cachedOpenAICodexTicketSettings struct {
-	enabled    bool
-	enabled332 bool
-	expiresAt  int64
-}
-
-func normalizeOpenAICodexTicketModes(enabled, enabled332 bool) (bool, bool) {
-	if enabled && enabled332 {
-		return false, false
-	}
-	return enabled, enabled332
+	enabled   bool
+	expiresAt int64
 }
 
 const openAICodexTicketEnabledCacheTTL = 5 * time.Second
 
-// getOpenAICodexTicketSettings reads both mutually-exclusive mode switches as
-// one cached snapshot so a live settings update cannot expose a mixed pair.
-func (s *SettingService) getOpenAICodexTicketSettings(ctx context.Context, fallback, fallback332 bool) (bool, bool) {
-	fallback, fallback332 = normalizeOpenAICodexTicketModes(fallback, fallback332)
+// codexTicketMasterSetting keeps v1 settings read-only for rollback instances.
+// A persisted legacy pair replaces the YAML pair as a whole. Invalid double
+// enable remains disabled; the explicit v2 master always takes precedence.
+func codexTicketMasterSetting(values map[string]string, fallback bool) bool {
+	if v := strings.TrimSpace(values[SettingKeyOpenAICodexTicketV2Enabled]); v != "" {
+		return v == "true"
+	}
+	legacy292 := strings.TrimSpace(values[SettingKeyOpenAICodexTicketEnabled])
+	legacy332 := strings.TrimSpace(values[SettingKeyOpenAICodexTicket332Enabled])
+	if legacy292 != "" || legacy332 != "" {
+		return (legacy292 == "true") != (legacy332 == "true")
+	}
+	return fallback
+}
+
+// GetOpenAICodexTicketEnabled reads the account-ticket master. The old switches
+// are only an upgrade fallback and do not select account plans or ticket length.
+func (s *SettingService) GetOpenAICodexTicketEnabled(ctx context.Context, fallback bool) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if ctx.Err() != nil {
-		return fallback, fallback332
+	if ctx.Err() != nil || s == nil || s.settingRepo == nil {
+		return fallback
 	}
-	if s == nil || s.settingRepo == nil {
-		return fallback, fallback332
+	if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
+		return cached.enabled
 	}
-	if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
-		if time.Now().UnixNano() < cached.expiresAt {
-			return cached.enabled, cached.enabled332
-		}
-	}
-	resultCh := s.openAICodexTicketEnabledSF.DoChan("openai_codex_ticket_modes", func() (any, error) {
-		if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
-			if time.Now().UnixNano() < cached.expiresAt {
-				return cached, nil
-			}
+	resultCh := s.openAICodexTicketEnabledSF.DoChan("openai_codex_ticket_master", func() (any, error) {
+		if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
+			return cached, nil
 		}
 		dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		values, err := s.settingRepo.GetMultiple(dbCtx, []string{SettingKeyOpenAICodexTicketEnabled, SettingKeyOpenAICodexTicket332Enabled})
+		values, err := s.settingRepo.GetMultiple(dbCtx, []string{SettingKeyOpenAICodexTicketV2Enabled, SettingKeyOpenAICodexTicketEnabled, SettingKeyOpenAICodexTicket332Enabled})
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -242,57 +241,26 @@ func (s *SettingService) getOpenAICodexTicketSettings(ctx context.Context, fallb
 			if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
 				return cached, nil
 			}
-			return &cachedOpenAICodexTicketSettings{enabled: fallback, enabled332: fallback332}, nil
+			return &cachedOpenAICodexTicketSettings{enabled: fallback}, nil
 		}
-		enabled, enabled332 := fallback, fallback332
-		dbModesConfigured := false
-		dbEnabledConfigured := false
-		dbEnabled332Configured := false
-		if value, ok := values[SettingKeyOpenAICodexTicketEnabled]; ok && strings.TrimSpace(value) != "" {
-			dbModesConfigured = true
-			dbEnabledConfigured = true
-			enabled = value == "true"
-		}
-		if value, ok := values[SettingKeyOpenAICodexTicket332Enabled]; ok && strings.TrimSpace(value) != "" {
-			dbModesConfigured = true
-			dbEnabled332Configured = true
-			enabled332 = value == "true"
-		}
-		if dbModesConfigured {
-			if !dbEnabledConfigured {
-				enabled = false
-			}
-			if !dbEnabled332Configured {
-				enabled332 = false
-			}
-		}
-		enabled, enabled332 = normalizeOpenAICodexTicketModes(enabled, enabled332)
-		cached := &cachedOpenAICodexTicketSettings{enabled: enabled, enabled332: enabled332, expiresAt: time.Now().Add(openAICodexTicketEnabledCacheTTL).UnixNano()}
+		cached := &cachedOpenAICodexTicketSettings{enabled: codexTicketMasterSetting(values, fallback), expiresAt: time.Now().Add(openAICodexTicketEnabledCacheTTL).UnixNano()}
 		s.openAICodexTicketEnabledCache.Store(cached)
 		return cached, nil
 	})
 	select {
 	case <-ctx.Done():
-		return fallback, fallback332
+		return fallback
 	case result := <-resultCh:
 		if v, ok := result.Val.(*cachedOpenAICodexTicketSettings); ok && result.Err == nil && v != nil {
-			return v.enabled, v.enabled332
+			return v.enabled
 		}
-		return fallback, fallback332
+		return fallback
 	}
 }
 
-// GetOpenAICodexTicketEnabled 返回后台 292 打票总开关。
-// 设置键存在时以后台为准；缺失则回退 yaml/env。
-func (s *SettingService) GetOpenAICodexTicketEnabled(ctx context.Context, fallback bool) bool {
-	enabled, _ := s.getOpenAICodexTicketSettings(ctx, fallback, false)
-	return enabled
-}
-
-// ResolveOpenAICodexTicketConfig applies both live mode switches while
-// preserving all other startup configuration, including TargetLength.
 func (s *SettingService) ResolveOpenAICodexTicketConfig(ctx context.Context, cfg config.OpenAICodexTicketConfig) config.OpenAICodexTicketConfig {
-	cfg.Enabled, cfg.Enabled332 = s.getOpenAICodexTicketSettings(ctx, cfg.Enabled, cfg.Enabled332)
+	cfg.Enabled = s.GetOpenAICodexTicketEnabled(ctx, cfg.Enabled != cfg.Enabled332)
+	cfg.Enabled332 = false // legacy fallback is never a runtime mode
 	return cfg
 }
 
@@ -300,7 +268,7 @@ func (s *SettingService) InvalidateOpenAICodexTicketEnabledCache() {
 	if s == nil {
 		return
 	}
-	s.openAICodexTicketEnabledSF.Forget("openai_codex_ticket_modes")
+	s.openAICodexTicketEnabledSF.Forget("openai_codex_ticket_master")
 	s.openAICodexTicketEnabledCache.Store(&cachedOpenAICodexTicketSettings{expiresAt: 0})
 }
 

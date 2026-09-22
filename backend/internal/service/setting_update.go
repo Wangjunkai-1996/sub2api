@@ -492,11 +492,7 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyOpenAICodexUserAgent] = strings.TrimSpace(settings.OpenAICodexUserAgent)
 	updates[SettingKeyOpenAICodexClientVersion] = NormalizeCodexClientVersion(settings.OpenAICodexClientVersion)
 	updates[SettingKeyOpenAICodexVersionAutoSyncEnabled] = strconv.FormatBool(settings.OpenAICodexVersionAutoSyncEnabled)
-	updates[SettingKeyOpenAICodexTicketEnabled] = strconv.FormatBool(settings.OpenAICodexTicketEnabled)
-	if settings.OpenAICodexTicketEnabled && settings.OpenAICodexTicket332Enabled {
-		return nil, infraerrors.BadRequest("INVALID_CODEX_TICKET_MODE", "openai_codex_ticket_enabled and openai_codex_ticket_332_enabled are mutually exclusive")
-	}
-	updates[SettingKeyOpenAICodexTicket332Enabled] = strconv.FormatBool(settings.OpenAICodexTicket332Enabled)
+	updates[SettingKeyOpenAICodexTicketV2Enabled] = strconv.FormatBool(settings.OpenAICodexTicketEnabled)
 	if err := ValidateOpenAICodexTicketHarvestProxyURL(settings.OpenAICodexTicketHarvestProxyURL); err != nil {
 		return nil, infraerrors.BadRequest("INVALID_CODEX_HARVEST_PROXY", err.Error())
 	}

@@ -183,15 +183,14 @@ func TestAccountTestService_OpenAICodexTicket332(t *testing.T) {
 			ctx, recorder := newTestContext()
 			resp := newJSONResponse(http.StatusOK, "data: {\"type\":\"response.completed\"}\n\n")
 			upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
-			gateway := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled332: true, FailClosed: true}, nil)
+			gateway := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: true, FailClosed: true}, nil)
 			account := ticketTestAccount(91)
+			ac := codexAccountTicketConfigOf(account)
+			ac.TicketPlan = codexTicketPlanTeam
+			ac.Model = "gpt-5.6-sol"
+			account.Extra[codexAccountTicketConfigKey] = ac
 			if tc.ticketLength > 0 {
-				account.Extra = map[string]any{
-					openAICodexTicketExtraKey(tc.model): &openAICodexTicket{
-						State: fakeCodexTicketState(tc.ticketLength), Length: tc.ticketLength,
-						CapturedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
-					},
-				}
+				account.Extra[openAICodexTicketExtraKey(ac.Model)] = verifiedTestTicket(account, tc.ticketLength)
 			}
 			svc := &AccountTestService{httpUpstream: upstream, openaiGatewayService: gateway}
 			if tc.shadow {
@@ -202,9 +201,9 @@ func TestAccountTestService_OpenAICodexTicket332(t *testing.T) {
 
 			err := svc.testOpenAIAccountConnection(ctx, account, tc.model, "", "")
 			if tc.wantBlocked {
-				require.ErrorContains(t, err, "未打到 332 门票")
+				require.ErrorContains(t, err, "缺少有效验证门票")
 				require.Empty(t, upstream.requests)
-				require.Contains(t, recorder.Body.String(), "未打到 332 门票")
+				require.Contains(t, recorder.Body.String(), "缺少有效验证门票")
 				return
 			}
 			require.NoError(t, err)

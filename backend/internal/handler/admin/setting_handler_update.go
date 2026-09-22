@@ -511,6 +511,10 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	if req.OpenAICodexTicket332Enabled != nil {
+		response.BadRequest(c, "Global 332 mode has been replaced by per-account Pro/Team settings; refresh the settings page")
+		return
+	}
 	auditReq := settingsAuditRequest(req)
 	omitted := omittedSettingKeys(sentFields)
 
@@ -1785,12 +1789,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAICodexTicketEnabled
 		}(),
-		OpenAICodexTicket332Enabled: func() bool {
-			if req.OpenAICodexTicket332Enabled != nil {
-				return *req.OpenAICodexTicket332Enabled
-			}
-			return previousSettings.OpenAICodexTicket332Enabled
-		}(),
 		OpenAICodexTicketHarvestProxyURL: func() string {
 			next := strings.TrimSpace(req.OpenAICodexTicketHarvestProxyURL)
 			if service.IsMaskedProxyURL(next) {
@@ -2401,7 +2399,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAICodexClientVersionSynced:                         updatedSettings.OpenAICodexClientVersionSynced,
 		OpenAICodexVersionAutoSyncEnabled:                      updatedSettings.OpenAICodexVersionAutoSyncEnabled,
 		OpenAICodexTicketEnabled:                               updatedSettings.OpenAICodexTicketEnabled,
-		OpenAICodexTicket332Enabled:                            updatedSettings.OpenAICodexTicket332Enabled,
 		OpenAICodexTicketHarvestProxyURL:                       service.MaskProxyURL(updatedSettings.OpenAICodexTicketHarvestProxyURL),
 		OpenAICodexTicketHarvestProxyConfigured:                strings.TrimSpace(updatedSettings.OpenAICodexTicketHarvestProxyURL) != "",
 		MinCodexVersion:                                        updatedSettings.MinCodexVersion,

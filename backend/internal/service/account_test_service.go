@@ -901,9 +901,28 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	credentialAccount.ApplyHeaderOverrides(req.Header)
 	if isOAuth && s.openaiGatewayService != nil {
-		if err := s.openaiGatewayService.applyOpenAICodexTicket(ctx, account, upstreamTestModelID, req.Header); err != nil {
-			ticketConfig := s.openaiGatewayService.openAICodexTicketConfigContext(ctx)
-			return s.sendErrorAndEnd(c, fmt.Sprintf("未打到 %d 门票，该模型已暂停，请等待后台打票成功后重试", ticketConfig.TargetLength))
+		gateway := s.openaiGatewayService
+		if account.EgressMode == EgressModePool && account.SelectedEgress == nil && codexAccountTicketConfigOf(account).Enabled {
+			admissionCtx, ticketErr := gateway.codexTicketSelectionContext(ctx, account, modelID, false)
+			if ticketErr != nil {
+				return s.sendErrorAndEnd(c, "票据验证出口不可用，请等待后台采集成功后重试")
+			}
+			acquired, acquireErr := acquireAccountSlotForSelection(admissionCtx, gateway.concurrencyService, gateway.settingService, account)
+			if acquireErr != nil || acquired == nil || !acquired.Acquired {
+				return s.sendErrorAndEnd(c, "票据验证出口暂不可用")
+			}
+			if acquired.ReleaseFunc != nil {
+				defer acquired.ReleaseFunc()
+			}
+			selected, hydrateErr := PreserveSelectedAccountEgress(account, acquired.Account)
+			if hydrateErr != nil {
+				return s.sendErrorAndEnd(c, "票据验证出口配置已变化")
+			}
+			account = selected
+			req = req.WithContext(ContextWithSelectedAccountEgress(req.Context(), account))
+		}
+		if err := gateway.applyOpenAICodexTicketToRequest(ctx, account, upstreamTestModelID, req); err != nil {
+			return s.sendErrorAndEnd(c, "该账号缺少有效验证门票，该模型已暂停，请等待后台采集成功后重试")
 		}
 	}
 
@@ -913,9 +932,19 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		proxyURL = account.Proxy.URL()
 	}
 
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return s.sendErrorAndEnd(c, "票据验证出口租约已失效")
+		}
+		defer releaseUse()
+	}
 	resp, err := s.doOpenAIAccountTestUpstream(req, proxyURL, account, true)
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
+	if isOAuth && s.openaiGatewayService != nil {
+		s.openaiGatewayService.observeCodexTicketResponse(req, resp)
 	}
 	defer func() { _ = resp.Body.Close() }()
 

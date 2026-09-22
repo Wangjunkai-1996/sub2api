@@ -924,33 +924,8 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	} else {
 		result.OpenAICodexVersionAutoSyncEnabled = true
 	}
-	result.OpenAICodexTicketEnabled = s != nil && s.cfg != nil && s.cfg.Gateway.OpenAICodexTicket.Enabled
-	result.OpenAICodexTicket332Enabled = s != nil && s.cfg != nil && s.cfg.Gateway.OpenAICodexTicket.Enabled332
-	dbModesConfigured := false
-	dbEnabledConfigured := false
-	dbEnabled332Configured := false
-	if v, ok := settings[SettingKeyOpenAICodexTicketEnabled]; ok && strings.TrimSpace(v) != "" {
-		dbModesConfigured = true
-		dbEnabledConfigured = true
-		result.OpenAICodexTicketEnabled = v == "true"
-	}
-	if v, ok := settings[SettingKeyOpenAICodexTicket332Enabled]; ok && strings.TrimSpace(v) != "" {
-		dbModesConfigured = true
-		dbEnabled332Configured = true
-		result.OpenAICodexTicket332Enabled = v == "true"
-	}
-	if dbModesConfigured {
-		if !dbEnabledConfigured {
-			result.OpenAICodexTicketEnabled = false
-		}
-		if !dbEnabled332Configured {
-			result.OpenAICodexTicket332Enabled = false
-		}
-	}
-	result.OpenAICodexTicketEnabled, result.OpenAICodexTicket332Enabled = normalizeOpenAICodexTicketModes(
-		result.OpenAICodexTicketEnabled,
-		result.OpenAICodexTicket332Enabled,
-	)
+	legacyFallback := s != nil && s.cfg != nil && (s.cfg.Gateway.OpenAICodexTicket.Enabled != s.cfg.Gateway.OpenAICodexTicket.Enabled332)
+	result.OpenAICodexTicketEnabled = codexTicketMasterSetting(settings, legacyFallback)
 	result.OpenAICodexTicketHarvestProxyURL = strings.TrimSpace(settings[SettingKeyOpenAICodexTicketHarvestProxyURL])
 	// codex_cli_only 加固
 	result.MinCodexVersion = settings[SettingKeyMinCodexVersion]

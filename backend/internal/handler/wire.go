@@ -53,6 +53,7 @@ func ProvideAdminHandlers(
 	ollamaCloudUsage *service.OllamaCloudUsageService,
 	openAIWindowWarmup *service.OpenAIWindowWarmupService,
 	settingService *service.SettingService,
+	codexTicketGateway *service.OpenAIGatewayService,
 ) *AdminHandlers {
 	accountHandler.SetEgressService(egressService)
 	accountHandler.SetUpstreamBillingProbeService(upstreamBillingProbe)
@@ -60,6 +61,7 @@ func ProvideAdminHandlers(
 	accountHandler.SetCodexTicketSettings(settingService)
 	accountHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
 	openaiOAuthHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
+	accountHandler.SetCodexAccountTicketService(codexTicketGateway)
 	return &AdminHandlers{
 		Dashboard:              dashboardHandler,
 		User:                   userHandler,

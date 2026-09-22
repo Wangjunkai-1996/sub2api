@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func (r *codexTicketSettingRepo) GetMultiple(ctx context.Context, keys []string)
 	return values, nil
 }
 
-func TestResolveOpenAICodexTicketConfigReadsBothModesTogether(t *testing.T) {
+func TestResolveOpenAICodexTicketConfigInheritsLegacy332Master(t *testing.T) {
 	repo := &codexTicketSettingRepo{codexPolicyMigrationRepoStub: &codexPolicyMigrationRepoStub{values: map[string]string{
 		SettingKeyOpenAICodexTicket332Enabled: "true",
 	}}}
@@ -44,8 +45,8 @@ func TestResolveOpenAICodexTicketConfigReadsBothModesTogether(t *testing.T) {
 	resolved := settings.ResolveOpenAICodexTicketConfig(nil, config.OpenAICodexTicketConfig{
 		TargetLength: 292,
 	})
-	require.False(t, resolved.Enabled)
-	require.True(t, resolved.Enabled332)
+	require.True(t, resolved.Enabled)
+	require.False(t, resolved.Enabled332)
 	require.Equal(t, 292, resolved.TargetLength)
 }
 
@@ -76,14 +77,7 @@ func TestCodexTicketEnabledRuntimeSettingOverridesYaml(t *testing.T) {
 	svc := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: false, FailClosed: true}, nil)
 	svc.settingService = settings
 	account := ticketTestAccount(41)
-	svc.storeOpenAICodexTicket(context.Background(), account, &openAICodexTicket{
-		AccountID:  41,
-		Model:      "gpt-6-astra",
-		State:      fakeCodexTicketState(292),
-		Length:     292,
-		CapturedAt: time.Now(),
-		ExpiresAt:  time.Now().Add(time.Hour),
-	})
+	svc.storeOpenAICodexTicket(context.Background(), account, verifiedTestTicket(account, 292))
 
 	h := http.Header{}
 	h.Set(openAICodexTurnStateHeader, "client-state")
@@ -163,4 +157,20 @@ func TestCodexTicketSettingsRefreshDoesNotMutateSharedConfig(t *testing.T) {
 	svc.refreshCachedSettings(&SystemSettings{OpenAICodexTicketEnabled: true})
 	require.False(t, cfg.Gateway.OpenAICodexTicket.Enabled, "runtime settings must not write the shared immutable startup configuration")
 	require.True(t, svc.GetOpenAICodexTicketEnabled(context.Background(), false))
+}
+
+func TestResolveOpenAICodexTicketConfigExplicitV2MasterWins(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			repo := &codexTicketSettingRepo{codexPolicyMigrationRepoStub: &codexPolicyMigrationRepoStub{values: map[string]string{
+				SettingKeyOpenAICodexTicketV2Enabled:  fmt.Sprint(enabled),
+				SettingKeyOpenAICodexTicketEnabled:    "true",
+				SettingKeyOpenAICodexTicket332Enabled: "true",
+			}}}
+			settings := NewSettingService(repo, &config.Config{})
+			resolved := settings.ResolveOpenAICodexTicketConfig(nil, config.OpenAICodexTicketConfig{Enabled332: true})
+			require.Equal(t, enabled, resolved.Enabled)
+			require.False(t, resolved.Enabled332)
+		})
+	}
 }

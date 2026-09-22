@@ -658,7 +658,7 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapabilityWit
 		ctx = WithRequiredAccountEgressBinding(ctx, requiredBindingID)
 	}
 
-	result, acquireErr := s.acquirePreviousResponseAccountSlot(ctx, account, poolEnforced)
+	result, acquireErr := s.acquirePreviousResponseAccountSlot(ctx, account, poolEnforced, requestedModel, requireCompact)
 	if acquireErr == nil && result != nil && result.Acquired {
 		selectedAccount := selectionAccount(result, account)
 		if !openAIProxyStreamQuarantineBypassed(ctx) && s.isOpenAIProxyStreamQuarantined(ctx, selectedAccount) {
@@ -708,8 +708,10 @@ func (s *OpenAIGatewayService) acquirePreviousResponseAccountSlot(
 	ctx context.Context,
 	account *Account,
 	poolEnforced bool,
+	requestedModel string,
+	requireCompact bool,
 ) (*AcquireResult, error) {
-	result, err := s.tryAcquireAccountSlot(ctx, account)
+	result, err := s.tryAcquireAccountSlot(ctx, account, requestedModel, requireCompact)
 	if !poolEnforced || !errors.Is(err, ErrAccountEgressCapacityFull) || s.concurrencyService == nil {
 		return result, err
 	}
@@ -748,7 +750,11 @@ func (s *OpenAIGatewayService) acquirePreviousResponseAccountSlot(
 		}
 
 		// Recovery admission belongs to the request, not this temporary wait.
-		result, err = acquireAccountSlotForSelection(waitCtx, s.concurrencyService, s.settingService, account)
+		admissionCtx, ticketErr := s.codexTicketSelectionContext(waitCtx, account, requestedModel, requireCompact)
+		if ticketErr != nil {
+			return nil, ticketErr
+		}
+		result, err = acquireAccountSlotForSelection(admissionCtx, s.concurrencyService, s.settingService, account)
 		if err == nil && result != nil && result.Acquired {
 			return result, nil
 		}

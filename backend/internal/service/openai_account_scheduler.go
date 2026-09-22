@@ -732,7 +732,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		)
 		return nil, true, nil
 	}
-	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account)
+	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account, req.RequestedModel, req.RequireCompact)
 	if acquireErr != nil && req.DisableStickyEscape {
 		return nil, false, acquireErr
 	}
@@ -1428,7 +1428,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			continue
 		}
 
-		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, candidate.account, budget)
+		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, candidate.account, budget, req.RequestedModel, req.RequireCompact)
 		if !attempted {
 			break
 		}
@@ -1491,7 +1491,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		}
 		if admissionChanged {
 			release(result)
-			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget)
+			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget, req.RequestedModel, req.RequireCompact)
 			if !attempted {
 				continue
 			}
@@ -1530,6 +1530,8 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAIAccountSlot(
 	ctx context.Context,
 	account *Account,
 	budget *openAISelectionProbeBudget,
+	requestedModel string,
+	requireCompact bool,
 ) (*AcquireResult, bool, error) {
 	if account == nil {
 		return nil, true, ErrAccountEgressConfigStale
@@ -1537,7 +1539,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAIAccountSlot(
 	if s.service.concurrencyService != nil && account.Concurrency > 0 && !budget.recordAcquire(account.ID) {
 		return nil, false, nil
 	}
-	result, err := s.service.tryAcquireAccountSlot(ctx, account)
+	result, err := s.service.tryAcquireAccountSlot(ctx, account, requestedModel, requireCompact)
 	return result, true, err
 }
 
@@ -1614,7 +1616,7 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 		if _, rejected := budget.egressAdmissionFailure(ctx, s.service.settingService, account); rejected {
 			continue
 		}
-		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, account, budget)
+		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, account, budget, req.RequestedModel, req.RequireCompact)
 		if !attempted {
 			continue
 		}
@@ -2201,10 +2203,10 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 				var attempted bool
 				var acquireErr error
 				if candidate.egressAdmission == openAIEgressSchedulingAdmissionWaitable {
-					result, acquireErr = s.service.tryAcquireAccountSlot(ctx, fresh)
+					result, acquireErr = s.service.tryAcquireAccountSlot(ctx, fresh, req.RequestedModel, req.RequireCompact)
 					attempted = true
 				} else {
-					result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget)
+					result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh, budget, req.RequestedModel, req.RequireCompact)
 				}
 				if !attempted {
 					// The bounded admission probe budget is shared with the primary
