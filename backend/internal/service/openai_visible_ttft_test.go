@@ -144,7 +144,7 @@ func TestOpenAIResponsesTTFTStartsAtCompletedImage(t *testing.T) {
 	}
 }
 
-func TestOpenAINativeMetadataDoesNotDisarmFirstOutputTimeout(t *testing.T) {
+func TestOpenAINativeMetadataAndKeepaliveDoNotDisarmFirstOutputTimeout(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
 		MaxLineSize:                     defaultMaxLineSize,

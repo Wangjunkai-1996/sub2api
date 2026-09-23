@@ -18,7 +18,7 @@ func TestOpenAIAdvancedSchedulerEffectiveRuntimeSettings(t *testing.T) {
 	groupID := int64(8101)
 	global := openAIAdvancedSchedulerRuntimeSettings{
 		lowUpstreamRatePriorityEnabled: true,
-		oauthSchedulingRateMultiplier:  0.75,
+		oauthSchedulingRateMultiplier:  schedulerRuntimeTestPointer(0.75),
 		enabled:                        true,
 		stickyWeightedEnabled:          true,
 		subscriptionPriorityEnabled:    true,

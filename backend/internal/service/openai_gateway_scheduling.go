@@ -972,6 +972,17 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	return hydrated, nil
 }
 
+// selectAccountForModelWithExclusionsStickyHit preserves the official sticky-hit
+// metadata while reusing KKAI's ticket/egress-aware selector. The durable
+// binding flag remains controlled by the caller-specific wrapper above.
+func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, bool, error) {
+	account, err := s.selectAccountForModelWithExclusions(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability, preferLowUpstreamRate, false)
+	if err != nil || account == nil {
+		return account, false, err
+	}
+	return account, stickyAccountID > 0 && account.ID == stickyAccountID, nil
+}
+
 // tryStickySessionHit 尝试从粘性会话获取账号。
 // 如果命中且账号可用则返回账号；如果账号不可用则清理会话并返回 nil。
 //
@@ -1238,7 +1249,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					return nil, selectionErr
 				}
 				persistSelectedSticky(account)
-				return selection, nil
+				return markStickySessionHit(selection, stickyAccountID > 0 && account.ID == stickyAccountID), nil
 			}
 			if isAccountEgressAdmissionError(acquireErr) {
 				lastEgressAdmissionErr = preferEarlierOpenAI429Cooldown(lastEgressAdmissionErr, acquireErr)
@@ -1267,7 +1278,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 						return nil, selectionErr
 					}
 					persistSelectedSticky(account)
-					return selection, nil
+					return markStickySessionHit(selection, true), nil
 				}
 			}
 			selection, selectionErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
@@ -1280,7 +1291,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				return nil, selectionErr
 			}
 			persistSelectedSticky(account)
-			return selection, nil
+			return markStickySessionHit(selection, stickyAccountID > 0 && account.ID == stickyAccountID), nil
 		}
 	}
 
@@ -1340,7 +1351,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 								return nil, selectErr
 							}
 							_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
-							return selection, nil
+							return markStickySessionHit(selection, true), nil
 						}
 
 						if isAccountEgressAdmissionError(err) {
@@ -1350,12 +1361,13 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 						} else {
 							waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
 							if waitingCount < cfg.StickySessionMaxWaiting {
-								return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
+								selection, selectErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
 									AccountID:      accountID,
 									MaxConcurrency: account.Concurrency,
 									Timeout:        cfg.StickySessionWaitTimeout,
 									MaxWaiting:     cfg.StickySessionMaxWaiting,
 								})
+								return markStickySessionHit(selection, true), selectErr
 							}
 							stickySpillover = true
 						}
@@ -2019,6 +2031,14 @@ func (s *OpenAIGatewayService) newAcquiredSelectionResult(ctx context.Context, a
 		return nil, err
 	}
 	return selection, err
+}
+
+// markStickySessionHit 在选号结果上记录账号是否来自会话粘性命中。
+func markStickySessionHit(selection *AccountSelectionResult, hit bool) *AccountSelectionResult {
+	if selection != nil && hit {
+		selection.stickySessionHit = true
+	}
+	return selection
 }
 
 func (s *OpenAIGatewayService) schedulingConfig() config.GatewaySchedulingConfig {

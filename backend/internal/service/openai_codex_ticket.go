@@ -457,8 +457,7 @@ func applyOpenAICodexTicketHarvestIdentity(h http.Header, model string) {
 }
 
 func needsOpenAICodexAstraVersion(model string) bool {
-	m := strings.ToLower(normalizeOpenAICodexTicketModel(model))
-	return strings.Contains(m, "gpt-6") || strings.Contains(m, "astra")
+	return isOpenAIGPT6AstraModel(normalizeOpenAICodexTicketModel(model))
 }
 
 func (s *OpenAIGatewayService) StartOpenAICodexTicketHarvester() {

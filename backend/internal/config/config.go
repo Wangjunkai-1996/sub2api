@@ -101,6 +101,7 @@ type Config struct {
 	// enabled; image-only slots must set OPENAI_WINDOW_WARMUP_WORKER_ENABLED=false
 	// so they cannot compete for shared warmup jobs.
 	OpenAIWindowWarmupWorkerEnabled bool               `mapstructure:"openai_window_warmup_worker_enabled"`
+	SimpleMode                      SimpleModeConfig   `mapstructure:"simple_mode" yaml:"simple_mode"`
 	RunMode                         string             `mapstructure:"run_mode" yaml:"run_mode"`
 	Timezone                        string             `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
 	Gemini                          GeminiConfig       `mapstructure:"gemini"`
@@ -109,6 +110,14 @@ type Config struct {
 	BatchImage                      BatchImageConfig   `mapstructure:"batch_image"`
 	ImageStorage                    ImageStorageConfig `mapstructure:"image_storage"`
 	Plugins                         PluginConfig       `mapstructure:"plugins"`
+
+	// Enforce only API-key spending windows in simple mode.
+	SimpleModeKeyRateLimitEnabled bool `mapstructure:"simple_mode_key_rate_limit_enabled" yaml:"simple_mode_key_rate_limit_enabled"`
+}
+
+// SimpleModeConfig controls startup behavior in simple mode.
+type SimpleModeConfig struct {
+	AutoCreateDefaultGroups bool `mapstructure:"auto_create_default_groups" yaml:"auto_create_default_groups"`
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -2059,6 +2068,8 @@ func configureConfigSource(setConfigFile, addConfigPath func(string)) {
 
 func setDefaults() {
 	viper.SetDefault("run_mode", RunModeStandard)
+	viper.SetDefault("simple_mode.auto_create_default_groups", true)
+	viper.SetDefault("simple_mode_key_rate_limit_enabled", false)
 
 	// Server
 	viper.SetDefault("server.host", "0.0.0.0")

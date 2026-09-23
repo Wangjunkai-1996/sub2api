@@ -20,6 +20,16 @@ import (
 func fakeCodexTicketState(n int) string {
 	return openAICodexTicketStatePrefix + strings.Repeat("B", n-len(openAICodexTicketStatePrefix))
 }
+
+func TestNeedsOpenAICodexAstraVersionAllowlist(t *testing.T) {
+	for _, model := range []string{"gpt-6", "gpt-6-astra", "openai/gpt-6-astra-2026-09-01"} {
+		require.Truef(t, needsOpenAICodexAstraVersion(model), "model %q should use the Astra ticket identity", model)
+	}
+	for _, model := range []string{"gpt-6-sol", "gpt-6-luna", "gpt-6-sol-max", "gpt-6-luna-openai-compact"} {
+		require.Falsef(t, needsOpenAICodexAstraVersion(model), "model %q must stay outside the Astra ticket allowlist", model)
+	}
+}
+
 func ticketTestAccount(id int64) *Account {
 	proxyID := int64(7)
 	return &Account{ID: id, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, ProxyID: &proxyID, Proxy: &Proxy{ID: 7, Protocol: "http", Host: "fixed.example.com", Port: 8080}, Credentials: map[string]any{"access_token": "tok", "chatgpt_account_id": "acc-1"}, Extra: map[string]any{codexAccountTicketConfigKey: codexAccountTicketConfig{Enabled: true, Model: openAICodexTicketDefaultModel, ProxyURL: "socks5h://user-sid-{sid}-t-5:secret@us.1024proxy.io:3000", Revision: "revision-1"}}}

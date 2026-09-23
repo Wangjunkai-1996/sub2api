@@ -34,36 +34,40 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurnFailoverBoundaries(t *testing.T) {
 		wantFailover  bool
 		wantErr       bool
 		wantWrites    []string
+		wantResult    bool
 	}{
 		{
-			name:         "http_503",
-			status:       http.StatusServiceUnavailable,
-			body:         `{"error":{"type":"server_error","message":"temporarily unavailable"}}`,
-			wantFailover: true,
-			wantErr:      true,
+			name:       "http_503",
+			status:     http.StatusServiceUnavailable,
+			body:       `{"error":{"type":"server_error","message":"temporarily unavailable"}}`,
+			wantWrites: []string{"error"},
+			wantErr:    true,
 		},
 		{
 			name:         "transport_error",
 			transportErr: io.ErrUnexpectedEOF,
-			wantFailover: true,
+			wantWrites:   []string{"error"},
 			wantErr:      true,
 		},
 		{
-			name:         "staged_created_then_eof",
-			body:         created,
-			wantFailover: true,
-			wantErr:      true,
+			name:       "staged_created_then_eof",
+			body:       created,
+			wantWrites: []string{"response.created"},
+			wantErr:    true,
+			wantResult: true,
 		},
 		{
-			name:         "staged_created_then_overloaded",
-			body:         created + overloaded,
-			wantFailover: true,
-			wantErr:      true,
+			name:       "staged_created_then_overloaded",
+			body:       created + overloaded,
+			wantWrites: []string{"response.created", "response.failed"},
+			wantErr:    false,
+			wantResult: true,
 		},
 		{
 			name:       "encrypted_reasoning_then_overloaded",
 			body:       created + privateReasoning + overloaded,
 			wantWrites: []string{"response.created", "response.output_item.added", "response.failed"},
+			wantResult: true,
 		},
 		{
 			name:          "canceled_transport",
@@ -72,21 +76,25 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurnFailoverBoundaries(t *testing.T) {
 			wantErr:       true,
 		},
 		{
-			name:    "canceled_stream_read",
-			body:    created,
-			readErr: context.Canceled,
-			wantErr: true,
+			name:       "canceled_stream_read",
+			body:       created,
+			readErr:    context.Canceled,
+			wantErr:    true,
+			wantWrites: []string{"response.created"},
+			wantResult: true,
 		},
 		{
 			name:       "semantic_output_then_eof",
 			body:       created + output,
 			wantErr:    true,
 			wantWrites: []string{"response.created", "response.output_text.delta"},
+			wantResult: true,
 		},
 		{
 			name:       "semantic_output_then_overloaded",
 			body:       created + output + overloaded,
 			wantWrites: []string{"response.created", "response.output_text.delta", "response.failed"},
+			wantResult: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,10 +143,10 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurnFailoverBoundaries(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			if len(tc.wantWrites) == 0 {
-				require.Nil(t, result)
-			} else {
+			if tc.wantResult {
 				require.NotNil(t, result)
+			} else {
+				require.Nil(t, result)
 			}
 			if tc.transportErr == context.Canceled || tc.readErr == context.Canceled {
 				require.ErrorIs(t, err, context.Canceled)
@@ -214,10 +222,8 @@ func TestOpenAIWSHTTPBridgeLaterTurnUnknownPreviousResponseDoesNotReplay(t *test
 	select {
 	case proxyErr := <-proxyErrCh:
 		var failoverErr *UpstreamFailoverError
-		require.ErrorAs(t, proxyErr, &failoverErr)
-		retryPayload, retryCurrentTurn := OpenAIWSCurrentTurnRetryPayload(proxyErr)
-		require.True(t, retryCurrentTurn)
-		require.Nil(t, retryPayload, "unobserved continuation history cannot be moved to another account")
+		require.Error(t, proxyErr)
+		require.False(t, errors.As(proxyErr, &failoverErr), "later-turn HTTP errors must not replay on another account")
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for unsafe continuation failover")
 	}

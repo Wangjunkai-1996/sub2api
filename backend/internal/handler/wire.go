@@ -54,6 +54,7 @@ func ProvideAdminHandlers(
 	openAIWindowWarmup *service.OpenAIWindowWarmupService,
 	settingService *service.SettingService,
 	codexTicketGateway *service.OpenAIGatewayService,
+	opencodeGoUsage *service.OpenCodeGoUsageService,
 ) *AdminHandlers {
 	accountHandler.SetEgressService(egressService)
 	accountHandler.SetUpstreamBillingProbeService(upstreamBillingProbe)
@@ -62,6 +63,7 @@ func ProvideAdminHandlers(
 	accountHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
 	openaiOAuthHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
 	accountHandler.SetCodexAccountTicketService(codexTicketGateway)
+	accountHandler.SetOpenCodeGoUsageService(opencodeGoUsage)
 	return &AdminHandlers{
 		Dashboard:              dashboardHandler,
 		User:                   userHandler,
