@@ -300,6 +300,9 @@ func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	token string,
 ) (*http.Request, []byte, error) {
 	body = stripDeferredToolCacheControl(body)
+	if isAnthropicMessagesEndpoint(c) {
+		body = injectAnthropicMetadataUserID(ctx, account, body)
+	}
 	targetURL := claudeAPIURL
 	baseURL := account.GetBaseURL()
 	if baseURL != "" {

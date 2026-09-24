@@ -155,6 +155,9 @@ func (s *OpenAIGatewayService) buildNativeAnthropicUpstreamRequest(
 	targetURL string,
 	sessionBodies ...[]byte,
 ) (*http.Request, []byte, error) {
+	if isAnthropicMessagesEndpoint(c) {
+		body = injectAnthropicMetadataUserID(ctx, account, body)
+	}
 	// 能力维度 body sanitize：与 Anthropic 平台 passthrough 相同，按 beta
 	// header 决定是否保留 body 中的 beta 能力字段，避免客户端"body 带字段但
 	// header 忘带 token"的 bug 让第三方上游 400。
