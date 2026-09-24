@@ -10,7 +10,7 @@ import (
 )
 
 // AnthropicMetadataUserIDEnabledExtraKey enables forwarding the authenticated
-// Sub2API user ID as metadata.user_id for this account's /v1/messages calls.
+// end-user identity as metadata.user_id for this account's /v1/messages calls.
 // It is deliberately opt-in so each upstream account can be controlled without
 // relying on mutable account or group names.
 const AnthropicMetadataUserIDEnabledExtraKey = "anthropic_metadata_user_id_enabled"
@@ -22,8 +22,9 @@ func isAnthropicMessagesEndpoint(c *gin.Context) bool {
 	return strings.HasSuffix(strings.TrimRight(c.Request.URL.Path, "/"), "/v1/messages")
 }
 
-// injectAnthropicMetadataUserID adds the authenticated Sub2API user ID only when the
-// account switch is enabled. The inbound body remains untouched so existing
+// injectAnthropicMetadataUserID prefers a verified NewAPI user ID, and otherwise
+// namespaces the authenticated Sub2API user ID, only when the account switch is
+// enabled. The inbound body remains untouched so existing
 // Claude session detection and sticky routing keep using the client metadata.
 func injectAnthropicMetadataUserID(ctx context.Context, account *Account, body []byte) []byte {
 	if ctx == nil || account == nil || account.Platform != PlatformAnthropic || account.Type != AccountTypeAPIKey || account.Extra == nil {
@@ -38,7 +39,12 @@ func injectAnthropicMetadataUserID(ctx context.Context, account *Account, body [
 		return body
 	}
 
-	value := strconv.FormatInt(userID, 10)
+	// Keep direct Sub2API callers in a separate namespace so they cannot collide
+	// with users behind NewAPI's shared Sub2API account.
+	value := "KKAI_SUB2_" + strconv.FormatInt(userID, 10)
+	if newAPIUserID, ok := ctx.Value(ctxkey.NewAPIUserID).(int64); ok && newAPIUserID > 0 {
+		value = "KKAI_" + strconv.FormatInt(newAPIUserID, 10)
+	}
 	if next, changed := setJSONValueBytes(body, "metadata.user_id", value); changed {
 		return next
 	}

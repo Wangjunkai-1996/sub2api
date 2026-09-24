@@ -77,6 +77,9 @@ func Logger() gin.HandlerFunc {
 		if model != "" {
 			fields = append(fields, zap.String("model", model))
 		}
+		if userID, ok := c.Request.Context().Value(ctxkey.NewAPIUserID).(int64); ok && userID > 0 {
+			fields = append(fields, zap.Bool("newapi_identity_verified", true))
+		}
 
 		l := logger.FromContext(c.Request.Context()).With(fields...)
 		l.Info("http request completed", zap.Time("completed_at", endTime))

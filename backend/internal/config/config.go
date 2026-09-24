@@ -964,8 +964,16 @@ const (
 	DefaultOpenAIRetryBudgetSeconds                  = 300
 )
 
+// NewAPIAttributionConfig identifies trusted relay origins and their signing key.
+type NewAPIAttributionConfig struct {
+	Origins []string `mapstructure:"origins"`
+	Secret  string   `mapstructure:"secret"`
+}
+
 // GatewayConfig API网关相关配置
 type GatewayConfig struct {
+	// NewAPIAttribution verifies end-user identities supplied by a trusted NewAPI relay.
+	NewAPIAttribution NewAPIAttributionConfig `mapstructure:"newapi_attribution"`
 	// 等待上游响应头的超时时间（秒），0表示无超时
 	// 注意：这不影响流式数据传输，只控制等待响应头的时间
 	ResponseHeaderTimeout int `mapstructure:"response_header_timeout"`
@@ -2344,6 +2352,8 @@ func setDefaults() {
 
 	// JWT
 	viper.SetDefault("jwt.secret", "")
+	viper.SetDefault("gateway.newapi_attribution.origins", []string{})
+	viper.SetDefault("gateway.newapi_attribution.secret", "")
 	viper.SetDefault("jwt.expire_hour", 24)
 	viper.SetDefault("jwt.access_token_expire_minutes", 0) // 0 表示回退到 expire_hour
 	viper.SetDefault("jwt.refresh_token_expire_days", 30)  // 30天Refresh Token有效期

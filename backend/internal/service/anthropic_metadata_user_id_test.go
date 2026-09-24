@@ -35,8 +35,8 @@ func TestInjectAnthropicMetadataUserID(t *testing.T) {
 	account := &Account{Platform: PlatformAnthropic, Type: AccountTypeAPIKey, Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}
 
 	got := injectAnthropicMetadataUserID(ctx, account, []byte(`{"metadata":{"trace":"keep","user_id":"client-value"},"stream":true}`))
-	if userID := gjson.GetBytes(got, "metadata.user_id").String(); userID != "8871" {
-		t.Fatalf("metadata.user_id = %q, want 8871", userID)
+	if userID := gjson.GetBytes(got, "metadata.user_id").String(); userID != "KKAI_SUB2_8871" {
+		t.Fatalf("metadata.user_id = %q, want KKAI_SUB2_8871", userID)
 	}
 	if trace := gjson.GetBytes(got, "metadata.trace").String(); trace != "keep" {
 		t.Fatalf("metadata.trace = %q, want keep", trace)
@@ -48,8 +48,8 @@ func TestInjectAnthropicMetadataUserIDReplacesInvalidMetadata(t *testing.T) {
 	account := &Account{Platform: PlatformAnthropic, Type: AccountTypeAPIKey, Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}
 
 	got := injectAnthropicMetadataUserID(ctx, account, []byte(`{"metadata":"client-value"}`))
-	if userID := gjson.GetBytes(got, "metadata.user_id").String(); userID != "42" {
-		t.Fatalf("metadata.user_id = %q, want 42", userID)
+	if userID := gjson.GetBytes(got, "metadata.user_id").String(); userID != "KKAI_SUB2_42" {
+		t.Fatalf("metadata.user_id = %q, want KKAI_SUB2_42", userID)
 	}
 }
 
@@ -58,13 +58,14 @@ func TestInjectAnthropicMetadataUserIDCreatesMetadata(t *testing.T) {
 	account := &Account{Platform: PlatformAnthropic, Type: AccountTypeAPIKey, Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}
 
 	got := injectAnthropicMetadataUserID(ctx, account, []byte(`{"model":"claude-sonnet-4-5"}`))
-	if userID := gjson.GetBytes(got, "metadata.user_id").String(); userID != "7" {
-		t.Fatalf("metadata.user_id = %q, want 7", userID)
+	if userID := gjson.GetBytes(got, "metadata.user_id").String(); userID != "KKAI_SUB2_7" {
+		t.Fatalf("metadata.user_id = %q, want KKAI_SUB2_7", userID)
 	}
 }
 
 func TestInjectAnthropicMetadataUserIDRequiresAccountSwitch(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ctxkey.UserID, int64(8871))
+	ctx = context.WithValue(ctx, ctxkey.NewAPIUserID, int64(42))
 	body := []byte(`{"metadata":{"user_id":"client-value"}}`)
 
 	if got := injectAnthropicMetadataUserID(ctx, &Account{Platform: PlatformAnthropic, Type: AccountTypeAPIKey}, body); string(got) != string(body) {
@@ -81,6 +82,23 @@ func TestInjectAnthropicMetadataUserIDRequiresAccountSwitch(t *testing.T) {
 	}
 }
 
+func TestInjectAnthropicMetadataUserIDKeepsNamespacesSeparate(t *testing.T) {
+	account := &Account{Platform: PlatformAnthropic, Type: AccountTypeAPIKey,
+		Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}
+	ctx := context.WithValue(context.Background(), ctxkey.UserID, int64(1))
+	for _, userID := range []int64{0, -1, 1, 8871, 8871, 42} {
+		want := "KKAI_SUB2_1"
+		if userID > 0 {
+			want = fmt.Sprintf("KKAI_%d", userID)
+		}
+		got := injectAnthropicMetadataUserID(context.WithValue(ctx, ctxkey.NewAPIUserID, userID), account,
+			[]byte(`{"metadata":{"user_id":"KKAI_999"}}`))
+		if gjson.GetBytes(got, "metadata.user_id").String() != want {
+			t.Fatalf("user %d: got %s, want %s", userID, got, want)
+		}
+	}
+}
+
 func TestAnthropicMetadataUserIDOnWire(t *testing.T) {
 	for _, passthrough := range []bool{false, true} {
 		for _, stream := range []bool{false, true} {
@@ -91,7 +109,8 @@ func TestAnthropicMetadataUserIDOnWire(t *testing.T) {
 					Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}
 				svc := &GatewayService{cfg: &config.Config{}}
 				for _, userID := range []int64{8871, 8871, 42} {
-					ctx := context.WithValue(context.Background(), ctxkey.UserID, userID)
+					ctx := context.WithValue(context.Background(), ctxkey.UserID, int64(1))
+					ctx = context.WithValue(ctx, ctxkey.NewAPIUserID, userID)
 					ctx, cancel := detachStreamUpstreamContext(ctx, stream)
 					defer cancel()
 					c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -111,8 +130,8 @@ func TestAnthropicMetadataUserIDOnWire(t *testing.T) {
 					if string(wire) != string(wireBody) {
 						t.Fatal("request body differs from wire body")
 					}
-					if got := gjson.GetBytes(wire, "metadata.user_id"); got.Type != gjson.String || got.String() != fmt.Sprint(userID) {
-						t.Fatalf("wire user_id=%s, want string %d", got.Raw, userID)
+					if got := gjson.GetBytes(wire, "metadata.user_id"); got.Type != gjson.String || got.String() != fmt.Sprintf("KKAI_%d", userID) {
+						t.Fatalf("wire user_id=%s, want KKAI_%d", got.Raw, userID)
 					}
 					if gjson.GetBytes(wire, "metadata.trace").String() != "keep" {
 						t.Fatal("other metadata was lost")

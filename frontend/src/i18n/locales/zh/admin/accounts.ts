@@ -1006,7 +1006,7 @@ export default {
         apiKeyAuthSchemeBearer: 'Authorization: Bearer',
         metadataUserId: '传递稳定用户 ID',
         metadataUserIdDesc:
-          '默认关闭。开启后，发往此账号的 /v1/messages 请求会将 metadata.user_id 设为本站用户 ID，覆盖客户端传入的值；流式和非流式请求均生效。',
+          '默认关闭。开启后，metadata.user_id 使用 KKAI_ + 已验证的 NewAPI 用户 ID；直接调用本站时使用 KKAI_SUB2_ + 本站用户 ID。覆盖客户端传入的值，流式和非流式请求均生效。',
         webSearchEmulation: 'Web Search 模拟',
         webSearchEmulationDesc:
           '为该 API Key 账号启用 web search 模拟。客户端发送纯 web_search 请求时，由网关调用第三方搜索 API 并构造响应返回。默认跟随渠道配置。',

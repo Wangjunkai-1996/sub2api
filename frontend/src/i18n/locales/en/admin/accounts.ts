@@ -890,7 +890,7 @@ export default {
         apiKeyAuthSchemeBearer: 'Authorization: Bearer',
         metadataUserId: 'Send stable user ID',
         metadataUserIdDesc:
-          'Off by default. When enabled, /v1/messages requests sent through this account set metadata.user_id to the local user ID, replacing any client-provided value. Applies to streaming and non-streaming requests.',
+          'Off by default. Sets metadata.user_id to KKAI_ plus the verified NewAPI user ID, or KKAI_SUB2_ plus the local user ID for direct calls. Replaces client-provided values for streaming and non-streaming requests.',
         webSearchEmulation: 'Web Search Emulation',
         webSearchEmulationDesc:
           'Enable web search emulation for this API Key account. When a pure web_search request is detected, the gateway calls a third-party search API and constructs the response locally. Default follows channel config.',

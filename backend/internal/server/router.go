@@ -61,6 +61,11 @@ func SetupRouter(
 	// 解析模式按请求快照：兼容开关开启时信任原始转发头，关闭时使用 server.trusted_proxies。
 	r.Use(middleware2.SessionBindingContext(cfg))
 	r.Use(middleware2.Logger())
+	attribution, err := middleware2.NewAPIAttribution(cfg.Gateway.NewAPIAttribution, redisClient)
+	if err != nil {
+		panic("invalid NewAPI attribution configuration")
+	}
+	r.Use(attribution)
 	r.Use(middleware2.CORS(cfg.CORS))
 	r.Use(middleware2.SecurityHeaders(cfg.Security.CSP, func() []string {
 		if p := cachedFrameOrigins.Load(); p != nil {
