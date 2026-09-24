@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/gin-gonic/gin"
@@ -18,11 +19,7 @@ func isAnthropicMessagesEndpoint(c *gin.Context) bool {
 	if c == nil || c.Request == nil || c.Request.URL == nil {
 		return false
 	}
-	path := c.Request.URL.Path
-	for len(path) > 1 && path[len(path)-1] == '/' {
-		path = path[:len(path)-1]
-	}
-	return len(path) >= len("/messages") && path[len(path)-len("/messages"):] == "/messages"
+	return strings.HasSuffix(strings.TrimRight(c.Request.URL.Path, "/"), "/v1/messages")
 }
 
 // injectAnthropicMetadataUserID adds the authenticated Sub2API user ID only when the

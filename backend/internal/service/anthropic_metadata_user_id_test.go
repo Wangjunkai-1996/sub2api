@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -75,5 +78,53 @@ func TestInjectAnthropicMetadataUserIDRequiresAccountSwitch(t *testing.T) {
 	}
 	if got := injectAnthropicMetadataUserID(ctx, &Account{Platform: PlatformAnthropic, Type: AccountTypeOAuth, Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}, body); string(got) != string(body) {
 		t.Fatalf("non-API-key account body changed: %s", got)
+	}
+}
+
+func TestAnthropicMetadataUserIDOnWire(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("passthrough=%t/stream=%t", passthrough, stream), func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"claude-sonnet-4-5","max_tokens":16,"stream":%t,"metadata":{"user_id":"client-session","trace":"keep"},"messages":[{"role":"user","content":"hi"}]}`, stream))
+				original := string(body)
+				account := &Account{Platform: PlatformAnthropic, Type: AccountTypeAPIKey,
+					Extra: map[string]any{AnthropicMetadataUserIDEnabledExtraKey: true}}
+				svc := &GatewayService{cfg: &config.Config{}}
+				for _, userID := range []int64{8871, 8871, 42} {
+					ctx := context.WithValue(context.Background(), ctxkey.UserID, userID)
+					ctx, cancel := detachStreamUpstreamContext(ctx, stream)
+					defer cancel()
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = httptest.NewRequest("POST", "/v1/messages", nil).WithContext(ctx)
+					req, wireBody, err := svc.buildUpstreamRequest(ctx, c, account, body, "test-key", "apikey", "claude-sonnet-4-5", stream, false)
+					if passthrough {
+						req, wireBody, err = svc.buildUpstreamRequestAnthropicAPIKeyPassthrough(ctx, c, account, body, "test-key")
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					wire, err := io.ReadAll(req.Body)
+					req.Body.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(wire) != string(wireBody) {
+						t.Fatal("request body differs from wire body")
+					}
+					if got := gjson.GetBytes(wire, "metadata.user_id"); got.Type != gjson.String || got.String() != fmt.Sprint(userID) {
+						t.Fatalf("wire user_id=%s, want string %d", got.Raw, userID)
+					}
+					if gjson.GetBytes(wire, "metadata.trace").String() != "keep" {
+						t.Fatal("other metadata was lost")
+					}
+					if gjson.GetBytes(wire, "stream").Bool() != stream {
+						t.Fatal("stream mode changed")
+					}
+					if string(body) != original {
+						t.Fatal("inbound body was modified")
+					}
+				}
+			})
+		}
 	}
 }

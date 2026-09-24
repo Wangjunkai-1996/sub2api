@@ -364,6 +364,51 @@ describe('EditAccountModal', () => {
 
   afterEach(() => vi.useRealTimers())
 
+  describe('Anthropic metadata user ID', () => {
+    const selector = '[data-testid="anthropic-metadata-user-id-toggle"]'
+
+    it.each([undefined, false, true])('loads %s and saves both toggle states without losing other extra fields', async (enabled) => {
+      const account = {
+        ...buildAccount(),
+        platform: 'anthropic',
+        extra: { anthropic_metadata_user_id_enabled: enabled, custom_setting: 'keep-me' }
+      }
+      updateAccountMock.mockReset().mockResolvedValue(account)
+      checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+      const wrapper = mountModal(account)
+      const toggle = wrapper.get(selector)
+      expect(toggle.attributes('aria-checked')).toBe(String(enabled === true))
+
+      for (const [index, expected] of [enabled !== true, enabled === true].entries()) {
+        await toggle.trigger('click')
+        await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+        expect(showErrorMock).not.toHaveBeenCalled()
+        await vi.waitFor(() => expect(updateAccountMock).toHaveBeenCalledTimes(index + 1))
+        const extra = updateAccountMock.mock.lastCall?.[1]?.extra
+        expect(extra?.custom_setting).toBe('keep-me')
+        if (expected) {
+          expect(extra?.anthropic_metadata_user_id_enabled).toBe(true)
+        } else {
+          expect(extra).not.toHaveProperty('anthropic_metadata_user_id_enabled')
+        }
+      }
+      expect(updateAccountMock).toHaveBeenCalledTimes(2)
+      wrapper.unmount()
+    })
+
+    it.each([
+      ['openai', 'apikey'],
+      ['grok', 'apikey'],
+      ['anthropic', 'oauth'],
+      ['anthropic', 'setup-token'],
+      ['anthropic', 'bedrock']
+    ])('hides the toggle for %s %s accounts', (platform, type) => {
+      const wrapper = mountModal({ ...buildAccount(), platform, type })
+      expect(wrapper.find(selector).exists()).toBe(false)
+      wrapper.unmount()
+    })
+  })
+
   it('sets expiry presets from now instead of extending the saved expiry', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2028-02-29T12:34:00'))

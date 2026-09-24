@@ -2188,6 +2188,25 @@
         </div>
       </div>
 
+      <div
+        v-if="account?.platform === 'anthropic' && account?.type === 'apikey'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.anthropic.metadataUserId') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.anthropic.metadataUserIdDesc') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="anthropicMetadataUserIDEnabled"
+            :aria-label="t('admin.accounts.anthropic.metadataUserId')"
+            data-testid="anthropic-metadata-user-id-toggle"
+          />
+        </div>
+      </div>
+
       <!-- Anthropic API Key: Web Search Emulation (hidden when global disabled) -->
       <div
         v-if="account?.platform === 'anthropic' && account?.type === 'apikey' && webSearchGlobalEnabled"
@@ -3797,6 +3816,7 @@ const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
 const anthropicPassthroughEnabled = ref(false)
 const anthropicAPIKeyAuthScheme = ref<AnthropicAPIKeyAuthScheme>('x_api_key')
+const anthropicMetadataUserIDEnabled = ref(false)
 const webSearchEmulationMode = ref('default')
 const webSearchGlobalEnabled = ref(false)
 const {
@@ -4311,6 +4331,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
+  anthropicMetadataUserIDEnabled.value = false
   webSearchEmulationMode.value = 'default'
   if (newAccount.platform === 'openai' && (newAccount.type === 'oauth' || newAccount.type === 'setup-token' || newAccount.type === 'apikey')) {
     openaiPassthroughEnabled.value = extra?.openai_passthrough === true || extra?.openai_oauth_passthrough === true
@@ -4379,6 +4400,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   }
   if (newAccount.platform === 'anthropic' && newAccount.type === 'apikey') {
     anthropicPassthroughEnabled.value = extra?.anthropic_passthrough === true
+    anthropicMetadataUserIDEnabled.value = extra?.anthropic_metadata_user_id_enabled === true
     anthropicAPIKeyAuthScheme.value = extra?.anthropic_apikey_auth_scheme === 'authorization_bearer'
       ? 'authorization_bearer'
       : 'x_api_key'
@@ -5797,7 +5819,7 @@ const handleSubmit = async () => {
       updatePayload.extra = newExtra
     }
 
-    // For Anthropic API Key accounts, handle passthrough mode + web search emulation in extra
+    // For Anthropic API Key accounts, handle upstream options in extra
     if (props.account.platform === 'anthropic' && props.account.type === 'apikey') {
       const currentExtra = (updatePayload.extra as Record<string, unknown>) || (props.account.extra as Record<string, unknown>) || {}
       const newExtra: Record<string, unknown> = { ...currentExtra }
@@ -5810,6 +5832,11 @@ const handleSubmit = async () => {
         newExtra.anthropic_apikey_auth_scheme = 'authorization_bearer'
       } else {
         delete newExtra.anthropic_apikey_auth_scheme
+      }
+      if (anthropicMetadataUserIDEnabled.value) {
+        newExtra.anthropic_metadata_user_id_enabled = true
+      } else {
+        delete newExtra.anthropic_metadata_user_id_enabled
       }
       if (webSearchEmulationMode.value === 'default') {
         delete newExtra.web_search_emulation
