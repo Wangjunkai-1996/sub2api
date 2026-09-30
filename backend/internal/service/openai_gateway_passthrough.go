@@ -2591,7 +2591,8 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
 	}
-	if bodyHasSSEFraming(body) {
+	bodyLooksLikeSSE := bodyHasSSEFraming(body)
+	if bodyLooksLikeSSE {
 		observeOpenAISSEBody(observer, string(body))
 	} else {
 		observer.ObserveOpenAI(body, strings.TrimSpace(gjson.GetBytes(body, "type").String()))
@@ -2601,7 +2602,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	// Some upstreams (e.g. other sub2api instances) may return SSE even when
 	// stream=false was requested. Without this conversion the client would
 	// receive raw SSE text or a terminal event with empty output.
-	if isEventStreamResponse(resp.Header) {
+	if isEventStreamResponse(resp.Header) || bodyLooksLikeSSE {
 		return s.handlePassthroughSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 	}
 
@@ -2710,7 +2711,11 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	}
 	// Correct tool calls in final response
 	body = s.correctToolCallsInResponseBody(body)
-	restoredBody, restoreErr := restoreOpenAIResponsesNamespacePayload(c, body)
+	restoredBody, restoreErr := restoreOpenAIResponsesClientToolPayload(c, body)
+	if restoreErr != nil {
+		return nil, fmt.Errorf("restore OpenAI Responses client tools: %w", restoreErr)
+	}
+	restoredBody, restoreErr = restoreOpenAIResponsesNamespacePayload(c, restoredBody)
 	if restoreErr != nil {
 		return nil, fmt.Errorf("restore OpenAI passthrough namespace response: %w", restoreErr)
 	}

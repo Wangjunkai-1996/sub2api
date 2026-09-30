@@ -392,13 +392,16 @@ func captureStructuredLog(t *testing.T) (*inMemoryLogSink, func()) {
 func TestOpenAIGatewayService_OAuthPassthrough_PreservesClientStreamMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, tc := range []struct {
-		name        string
-		streamField string
-		stream      bool
+		name                string
+		streamField         string
+		upstreamContentType string
+		stream              bool
 	}{
-		{name: "explicit non-streaming", streamField: `,"stream":false`},
-		{name: "omitted stream"},
-		{name: "streaming", streamField: `,"stream":true`, stream: true},
+		{name: "explicit non-streaming", streamField: `,"stream":false`, upstreamContentType: "text/event-stream"},
+		{name: "omitted stream", upstreamContentType: "text/event-stream"},
+		{name: "streaming", streamField: `,"stream":true`, upstreamContentType: "text/event-stream", stream: true},
+		{name: "SSE with JSON content type", streamField: `,"stream":false`, upstreamContentType: "application/json"},
+		{name: "SSE without content type", streamField: `,"stream":false`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
@@ -407,12 +410,15 @@ func TestOpenAIGatewayService_OAuthPassthrough_PreservesClientStreamMode(t *test
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 			upstream := &httpUpstreamRecorder{resp: &http.Response{
 				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Header:     http.Header{},
 				Body: io.NopCloser(strings.NewReader(
 					"event: response.completed\n" +
 						`data: {"type":"response.completed","response":{"id":"resp_nonstream","object":"response","model":"gpt-6-astra","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}` + "\n\n",
 				)),
 			}}
+			if tc.upstreamContentType != "" {
+				upstream.resp.Header.Set("Content-Type", tc.upstreamContentType)
+			}
 			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 			account := &Account{
 				ID: 123, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
@@ -440,6 +446,59 @@ func TestOpenAIGatewayService_OAuthPassthrough_PreservesClientStreamMode(t *test
 			}
 		})
 	}
+}
+
+func TestHandleNonStreamingResponsePassthrough_JSONWithSSETextKeepsJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := `{"id":"resp_json","output":[{"type":"message","content":[{"type":"output_text","text":"event: response.completed\ndata: example"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+
+	result, err := svc.handleNonStreamingResponsePassthrough(context.Background(), resp, c, nil, "gpt-6-astra", "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.JSONEq(t, body, rec.Body.String())
+	assert.Equal(t, 7, result.usage.InputTokens)
+	assert.Equal(t, 2, result.usage.OutputTokens)
+}
+
+func TestOpenAIGatewayService_APIKeyPassthrough_RestoresClientToolsWithWrongContentType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := openAIClientToolsRequest(false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`data: {"type":"response.completed","response":{"id":"resp_tools","status":"completed","output":[{"type":"function_call","id":"i1","call_id":"c1","name":"exec","arguments":"{\"input\":\"pwd\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n")),
+	}}
+	svc := openAIClientToolsTestService(upstream)
+	account := &Account{
+		ID: 5659, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "test-key"},
+		Extra:       map[string]any{"openai_passthrough": true},
+		Status:      StatusActive, Schedulable: true, Concurrency: 1,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assertOpenAIClientToolsLowered(t, upstream.lastBody)
+	assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+	require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+	assert.Equal(t, "custom_tool_call", gjson.GetBytes(rec.Body.Bytes(), "output.0.type").String())
+	assert.Equal(t, "pwd", gjson.GetBytes(rec.Body.Bytes(), "output.0.input").String())
+	assert.Equal(t, "c1", gjson.GetBytes(rec.Body.Bytes(), "output.0.call_id").String())
 }
 
 func TestHandlePassthroughSSEToJSON_TerminalResponseContract(t *testing.T) {
