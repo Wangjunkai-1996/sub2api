@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -112,15 +113,108 @@ func TestCodexDirectImagesHTTPErrorFallbacksOnlyWhenEndpointUnavailable(t *testi
 	}
 }
 
-func TestCodexDirectImagesStreamRejectsPlainJSON(t *testing.T) {
-	body := []byte(`{"model":"gpt-image-2","prompt":"draw","stream":true}`)
-	c, _ := newOpenAIImagesTestContext(t, body)
-	svc := newOpenAIImagesTestService(&httpUpstreamRecorder{resp: openAIImagesJSONResponse()})
-	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
-	require.NoError(t, err)
-	result, err := svc.ForwardImages(context.Background(), c, directImagesTestAccount(), body, parsed, "")
-	require.Error(t, err, "未收到 SSE 完成事件，不能把未转发的 JSON 当作成功")
-	require.Nil(t, result)
+func TestCodexDirectImagesStreamConvertsCompleteJSON(t *testing.T) {
+	encoded := encodeOpenAIImageTestPNG(t, 16, 9)
+	usage := `{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"image_tokens":4,"cached_tokens":3,"cached_tokens_details":{"image_tokens":2,"text_tokens":1}}}`
+	responseBody := fmt.Sprintf(`{"created":1710000000,"model":"gpt-image-2-codex","size":"1024x1024","output_format":"png","data":[{"b64_json":%q}],"usage":%s}`, encoded, usage)
+	for _, test := range []struct {
+		name, endpoint, contentType, responseFormat, eventType string
+	}{
+		{"generation_json", "/v1/images/generations", "application/json", "b64_json", "image_generation.completed"},
+		{"edit_mislabeled_sse_url", "/v1/images/edits", "text/event-stream", "url", "image_edit.completed"},
+		{"edit_missing_content_type", "/v1/images/edits", "", "b64_json", "image_edit.completed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"gpt-image-2","prompt":"draw","stream":true,"response_format":%q,"images":[{"image_url":"data:image/png;base64,AA=="}]}`, test.responseFormat))
+			c, rec := newOpenAIImagesTestContext(t, body)
+			c.Request.URL.Path = test.endpoint
+			response := openAIImagesJSONResponse()
+			response.Header.Del("Content-Type")
+			if test.contentType != "" {
+				response.Header.Set("Content-Type", test.contentType)
+			}
+			response.Body = io.NopCloser(strings.NewReader(responseBody))
+			upstream := &httpUpstreamRecorder{resp: response}
+			svc := newOpenAIImagesTestService(upstream)
+			if test.contentType == "" {
+				svc.cfg.Gateway.ImageStreamKeepaliveInterval = 60
+			}
+			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+			require.NoError(t, err)
+
+			result, err := svc.ForwardImages(context.Background(), c, directImagesTestAccount(), body, parsed, "")
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, result.Stream)
+			assert.Equal(t, 1, result.ImageCount)
+			assert.Equal(t, []string{"16x9"}, result.ImageOutputSizes)
+			assert.Equal(t, "gpt-image-2-codex", result.UpstreamResponseModel)
+			assert.Equal(t, OpenAIUsage{
+				InputTokens: 10, OutputTokens: 20, CacheReadInputTokens: 3,
+				ImageInputTokens: 4, ImageCacheReadTokens: 2, ImageOutputTokens: 20,
+			}, result.Usage)
+			assert.Len(t, upstream.requests, 1, "a complete JSON response must not cause another generation request")
+			assert.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+			assert.Equal(t, "text/event-stream", upstream.lastReq.Header.Get("Accept"))
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+			events := parseOpenAIImageTestSSEEvents(rec.Body.String())
+			require.Len(t, events, 1)
+			assert.Equal(t, test.eventType, events[0].Name)
+			assert.Equal(t, test.eventType, gjson.Get(events[0].Data, "type").String())
+			assert.EqualValues(t, 1710000000, gjson.Get(events[0].Data, "created_at").Int())
+			assert.Equal(t, "gpt-image-2", gjson.Get(events[0].Data, "model").String())
+			assert.Equal(t, "16x9", gjson.Get(events[0].Data, "size").String())
+			assert.Equal(t, encoded, gjson.Get(events[0].Data, "b64_json").String())
+			assert.JSONEq(t, usage, gjson.Get(events[0].Data, "usage").Raw)
+			if test.responseFormat == "url" {
+				assert.Equal(t, "data:image/png;base64,"+encoded, gjson.Get(events[0].Data, "url").String())
+			}
+		})
+	}
+}
+
+func TestCodexDirectImagesStreamRejectsInvalidJSONFallback(t *testing.T) {
+	for _, test := range []struct {
+		name, response string
+		readLimit      int64
+		readErr        error
+	}{
+		{name: "empty", response: ""},
+		{name: "empty_data", response: `{"data":[]}`},
+		{name: "no_image_data", response: `{"data":[{"b64_json":""}]}`},
+		{name: "malformed", response: `{"data":[`},
+		{name: "error", response: `{"error":{"type":"server_error","message":"image generation failed"}}`},
+		{name: "exceeds_read_limit", response: `{"data":[{"b64_json":"aGVsbG8="}]}`, readLimit: 16},
+		{name: "complete_json_read_error", response: `{"data":[{"b64_json":"aGVsbG8="}]}`, readErr: io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-image-2","prompt":"draw","stream":true}`)
+			c, rec := newOpenAIImagesTestContext(t, body)
+			response := openAIImagesJSONResponse()
+			response.Body = io.NopCloser(strings.NewReader(test.response))
+			if test.readErr != nil {
+				response.Body = io.NopCloser(io.MultiReader(strings.NewReader(test.response), &openAIImagesReadErrorBody{err: test.readErr}))
+			}
+			upstream := &httpUpstreamRecorder{resp: response}
+			svc := newOpenAIImagesTestService(upstream)
+			svc.cfg.Gateway.UpstreamResponseReadMaxBytes = test.readLimit
+			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+			require.NoError(t, err)
+
+			result, err := svc.ForwardImages(context.Background(), c, directImagesTestAccount(), body, parsed, "")
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.Len(t, upstream.requests, 1)
+			assert.NotContains(t, rec.Body.String(), "image_generation.completed")
+			if test.readLimit > 0 {
+				assert.ErrorIs(t, err, ErrUpstreamResponseBodyTooLarge)
+			}
+			if test.readErr != nil {
+				assert.ErrorIs(t, err, test.readErr)
+			}
+		})
+	}
 }
 
 func TestCodexDirectImagesMultipleOutputs(t *testing.T) {

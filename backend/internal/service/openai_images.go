@@ -1034,7 +1034,7 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 ) (OpenAIUsage, int, []string, *int, error) {
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if contentType == "" {
+	if direct != nil || contentType == "" {
 		contentType = "text/event-stream"
 	}
 	c.Status(resp.StatusCode)
@@ -1172,14 +1172,39 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 	}
 
 	finalizeFallbackBody := func() {
-		if direct != nil {
+		if seenSSEData {
 			return
 		}
-		if seenSSEData || fallbackBody.Len() == 0 {
+		if direct != nil && fallbackTooLarge {
+			streamErr = ErrUpstreamResponseBodyTooLarge
+			return
+		}
+		if fallbackBody.Len() == 0 {
 			return
 		}
 		body := bytes.TrimSpace(fallbackBody.Bytes())
 		if len(body) == 0 {
+			return
+		}
+		if direct != nil {
+			// Some native Images endpoints return complete JSON despite stream=true.
+			// Emit completed events through the same accounting and output path as SSE.
+			results, err := parseCodexDirectImagesResponse(body)
+			if err != nil {
+				streamErr = err
+				return
+			}
+			root := gjson.ParseBytes(body)
+			if observer := upstreamResponseModelObserverFromContext(c); observer != nil {
+				observer.Observe(root.Get("model").String(), true)
+			}
+			usageRaw := []byte(root.Get("usage").Raw)
+			for _, result := range results {
+				payload := buildOpenAIImagesStreamCompletedPayload(
+					"image_generation.completed", result, "", root.Get("created").Int(), usageRaw,
+				)
+				processSSEData(payload)
+			}
 			return
 		}
 		mergeOpenAIUsage(&usage, body)
