@@ -178,7 +178,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		if normalized {
 			body = normalizedBody
 		}
-		reqStream = gjson.GetBytes(body, "stream").Bool()
+		// Upstream Codex requires SSE; preserve the client's response mode.
+		// Compact uses its separate downstream SSE bridge.
+		reqStream = reqStream && !isOpenAIResponsesCompactPath(c)
 
 		accountScopedBody, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(body, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
 		if scopeErr != nil {
@@ -2673,51 +2675,51 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		}
 		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 	}
+	if terminalOK && terminalType != "response.completed" && terminalType != "response.done" && openAICompactClientWantsStream(c) {
+		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, "Upstream compact response did not complete: "+terminalType)
+	}
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
+	if !ok && terminalOK {
+		// Incomplete and cancelled responses still carry a final response object.
+		if response := gjson.GetBytes(terminalPayload, "response"); response.IsObject() {
+			finalResponse = []byte(response.Raw)
+			ok = true
+		}
+	}
+	if !ok || !gjson.ValidBytes(finalResponse) || !gjson.ParseBytes(finalResponse).IsObject() {
+		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, "Upstream stream ended without a valid final response")
+	}
 
 	usage := s.parseSSEUsageFromBody(bodyText)
-	if ok {
-		if parsedUsage, parsed := extractOpenAIUsageFromJSONBytes(finalResponse); parsed {
-			*usage = parsedUsage
-		}
-		// When the terminal event has an empty output array, reconstruct
-		// output from accumulated delta events so the client gets full content.
-		if len(gjson.GetBytes(finalResponse, "output").Array()) == 0 {
-			if outputJSON, reconstructed := reconstructResponseOutputFromSSE(bodyText); reconstructed {
-				if patched, err := sjson.SetRawBytes(finalResponse, "output", outputJSON); err == nil {
-					finalResponse = patched
-				}
+	if parsedUsage, parsed := extractOpenAIUsageFromJSONBytes(finalResponse); parsed {
+		*usage = parsedUsage
+	}
+	// When the terminal event has an empty output array, reconstruct
+	// output from accumulated delta events so the client gets full content.
+	if len(gjson.GetBytes(finalResponse, "output").Array()) == 0 {
+		if outputJSON, reconstructed := reconstructResponseOutputFromSSE(bodyText); reconstructed {
+			if patched, err := sjson.SetRawBytes(finalResponse, "output", outputJSON); err == nil {
+				finalResponse = patched
 			}
 		}
-		finalResponse = supplementCompactionItemFromSSE(c, finalResponse, bodyText)
-		body = finalResponse
-		if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
-			body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
-		}
-		// Correct tool calls in final response
-		body = s.correctToolCallsInResponseBody(body)
-		restoredBody, restoreErr := restoreOpenAIResponsesNamespacePayload(c, body)
-		if restoreErr != nil {
-			return nil, fmt.Errorf("restore OpenAI passthrough namespace response: %w", restoreErr)
-		}
-		restoredBody = restoreCodexToolNamesFromContext(c, restoredBody)
-		body = restoredBody
-	} else {
-		if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
-			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
-		}
-		body = []byte(bodyText)
 	}
+	finalResponse = supplementCompactionItemFromSSE(c, finalResponse, bodyText)
+	body = finalResponse
+	if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
+		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
+	}
+	// Correct tool calls in final response
+	body = s.correctToolCallsInResponseBody(body)
+	restoredBody, restoreErr := restoreOpenAIResponsesNamespacePayload(c, body)
+	if restoreErr != nil {
+		return nil, fmt.Errorf("restore OpenAI passthrough namespace response: %w", restoreErr)
+	}
+	restoredBody = restoreCodexToolNamesFromContext(c, restoredBody)
+	body = restoredBody
 
 	logOpenAISuccessMissingUsage(c.Request.Context(), c, account, resp, usage, terminalType, false)
 
 	contentType := "application/json; charset=utf-8"
-	if !ok {
-		contentType = resp.Header.Get("Content-Type")
-		if contentType == "" {
-			contentType = "text/event-stream"
-		}
-	}
 	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
 	s.bindHTTPResponseAccount(c.Request.Context(), c, account, responseID)
 	observeOpenAI429RecoveryOutput(c.Request.Context(), account, body, "")
@@ -2727,6 +2729,7 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		s.noteStagedOpenAICodexTurnStateCommitted(c, account, c.Writer.Header())
 	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
+		c.Header("Content-Type", contentType)
 		c.Data(resp.StatusCode, contentType, body)
 	}
 

@@ -21,6 +21,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -385,6 +386,142 @@ func captureStructuredLog(t *testing.T) (*inMemoryLogSink, func()) {
 	return sink, func() {
 		logger.SetSink(nil)
 		structuredLogCaptureMu.Unlock()
+	}
+}
+
+func TestOpenAIGatewayService_OAuthPassthrough_PreservesClientStreamMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name        string
+		streamField string
+		stream      bool
+	}{
+		{name: "explicit non-streaming", streamField: `,"stream":false`},
+		{name: "omitted stream"},
+		{name: "streaming", streamField: `,"stream":true`, stream: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			body := []byte(`{"model":"gpt-6-astra","instructions":"Reply briefly","input":"hello"` + tc.streamField + `}`)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"event: response.completed\n" +
+						`data: {"type":"response.completed","response":{"id":"resp_nonstream","object":"response","model":"gpt-6-astra","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}` + "\n\n",
+				)),
+			}}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			account := &Account{
+				ID: 123, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
+				Extra:       map[string]any{"openai_passthrough": true},
+				Status:      StatusActive, Schedulable: true, Concurrency: 1,
+			}
+
+			result, err := svc.Forward(context.Background(), c, account, body)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+			assert.Equal(t, tc.stream, result.Stream)
+			assert.Equal(t, 7, result.Usage.InputTokens)
+			assert.Equal(t, 2, result.Usage.OutputTokens)
+			assert.Equal(t, http.StatusOK, rec.Code)
+			if tc.stream {
+				assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+				assert.Contains(t, rec.Body.String(), "event: response.completed")
+			} else {
+				assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+				require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+				assert.Equal(t, "resp_nonstream", gjson.GetBytes(rec.Body.Bytes(), "id").String())
+				assert.Equal(t, "hello", gjson.GetBytes(rec.Body.Bytes(), "output.0.content.0.text").String())
+			}
+		})
+	}
+}
+
+func TestHandlePassthroughSSEToJSON_TerminalResponseContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name         string
+		sse          string
+		status       int
+		responseType string
+	}{
+		{name: "incomplete", sse: `data: {"type":"response.incomplete","response":{"id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, status: http.StatusOK, responseType: "incomplete"},
+		{name: "cancelled", sse: `data: {"type":"response.cancelled","response":{"id":"resp_partial","status":"cancelled","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, status: http.StatusOK, responseType: "cancelled"},
+		{name: "canceled", sse: `data: {"type":"response.canceled","response":{"id":"resp_partial","status":"canceled","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, status: http.StatusOK, responseType: "canceled"},
+		{name: "failed", sse: `data: {"type":"response.failed","response":{"error":{"message":"upstream rejected request"}}}`, status: http.StatusBadGateway},
+		{name: "bare error", sse: `event: error` + "\n" + `data: {"error":{"message":"upstream rejected request"}}`, status: http.StatusBadGateway},
+		{name: "missing terminal", sse: `data: {"type":"response.in_progress","response":{"id":"resp_partial"}}`, status: http.StatusBadGateway},
+		{name: "invalid final object", sse: `data: {"type":"response.completed","response":[]}`, status: http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			svc := &OpenAIGatewayService{cfg: &config.Config{}}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}}
+			body := []byte(tc.sse + "\n\ndata: [DONE]\n\n")
+
+			result, err := svc.handlePassthroughSSEToJSON(resp, c, nil, body, "gpt-6-astra", "")
+			assert.Equal(t, tc.status, rec.Code)
+			assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+			require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+			if tc.status != http.StatusOK {
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tc.responseType, gjson.GetBytes(rec.Body.Bytes(), "status").String())
+			assert.Equal(t, "partial", gjson.GetBytes(rec.Body.Bytes(), "output.0.content.0.text").String())
+			assert.Equal(t, 7, result.usage.InputTokens)
+			assert.Equal(t, 2, result.usage.OutputTokens)
+			if tc.responseType == "incomplete" {
+				assert.Equal(t, "max_output_tokens", gjson.GetBytes(rec.Body.Bytes(), "incomplete_details.reason").String())
+			}
+		})
+	}
+}
+
+func TestHandlePassthroughSSEToJSON_CompactIncompleteNeverCompletes(t *testing.T) {
+	for _, terminal := range []string{"incomplete", "cancelled", "canceled"} {
+		for _, committed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/committed=%v", terminal, committed), func(t *testing.T) {
+				c, rec := newCompactBridgeTestContext(t, true)
+				if committed {
+					keepalive := &openAICompactSSEKeepalive{writer: c.Writer, stop: make(chan struct{})}
+					c.Set(openAICompactSSEKeepaliveKey, keepalive)
+					t.Cleanup(keepalive.Stop)
+					require.True(t, keepalive.beat())
+				}
+				body := []byte(fmt.Sprintf(`data: {"type":"response.%s","response":{"id":"resp_partial","status":"%s","output":[{"type":"compaction","encrypted_content":"partial"}]}}`+"\n\n", terminal, terminal))
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}}
+
+				result, err := newCompactBridgeTestService().handlePassthroughSSEToJSON(resp, c, nil, body, "gpt-6-astra", "")
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.NotContains(t, rec.Body.String(), "response.completed")
+				if committed {
+					assert.Equal(t, http.StatusOK, rec.Code)
+					assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+					events := parseCompactBridgeSSE(t, stripKeepaliveComments(rec.Body.String()))
+					require.Len(t, events, 1)
+					assert.Equal(t, "response.failed", events[0][0])
+					assert.Equal(t, "failed", gjson.Get(events[0][1], "response.status").String())
+				} else {
+					assert.Equal(t, http.StatusBadGateway, rec.Code)
+					assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+					require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+					assert.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+				}
+			})
+		}
 	}
 }
 
@@ -2005,7 +2142,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_NonCodexUAFallbackToCodexUA(t *te
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}
 	upstream := &httpUpstreamRecorder{resp: resp}
 
@@ -2054,7 +2191,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_OfficialIdentityUnified(t *testin
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}
 	upstream := &httpUpstreamRecorder{resp: resp}
 
@@ -2099,7 +2236,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_CodexTuiIdentityUnified(t *testin
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}}
 
 	svc := &OpenAIGatewayService{
@@ -2204,7 +2341,7 @@ func TestOpenAIGatewayService_CodexFingerprintHTTPRawPassthroughHeaderBodyParity
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}}
 	svc := &OpenAIGatewayService{
 		cfg:          &config.Config{},
@@ -2401,7 +2538,7 @@ func TestOpenAIGatewayService_CodexCLIOnly_AllowOfficialClientFamilies(t *testin
 			resp := &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 			}
 			upstream := &httpUpstreamRecorder{resp: resp}
 
