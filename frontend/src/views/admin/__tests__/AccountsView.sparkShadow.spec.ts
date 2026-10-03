@@ -6,6 +6,7 @@ import AccountActionMenu from '@/components/admin/account/AccountActionMenu.vue'
 import PlatformTypeBadge from '@/components/common/PlatformTypeBadge.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import AccountCapacityCell from '@/components/account/AccountCapacityCell.vue'
 
 // 外审 F2:AccountActionMenu emit 'create-spark-shadow',但 AccountsView 此前未监听,
 // 导致按钮点击无效。本测试通过真实组件引用 emit 该事件,断言父页面接线调用 API。
@@ -13,7 +14,11 @@ const {
   listAccounts,
   listWithEtag,
   getBatchTodayStats,
-  getAllProxies,
+  getUpstreamBillingProbeSettings,
+  getProxyOptions,
+  getAssignableEgressCatalog,
+  getAccountById,
+  verifyEgressRoute,
   getAllGroups,
   duplicateAccount,
   createSparkShadow,
@@ -23,7 +28,11 @@ const {
   listAccounts: vi.fn(),
   listWithEtag: vi.fn(),
   getBatchTodayStats: vi.fn(),
-  getAllProxies: vi.fn(),
+  getUpstreamBillingProbeSettings: vi.fn(),
+  getProxyOptions: vi.fn(),
+  getAssignableEgressCatalog: vi.fn(),
+  getAccountById: vi.fn(),
+  verifyEgressRoute: vi.fn(),
   getAllGroups: vi.fn(),
   duplicateAccount: vi.fn(),
   createSparkShadow: vi.fn(),
@@ -37,15 +46,20 @@ vi.mock('@/api/admin', () => ({
       list: listAccounts,
       listWithEtag,
       getBatchTodayStats,
+      getById: getAccountById,
       duplicate: duplicateAccount,
-      getUpstreamBillingProbeSettings: vi.fn().mockResolvedValue({ enabled: true, interval_minutes: 30 }),
+      getUpstreamBillingProbeSettings,
       createSparkShadow,
       delete: vi.fn(),
       batchClearError: vi.fn(),
       batchRefresh: vi.fn(),
       toggleSchedulable: vi.fn()
     },
-    proxies: { getAll: getAllProxies },
+    proxies: { getOptions: getProxyOptions },
+    egressRoutes: {
+      getAssignableCatalog: getAssignableEgressCatalog,
+      verify: verifyEgressRoute
+    },
     groups: { getAll: getAllGroups }
   }
 }))
@@ -77,9 +91,15 @@ const mountView = () =>
         DataTable: true,
         Pagination: true,
         ConfirmDialog: true,
-        AccountTableActions: { template: '<div><slot name="beforeCreate" /><slot name="after" /></div>' },
+        AccountTableActions: {
+          emits: ['create'],
+          template: '<div><button data-test="open-create" @click="$emit(\'create\')">create</button><slot name="beforeCreate" /><slot name="after" /></div>'
+        },
         AccountTableFilters: { template: '<div></div>' },
-        AccountBulkActionsBar: true,
+        AccountBulkActionsBar: {
+          emits: ['edit-selected'],
+          template: '<button data-test="open-bulk-edit" @click="$emit(\'edit-selected\')">bulk</button>'
+        },
         AccountActionMenu: true,
         ImportDataModal: true,
         ReAuthAccountModal: true,
@@ -90,9 +110,15 @@ const mountView = () =>
         TempUnschedStatusModal: true,
         ErrorPassthroughRulesModal: true,
         TLSFingerprintProfilesModal: true,
-        CreateAccountModal: true,
+        CreateAccountModal: {
+          props: ['show', 'proxies', 'egressRoutes', 'defaultEgressRouteId', 'defaultEgressConcurrency'],
+          template: '<div data-test="create-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" :data-default-route-id="String(defaultEgressRouteId ?? \'\')" :data-default-concurrency="String(defaultEgressConcurrency ?? \'\')" />'
+        },
         EditAccountModal: true,
-        BulkEditAccountModal: true,
+        BulkEditAccountModal: {
+          props: ['show', 'proxies', 'egressRoutes', 'defaultEgressRouteId', 'defaultEgressConcurrency'],
+          template: '<div data-test="bulk-edit-account-modal" :data-show="String(show)" :data-proxy-count="String(proxies?.length || 0)" :data-route-count="String(egressRoutes?.length || 0)" :data-default-route-id="String(defaultEgressRouteId ?? \'\')" :data-default-concurrency="String(defaultEgressConcurrency ?? \'\')" />'
+        },
         PlatformTypeBadge: true,
         AccountCapacityCell: true,
         AccountStatusIndicator: true,
@@ -107,13 +133,17 @@ const mountView = () =>
 describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getAllProxies, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getProxyOptions, getAssignableEgressCatalog, getAccountById, verifyEgressRoute, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
     listAccounts.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20, pages: 0 })
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
-    getAllProxies.mockResolvedValue([])
+    getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: true, interval_minutes: 30 })
+    getProxyOptions.mockResolvedValue([])
+    getAssignableEgressCatalog.mockResolvedValue({ items: [], capabilities: { mutation_enabled: true } })
+    getAccountById.mockImplementation(async (id: number) => ({ id }))
+    verifyEgressRoute.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     duplicateAccount.mockResolvedValue({ id: 998, name: 'parent-acc (Copy)' })
     createSparkShadow.mockResolvedValue({ id: 999, name: 'parent-acc (Spark)' })
@@ -134,6 +164,67 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     expect(duplicateAccount).toHaveBeenCalledWith(42)
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.duplicateSuccess')
     expect(listAccounts.mock.calls.length).toBeGreaterThan(1)
+    wrapper.unmount()
+  })
+
+  it('账号设置只加载脱敏的出口与代理选项', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(1)
+    expect(getProxyOptions).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('打开创建弹窗时刷新目录并清除加载失败的旧代理选项', async () => {
+    getProxyOptions
+      .mockResolvedValueOnce([{ id: 1, name: 'old', display_endpoint: 'old:1', status: 'active', selectable: true }])
+      .mockRejectedValueOnce(new Error('proxy catalog unavailable'))
+    getAssignableEgressCatalog
+      .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
+      .mockResolvedValueOnce({
+        items: [{ id: 2, kind: 'proxy', name: 'fresh-route', state: 'active', eligible: true }],
+        default_route_id: 2,
+        default_concurrency: 3,
+        capabilities: { mutation_enabled: true }
+      })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-test="open-create"]').trigger('click')
+    await flushPromises()
+
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
+    expect(getProxyOptions).toHaveBeenCalledTimes(2)
+    const modal = wrapper.get('[data-test="create-account-modal"]')
+    expect(modal.attributes('data-show')).toBe('true')
+    expect(modal.attributes('data-proxy-count')).toBe('0')
+    expect(modal.attributes('data-route-count')).toBe('1')
+    expect(modal.attributes('data-default-route-id')).toBe('2')
+    expect(modal.attributes('data-default-concurrency')).toBe('3')
+    wrapper.unmount()
+  })
+
+  it('打开批量编辑弹窗时刷新出口和代理目录', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    getAssignableEgressCatalog.mockResolvedValueOnce({
+      items: [{ id: 2, kind: 'proxy', name: 'fresh-route', state: 'active', eligible: true }],
+      default_route_id: 2,
+      default_concurrency: 3,
+      capabilities: { mutation_enabled: true }
+    })
+    await wrapper.get('[data-test="open-bulk-edit"]').trigger('click')
+    await flushPromises()
+
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
+    expect(getProxyOptions).toHaveBeenCalledTimes(2)
+    const modal = wrapper.get('[data-test="bulk-edit-account-modal"]')
+    expect(modal.attributes('data-show')).toBe('true')
+    expect(modal.attributes('data-route-count')).toBe('1')
+    expect(modal.attributes('data-default-route-id')).toBe('2')
+    expect(modal.attributes('data-default-concurrency')).toBe('3')
     wrapper.unmount()
   })
 
@@ -224,6 +315,9 @@ const mountViewWithRow = () =>
             <div v-for="(row, idx) in (data || [])" :key="idx">
               <slot name="cell-name" :row="row" :value="row.name" />
               <slot name="cell-platform_type" :row="row" />
+              <slot name="cell-capacity" :row="row" />
+              <slot name="cell-proxy" :row="row" />
+              <slot name="cell-actions" :row="row" />
             </div>
           </div>`
         },
@@ -243,7 +337,37 @@ const mountViewWithRow = () =>
         ErrorPassthroughRulesModal: true,
         TLSFingerprintProfilesModal: true,
         CreateAccountModal: true,
-        EditAccountModal: true,
+        EditAccountModal: {
+          props: [
+            'show',
+            'account',
+            'proxies',
+            'egressRoutes',
+            'egressMutationEnabled',
+            'egressVerifyingRouteId',
+            'egressVerifyErrors'
+          ],
+          emits: ['verify-egress-route'],
+          template: `<div
+            data-test="edit-account-modal"
+            :data-show="String(show)"
+            :data-account-name="account?.name"
+            :data-mutation-enabled="String(egressMutationEnabled)"
+          >
+            <button
+              v-for="route in egressRoutes"
+              :key="route.id"
+              data-test="edit-egress-route"
+              @click="$emit('verify-egress-route', route)"
+            >{{ route.name }} {{ route.probe_latency_ms }}</button>
+            <span v-for="proxy in proxies" :key="proxy.id" data-test="edit-proxy-option">{{ proxy.display_endpoint }}</span>
+            <span
+              v-for="route in (account?.egress_pool?.routes || [])"
+              :key="route.id"
+              data-test="edit-embedded-egress-route"
+            >{{ route.name }}</span>
+          </div>`
+        },
         BulkEditAccountModal: true,
         PlatformTypeBadge: true,
         AccountCapacityCell: true,
@@ -259,12 +383,16 @@ const mountViewWithRow = () =>
 describe('admin AccountsView — 账号行展示', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getAllProxies, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getUpstreamBillingProbeSettings, getProxyOptions, getAssignableEgressCatalog, getAccountById, verifyEgressRoute, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
-    getAllProxies.mockResolvedValue([])
+    getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: true, interval_minutes: 30 })
+    getProxyOptions.mockResolvedValue([])
+    getAssignableEgressCatalog.mockResolvedValue({ items: [], capabilities: { mutation_enabled: true } })
+    getAccountById.mockImplementation(async (id: number) => ({ id }))
+    verifyEgressRoute.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     vi.stubGlobal('confirm', vi.fn(() => true))
   })
@@ -273,6 +401,109 @@ describe('admin AccountsView — 账号行展示', () => {
     vi.useRealTimers()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
+  })
+
+  it('打开 OpenAI OAuth 编辑弹窗前重新加载可分配出口', async () => {
+    const account = {
+      id: 11049,
+      name: 'openai-oauth',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active',
+      schedulable: true
+    }
+    const refreshedRoutes = [{
+      id: 12,
+      kind: 'proxy',
+      name: 'racknerd-104-ipv4',
+      state: 'active',
+      eligible: true,
+      observed_ip: '104.223.77.152'
+    }]
+    const proxyOptions = [{
+      id: 104,
+      name: 'racknerd-104',
+      display_endpoint: 'socks5://104.223.77.152:1080',
+      status: 'active',
+      selectable: true
+    }]
+    listAccounts.mockResolvedValue({ items: [account], total: 1, page: 1, page_size: 20, pages: 1 })
+    getAssignableEgressCatalog
+      .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
+      .mockResolvedValueOnce({ items: refreshedRoutes, capabilities: { mutation_enabled: true } })
+    getProxyOptions
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(proxyOptions)
+    getAccountById.mockResolvedValue({ ...account, name: 'fresh-openai-oauth' })
+    verifyEgressRoute.mockResolvedValue([{ ...refreshedRoutes[0], probe_latency_ms: 61 }])
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+
+    const editButton = wrapper.findAll('button').find(button => button.text() === 'common.edit')
+    expect(editButton).toBeTruthy()
+    await editButton!.trigger('click')
+    await flushPromises()
+
+    expect(getAssignableEgressCatalog).toHaveBeenCalledTimes(2)
+    expect(getAccountById).toHaveBeenCalledWith(11049)
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-show')).toBe('true')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-account-name')).toBe('fresh-openai-oauth')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-mutation-enabled')).toBe('true')
+    expect(wrapper.get('[data-test="edit-egress-route"]').text()).toContain('racknerd-104-ipv4')
+    expect(wrapper.get('[data-test="edit-proxy-option"]').text()).toBe('socks5://104.223.77.152:1080')
+
+    await wrapper.get('[data-test="edit-egress-route"]').trigger('click')
+    await flushPromises()
+    expect(verifyEgressRoute).toHaveBeenCalledWith([12])
+    expect(wrapper.get('[data-test="edit-egress-route"]').text()).toContain('61')
+    wrapper.unmount()
+  })
+
+  it('目录刷新失败时使用 fresh 详情展示已绑定出口并禁用修改', async () => {
+    const rowAccount = {
+      id: 11050,
+      name: 'stale-row',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active'
+    }
+    const embeddedRoute = {
+      id: 18,
+      kind: 'proxy',
+      name: 'bound-route',
+      state: 'retired',
+      eligible: false
+    }
+    listAccounts.mockResolvedValue({ items: [rowAccount], total: 1, page: 1, page_size: 20, pages: 1 })
+    getAssignableEgressCatalog
+      .mockResolvedValueOnce({ items: [], capabilities: { mutation_enabled: true } })
+      .mockRejectedValueOnce(new Error('catalog unavailable'))
+    getAccountById.mockResolvedValue({
+      ...rowAccount,
+      name: 'fresh-account',
+      egress_mode: 'pool',
+      egress_pool: {
+        route_ids: [18],
+        primary_route_id: 18,
+        concurrency_per_egress: 2,
+        revision: 4,
+        routes: [embeddedRoute]
+      }
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+    const editButton = wrapper.findAll('button').find(button => button.text() === 'common.edit')
+    await editButton!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-show')).toBe('true')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-account-name')).toBe('fresh-account')
+    expect(wrapper.get('[data-test="edit-account-modal"]').attributes('data-mutation-enabled')).toBe('false')
+    expect(wrapper.get('[data-test="edit-embedded-egress-route"]').text()).toBe('bound-route')
+    wrapper.unmount()
   })
 
   it('影子行 email 单元格显示 parent_email，PlatformTypeBadge 接收 parent_plan_type/parent_privacy_mode', async () => {
@@ -304,6 +535,49 @@ describe('admin AccountsView — 账号行展示', () => {
     expect(badge.props('privacyMode')).toBe('false')
     expect(badge.props('subscriptionExpiresAt')).toBe('2027-01-01T00:00:00Z')
 
+    wrapper.unmount()
+  })
+
+  it('出口列显示两个节点、折叠剩余数量，并标记继承与降级', async () => {
+    listAccounts.mockResolvedValue({
+      items: [{
+        id: 100,
+        name: 'shadow',
+        platform: 'openai',
+        type: 'oauth',
+        parent_account_id: 1,
+        egress_mode: 'inherited',
+        egress_summary: {
+          configured_route_count: 3,
+          eligible_route_count: 2,
+          degraded_route_count: 1,
+          concurrency_per_egress: 4,
+          effective_capacity: 8,
+          routes: [
+            { id: 1, kind: 'direct', name: 'Local', state: 'active', eligible: true },
+            { id: 2, kind: 'proxy', name: 'RN-104', state: 'active', eligible: true, observed_ip: '104.223.77.152' },
+            { id: 3, kind: 'proxy', name: 'RN-67', state: 'expired', eligible: false }
+          ]
+        }
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.inherited')
+    expect(wrapper.text()).toContain('Local')
+    expect(wrapper.text()).toContain('RN-104')
+    expect(wrapper.text()).not.toContain('RN-67')
+    const routeChip = wrapper.findAll('span[title]').find((node) => node.text().includes('RN-104'))
+    expect(routeChip?.attributes('title')).toContain('104.***.***.152')
+    expect(routeChip?.attributes('title')).not.toContain('104.223.77.152')
+    expect(wrapper.text()).toContain('+1')
+    expect(wrapper.text()).toContain('admin.accounts.egressPool.degraded')
     wrapper.unmount()
   })
 
@@ -577,6 +851,133 @@ describe('admin AccountsView — 账号行展示', () => {
 
     expect(listWithEtag).toHaveBeenCalledTimes(1)
     expect(wrapper.findComponent(PlatformTypeBadge).props('planType')).toBe('SuperGrok')
+    wrapper.unmount()
+  })
+
+  it('replaces an OpenAI pool row when per-IP load moves but the total stays unchanged', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    localStorage.setItem('account-auto-refresh', JSON.stringify({ enabled: true, interval_seconds: 5 }))
+
+    const initialAccount = {
+      id: 214,
+      name: 'pool-load-refresh',
+      platform: 'openai',
+      type: 'oauth',
+      current_concurrency: 3,
+      egress_summary: {
+        configured_route_count: 3,
+        eligible_route_count: 3,
+        concurrency_per_egress: 3,
+        effective_capacity: 9,
+        current_concurrency: 3,
+        bindings: [
+          { route_id: 10, observed_ip: '51.81.109.154', eligible: true, current_concurrency: 1 },
+          { route_id: 11, observed_ip: '67.215.237.47', eligible: true, current_concurrency: 2 },
+          { route_id: 12, observed_ip: '104.223.77.152', eligible: true, current_concurrency: 0 },
+        ],
+      },
+    }
+    const refreshedAccount = {
+      ...initialAccount,
+      egress_summary: {
+        ...initialAccount.egress_summary,
+        bindings: [
+          { route_id: 10, observed_ip: '51.81.109.154', eligible: true, current_concurrency: 0 },
+          { route_id: 11, observed_ip: '67.215.237.47', eligible: true, current_concurrency: 3 },
+          { route_id: 12, observed_ip: '104.223.77.152', eligible: true, current_concurrency: 0 },
+        ],
+      },
+    }
+    listAccounts.mockResolvedValue({ items: [initialAccount], total: 1, page: 1, page_size: 20, pages: 1 })
+    listWithEtag.mockResolvedValueOnce({
+      notModified: false,
+      etag: 'pool-load-2',
+      data: { items: [refreshedAccount], total: 1, page: 1, page_size: 20, pages: 1 },
+    })
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+    expect(wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings[0].current_concurrency).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(6000)
+    await flushPromises()
+
+    expect(wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings[0].current_concurrency).toBe(0)
+    expect(wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings[1].current_concurrency).toBe(3)
+    wrapper.unmount()
+  })
+
+  it('replaces an OpenAI pool row when binding metadata changes but all loads stay unchanged', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    localStorage.setItem('account-auto-refresh', JSON.stringify({ enabled: true, interval_seconds: 5 }))
+
+    const initialAccount = {
+      id: 215,
+      name: 'pool-metadata-refresh',
+      platform: 'openai',
+      type: 'oauth',
+      current_concurrency: 3,
+      egress_summary: {
+        configured_route_count: 3,
+        eligible_route_count: 3,
+        concurrency_per_egress: 3,
+        effective_capacity: 9,
+        current_concurrency: 3,
+        bindings: [
+          { route_id: 10, name: 'Local', observed_ip: '51.81.109.154', eligible: true, current_concurrency: 1 },
+          { route_id: 11, name: 'RN-67', observed_ip: '67.215.237.47', eligible: true, current_concurrency: 2 },
+          { route_id: 12, name: 'RN-104', observed_ip: '104.223.77.152', eligible: true, current_concurrency: 0 },
+        ],
+      },
+    }
+    const renamedAccount = {
+      ...initialAccount,
+      egress_summary: {
+        ...initialAccount.egress_summary,
+        bindings: initialAccount.egress_summary.bindings.map(binding => (
+          binding.route_id === 11 ? { ...binding, name: 'RackNerd 67' } : binding
+        )),
+      },
+    }
+    const reidentifiedAccount = {
+      ...renamedAccount,
+      egress_summary: {
+        ...renamedAccount.egress_summary,
+        bindings: renamedAccount.egress_summary.bindings.map(binding => (
+          binding.route_id === 12 ? { ...binding, observed_ip: '104.223.77.153' } : binding
+        )),
+      },
+    }
+    listAccounts.mockResolvedValue({ items: [initialAccount], total: 1, page: 1, page_size: 20, pages: 1 })
+    listWithEtag
+      .mockResolvedValueOnce({
+        notModified: false,
+        etag: 'pool-metadata-2',
+        data: { items: [renamedAccount], total: 1, page: 1, page_size: 20, pages: 1 },
+      })
+      .mockResolvedValueOnce({
+        notModified: false,
+        etag: 'pool-metadata-3',
+        data: { items: [reidentifiedAccount], total: 1, page: 1, page_size: 20, pages: 1 },
+      })
+
+    const wrapper = mountViewWithRow()
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(6000)
+    await flushPromises()
+    let renderedBindings = wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings
+    expect(renderedBindings[1].name).toBe('RackNerd 67')
+    expect(renderedBindings.map((binding: { current_concurrency: number }) => binding.current_concurrency)).toEqual([1, 2, 0])
+
+    await vi.advanceTimersByTimeAsync(6000)
+    await flushPromises()
+    renderedBindings = wrapper.findComponent(AccountCapacityCell).props('account').egress_summary.bindings
+    expect(renderedBindings[2].observed_ip).toBe('104.223.77.153')
+    expect(renderedBindings.map((binding: { current_concurrency: number }) => binding.current_concurrency)).toEqual([1, 2, 0])
+    expect(listWithEtag).toHaveBeenCalledTimes(2)
     wrapper.unmount()
   })
 })

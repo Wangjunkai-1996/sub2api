@@ -102,6 +102,9 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	if err := s.validateDefaultSubscriptionGroups(ctx, settings.DefaultSubscriptions); err != nil {
 		return nil, err
 	}
+	if err := normalizeOpenAICyberAccountCooldownSettings(settings); err != nil {
+		return nil, infraerrors.BadRequest("INVALID_OPENAI_CYBER_ACCOUNT_COOLDOWN", err.Error())
+	}
 	normalizedWhitelist, err := NormalizeRegistrationEmailSuffixWhitelist(settings.RegistrationEmailSuffixWhitelist)
 	if err != nil {
 		return nil, infraerrors.BadRequest("INVALID_REGISTRATION_EMAIL_SUFFIX_WHITELIST", err.Error())
@@ -457,6 +460,17 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 		updates[SettingKeyCyberSessionBlockTTLSeconds] = strconv.Itoa(settings.CyberSessionBlockTTLSeconds)
 	}
 
+	// OpenAI upstream Cyber account cooldown
+	updates[SettingKeyOpenAICyberAccountCooldownEnabled] = strconv.FormatBool(settings.OpenAICyberAccountCooldownEnabled)
+	updates[SettingKeyOpenAICyberAccountCooldownWindowSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownWindowSeconds)
+	updates[SettingKeyOpenAICyberAccountCooldownFirstSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownFirstSeconds)
+	updates[SettingKeyOpenAICyberAccountCooldownEscalatedSeconds] = strconv.Itoa(settings.OpenAICyberAccountCooldownEscalatedSeconds)
+	cooldownGroupIDsJSON, err := json.Marshal(settings.OpenAICyberAccountCooldownGroupIDs)
+	if err != nil {
+		return nil, fmt.Errorf("marshal OpenAI Cyber account cooldown group IDs: %w", err)
+	}
+	updates[SettingKeyOpenAICyberAccountCooldownGroupIDs] = string(cooldownGroupIDsJSON)
+
 	// Claude Code version check
 	updates[SettingKeyMinClaudeCodeVersion] = settings.MinClaudeCodeVersion
 	updates[SettingKeyMaxClaudeCodeVersion] = settings.MaxClaudeCodeVersion
@@ -489,6 +503,11 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyOpenAICodexUserAgent] = strings.TrimSpace(settings.OpenAICodexUserAgent)
 	updates[SettingKeyOpenAICodexClientVersion] = NormalizeCodexClientVersion(settings.OpenAICodexClientVersion)
 	updates[SettingKeyOpenAICodexVersionAutoSyncEnabled] = strconv.FormatBool(settings.OpenAICodexVersionAutoSyncEnabled)
+	updates[SettingKeyOpenAICodexTicketV2Enabled] = strconv.FormatBool(settings.OpenAICodexTicketEnabled)
+	if err := ValidateOpenAICodexTicketHarvestProxyURL(settings.OpenAICodexTicketHarvestProxyURL); err != nil {
+		return nil, infraerrors.BadRequest("INVALID_CODEX_HARVEST_PROXY", err.Error())
+	}
+	updates[SettingKeyOpenAICodexTicketHarvestProxyURL] = strings.TrimSpace(settings.OpenAICodexTicketHarvestProxyURL)
 	// SettingKeyOpenAICodexClientVersionSynced 由自动同步任务独占写入，此处不得覆盖，
 	// 否则面板保存会把同步结果清空。
 	updates[SettingKeyClaudeCodeClientVersion] = NormalizeClaudeCodeClientVersion(settings.ClaudeCodeClientVersion)
@@ -502,6 +521,24 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyCodexCLIOnlyWhitelist] = strings.TrimSpace(settings.CodexCLIOnlyWhitelist)
 	updates[SettingKeyCodexCLIOnlyAllowAppServerClients] = strconv.FormatBool(settings.CodexCLIOnlyAllowAppServerClients)
 	updates[SettingKeyCodexCLIOnlyEngineFingerprintSignals] = strings.TrimSpace(settings.CodexCLIOnlyEngineFingerprintSignals)
+	if err := validateOpenAIWindowWarmupSettings(settings); err != nil {
+		return nil, err
+	}
+	warmupAllowlist, err := json.Marshal(settings.OpenAIWindowWarmupAllowlist)
+	if err != nil {
+		return nil, fmt.Errorf("marshal OpenAI window warmup allowlist: %w", err)
+	}
+	updates[SettingKeyOpenAIWindowWarmupEnabled] = strconv.FormatBool(settings.OpenAIWindowWarmupEnabled)
+	updates[SettingKeyOpenAIWindowWarmupDefaultPolicy] = settings.OpenAIWindowWarmupDefaultPolicy
+	updates[SettingKeyOpenAIWindowWarmupAllowlist] = string(warmupAllowlist)
+	updates[SettingKeyOpenAIWindowWarmupProbeModel] = strings.TrimSpace(settings.OpenAIWindowWarmupProbeModel)
+	updates[SettingKeyOpenAIWindowWarmupWorkerConcurrency] = strconv.Itoa(settings.OpenAIWindowWarmupWorkerConcurrency)
+	updates[SettingKeyOpenAIWindowWarmupGlobalQPS] = strconv.FormatFloat(settings.OpenAIWindowWarmupGlobalQPS, 'f', -1, 64)
+	updates[SettingKeyOpenAIWindowWarmupBatchSize] = strconv.Itoa(settings.OpenAIWindowWarmupBatchSize)
+	updates[SettingKeyOpenAIWindowWarmupScanSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupScanSeconds)
+	updates[SettingKeyOpenAIWindowWarmupRequestTimeoutSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupRequestTimeoutSeconds)
+	updates[SettingKeyOpenAIWindowWarmupLeaseSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupLeaseSeconds)
+	updates[SettingKeyOpenAIWindowWarmupResetGraceSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupResetGraceSeconds)
 	updates[SettingPaymentVisibleMethodAlipaySource] = settings.PaymentVisibleMethodAlipaySource
 	updates[SettingPaymentVisibleMethodWxpaySource] = settings.PaymentVisibleMethodWxpaySource
 	updates[SettingPaymentVisibleMethodAlipayEnabled] = strconv.FormatBool(settings.PaymentVisibleMethodAlipayEnabled)
@@ -710,6 +747,17 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		max:       settings.MaxClaudeCodeVersion,
 		expiresAt: time.Now().Add(versionBoundsCacheTTL).UnixNano(),
 	})
+	s.openAICyberAccountCooldownRuntimeSF.Forget(openAICyberAccountCooldownRuntimeSFKey)
+	s.openAICyberAccountCooldownRuntimeCache.Store(&cachedOpenAICyberAccountCooldownRuntime{
+		policy: newOpenAICyberAccountCooldownPolicy(
+			settings.OpenAICyberAccountCooldownEnabled,
+			settings.OpenAICyberAccountCooldownWindowSeconds,
+			settings.OpenAICyberAccountCooldownFirstSeconds,
+			settings.OpenAICyberAccountCooldownEscalatedSeconds,
+			settings.OpenAICyberAccountCooldownGroupIDs,
+		),
+		expiresAt: time.Now().Add(openAICyberAccountCooldownRuntimeCacheTTL).UnixNano(),
+	})
 	backendModeSF.Forget("backend_mode")
 	backendModeCache.Store(&cachedBackendMode{
 		value:     settings.BackendModeEnabled,
@@ -750,6 +798,8 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 	// 版本号缓存只做失效，不在此重算：生效值还取决于自动同步写入的 synced 键，
 	// 这里没有它的最新值，重算会把同步结果覆盖成陈旧值。
 	s.InvalidateOpenAICodexClientVersionCache()
+	s.InvalidateOpenAICodexTicketEnabledCache()
+	s.InvalidateOpenAICodexTicketHarvestProxyCache()
 	s.InvalidateClaudeCodeClientVersionCache()
 	openAIAdvancedSchedulerSettingSF.Forget(openAIAdvancedSchedulerSettingKey)
 	openAIAdvancedSchedulerSettingCache.Store(&cachedOpenAIAdvancedSchedulerSetting{

@@ -107,7 +107,7 @@ func TestCodexImagesLunaErrorDoesNotCoolImageAccount(t *testing.T) {
 func TestCodexDirectImagesShadowCredentials(t *testing.T) {
 	parent := directImagesTestAccount()
 	parent.Status = StatusActive
-	shadow := &Account{ID: 99, ParentAccountID: &parent.ID, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	shadow := &Account{ID: 99, ParentAccountID: &parent.ID, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive}
 	body := []byte(`{"model":"gpt-image-2","prompt":"draw"}`)
 	c, _ := newOpenAIImagesTestContext(t, body)
 	upstream := &httpUpstreamRecorder{resp: openAIImagesJSONResponse()}

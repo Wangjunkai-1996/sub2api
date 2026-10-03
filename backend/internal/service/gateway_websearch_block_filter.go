@@ -7,7 +7,6 @@ import (
 	"unsafe"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -42,6 +41,7 @@ var (
 // The emulated assistant turn always carries a trailing text summary, so the
 // search context survives the strip. A message whose content would become
 // empty gets a placeholder text block (mirroring FilterThinkingBlocksForRetry).
+// The latest assistant content is immutable when it contains trusted thinking.
 // Returns the original body unchanged when nothing needs stripping.
 func FilterWebSearchHistoryBlocks(body []byte, mappedModel string) []byte {
 	if !bytes.Contains(body, patternServerToolUse) && !bytes.Contains(body, patternWebSearchToolResult) {
@@ -56,20 +56,20 @@ func FilterWebSearchHistoryBlocks(body []byte, mappedModel string) []byte {
 		return body
 	}
 
-	var messages []any
-	if err := json.Unmarshal(sliceRawFromBody(body, msgsRes), &messages); err != nil {
-		return body
-	}
-
-	modified := false
-	for _, msg := range messages {
-		msgMap, ok := msg.(map[string]any)
-		if !ok {
+	messages := msgsRes.Array()
+	protectedIndex := latestAssistantContentToPreserve(msgsRes)
+	out := body
+	for messageIndex, message := range messages {
+		if messageIndex == protectedIndex {
 			continue
 		}
-		content, ok := msgMap["content"].([]any)
-		if !ok {
+		contentResult := message.Get("content")
+		if !contentResult.IsArray() {
 			continue
+		}
+		var content []any
+		if err := json.Unmarshal([]byte(contentResult.Raw), &content); err != nil {
+			return body
 		}
 
 		// 延迟分配：只有命中需剥离的块才构建新 slice。
@@ -90,29 +90,19 @@ func FilterWebSearchHistoryBlocks(body []byte, mappedModel string) []byte {
 		if newContent == nil {
 			continue
 		}
-		modified = true
 		if len(newContent) == 0 {
-			role, _ := msgMap["role"].(string)
+			role := message.Get("role").String()
 			placeholder := "(content removed)"
 			if role == "assistant" {
 				placeholder = "(assistant content removed)"
 			}
 			newContent = []any{map[string]any{"type": "text", "text": placeholder}}
 		}
-		msgMap["content"] = newContent
-	}
-
-	if !modified {
-		return body
-	}
-
-	msgsBytes, err := json.Marshal(messages)
-	if err != nil {
-		return body
-	}
-	out, err := sjson.SetRawBytes(body, "messages", msgsBytes)
-	if err != nil {
-		return body
+		var err error
+		out, err = replaceMessageContent(out, messageIndex, newContent)
+		if err != nil {
+			return body
+		}
 	}
 	return out
 }

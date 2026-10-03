@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -110,6 +111,58 @@ func TestOpenAIProxyStreamQuarantineBypassContext(t *testing.T) {
 	ctx := context.Background()
 	require.True(t, svc.isOpenAIProxyStreamQuarantined(ctx, account))
 	require.False(t, svc.isOpenAIProxyStreamQuarantined(withOpenAIProxyStreamQuarantineBypass(ctx), account))
+}
+
+func TestOpenAIProxyStreamCircuitUsesSelectedPoolRoute(t *testing.T) {
+	primaryID := int64(9)
+	selectedID := int64(42)
+	account := &Account{
+		ID:       1001,
+		Platform: PlatformOpenAI,
+		ProxyID:  &primaryID,
+		EgressBindings: []AccountEgressBinding{{
+			BindingID: "1001:7",
+			RouteID:   7,
+			Route: &EgressRoute{
+				Kind:    EgressRouteKindProxy,
+				ProxyID: &selectedID,
+			},
+		}},
+		SelectedEgress: &ResolvedAccountEgress{BindingID: "1001:7", RouteID: 7},
+	}
+
+	got, ok := openAIProxyStreamCircuitProxyID(account)
+	require.True(t, ok)
+	require.Equal(t, selectedID, got, "the circuit must key on the admitted pool route, not the durable primary mirror")
+}
+
+func TestOpenAIProxyStreamCircuitQuarantinesSelectedPoolRoute(t *testing.T) {
+	primaryID := int64(9)
+	selectedID := int64(42)
+	account := &Account{
+		ID:       1003,
+		Platform: PlatformOpenAI,
+		ProxyID:  &primaryID,
+		EgressBindings: []AccountEgressBinding{{
+			BindingID: "1003:7",
+			RouteID:   7,
+			Route:     &EgressRoute{Kind: EgressRouteKindProxy, ProxyID: &selectedID},
+		}},
+		SelectedEgress: &ResolvedAccountEgress{BindingID: "1003:7", RouteID: 7},
+	}
+	svc := &OpenAIGatewayService{}
+	svc.openaiProxyStreamCircuit = newOpenAIProxyStreamCircuit(openAIProxyStreamCircuitSettings{
+		failureThreshold: 2,
+		failureWindow:    time.Minute,
+		quarantineTTL:    10 * time.Minute,
+		collapseInterval: 0,
+		maxEntries:       16,
+	})
+
+	svc.recordOpenAIProxyStreamDisconnect(account, errors.New("unexpected EOF"), "r1")
+	svc.recordOpenAIProxyStreamDisconnect(account, errors.New("unexpected EOF"), "r2")
+	require.True(t, svc.isOpenAIProxyStreamQuarantined(context.Background(), account))
+	require.False(t, svc.openaiProxyStreamCircuit.isBlocked(primaryID, time.Now()), "the durable primary mirror must not be quarantined for a different selected route")
 }
 
 func TestOpenAIProxyStreamCircuitBoundsEntries(t *testing.T) {

@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -21,12 +22,13 @@ var errOpenAICyberPolicyForwarded = errors.New("openai cyber_policy forwarded to
 
 // CyberPolicyMark 记录一次 cyber_policy 硬阻断的上游证据。
 type CyberPolicyMark struct {
-	Code           string // 固定 "cyber_policy"
-	Message        string // 上游 error.message
-	Body           string // 上游 response.failed / 400 原始 body（已截断；未脱敏，ops_error 落库由 sanitizeErrorBodyForStorage、风控日志由 redactContentModerationSecrets 统一脱敏）
-	UpstreamStatus int    // 上游 HTTP 状态（流式=200，非流式=400）
-	UpstreamInTok  int    // 上游已报 input tokens（如有）
-	UpstreamOutTok int    // 上游已报 output tokens（如有）
+	Code           string    // 固定 "cyber_policy"
+	Message        string    // 上游 error.message
+	Body           string    // 上游 response.failed / 400 原始 body（已截断；未脱敏，ops_error 落库由 sanitizeErrorBodyForStorage、风控日志由 redactContentModerationSecrets 统一脱敏）
+	UpstreamStatus int       // 上游 HTTP 状态（流式=200，非流式=400）
+	UpstreamInTok  int       // 上游已报 input tokens（如有）
+	UpstreamOutTok int       // 上游已报 output tokens（如有）
+	ObservedAt     time.Time // 首次识别该真实上游事件的时间，用于生成稳定的事件指纹
 }
 
 // MarkOpsCyberPolicy 记录 cyber 标记；首个写入生效，后续忽略（同一 turn 只记一次）。
@@ -41,6 +43,9 @@ func MarkOpsCyberPolicy(c *gin.Context, mark CyberPolicyMark) {
 	mark.Code = "cyber_policy"
 	mark.Message = strings.TrimSpace(mark.Message)
 	mark.Body = strings.TrimSpace(mark.Body)
+	if mark.ObservedAt.IsZero() {
+		mark.ObservedAt = time.Now().UTC()
+	}
 	c.Set(opsCyberPolicyKey, &mark)
 }
 
@@ -104,4 +109,37 @@ func markOpenAICyberPolicyEvent(c *gin.Context, payload []byte, upstreamStatus i
 	}
 	MarkOpsCyberPolicy(c, mark)
 	return true
+}
+
+// OpenAISessionBlockedReason distinguishes a permanently invalid upstream
+// conversation from an ordinary request-level cyber-policy rejection.
+const OpenAISessionBlockedReason = GatewayFailureReason("openai_session_blocked")
+
+func isOpenAISessionBlockedCyberPolicyMessage(message string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	if normalized == "" {
+		return false
+	}
+
+	englishSessionBlocked := strings.Contains(normalized, "session") &&
+		(strings.Contains(normalized, "blocked") || strings.Contains(normalized, "disabled"))
+	englishCyberPolicy := strings.Contains(normalized, "cyber-security policy") ||
+		strings.Contains(normalized, "cyber security policy") ||
+		strings.Contains(normalized, "cybersecurity policy")
+	englishNewSession := strings.Contains(normalized, "start a new session") ||
+		strings.Contains(normalized, "create a new session") ||
+		strings.Contains(normalized, "begin a new session")
+	if englishSessionBlocked && englishCyberPolicy && englishNewSession {
+		return true
+	}
+
+	chineseSessionBlocked := strings.Contains(normalized, "会话") &&
+		(strings.Contains(normalized, "屏蔽") || strings.Contains(normalized, "封禁") ||
+			strings.Contains(normalized, "阻止") || strings.Contains(normalized, "拦截"))
+	return chineseSessionBlocked && strings.Contains(normalized, "网络安全策略") && strings.Contains(normalized, "新会话")
+}
+
+func isOpenAISessionBlockedCyberPolicy(payload []byte) bool {
+	hit, _, message := detectOpenAICyberPolicy(payload)
+	return hit && isOpenAISessionBlockedCyberPolicyMessage(message)
 }

@@ -1363,104 +1363,84 @@ func (r *contentModerationHandlerTestRepo) UpdateLogEmailSent(ctx context.Contex
 	return nil
 }
 
-func TestOpenAIResponsesWebSocket_ContentModerationBlocksFirstFrame(t *testing.T) {
+func TestOpenAIResponsesWebSocket_BusyWaitPlanReturnsTryAgainWithoutQueueing(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	moderationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/v1/moderations", r.URL.Path)
-		_, _ = w.Write([]byte(`{"results":[{"category_scores":{"sexual":0.9}}]}`))
-	}))
-	defer moderationServer.Close()
-
-	cfg := &service.ContentModerationConfig{
-		Enabled:      true,
-		Mode:         service.ContentModerationModePreBlock,
-		BaseURL:      moderationServer.URL,
-		Model:        "omni-moderation-latest",
-		APIKeys:      []string{"sk-test"},
-		SampleRate:   100,
-		AllGroups:    true,
-		BlockMessage: "内容审计测试阻断",
+	groupID := int64(4202)
+	account := service.Account{
+		ID: 9902, Name: "openai-ws-busy", Platform: service.PlatformOpenAI,
+		Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
+		Concurrency: 1, GroupIDs: []int64{groupID},
+		Credentials: map[string]any{"api_key": "sk-test"},
+		Extra: map[string]any{
+			"openai_apikey_responses_websockets_v2_enabled": true,
+			"openai_apikey_responses_websockets_v2_mode":    service.OpenAIWSIngressModePassthrough,
+		},
 	}
-	rawCfg, err := json.Marshal(cfg)
-	require.NoError(t, err)
-
-	repo := &contentModerationHandlerTestRepo{}
-	settingRepo := &contentModerationHandlerSettingRepo{values: map[string]string{
-		service.SettingKeyRiskControlEnabled:      "true",
-		service.SettingKeyContentModerationConfig: string(rawCfg),
-	}}
-	moderationSvc := service.NewContentModerationService(
-		settingRepo,
-		repo,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
+	var accountAcquireCalls atomic.Int32
+	cache := &concurrencyCacheMock{
+		acquireUserSlotFn: func(context.Context, int64, int, string) (bool, error) {
+			return true, nil
+		},
+		acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) {
+			accountAcquireCalls.Add(1)
+			return false, nil
+		},
+	}
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	concurrencySvc := service.NewConcurrencyService(cache)
+	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	defer billingCacheSvc.Stop()
+	gatewaySvc := service.NewOpenAIGatewayService(
+		&openAIWSUsageHandlerAccountRepoStub{account: account},
+		nil, nil, nil, nil, nil, nil, cfg, nil, concurrencySvc,
+		service.NewBillingService(cfg, nil), nil, billingCacheSvc, nil,
+		&service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil,
 	)
-	decision, err := moderationSvc.Check(context.Background(), service.ContentModerationCheckInput{
-		UserID:   1,
-		Endpoint: "/v1/responses",
-		Provider: "openai",
-		Model:    "gpt-5.5",
-		Protocol: service.ContentModerationProtocolOpenAIResponses,
-		Body:     []byte(`{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"bad prompt"}]}]}`),
-	})
-	require.NoError(t, err)
-	require.True(t, decision.Blocked)
-	require.Eventually(t, func() bool {
-		return len(repo.logSnapshot()) == 1
-	}, time.Second, 10*time.Millisecond)
-	repo.resetLogs()
 	h := &OpenAIGatewayHandler{
-		gatewayService:           &service.OpenAIGatewayService{},
-		billingCacheService:      &service.BillingCacheService{},
-		apiKeyService:            &service.APIKeyService{},
-		contentModerationService: moderationSvc,
-		concurrencyHelper:        NewConcurrencyHelper(service.NewConcurrencyService(&concurrencyCacheMock{}), SSEPingFormatNone, time.Second),
+		gatewayService: gatewaySvc, billingCacheService: billingCacheSvc,
+		apiKeyService: &service.APIKeyService{},
+		concurrencyHelper: NewConcurrencyHelper(
+			concurrencySvc, SSEPingFormatNone, time.Second,
+		),
 	}
-	wsServer := newOpenAIWSHandlerTestServer(t, h, middleware.AuthSubject{UserID: 1, Concurrency: 1})
-	defer wsServer.Close()
+	apiKey := &service.APIKey{
+		ID: 1802, GroupID: &groupID,
+		User: &service.User{ID: 1702, Status: service.StatusActive},
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware.ContextKeyAPIKey), apiKey)
+		c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.User.ID, Concurrency: 1})
+		c.Next()
+	})
+	router.GET("/openai/v1/responses", h.ResponsesWebSocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
 
 	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
-	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http")+"/openai/v1/responses", nil)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http")+"/openai/v1/responses", nil)
 	cancelDial()
 	require.NoError(t, err)
-	defer func() {
-		_ = clientConn.CloseNow()
-	}()
+	defer func() { _ = clientConn.CloseNow() }()
 
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
-	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{
-		"type":"response.create",
-		"model":"gpt-5.5",
-		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"bad prompt"}]}]
-	}`))
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","stream":false,"input":"hello"}`))
 	cancelWrite()
 	require.NoError(t, err)
 
 	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
-	_, payload, readErr := clientConn.Read(readCtx)
+	_, _, err = clientConn.Read(readCtx)
 	cancelRead()
-	if readErr == nil {
-		require.Contains(t, string(payload), "content_policy_violation")
-		require.Contains(t, string(payload), "内容审计测试阻断")
-	} else {
-		var closeErr coderws.CloseError
-		require.ErrorAs(t, readErr, &closeErr)
-		require.Equal(t, coderws.StatusPolicyViolation, closeErr.Code)
-		require.Contains(t, closeErr.Reason, "内容审计测试阻断")
-	}
-	var logs []service.ContentModerationLog
-	require.Eventually(t, func() bool {
-		logs = repo.logSnapshot()
-		return len(logs) == 1
-	}, time.Second, 10*time.Millisecond)
-	require.True(t, logs[0].Flagged)
-	require.Equal(t, service.ContentModerationActionBlock, logs[0].Action)
-	require.Equal(t, "bad prompt", logs[0].InputExcerpt)
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
+	require.Contains(t, strings.ToLower(closeErr.Reason), "account is busy")
+	require.Equal(t, int32(2), accountAcquireCalls.Load(), "scheduler and handler should each make one non-blocking slot attempt")
 }
 
 func TestOpenAIResponsesWebSocket_PassthroughUsageLogPersistsUserAgentAndReasoningEffort(t *testing.T) {
@@ -2190,7 +2170,7 @@ func (s *openAIWSUsageHandlerChannelRepoStub) GetGroupPlatforms(ctx context.Cont
 	return out, nil
 }
 
-func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(t *testing.T) {
+func TestOpenAIResponses_APIKeyPassthroughPool5xxSwitchesWithoutSameAccountRetry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	groupID := int64(4203)
 	accounts := []service.Account{
@@ -2274,13 +2254,13 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 
 	h.Responses(c)
 
-	require.Equal(t, []int64{9910, 9910, 9911}, upstream.calls())
+	require.Equal(t, []int64{9910, 9911}, upstream.calls())
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
 	require.Equal(t, "Upstream service temporarily unavailable", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
 }
 
-func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHealthyAccount(t *testing.T) {
+func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureImmediatelySwitchesToHealthyAccount(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
@@ -2375,14 +2355,14 @@ func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHe
 
 			h.Responses(c)
 
-			require.Equal(t, []int64{9910, 9910, 9911}, upstream.calls())
+			require.Equal(t, []int64{9910, 9911}, upstream.calls())
 			require.Equal(t, http.StatusOK, rec.Code)
 			require.Equal(t, "resp_healthy", gjson.GetBytes(rec.Body.Bytes(), "id").String())
 		})
 	}
 }
 
-func TestOpenAIResponses_APIKeyPassthroughSSERateLimitUsesConfiguredPoolRetry(t *testing.T) {
+func TestOpenAIResponses_APIKeyPassthroughSSERateLimitDoesNotRepeatAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	groupID := int64(4204)
 	accounts := []service.Account{
@@ -2457,7 +2437,7 @@ func TestOpenAIResponses_APIKeyPassthroughSSERateLimitUsesConfiguredPoolRetry(t 
 
 	h.Responses(c)
 
-	require.Equal(t, []int64{9912, 9912}, upstream.calls())
+	require.Equal(t, []int64{9912}, upstream.calls())
 	require.Equal(t, http.StatusTooManyRequests, rec.Code)
 	require.Equal(t, "1", rec.Header().Get("Retry-After"))
 	require.Equal(t, "rate_limit_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())

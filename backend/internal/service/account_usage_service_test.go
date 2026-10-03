@@ -170,6 +170,46 @@ func TestAccountUsageService_PersistOpenAICodexProbeSnapshotOnlyUpdatesExtra(t *
 	}
 }
 
+func TestAccountUsageService_GetCachedUsageDoesNotProbeOrWrite(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+	resetAt := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	repo := &accountUsageCodexProbeRepo{
+		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{{
+			ID:       322,
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+			Extra: map[string]any{
+				"codex_usage_updated_at": updatedAt.Format(time.RFC3339),
+				"codex_5h_used_percent":  12.0,
+				"codex_5h_reset_at":      resetAt.Format(time.RFC3339),
+			},
+		}}},
+		updateExtraCh: make(chan map[string]any, 1),
+	}
+	svc := &AccountUsageService{accountRepo: repo}
+
+	usage, err := svc.GetCachedUsage(context.Background(), 322)
+	if err != nil {
+		t.Fatalf("GetCachedUsage() error = %v", err)
+	}
+	if usage == nil || usage.Source != "cached" {
+		t.Fatalf("expected cached usage, got %#v", usage)
+	}
+	if usage.FiveHour == nil || usage.FiveHour.Utilization != 12.0 {
+		t.Fatalf("expected persisted five-hour snapshot, got %#v", usage.FiveHour)
+	}
+	if usage.UpdatedAt == nil || !usage.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("expected snapshot timestamp %v, got %v", updatedAt, usage.UpdatedAt)
+	}
+	select {
+	case updates := <-repo.updateExtraCh:
+		t.Fatalf("cached usage must not write account extra: %#v", updates)
+	default:
+	}
+}
+
 func TestAccountUsageService_GetOpenAIUsage_DoesNotPromoteCodexExtraToRateLimit(t *testing.T) {
 	t.Parallel()
 

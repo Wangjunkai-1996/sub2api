@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -23,14 +24,15 @@ var (
 )
 
 const (
-	outboxEventTimeout                    = 2 * time.Minute
-	schedulerOutboxCleanupBatch           = 5000
-	schedulerGroupLifecycleTimeout        = 30 * time.Second
-	schedulerGroupLifecycleLeaseTTL       = 60 * time.Second
-	schedulerGroupLifecycleReleaseTimeout = 2 * time.Second
-	outboxRebuildRetryBaseDelay           = 5 * time.Second
-	outboxRebuildRetryMaxDelay            = 5 * time.Minute
-	outboxMaxIDErrorLogSampleInterval     = time.Minute
+	outboxEventTimeout                     = 2 * time.Minute
+	schedulerOutboxCleanupBatch            = 5000
+	schedulerGroupLifecycleTimeout         = 30 * time.Second
+	schedulerGroupLifecycleLeaseTTL        = 60 * time.Second
+	schedulerGroupLifecycleReleaseTimeout  = 2 * time.Second
+	schedulerSnapshotFallbackSharedTimeout = 30 * time.Second
+	outboxRebuildRetryBaseDelay            = 5 * time.Second
+	outboxRebuildRetryMaxDelay             = 5 * time.Minute
+	outboxMaxIDErrorLogSampleInterval      = time.Minute
 )
 
 // batchSeenKey tracks completed per-platform rebuilds and group lifecycle work
@@ -137,6 +139,7 @@ type SchedulerSnapshotService struct {
 	outboxRebuildRetryReason     string
 	outboxLagWarningActive       bool
 	outboxMaxIDErrorLastLoggedAt time.Time
+	fallbackLoadSF               singleflight.Group
 
 	fullRebuildRunMu     sync.Mutex
 	fullRebuildStateMu   sync.Mutex
@@ -211,8 +214,6 @@ func (s *SchedulerSnapshotService) ListSchedulableAccounts(ctx context.Context, 
 	useMixed := (platform == PlatformAnthropic || platform == PlatformGemini) && !hasForcePlatform
 	mode := s.resolveMode(platform, hasForcePlatform)
 	bucket := s.bucketFor(groupID, platform, mode)
-	var writeToken SchedulerBucketWriteToken
-	canPublish := false
 	if err := ctx.Err(); err != nil {
 		return nil, useMixed, err
 	}
@@ -227,10 +228,78 @@ func (s *SchedulerSnapshotService) ListSchedulableAccounts(ctx context.Context, 
 		} else if hit {
 			return derefAccounts(cached), useMixed, nil
 		}
-		token, err := s.cache.CaptureBucketWriteToken(ctx, bucket)
+	}
+
+	// The cache can be temporarily unreadable or can contain a projection from
+	// an older slot.  Coalesce that fallback by the complete bucket identity;
+	// mode is part of the key, so mixed and forced snapshots never share data.
+	resultCh := s.fallbackLoadSF.DoChan(bucket.String(), func() (any, error) {
+		// Do not let the first request to enter the flight cancel a query needed by
+		// its followers.  The caller that owns this context still observes its own
+		// cancellation below while the shared operation has an independent bound.
+		fallbackCtx, cancel := s.newSharedFallbackContext(ctx)
+		defer cancel()
+		return s.loadSchedulableAccountsFallback(fallbackCtx, bucket, useMixed)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, useMixed, ctx.Err()
+	case result := <-resultCh:
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, useMixed, ctxErr
 		}
+		if result.Err != nil {
+			return nil, useMixed, result.Err
+		}
+		accounts, ok := result.Val.([]Account)
+		if !ok {
+			return nil, useMixed, fmt.Errorf("invalid scheduler fallback result for bucket=%s", bucket.String())
+		}
+		// Downstream scheduling paths sort/filter their own slice.  Never hand
+		// multiple singleflight waiters the same backing array.
+		return append([]Account(nil), accounts...), useMixed, nil
+	}
+}
+
+// newSharedFallbackContext detaches the shared DB/cache operation from the
+// first caller while retaining request values used by logging and tracing.
+// A configured timeout remains authoritative; otherwise the shared operation
+// gets a bounded default so a canceled leader cannot leave a flight hanging.
+func (s *SchedulerSnapshotService) newSharedFallbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := schedulerSnapshotFallbackSharedTimeout
+	if s != nil && s.cfg != nil && s.cfg.Gateway.Scheduling.DbFallbackTimeoutSeconds > 0 {
+		timeout = time.Duration(s.cfg.Gateway.Scheduling.DbFallbackTimeoutSeconds) * time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
+// loadSchedulableAccountsFallback is the singleflight execution body.  The
+// cache read after entering the flight is intentional: a prior flight may have
+// published the snapshot in the small window after this caller's initial miss.
+func (s *SchedulerSnapshotService) loadSchedulableAccountsFallback(ctx context.Context, bucket SchedulerBucket, useMixed bool) ([]Account, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if s.cache != nil {
+		if cached, hit, err := s.readFallbackSnapshot(ctx, bucket); hit {
+			return cached, nil
+		} else if err != nil {
+			// Keep the existing fail-open-to-DB behavior for a transient cache
+			// read error; the limiter below still bounds the resulting load.
+			logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] fallback cache read failed: bucket=%s err=%v", bucket.String(), err)
+		}
+	}
+
+	if err := s.guardFallback(ctx); err != nil {
+		return nil, err
+	}
+
+	var writeToken SchedulerBucketWriteToken
+	canPublish := false
+	if s.cache != nil {
+		token, err := s.cache.CaptureBucketWriteToken(ctx, bucket)
 		if err != nil {
 			if errors.Is(err, ErrSchedulerBucketRetired) || errors.Is(err, ErrSchedulerBucketWriteFenced) {
 				slog.Debug("[Scheduler] cache publish fenced", "bucket", bucket.String())
@@ -243,23 +312,13 @@ func (s *SchedulerSnapshotService) ListSchedulableAccounts(ctx context.Context, 
 		}
 	}
 
-	if err := s.guardFallback(ctx); err != nil {
-		return nil, useMixed, err
-	}
-
-	fallbackCtx, cancel := s.withFallbackTimeout(ctx)
-	defer cancel()
-
-	accounts, err := s.loadAccountsFromDB(fallbackCtx, bucket, useMixed)
+	accounts, err := s.loadAccountsFromDB(ctx, bucket, useMixed)
 	if err != nil {
-		return nil, useMixed, err
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, useMixed, ctxErr
+		return nil, err
 	}
 
 	if s.cache != nil && canPublish {
-		if err := s.cache.SetSnapshot(fallbackCtx, bucket, writeToken, accounts); err != nil {
+		if err := s.cache.SetSnapshot(ctx, bucket, writeToken, accounts); err != nil {
 			if errors.Is(err, ErrSchedulerBucketRetired) || errors.Is(err, ErrSchedulerBucketWriteFenced) {
 				slog.Debug("[Scheduler] cache publish fenced", "bucket", bucket.String())
 			} else {
@@ -268,7 +327,23 @@ func (s *SchedulerSnapshotService) ListSchedulableAccounts(ctx context.Context, 
 		}
 	}
 
-	return accounts, useMixed, nil
+	return accounts, nil
+}
+
+// readFallbackSnapshot returns a copied value so the shared execution body
+// never exposes the cache's pointer slice to downstream callers.
+func (s *SchedulerSnapshotService) readFallbackSnapshot(ctx context.Context, bucket SchedulerBucket) ([]Account, bool, error) {
+	if s == nil || s.cache == nil {
+		return nil, false, nil
+	}
+	cached, hit, err := s.cache.GetSnapshot(ctx, bucket)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, false, ctxErr
+	}
+	if err != nil || !hit {
+		return nil, false, err
+	}
+	return derefAccounts(cached), true, nil
 }
 
 func (s *SchedulerSnapshotService) GetAccount(ctx context.Context, accountID int64) (*Account, error) {

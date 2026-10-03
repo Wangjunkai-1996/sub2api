@@ -336,7 +336,9 @@ func TestGatewayProfitControlTerminalRefreshUsesReplacementObject(t *testing.T) 
 	})
 
 	latest, vetoed, reason := profitControlVetoLatest(ctx, &selected, snapshot)
-	require.Same(t, &replacement, latest)
+	require.Equal(t, &replacement, latest)
+	require.NotSame(t, &replacement, latest, "terminal refresh must keep cache snapshots request-isolated")
+	require.NotSame(t, &selected, latest)
 	require.True(t, vetoed)
 	require.Equal(t, openAIProfitFilterReasonThreshold, reason)
 	require.InDelta(t, 0.2, *selected.RateMultiplier, 1e-12, "测试必须替换缓存对象，不能原地修改旧指针")
@@ -362,9 +364,12 @@ func TestGatewayProfitControlTerminalRefreshFallsBackFromCacheToDatabase(t *test
 	})
 
 	latest, vetoed, reason := profitControlVetoLatest(ctx, &selected, snapshot)
-	require.Same(t, &replacement, latest)
+	require.Equal(t, &replacement, latest)
+	require.NotSame(t, &replacement, latest, "terminal refresh must keep repository snapshots request-isolated")
+	require.NotSame(t, &selected, latest)
 	require.True(t, vetoed, "缓存读取失败时必须继续从数据库重读，不能直接使用选号旧对象")
 	require.Equal(t, openAIProfitFilterReasonThreshold, reason)
+	require.InDelta(t, 0.2, *selected.RateMultiplier, 1e-12)
 }
 
 func TestGatewayProfitControlTerminalRefreshFailureFallsBackToSelectedObject(t *testing.T) {

@@ -25,6 +25,10 @@ type helperConcurrencyCacheStub struct {
 	userAcquireCalls    int
 	accountReleaseCalls int
 	userReleaseCalls    int
+	accountWaitDenied   bool
+	accountWaitCalls    int
+	accountWaitReleases int
+	accountWaitMax      int
 	waitAllowed         bool
 	waitIncrementCalls  int
 	waitDecrementCalls  int
@@ -67,10 +71,17 @@ func (s *helperConcurrencyCacheStub) GetAccountConcurrencyBatch(ctx context.Cont
 }
 
 func (s *helperConcurrencyCacheStub) IncrementAccountWaitCount(ctx context.Context, accountID int64, maxWait int) (bool, error) {
-	return true, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accountWaitCalls++
+	s.accountWaitMax = maxWait
+	return !s.accountWaitDenied, nil
 }
 
 func (s *helperConcurrencyCacheStub) DecrementAccountWaitCount(ctx context.Context, accountID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accountWaitReleases++
 	return nil
 }
 
