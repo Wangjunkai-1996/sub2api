@@ -12,6 +12,18 @@
       </div>
     </div>
 
+    <div v-if="visibleRoutes.length > 0" class="flex justify-end">
+      <button
+        type="button"
+        class="text-sm font-medium text-primary-600 hover:text-primary-700 disabled:cursor-not-allowed disabled:opacity-50 dark:text-primary-400"
+        :disabled="disabled || selectableRouteIds.every(isSelected)"
+        data-testid="select-all-egress-routes"
+        @click="selectAllRoutes"
+      >
+        {{ t('common.selectAll') }}
+      </button>
+    </div>
+
     <div class="overflow-hidden rounded-md border border-gray-200 dark:border-dark-600">
       <div
         v-for="route in visibleRoutes"
@@ -152,6 +164,16 @@ const visibleRoutes = computed(() => {
 })
 
 const isSelected = (id: number) => props.selectedRouteIds.includes(id)
+const selectableRouteIds = computed(() => visibleRoutes.value.filter((route) => route.eligible).map((route) => route.id))
+
+const selectAllRoutes = () => {
+  if (props.disabled || selectableRouteIds.value.length === 0) return
+  const next = Array.from(new Set([...props.selectedRouteIds, ...selectableRouteIds.value]))
+  emit('update:selectedRouteIds', next)
+  if (props.requirePrimary && (props.primaryRouteId == null || !next.includes(props.primaryRouteId))) {
+    emit('update:primaryRouteId', selectableRouteIds.value[0])
+  }
+}
 
 const toggleRoute = (id: number, selected: boolean) => {
   if (props.disabled) return

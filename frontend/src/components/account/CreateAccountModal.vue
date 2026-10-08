@@ -4885,18 +4885,14 @@ const initializeOpenAIEgressDefaults = () => {
   if (!props.show || !usesEgressPool.value || egressDefaultsTouched.value) return
   const routeIds = Array.from(new Set(
     props.egressRoutes
-      .filter((route) => route.kind === 'proxy' && route.eligible)
+      .filter((route) => route.kind === 'proxy' && route.eligible && route.id === props.defaultEgressRouteId)
       .map((route) => route.id)
   ))
-  if (routeIds.length === 0) return
-
   if (!egressDefaultsInitialized.value) {
     legacyConcurrencyBeforeEgress.value = form.concurrency
   }
   egressRouteIds.value = routeIds
-  primaryEgressRouteId.value = props.defaultEgressRouteId != null && routeIds.includes(props.defaultEgressRouteId)
-    ? props.defaultEgressRouteId
-    : null
+  primaryEgressRouteId.value = routeIds[0] ?? null
   form.concurrency = props.defaultEgressConcurrency != null
     && Number.isSafeInteger(props.defaultEgressConcurrency)
     && props.defaultEgressConcurrency > 0

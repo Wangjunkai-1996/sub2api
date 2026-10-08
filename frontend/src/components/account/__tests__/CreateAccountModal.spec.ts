@@ -190,12 +190,6 @@ async function selectButtonByText(wrapper: ReturnType<typeof mountModal>, text: 
   const button = wrapper.findAll('button').find((candidate) => candidate.text().includes(text))
   expect(button).toBeDefined()
   await button?.trigger('click')
-  if (text === 'OpenAI') {
-    const firstEgressRoute = wrapper.find('input[id^="egress-route-"]')
-    if (firstEgressRoute.exists() && !(firstEgressRoute.element as HTMLInputElement).checked) {
-      await firstEgressRoute.setValue(true)
-    }
-  }
 }
 
 async function submitApiKeyAccount(
@@ -910,7 +904,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(createAccountMock.mock.calls[0]?.[0]?.openai_codex_warmup_policy).toBe('initial_once')
   })
 
-  it('submits a multi-route egress pool with one shared per-egress concurrency', async () => {
+  it('defaults to only the authoritative egress and submits its per-egress concurrency', async () => {
     const egressRoutes = [
       { id: 1, kind: 'proxy', name: 'first-route', proxy_id: 1, state: 'active', eligible: true },
       { id: 2, kind: 'proxy', name: 'authoritative-default', proxy_id: 104, state: 'active', eligible: true },
@@ -923,7 +917,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     })
     await selectButtonByText(wrapper, 'OpenAI')
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Pooled account')
-    expect((wrapper.get('#egress-route-1').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-1').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-2').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#egress-route-3').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('[data-testid="egress-concurrency-per-route"]').element as HTMLInputElement).value).toBe('3')
@@ -950,7 +944,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(payload).toMatchObject({
       egress_mode: 'pool',
       egress_pool: {
-        route_ids: [1, 2],
+        route_ids: [2],
         primary_route_id: 2,
         concurrency_per_egress: 4
       }
@@ -978,19 +972,21 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     })
   })
 
-  it('does not guess the authentication egress from catalog order', async () => {
+  it.each([null, 1, 3, 99])('does not choose another route when default %s is missing or unavailable', async (defaultEgressRouteId) => {
     const wrapper = mountModal([], {
       egressRoutes: [
+        { id: 1, kind: 'direct', name: 'local', state: 'active', eligible: true },
         { id: 9, kind: 'proxy', name: 'first-route', state: 'active', eligible: true },
-        { id: 4, kind: 'proxy', name: 'second-route', state: 'active', eligible: true }
+        { id: 4, kind: 'proxy', name: 'second-route', state: 'active', eligible: true },
+        { id: 3, kind: 'proxy', name: 'unavailable-route', state: 'inactive', eligible: false }
       ],
-      defaultEgressRouteId: null
+      defaultEgressRouteId
     })
     await selectButtonByText(wrapper, 'OpenAI')
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Missing primary')
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
 
-    expect(showErrorMock).toHaveBeenCalledWith('admin.accounts.egressPool.primaryRequired')
+    expect(showErrorMock).toHaveBeenCalledWith('admin.accounts.egressPool.noSelection')
     expect(wrapper.findComponent(OAuthAuthorizationFlowStub).exists()).toBe(false)
     expect(generateAuthUrlMock).not.toHaveBeenCalled()
   })
@@ -1004,7 +1000,11 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       defaultEgressRouteId: null
     })
     await selectButtonByText(wrapper, 'OpenAI')
+    expect((wrapper.get('#egress-route-1').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-2').element as HTMLInputElement).checked).toBe(false)
     await wrapper.setProps({ defaultEgressRouteId: 2 })
+    expect((wrapper.get('#egress-route-1').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-2').element as HTMLInputElement).checked).toBe(true)
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Late default')
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
     await wrapper.get('[data-testid="generate-auth-url"]').trigger('click')

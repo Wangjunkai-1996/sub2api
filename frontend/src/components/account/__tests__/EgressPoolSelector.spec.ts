@@ -103,6 +103,38 @@ describe('EgressPoolSelector', () => {
     expect(unselected.get('#egress-route-3').attributes('disabled')).toBeDefined()
   })
 
+  it('selects all eligible proxy routes while preserving the selected primary', async () => {
+    const wrapper = mountSelector([4], 4)
+
+    await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
+
+    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[4, 2]]])
+    expect(wrapper.emitted('update:primaryRouteId')).toBeUndefined()
+    await wrapper.setProps({ selectedRouteIds: [4, 2] })
+    expect(wrapper.get('[data-testid="select-all-egress-routes"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('preserves existing unavailable selections and chooses an eligible primary when selecting all', async () => {
+    const wrapper = mountSelector([3])
+
+    await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
+
+    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[3, 2, 4]]])
+    expect(wrapper.emitted('update:primaryRouteId')).toEqual([[2]])
+  })
+
+  it('respects disabled selectors and bulk operations that do not require a primary', async () => {
+    const wrapper = mountSelector()
+    await wrapper.setProps({ disabled: true })
+    await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
+    expect(wrapper.emitted('update:selectedRouteIds')).toBeUndefined()
+
+    await wrapper.setProps({ disabled: false, requirePrimary: false })
+    await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
+    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[2, 4]]])
+    expect(wrapper.emitted('update:primaryRouteId')).toBeUndefined()
+  })
+
   it('emits a verification request and renders the refreshed route supplied by its owner', async () => {
     const refreshed = { ...routes[1], observed_ip: null, public_ip: '198.51.100.105', probe_success: true, probe_latency_ms: 61 }
     const wrapper = mountSelector([2], 2)

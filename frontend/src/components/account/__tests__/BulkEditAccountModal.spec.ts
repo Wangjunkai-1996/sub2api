@@ -777,7 +777,7 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
-  it('OpenAI OAuth 打开时预选可用代理出口并应用默认主出口和并发', async () => {
+  it('OpenAI OAuth 打开时只预选默认主出口并应用默认并发', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
@@ -795,7 +795,7 @@ describe('BulkEditAccountModal', () => {
     expect((wrapper.get('#bulk-edit-proxy-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#bulk-edit-concurrency-enabled').element as HTMLInputElement).checked).toBe(false)
     expect(wrapper.find('#egress-route-10').exists()).toBe(false)
-    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#egress-route-13').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
@@ -822,13 +822,13 @@ describe('BulkEditAccountModal', () => {
     })
     await nextTick()
 
-    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('9')
 
     await wrapper.get('#bulk-edit-proxy-enabled').setValue(true)
-    await wrapper.get('#egress-route-11').setValue(false)
+    await wrapper.get('#egress-route-11').setValue(true)
     await wrapper.setProps({
       defaultEgressRouteId: 13,
       egressRoutes: [
@@ -839,13 +839,13 @@ describe('BulkEditAccountModal', () => {
     })
     await nextTick()
 
-    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#egress-route-13').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
   })
 
-  it('替换出口池缺少有效主出口时阻止提交', async () => {
+  it('替换出口池缺少默认主出口时不猜测其他出口并阻止空池提交', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
@@ -859,10 +859,10 @@ describe('BulkEditAccountModal', () => {
     await flushPromises()
 
     expect(adminAPI.accounts.bulkUpdate).not.toHaveBeenCalled()
-    expect(showError).toHaveBeenCalledWith('admin.accounts.egressPool.primaryRequired')
+    expect(showError).toHaveBeenCalledWith('admin.accounts.egressPool.noSelection')
   })
 
-  it('切换到追加或移除时不沿用替换模式的默认全选', async () => {
+  it('切换到追加或移除时清空选择，切回替换时仅恢复默认出口', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
@@ -879,7 +879,7 @@ describe('BulkEditAccountModal', () => {
     expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(false)
 
     await wrapper.get('[data-testid="bulk-egress-operation-replace"]').trigger('click')
-    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
 
@@ -1204,6 +1204,7 @@ describe('BulkEditAccountModal', () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
+      defaultEgressRouteId: 21,
       egressRoutes: [
         { id: 21, kind: 'proxy', name: 'sys1-ipv4', proxy_id: 1, state: 'active', eligible: true },
         { id: 22, kind: 'proxy', name: 'rn-104', proxy_id: 104, state: 'active', eligible: true }
@@ -1227,7 +1228,7 @@ describe('BulkEditAccountModal', () => {
     expect((wrapper.get('#bulk-edit-concurrency-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#bulk-edit-priority-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-21').element as HTMLInputElement).checked).toBe(true)
-    expect((wrapper.get('#egress-route-22').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-22').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('3')
     expect((wrapper.get('#bulk-edit-priority').element as HTMLInputElement).value).toBe('1')
   })
