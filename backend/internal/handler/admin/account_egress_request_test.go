@@ -133,10 +133,21 @@ func TestResolveOpenAICodexPATCreateEgressUsesPoolPrimaryForAuthentication(t *te
 	require.Nil(t, resolved.proxyID)
 	require.NotNil(t, resolved.authRouteID)
 	require.Equal(t, int64(12), *resolved.authRouteID)
-	require.Equal(t, 3, resolved.concurrency)
+	require.Equal(t, 8, resolved.concurrency)
 	require.NotNil(t, resolved.pool)
 	require.Equal(t, []int64{11, 12, 13}, resolved.pool.RouteIDs)
 	require.Equal(t, int64(12), resolved.pool.PrimaryRouteID)
+}
+
+func TestResolveOpenAICodexPATCreateEgressConcurrencyDefaultAndOverride(t *testing.T) {
+	resolved, err := resolveOpenAICodexPATCreateEgress(OpenAICodexPATCreateRequest{})
+	require.NoError(t, err)
+	require.Equal(t, 8, resolved.concurrency)
+
+	concurrency := 3
+	resolved, err = resolveOpenAICodexPATCreateEgress(OpenAICodexPATCreateRequest{Concurrency: &concurrency})
+	require.NoError(t, err)
+	require.Equal(t, 3, resolved.concurrency)
 }
 
 func ptrAccountEgressRequestInt64(value int64) *int64 {

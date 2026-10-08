@@ -1785,7 +1785,7 @@ const initializeOpenAIEgressDefaults = () => {
       && Number.isSafeInteger(props.defaultEgressConcurrency)
       && props.defaultEgressConcurrency > 0
       ? props.defaultEgressConcurrency
-      : 3
+      : 8
   }
 }
 

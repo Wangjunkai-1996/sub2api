@@ -644,6 +644,9 @@ func TestImportCodexSessionsAccessTokenOnlySameWorkspaceDifferentUsersCreatesTwo
 	if len(svc.createdAccounts) != 2 {
 		t.Fatalf("created accounts = %d, want 2", len(svc.createdAccounts))
 	}
+	for _, account := range svc.createdAccounts {
+		require.Equal(t, 8, account.Concurrency)
+	}
 	if svc.createdAccounts[0].Credentials["chatgpt_user_id"] == svc.createdAccounts[1].Credentials["chatgpt_user_id"] {
 		t.Fatalf("created accounts share user id: %v", svc.createdAccounts)
 	}

@@ -69,7 +69,7 @@ func TestEgressAssignableCatalogAdvertisesMutationCapability(t *testing.T) {
 	capabilities, ok := data["capabilities"].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, true, capabilities["mutation_enabled"])
-	require.Equal(t, float64(service.DefaultOpenAIOAuthEgressConcurrency), data["default_concurrency"])
+	require.Equal(t, float64(8), data["default_concurrency"])
 }
 
 func TestEgressAssignableCatalogAdvertisesAuthoritativeOAuthPrimary(t *testing.T) {
@@ -100,7 +100,7 @@ func TestEgressAssignableCatalogAdvertisesAuthoritativeOAuthPrimary(t *testing.T
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
 	data := envelope.Data.(map[string]any)
 	require.Equal(t, float64(41), data["default_route_id"])
-	require.Equal(t, float64(service.DefaultOpenAIOAuthEgressConcurrency), data["default_concurrency"])
+	require.Equal(t, float64(8), data["default_concurrency"])
 }
 
 func TestEgressAssignableCatalogFreezesMutationWithoutService(t *testing.T) {

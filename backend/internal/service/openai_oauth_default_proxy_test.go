@@ -347,41 +347,73 @@ func TestOpenAIOAuthServiceCodexPATInvalidDefaultDoesNotCallUpstream(t *testing.
 }
 
 func TestAdminServiceCreateAccountOpenAIOAuthDefaultProxy(t *testing.T) {
-	t.Run("OpenAI OAuth inherits the eligible pool", func(t *testing.T) {
-		settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "41"}}
-		proxy := activeOpenAIDefaultProxy(41, "203.0.113.41", 3128)
-		proxies := &mockProxyRepoForOAuth{getByIDFunc: func(context.Context, int64) (*Proxy, error) {
-			return proxy, nil
-		}}
-		now := time.Now()
-		otherProxyID := int64(42)
-		routes := []EgressRoute{
-			eligibleProxyRoute(141, proxy.ID, "203.0.113.41", now),
-			eligibleProxyRoute(142, otherProxyID, "203.0.113.42", now),
-		}
-		repo := newDuplicateAccountRepoStub()
-		svc := &adminServiceImpl{
-			accountRepo:          repo,
-			accountDuplicateRepo: repo,
-			settingService:       newOpenAIDefaultProxySettingService(settings, proxies),
-			egressService:        NewEgressService(&openAIOAuthEgressRepoStub{routes: routes}, nil),
-		}
+	for _, tc := range []struct {
+		name        string
+		concurrency int
+		expected    int
+	}{
+		{name: "inherits only the configured default route", expected: 8},
+		{name: "preserves explicit concurrency", concurrency: 3, expected: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "41"}}
+			proxy := activeOpenAIDefaultProxy(41, "203.0.113.41", 3128)
+			proxies := &mockProxyRepoForOAuth{getByIDFunc: func(context.Context, int64) (*Proxy, error) {
+				return proxy, nil
+			}}
+			now := time.Now()
+			otherProxyID := int64(42)
+			routes := []EgressRoute{
+				eligibleProxyRoute(141, proxy.ID, "203.0.113.41", now),
+				eligibleProxyRoute(142, otherProxyID, "203.0.113.42", now),
+			}
+			repo := newDuplicateAccountRepoStub()
+			svc := &adminServiceImpl{
+				accountRepo:          repo,
+				accountDuplicateRepo: repo,
+				settingService:       newOpenAIDefaultProxySettingService(settings, proxies),
+				egressService:        NewEgressService(&openAIOAuthEgressRepoStub{routes: routes}, nil),
+			}
 
+			account, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
+				Name:                 "oauth-default-proxy",
+				Platform:             PlatformOpenAI,
+				Type:                 AccountTypeOAuth,
+				Credentials:          map[string]any{"access_token": "at-test"},
+				Concurrency:          tc.concurrency,
+				SkipDefaultGroupBind: true,
+			})
+
+			require.NoError(t, err)
+			require.Nil(t, account.ProxyID)
+			require.Equal(t, EgressModePool, account.EgressMode)
+			require.NotNil(t, account.EgressPoolWrite)
+			require.Equal(t, []int64{141}, account.EgressPoolWrite.RouteIDs)
+			require.Equal(t, int64(141), account.EgressPoolWrite.PrimaryRouteID)
+			require.Equal(t, tc.expected, account.Concurrency)
+		})
+	}
+
+	t.Run("preserves explicit pool and concurrency", func(t *testing.T) {
+		repo := newDuplicateAccountRepoStub()
+		svc := &adminServiceImpl{accountRepo: repo, accountDuplicateRepo: repo}
+		concurrency := 3
 		account, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
-			Name:                 "oauth-default-proxy",
+			Name:                 "oauth-explicit-pool",
 			Platform:             PlatformOpenAI,
 			Type:                 AccountTypeOAuth,
-			Credentials:          map[string]any{"access_token": "at-test"},
+			Credentials:          map[string]any{"access_token": "at-explicit"},
 			SkipDefaultGroupBind: true,
+			EgressPool: &ReplaceAccountPoolInput{
+				Mode: EgressModePool, RouteIDs: []int64{141, 142}, PrimaryRouteID: 142,
+				ConcurrencyPerEgress: &concurrency,
+			},
 		})
 
 		require.NoError(t, err)
-		require.Nil(t, account.ProxyID)
-		require.Equal(t, EgressModePool, account.EgressMode)
-		require.NotNil(t, account.EgressPoolWrite)
 		require.Equal(t, []int64{141, 142}, account.EgressPoolWrite.RouteIDs)
-		require.Equal(t, int64(141), account.EgressPoolWrite.PrimaryRouteID)
-		require.Equal(t, DefaultOpenAIOAuthEgressConcurrency, account.Concurrency)
+		require.Equal(t, int64(142), account.EgressPoolWrite.PrimaryRouteID)
+		require.Equal(t, 3, account.Concurrency)
 	})
 
 	t.Run("explicit proxy skips default", func(t *testing.T) {

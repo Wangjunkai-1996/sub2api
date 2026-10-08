@@ -164,7 +164,7 @@ function mountModal(groups: any[] = [], extraProps: Record<string, unknown> = {}
       proxies: [],
       egressRoutes: defaultEgressRoutes,
       defaultEgressRouteId: 1,
-      defaultEgressConcurrency: 3,
+      defaultEgressConcurrency: 8,
       groups,
       ...extraProps
     },
@@ -669,7 +669,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(importCodexSessionMock.mock.calls[0]?.[0]?.egress_pool).toEqual({
       route_ids: [1],
       primary_route_id: 1,
-      concurrency_per_egress: 3
+      concurrency_per_egress: 8
     })
   })
 
@@ -732,7 +732,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       egress_pool: {
         route_ids: [1],
         primary_route_id: 1,
-        concurrency_per_egress: 3
+        concurrency_per_egress: 8
       }
     })
   })
@@ -749,7 +749,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       egress_pool: {
         route_ids: [1],
         primary_route_id: 1,
-        concurrency_per_egress: 3
+        concurrency_per_egress: 8
       }
     })
   })
@@ -807,7 +807,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       egress_pool: {
         route_ids: [1],
         primary_route_id: 1,
-        concurrency_per_egress: 3
+        concurrency_per_egress: 8
       }
     })
     expect(refreshOpenAITokenMock).toHaveBeenCalledWith(
@@ -913,14 +913,14 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     const wrapper = mountModal([], {
       egressRoutes,
       defaultEgressRouteId: 2,
-      defaultEgressConcurrency: 3
+      defaultEgressConcurrency: 8
     })
     await selectButtonByText(wrapper, 'OpenAI')
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Pooled account')
     expect((wrapper.get('#egress-route-1').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-2').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#egress-route-3').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('[data-testid="egress-concurrency-per-route"]').element as HTMLInputElement).value).toBe('3')
+    expect((wrapper.get('[data-testid="egress-concurrency-per-route"]').element as HTMLInputElement).value).toBe('8')
     await wrapper.get('[data-testid="egress-concurrency-per-route"]').setValue(4)
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
 
@@ -951,6 +951,13 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     })
     expect(payload).not.toHaveProperty('proxy_id')
     expect(payload).not.toHaveProperty('concurrency')
+  })
+
+  it('falls back to eight concurrent requests per egress without a server default', async () => {
+    const wrapper = mountModal([], { defaultEgressConcurrency: null })
+    await selectButtonByText(wrapper, 'OpenAI')
+
+    expect((wrapper.get('[data-testid="egress-concurrency-per-route"]').element as HTMLInputElement).value).toBe('8')
   })
 
   it('uses the selected primary egress route for OAuth authorization', async () => {

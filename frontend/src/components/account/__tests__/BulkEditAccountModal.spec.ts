@@ -1229,7 +1229,7 @@ describe('BulkEditAccountModal', () => {
     expect((wrapper.get('#bulk-edit-priority-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-21').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#egress-route-22').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('3')
+    expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('8')
     expect((wrapper.get('#bulk-edit-priority').element as HTMLInputElement).value).toBe('1')
   })
 

@@ -34,7 +34,7 @@ const (
 	AccountEgressBindingStatusDraining = "draining"
 
 	DefaultDirectEgressRuntimeScope     = "default"
-	DefaultOpenAIOAuthEgressConcurrency = 3
+	DefaultOpenAIOAuthEgressConcurrency = 8
 	MaxAccountEgressRoutes              = 32
 	MaxBulkAccountEgressAccounts        = 1000
 	MaxEgressVerifyBatchSize            = 32
@@ -222,16 +222,13 @@ func (s *EgressService) ListAssignableRoutes(ctx context.Context) ([]EgressRoute
 }
 
 // DefaultOpenAIOAuthEgressPool builds the server-authoritative pool used when
-// an OpenAI OAuth account does not provide an explicit route selection. Every
-// currently eligible proxy route participates; the configured OAuth proxy is
-// the primary only when its verified identity is IPv4.
+// an OpenAI OAuth account does not provide an explicit route selection. Only
+// the configured OAuth proxy participates, with a verified IPv4 identity.
 func DefaultOpenAIOAuthEgressPool(routes []EgressRoute, defaultProxyID int64, now time.Time) (ReplaceAccountPoolInput, error) {
 	if defaultProxyID <= 0 {
 		return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
 	}
 
-	routeIDs := make([]int64, 0, len(routes))
-	seen := make(map[int64]struct{}, len(routes))
 	primaryRouteID := int64(0)
 	for i := range routes {
 		route := &routes[i]
@@ -239,12 +236,6 @@ func DefaultOpenAIOAuthEgressPool(routes []EgressRoute, defaultProxyID int64, no
 		if !eligible || route.Kind != EgressRouteKindProxy || route.ID <= 0 {
 			continue
 		}
-		if _, duplicate := seen[route.ID]; duplicate {
-			continue
-		}
-		seen[route.ID] = struct{}{}
-		routeIDs = append(routeIDs, route.ID)
-
 		if route.ProxyID == nil || *route.ProxyID != defaultProxyID || route.ExpectedIdentity == nil {
 			continue
 		}
@@ -257,13 +248,13 @@ func DefaultOpenAIOAuthEgressPool(routes []EgressRoute, defaultProxyID int64, no
 		}
 	}
 
-	if len(routeIDs) == 0 || len(routeIDs) > MaxAccountEgressRoutes || primaryRouteID == 0 {
+	if primaryRouteID == 0 {
 		return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
 	}
 	concurrency := DefaultOpenAIOAuthEgressConcurrency
 	return ReplaceAccountPoolInput{
 		Mode:                 EgressModePool,
-		RouteIDs:             routeIDs,
+		RouteIDs:             []int64{primaryRouteID},
 		PrimaryRouteID:       primaryRouteID,
 		ConcurrencyPerEgress: &concurrency,
 	}, nil

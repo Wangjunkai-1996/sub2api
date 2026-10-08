@@ -269,7 +269,7 @@ func TestValidApplyAccountPoolsInputRejectsEmptyRouteNoOpAndReplace(t *testing.T
 	}))
 }
 
-func TestDefaultOpenAIOAuthEgressPoolSelectsAllEligibleProxyRoutes(t *testing.T) {
+func TestDefaultOpenAIOAuthEgressPoolSelectsOnlyConfiguredProxyRoute(t *testing.T) {
 	now := time.Now()
 	defaultProxyID := int64(20)
 	otherProxyID := int64(30)
@@ -293,16 +293,19 @@ func TestDefaultOpenAIOAuthEgressPoolSelectsAllEligibleProxyRoutes(t *testing.T)
 	pool, err := DefaultOpenAIOAuthEgressPool(routes, defaultProxyID, now)
 
 	require.NoError(t, err)
-	require.Equal(t, []int64{2, 3}, pool.RouteIDs)
+	require.Equal(t, []int64{2}, pool.RouteIDs)
 	require.Equal(t, int64(2), pool.PrimaryRouteID)
 	require.NotNil(t, pool.ConcurrencyPerEgress)
-	require.Equal(t, DefaultOpenAIOAuthEgressConcurrency, *pool.ConcurrencyPerEgress)
+	require.Equal(t, 8, *pool.ConcurrencyPerEgress)
 }
 
 func TestDefaultOpenAIOAuthEgressPoolRequiresConfiguredIPv4Primary(t *testing.T) {
 	now := time.Now()
 	defaultProxyID := int64(20)
-	routes := []EgressRoute{eligibleProxyRoute(2, defaultProxyID, "2001:db8::20", now)}
+	routes := []EgressRoute{
+		eligibleProxyRoute(2, defaultProxyID, "2001:db8::20", now),
+		eligibleProxyRoute(3, 30, "203.0.113.30", now),
+	}
 
 	_, err := DefaultOpenAIOAuthEgressPool(routes, defaultProxyID, now)
 

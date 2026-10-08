@@ -440,7 +440,7 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 	if tokenInfo.OAuthUsesEgressPool && tokenInfo.EgressRouteID != nil {
 		concurrency := req.Concurrency
 		if concurrency <= 0 {
-			concurrency = 3
+			concurrency = service.DefaultOpenAIOAuthEgressConcurrency
 		}
 		routeID := *tokenInfo.EgressRouteID
 		egressPool = &service.ReplaceAccountPoolInput{
