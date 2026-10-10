@@ -131,6 +131,25 @@ func TestOpenAIOAuthLegacySessionDoesNotUseRouteRevisionFence(t *testing.T) {
 	require.Equal(t, proxy.URL(), client.proxyURL)
 }
 
+func TestOpenAIOAuthDefaultSelectionUsesDirectRoute(t *testing.T) {
+	route := activeDirectOpenAIOAuthRoute(82, 4)
+	repo := &openAIOAuthEgressRepoStub{route: route}
+	client := &openAIDefaultProxyOAuthClientStub{}
+	svc := NewOpenAIOAuthService(nil, client)
+	svc.SetEgressService(NewEgressService(repo, nil))
+	defer svc.Stop()
+
+	result, err := svc.GenerateAuthURLWithRoute(context.Background(), nil, nil, "", PlatformOpenAI)
+	require.NoError(t, err)
+	session, ok := svc.sessionStore.Get(result.SessionID)
+	require.True(t, ok)
+	require.Equal(t, route.ID, session.EgressRouteID)
+	require.Equal(t, route.Revision, session.EgressRouteRevision)
+	require.True(t, session.RequireVerifiedEgress)
+	require.True(t, session.DirectEgress)
+	require.Nil(t, session.ProxyID)
+}
+
 func TestOpenAIOAuthPoolSessionRejectsRouteRevisionChange(t *testing.T) {
 	route := activeDirectOpenAIOAuthRoute(82, 4)
 	repo := &openAIOAuthEgressRepoStub{route: route}

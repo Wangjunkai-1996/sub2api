@@ -53,19 +53,12 @@ func (h *EgressRouteHandler) ListAssignable(c *gin.Context) {
 	}
 	var defaultRouteID *int64
 	defaultReasonCode := ""
-	if h.settingService != nil {
-		proxy, resolveErr := h.settingService.ResolveOpenAIOAuthDefaultProxy(c.Request.Context())
-		if resolveErr != nil {
-			defaultReasonCode = serviceErrorReason(resolveErr)
-		} else if proxy != nil {
-			pool, poolErr := service.DefaultOpenAIOAuthEgressPool(routes, proxy.ID, time.Now())
-			if poolErr != nil {
-				defaultReasonCode = serviceErrorReason(poolErr)
-			} else {
-				id := pool.PrimaryRouteID
-				defaultRouteID = &id
-			}
-		}
+	pool, poolErr := service.DefaultOpenAIOAuthDirectEgressPool(routes, time.Now())
+	if poolErr != nil {
+		defaultReasonCode = serviceErrorReason(poolErr)
+	} else {
+		id := pool.PrimaryRouteID
+		defaultRouteID = &id
 	}
 	response.Success(c, dto.AssignableEgressRouteCatalog{
 		Items:              out,

@@ -156,7 +156,7 @@ const visibleRoutes = computed(() => {
   // Keep removed selections visible while letting the fresh catalog win for
   // routes present in both projections.
   for (const route of [...props.selectedRoutes, ...props.routes]) {
-    if (route.kind === 'proxy') byID.set(route.id, route)
+    byID.set(route.id, route)
   }
   return Array.from(byID.values()).sort((left, right) => {
     return routeLabel(left).localeCompare(routeLabel(right))

@@ -527,24 +527,19 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if input.EgressPool != nil && (input.Platform != PlatformOpenAI || input.Type != AccountTypeOAuth) {
 		return nil, ErrEgressAccountUnsupported
 	}
-	// New OpenAI OAuth/PAT accounts inherit only the configured static-IP
-	// route when the caller did not explicitly choose a pool or legacy proxy.
-	// The configured OAuth proxy remains the authoritative authentication and
-	// primary route; explicit caller choices are never overwritten.
-	if input.EgressPool == nil && input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil && s.settingService != nil {
-		proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if proxy != nil {
-			if s.egressService == nil {
-				return nil, ErrEgressMutationFrozen
-			}
-			routes, err := s.egressService.ListAssignableRoutes(ctx)
+	// New OpenAI OAuth accounts inherit the verified deployment direct route
+	// when the caller did not explicitly choose a pool or legacy proxy.
+	// Explicit caller choices are never overwritten.
+	if input.EgressPool == nil && input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil {
+		if s.egressService != nil {
+			route, err := s.egressService.EnsureDirectRoute(ctx, DefaultDirectEgressRuntimeScope)
 			if err != nil {
 				return nil, err
 			}
-			pool, err := DefaultOpenAIOAuthEgressPool(routes, proxy.ID, time.Now())
+			if route == nil {
+				return nil, ErrOpenAIOAuthDefaultEgress
+			}
+			pool, err := DefaultOpenAIOAuthDirectEgressPool([]EgressRoute{*route}, time.Now())
 			if err != nil {
 				return nil, err
 			}
@@ -553,6 +548,16 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 				pool.ConcurrencyPerEgress = &concurrency
 			}
 			input.EgressPool = &pool
+		} else if s.settingService != nil {
+			// Keep the legacy path available to focused callers that have not
+			// installed the egress repository yet; production wiring always has it.
+			proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if proxy != nil {
+				input.ProxyID = &proxy.ID
+			}
 		}
 	}
 

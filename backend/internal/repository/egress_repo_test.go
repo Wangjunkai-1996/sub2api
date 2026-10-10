@@ -209,10 +209,11 @@ func TestAccountPoolMutationConcurrencyOnlyRejectsLegacyAccountBeforeBindings(t 
 	}
 }
 
-func TestValidateSelectedRoutesRejectsDirectRouteForPool(t *testing.T) {
+func TestValidateSelectedRoutesAllowsVerifiedDirectRouteForPool(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
+	verifiedAt := time.Now()
 
 	mock.ExpectQuery(`(?s)SELECT er\.id, er\.kind, er\.proxy_id.*FOR SHARE OF er`).
 		WithArgs(sqlmock.AnyArg()).
@@ -221,11 +222,13 @@ func TestValidateSelectedRoutesRejectsDirectRouteForPool(t *testing.T) {
 			"verified_at", "identity_status", "proxy_status", "expires_at", "deleted_at",
 		}).AddRow(
 			int64(11), service.EgressRouteKindDirect, nil, service.EgressRouteStateActive, int64(31),
-			nil, service.EgressIdentityStatusActive, "", nil, nil,
+			verifiedAt, service.EgressIdentityStatusActive, "", nil, nil,
 		))
 
-	_, err = validateSelectedRoutesTx(context.Background(), db, []int64{11}, true)
-	require.ErrorIs(t, err, service.ErrEgressPoolInvalid)
+	routes, err := validateSelectedRoutesTx(context.Background(), db, []int64{11}, true)
+	require.NoError(t, err)
+	require.Contains(t, routes, int64(11))
+	require.Nil(t, routes[11])
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

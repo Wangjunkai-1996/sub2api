@@ -33,7 +33,7 @@ const account = (overrides: Partial<Account> = {}): Account => ({
 } as Account)
 
 describe('accountEgressPolicy', () => {
-  it('normalizes create writes to explicit proxy routes only', () => {
+  it('normalizes create writes to the selected direct and proxy routes', () => {
     expect(buildCreateAccountEgressPatch({
       routeIds: [1, 2, 2],
       primaryRouteId: 1,
@@ -41,8 +41,8 @@ describe('accountEgressPolicy', () => {
     }, routes)).toEqual({
       egress_mode: 'pool',
       egress_pool: {
-        route_ids: [2],
-        primary_route_id: 2,
+        route_ids: [1, 2],
+        primary_route_id: 1,
         concurrency_per_egress: 1
       }
     })
@@ -70,7 +70,7 @@ describe('accountEgressPolicy', () => {
     }, routes)).toEqual({
       egress_mode: 'pool',
       egress_pool: {
-        route_ids: [2, 3],
+        route_ids: [1, 2, 3],
         primary_route_id: 3,
         concurrency_per_egress: 4,
         revision: 9

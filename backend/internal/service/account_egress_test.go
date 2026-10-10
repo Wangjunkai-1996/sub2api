@@ -269,10 +269,8 @@ func TestValidApplyAccountPoolsInputRejectsEmptyRouteNoOpAndReplace(t *testing.T
 	}))
 }
 
-func TestDefaultOpenAIOAuthEgressPoolSelectsOnlyConfiguredProxyRoute(t *testing.T) {
+func TestDefaultOpenAIOAuthDirectEgressPoolSelectsVerifiedDefaultDirectRoute(t *testing.T) {
 	now := time.Now()
-	defaultProxyID := int64(20)
-	otherProxyID := int64(30)
 	directScope := DefaultDirectEgressRuntimeScope
 	routes := []EgressRoute{
 		{
@@ -280,34 +278,30 @@ func TestDefaultOpenAIOAuthEgressPoolSelectsOnlyConfiguredProxyRoute(t *testing.
 			State: EgressRouteStateActive, VerifiedAt: &now,
 			ExpectedIdentity: &EgressIdentity{ID: 1, PublicIP: "203.0.113.1", Status: EgressIdentityStatusActive},
 		},
-		eligibleProxyRoute(2, defaultProxyID, "203.0.113.20", now),
-		eligibleProxyRoute(3, otherProxyID, "203.0.113.30", now),
-		{
-			ID: 4, Kind: EgressRouteKindProxy, ProxyID: &otherProxyID,
-			State: EgressRouteStateInactive, VerifiedAt: &now,
-			ExpectedIdentity: &EgressIdentity{ID: 4, PublicIP: "203.0.113.40", Status: EgressIdentityStatusActive},
-			Proxy:            &Proxy{ID: otherProxyID, Status: StatusActive},
-		},
+		eligibleProxyRoute(2, 20, "203.0.113.20", now),
 	}
 
-	pool, err := DefaultOpenAIOAuthEgressPool(routes, defaultProxyID, now)
+	pool, err := DefaultOpenAIOAuthDirectEgressPool(routes[:2], now)
 
 	require.NoError(t, err)
-	require.Equal(t, []int64{2}, pool.RouteIDs)
-	require.Equal(t, int64(2), pool.PrimaryRouteID)
+	require.Equal(t, []int64{1}, pool.RouteIDs)
+	require.Equal(t, int64(1), pool.PrimaryRouteID)
 	require.NotNil(t, pool.ConcurrencyPerEgress)
 	require.Equal(t, 8, *pool.ConcurrencyPerEgress)
 }
 
-func TestDefaultOpenAIOAuthEgressPoolRequiresConfiguredIPv4Primary(t *testing.T) {
+func TestDefaultOpenAIOAuthDirectEgressPoolRequiresVerifiedIPv4Route(t *testing.T) {
 	now := time.Now()
-	defaultProxyID := int64(20)
+	directScope := DefaultDirectEgressRuntimeScope
 	routes := []EgressRoute{
-		eligibleProxyRoute(2, defaultProxyID, "2001:db8::20", now),
-		eligibleProxyRoute(3, 30, "203.0.113.30", now),
+		{
+			ID: 2, Kind: EgressRouteKindDirect, RuntimeScope: &directScope,
+			State: EgressRouteStateActive, VerifiedAt: &now,
+			ExpectedIdentity: &EgressIdentity{ID: 2, PublicIP: "2001:db8::20", Status: EgressIdentityStatusActive},
+		},
 	}
 
-	_, err := DefaultOpenAIOAuthEgressPool(routes, defaultProxyID, now)
+	_, err := DefaultOpenAIOAuthDirectEgressPool(routes, now)
 
 	require.ErrorIs(t, err, ErrOpenAIOAuthDefaultEgress)
 }

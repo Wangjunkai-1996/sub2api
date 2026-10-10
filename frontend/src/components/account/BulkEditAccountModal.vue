@@ -1773,7 +1773,7 @@ const initializeOpenAIEgressDefaults = () => {
 
   const routeIds = Array.from(new Set(
     props.egressRoutes
-      .filter((route) => route.kind === 'proxy' && route.eligible && route.id === props.defaultEgressRouteId)
+      .filter((route) => route.eligible && route.id === props.defaultEgressRouteId)
       .map((route) => route.id)
   ))
   if (!egressRouteDefaultsTouched.value) {

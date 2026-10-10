@@ -346,7 +346,7 @@ func TestOpenAIOAuthServiceCodexPATInvalidDefaultDoesNotCallUpstream(t *testing.
 	require.Zero(t, atomic.LoadInt32(&upstreamCalls))
 }
 
-func TestAdminServiceCreateAccountOpenAIOAuthDefaultProxy(t *testing.T) {
+func TestAdminServiceCreateAccountOpenAIOAuthDefaultDirectEgress(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		concurrency int
@@ -356,27 +356,26 @@ func TestAdminServiceCreateAccountOpenAIOAuthDefaultProxy(t *testing.T) {
 		{name: "preserves explicit concurrency", concurrency: 3, expected: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			settings := &settingRepoStub{values: map[string]string{SettingKeyOpenAIOAuthDefaultProxyID: "41"}}
-			proxy := activeOpenAIDefaultProxy(41, "203.0.113.41", 3128)
-			proxies := &mockProxyRepoForOAuth{getByIDFunc: func(context.Context, int64) (*Proxy, error) {
-				return proxy, nil
-			}}
 			now := time.Now()
-			otherProxyID := int64(42)
+			directScope := DefaultDirectEgressRuntimeScope
+			directRoute := EgressRoute{
+				ID: 141, Kind: EgressRouteKindDirect, RuntimeScope: &directScope,
+				State: EgressRouteStateActive, VerifiedAt: &now,
+				ExpectedIdentity: &EgressIdentity{ID: 141, PublicIP: "203.0.113.41", Status: EgressIdentityStatusActive},
+			}
 			routes := []EgressRoute{
-				eligibleProxyRoute(141, proxy.ID, "203.0.113.41", now),
-				eligibleProxyRoute(142, otherProxyID, "203.0.113.42", now),
+				directRoute,
+				eligibleProxyRoute(142, 42, "203.0.113.42", now),
 			}
 			repo := newDuplicateAccountRepoStub()
 			svc := &adminServiceImpl{
 				accountRepo:          repo,
 				accountDuplicateRepo: repo,
-				settingService:       newOpenAIDefaultProxySettingService(settings, proxies),
-				egressService:        NewEgressService(&openAIOAuthEgressRepoStub{routes: routes}, nil),
+				egressService:        NewEgressService(&openAIOAuthEgressRepoStub{route: &directRoute, routes: routes}, nil),
 			}
 
 			account, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
-				Name:                 "oauth-default-proxy",
+				Name:                 "oauth-default-direct",
 				Platform:             PlatformOpenAI,
 				Type:                 AccountTypeOAuth,
 				Credentials:          map[string]any{"access_token": "at-test"},

@@ -154,6 +154,16 @@ func (s *OpenAIOAuthService) resolveOpenAIOAuthProxy(ctx context.Context, proxyI
 		return proxy, nil
 	}
 
+	// Once the egress repository is wired, an omitted proxy means the
+	// deployment's verified direct route. The route-aware selector records the
+	// route fence; this fallback is for legacy callers that only need a URL.
+	if s != nil && s.egressService != nil {
+		if _, err := s.resolveOpenAIOAuthDefaultDirectRoute(ctx); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
 	if s == nil || s.settingService == nil {
 		return nil, nil
 	}
@@ -162,6 +172,20 @@ func (s *OpenAIOAuthService) resolveOpenAIOAuthProxy(ctx context.Context, proxyI
 		return nil, err
 	}
 	return proxy, nil
+}
+
+func (s *OpenAIOAuthService) resolveOpenAIOAuthDefaultDirectRoute(ctx context.Context) (*EgressRoute, error) {
+	if s == nil || s.egressService == nil {
+		return nil, nil
+	}
+	route, err := s.egressService.EnsureDirectRoute(ctx, DefaultDirectEgressRuntimeScope)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := openAIOAuthRouteProxyURL(route, true); err != nil {
+		return nil, err
+	}
+	return route, nil
 }
 
 func (s *OpenAIOAuthService) resolveOpenAIOAuthSelection(ctx context.Context, proxyID, routeID *int64) (*openAIOAuthEgressSelection, error) {
@@ -177,6 +201,13 @@ func (s *OpenAIOAuthService) resolveOpenAIOAuthSelection(ctx context.Context, pr
 			return nil, err
 		}
 		if _, err := openAIOAuthRouteProxyURL(route, true); err != nil {
+			return nil, err
+		}
+		return openAIOAuthSelectionFromRoute(route, true), nil
+	}
+	if proxyID == nil && s != nil && s.egressService != nil {
+		route, err := s.resolveOpenAIOAuthDefaultDirectRoute(ctx)
+		if err != nil {
 			return nil, err
 		}
 		return openAIOAuthSelectionFromRoute(route, true), nil
@@ -312,6 +343,9 @@ func cloneOpenAIOAuthInt64(value *int64) *int64 {
 // through AdminService. An absent setting remains a deliberate no-op.
 func (s *OpenAIOAuthService) ResolveOpenAIOAuthDefaultProxyID(ctx context.Context) (*int64, error) {
 	if s == nil || s.settingService == nil {
+		return nil, nil
+	}
+	if s.egressService != nil {
 		return nil, nil
 	}
 	proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)

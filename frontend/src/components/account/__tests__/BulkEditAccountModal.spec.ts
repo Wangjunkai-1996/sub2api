@@ -781,7 +781,7 @@ describe('BulkEditAccountModal', () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth'],
-      defaultEgressRouteId: 12,
+      defaultEgressRouteId: 10,
       defaultEgressConcurrency: 7,
       egressRoutes: [
         { id: 10, kind: 'direct', name: 'Local', state: 'active', eligible: true },
@@ -794,11 +794,12 @@ describe('BulkEditAccountModal', () => {
 
     expect((wrapper.get('#bulk-edit-proxy-enabled').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#bulk-edit-concurrency-enabled').element as HTMLInputElement).checked).toBe(false)
-    expect(wrapper.find('#egress-route-10').exists()).toBe(false)
+    expect(wrapper.find('#egress-route-10').exists()).toBe(true)
     expect((wrapper.get('#egress-route-11').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-10').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('#egress-route-12').element as HTMLInputElement).checked).toBe(false)
     expect((wrapper.get('#egress-route-13').element as HTMLInputElement).checked).toBe(false)
-    expect((wrapper.get('[data-testid="egress-route-12"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('[data-testid="egress-route-10"] input[type="radio"]').element as HTMLInputElement).checked).toBe(true)
     expect((wrapper.get('#bulk-edit-concurrency').element as HTMLInputElement).value).toBe('7')
     expect(wrapper.get('#bulk-edit-concurrency').attributes('disabled')).toBeDefined()
   })

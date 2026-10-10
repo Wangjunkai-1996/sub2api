@@ -59,7 +59,62 @@ func TestCRSSyncOpenAIOAuthPreservesExplicitProxy(t *testing.T) {
 	require.Equal(t, existingProxyID, *repo.accounts["crs-default-proxy"].ProxyID)
 }
 
+func TestCRSSyncOpenAIOAuthCreateUsesDirectEgressPool(t *testing.T) {
+	repo := newCRSLongContextAccountRepo()
+	route := activeDirectOpenAIOAuthRoute(82, 4)
+	egressRepo := &crsSyncEgressRepo{
+		openAIOAuthEgressRepoStub: &openAIOAuthEgressRepoStub{route: route},
+		config: &AccountEgressPoolConfigDomain{
+			EgressMode:           EgressModePool,
+			EgressRevision:       1,
+			ConcurrencyPerEgress: 3,
+			Bindings: []AccountEgressBinding{{
+				AccountID: 1,
+				RouteID:   route.ID,
+				IsPrimary: true,
+				Status:    AccountEgressBindingStatusActive,
+			}},
+		},
+	}
+
+	result, err := runCRSDefaultProxySyncWithEgress(
+		t,
+		repo,
+		nil,
+		nil,
+		NewEgressService(egressRepo, nil),
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Created)
+	account := repo.accounts["crs-default-proxy"]
+	require.NotNil(t, account)
+	require.Equal(t, EgressModePool, account.EgressMode)
+	require.Equal(t, route.ID, account.EgressBindings[0].RouteID)
+	require.Equal(t, 1, egressRepo.replaceCalls)
+}
+
 func runCRSDefaultProxySync(t *testing.T, repo AccountRepository, proxyRepo ProxyRepository, oauthService *OpenAIOAuthService) (*SyncFromCRSResult, error) {
+	return runCRSDefaultProxySyncWithEgress(t, repo, proxyRepo, oauthService, nil)
+}
+
+type crsSyncEgressRepo struct {
+	*openAIOAuthEgressRepoStub
+	config       *AccountEgressPoolConfigDomain
+	replaceCalls int
+}
+
+func (r *crsSyncEgressRepo) ReplaceAccountPool(_ context.Context, accountID int64, input ReplaceAccountPoolInput) (*AccountEgressPoolConfigDomain, error) {
+	r.replaceCalls++
+	config := *r.config
+	config.AccountID = accountID
+	config.Bindings = append([]AccountEgressBinding(nil), r.config.Bindings...)
+	if len(config.Bindings) > 0 {
+		config.Bindings[0].AccountID = accountID
+	}
+	return &config, nil
+}
+
+func runCRSDefaultProxySyncWithEgress(t *testing.T, repo AccountRepository, proxyRepo ProxyRepository, oauthService *OpenAIOAuthService, egressService *EgressService) (*SyncFromCRSResult, error) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -89,6 +144,7 @@ func runCRSDefaultProxySync(t *testing.T, repo AccountRepository, proxyRepo Prox
 	cfg := &config.Config{}
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 	svc := NewCRSSyncService(repo, proxyRepo, nil, oauthService, nil, cfg)
+	svc.SetEgressService(egressService)
 	return svc.SyncFromCRS(context.Background(), SyncFromCRSInput{
 		BaseURL:  server.URL,
 		Username: "admin",

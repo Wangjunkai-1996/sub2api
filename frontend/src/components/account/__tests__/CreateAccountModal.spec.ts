@@ -907,7 +907,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
   it('defaults to only the authoritative egress and submits its per-egress concurrency', async () => {
     const egressRoutes = [
       { id: 1, kind: 'proxy', name: 'first-route', proxy_id: 1, state: 'active', eligible: true },
-      { id: 2, kind: 'proxy', name: 'authoritative-default', proxy_id: 104, state: 'active', eligible: true },
+      { id: 2, kind: 'direct', name: 'authoritative-default', state: 'active', eligible: true },
       { id: 3, kind: 'proxy', name: 'unavailable-route', proxy_id: 67, state: 'inactive', eligible: false }
     ]
     const wrapper = mountModal([], {
@@ -979,7 +979,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     })
   })
 
-  it.each([null, 1, 3, 99])('does not choose another route when default %s is missing or unavailable', async (defaultEgressRouteId) => {
+  it.each([null, 3, 99])('does not choose another route when default %s is missing or unavailable', async (defaultEgressRouteId) => {
     const wrapper = mountModal([], {
       egressRoutes: [
         { id: 1, kind: 'direct', name: 'local', state: 'active', eligible: true },

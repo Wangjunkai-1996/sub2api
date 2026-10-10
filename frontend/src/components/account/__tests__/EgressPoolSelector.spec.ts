@@ -65,11 +65,11 @@ function mountSelector(selectedRouteIds: number[] = [], primaryRouteId: number |
 }
 
 describe('EgressPoolSelector', () => {
-  it('shows only explicit proxy routes and hides direct routes even when previously selected', () => {
+  it('shows direct and proxy routes, including a previously selected direct route', () => {
     const wrapper = mountSelector([1, 2], 1)
 
-    expect(wrapper.find('[data-testid="egress-route-1"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="verify-egress-1"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="egress-route-1"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="verify-egress-1"]').exists()).toBe(true)
     expect(wrapper.get('[data-testid="egress-route-2"]').exists()).toBe(true)
   })
 
@@ -103,14 +103,14 @@ describe('EgressPoolSelector', () => {
     expect(unselected.get('#egress-route-3').attributes('disabled')).toBeDefined()
   })
 
-  it('selects all eligible proxy routes while preserving the selected primary', async () => {
+  it('selects all eligible direct and proxy routes while preserving the selected primary', async () => {
     const wrapper = mountSelector([4], 4)
 
     await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
 
-    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[4, 2]]])
+    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[4, 1, 2]]])
     expect(wrapper.emitted('update:primaryRouteId')).toBeUndefined()
-    await wrapper.setProps({ selectedRouteIds: [4, 2] })
+    await wrapper.setProps({ selectedRouteIds: [4, 1, 2] })
     expect(wrapper.get('[data-testid="select-all-egress-routes"]').attributes('disabled')).toBeDefined()
   })
 
@@ -119,8 +119,8 @@ describe('EgressPoolSelector', () => {
 
     await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
 
-    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[3, 2, 4]]])
-    expect(wrapper.emitted('update:primaryRouteId')).toEqual([[2]])
+    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[3, 1, 2, 4]]])
+    expect(wrapper.emitted('update:primaryRouteId')).toEqual([[1]])
   })
 
   it('respects disabled selectors and bulk operations that do not require a primary', async () => {
@@ -131,7 +131,7 @@ describe('EgressPoolSelector', () => {
 
     await wrapper.setProps({ disabled: false, requirePrimary: false })
     await wrapper.get('[data-testid="select-all-egress-routes"]').trigger('click')
-    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[2, 4]]])
+    expect(wrapper.emitted('update:selectedRouteIds')).toEqual([[[1, 2, 4]]])
     expect(wrapper.emitted('update:primaryRouteId')).toBeUndefined()
   })
 

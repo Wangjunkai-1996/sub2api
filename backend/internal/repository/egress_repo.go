@@ -1422,9 +1422,7 @@ func validateSelectedRoutesTx(ctx context.Context, tx sqlExecutor, routeIDs []in
 			return nil, service.ErrEgressPoolInvalid
 		}
 		if requireEligible {
-			// Direct routes are retained only as dormant legacy/backfill data. New
-			// pool configurations must be backed by explicit proxy transports.
-			if kind != service.EgressRouteKindProxy {
+			if kind != service.EgressRouteKindProxy && kind != service.EgressRouteKindDirect {
 				return nil, service.ErrEgressPoolInvalid
 			}
 			if state != service.EgressRouteStateActive || !identityID.Valid || identityStatus != service.EgressIdentityStatusActive {

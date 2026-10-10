@@ -22,6 +22,7 @@ import (
 type CRSSyncService struct {
 	accountRepo        AccountRepository
 	proxyRepo          ProxyRepository
+	egressService      *EgressService
 	oauthService       *OAuthService
 	openaiOAuthService *OpenAIOAuthService
 	geminiOAuthService *GeminiOAuthService
@@ -44,6 +45,66 @@ func NewCRSSyncService(
 		geminiOAuthService: geminiOAuthService,
 		cfg:                cfg,
 	}
+}
+
+// SetEgressService injects the route writer used when CRS creates an OpenAI
+// OAuth account without an explicit proxy.  Keep this as a setter so focused
+// CRS tests and older constructors remain source compatible.
+func (s *CRSSyncService) SetEgressService(egressService *EgressService) {
+	if s == nil {
+		return
+	}
+	s.egressService = egressService
+}
+
+// defaultOpenAIOAuthEgressPool resolves the deployment's verified direct route
+// for a newly imported/unbound OpenAI OAuth account. Existing pools and
+// explicit proxy assignments are left untouched.
+func (s *CRSSyncService) defaultOpenAIOAuthEgressPool(ctx context.Context, account *Account) (*ReplaceAccountPoolInput, error) {
+	if s == nil || s.egressService == nil || account == nil ||
+		account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth ||
+		account.ProxyID != nil || account.EgressMode == EgressModePool {
+		return nil, nil
+	}
+	route, err := s.egressService.EnsureDirectRoute(ctx, DefaultDirectEgressRuntimeScope)
+	if err != nil {
+		return nil, err
+	}
+	if route == nil {
+		return nil, ErrOpenAIOAuthDefaultEgress
+	}
+	pool, err := DefaultOpenAIOAuthDirectEgressPool([]EgressRoute{*route}, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if account.Concurrency > 0 {
+		concurrency := account.Concurrency
+		pool.ConcurrencyPerEgress = &concurrency
+	}
+	return &pool, nil
+}
+
+// ensureDefaultOpenAIOAuthEgress applies the deployment's verified direct
+// route after an existing CRS account is updated. New accounts use the
+// account repository's atomic EgressPoolWrite path when available.
+func (s *CRSSyncService) ensureDefaultOpenAIOAuthEgress(ctx context.Context, account *Account) error {
+	pool, err := s.defaultOpenAIOAuthEgressPool(ctx, account)
+	if err != nil || pool == nil {
+		return err
+	}
+	config, err := s.egressService.ReplaceAccountPool(ctx, account.ID, *pool)
+	if err != nil {
+		return err
+	}
+	if config == nil {
+		return ErrEgressPoolInvalid
+	}
+	account.EgressMode = config.EgressMode
+	account.EgressRevision = config.EgressRevision
+	account.EgressBindings = config.Bindings
+	account.Concurrency = config.ConcurrencyPerEgress
+	account.ProxyID = config.PrimaryProxyID
+	return nil
 }
 
 // guardCRSShadowParentInvariant 守住「有 spark 影子的母账号」不变量(与 AdminService.UpdateAccount 一致):
@@ -692,9 +753,32 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Status:      status,
 				Schedulable: src.Schedulable,
 			}
-			if err := s.accountRepo.Create(ctx, account); err != nil {
+			defaultPool, err := s.defaultOpenAIOAuthEgressPool(ctx, account)
+			if err != nil {
 				item.Action = "failed"
-				item.Error = "create failed: " + err.Error()
+				item.Error = "default egress resolve failed: " + err.Error()
+				result.Failed++
+				result.Items = append(result.Items, item)
+				continue
+			}
+			account.EgressPoolWrite = defaultPool
+			var createErr error
+			if defaultPool != nil {
+				if creator, ok := s.accountRepo.(AccountDuplicateRepository); ok {
+					createErr = creator.CreateWithAccountGroups(ctx, account, nil)
+				} else {
+					account.EgressPoolWrite = nil
+					createErr = s.accountRepo.Create(ctx, account)
+					if createErr == nil {
+						createErr = s.ensureDefaultOpenAIOAuthEgress(ctx, account)
+					}
+				}
+			} else {
+				createErr = s.accountRepo.Create(ctx, account)
+			}
+			if createErr != nil {
+				item.Action = "failed"
+				item.Error = "create failed: " + createErr.Error()
 				result.Failed++
 				result.Items = append(result.Items, item)
 				continue
@@ -725,6 +809,13 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 		if err := s.accountRepo.Update(ctx, existing); err != nil {
 			item.Action = "failed"
 			item.Error = "update failed: " + err.Error()
+			result.Failed++
+			result.Items = append(result.Items, item)
+			continue
+		}
+		if err := s.ensureDefaultOpenAIOAuthEgress(ctx, existing); err != nil {
+			item.Action = "failed"
+			item.Error = "default egress resolve failed: " + err.Error()
 			result.Failed++
 			result.Items = append(result.Items, item)
 			continue

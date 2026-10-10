@@ -29,8 +29,8 @@ export const accountHasEgressPool = (
 const positiveConcurrency = (value: number) => Math.max(1, Number(value) || 1)
 
 export function proxyRouteIDs(routeIDs: number[], routes: AssignableEgressRoute[]): number[] {
-  const proxyIDs = new Set(routes.filter((route) => route.kind === 'proxy').map((route) => route.id))
-  return Array.from(new Set(routeIDs.filter((routeID) => proxyIDs.has(routeID))))
+  const egressIDs = new Set(routes.map((route) => route.id))
+  return Array.from(new Set(routeIDs.filter((routeID) => egressIDs.has(routeID))))
 }
 
 export function initialAccountEgressDraft(

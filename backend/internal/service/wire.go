@@ -124,6 +124,24 @@ func ProvideOpenAIOAuthService(
 	return svc
 }
 
+// ProvideCRSSyncService installs the same egress route writer used by the
+// admin account and OAuth services.  Keeping the constructor itself compatible
+// with focused tests avoids making the egress repository a required argument
+// for older callers.
+func ProvideCRSSyncService(
+	accountRepo AccountRepository,
+	proxyRepo ProxyRepository,
+	oauthService *OAuthService,
+	openaiOAuthService *OpenAIOAuthService,
+	geminiOAuthService *GeminiOAuthService,
+	cfg *config.Config,
+	egressService *EgressService,
+) *CRSSyncService {
+	svc := NewCRSSyncService(accountRepo, proxyRepo, oauthService, openaiOAuthService, geminiOAuthService, cfg)
+	svc.SetEgressService(egressService)
+	return svc
+}
+
 // ProvideTokenRefreshService creates and starts TokenRefreshService
 func ProvideTokenRefreshService(
 	accountRepo AccountRepository,
@@ -1088,7 +1106,7 @@ var ProviderSet = wire.NewSet(
 	NewUsageRecordWorkerPool,
 	ProvideSchedulerSnapshotService,
 	NewIdentityService,
-	NewCRSSyncService,
+	ProvideCRSSyncService,
 	ProvideUpdateService,
 	ProvideTokenRefreshService,
 	wire.Bind(new(GrokOAuthReconciler), new(*TokenRefreshService)),

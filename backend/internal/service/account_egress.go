@@ -64,7 +64,7 @@ var (
 	ErrEgressPoolConflict        = infraerrors.Conflict("ACCOUNT_EGRESS_REVISION_CONFLICT", "account egress pool changed; reload it and try again")
 	ErrEgressPoolVersionRequired = infraerrors.Conflict("EGRESS_POOL_VERSION_REQUIRED", "account uses an egress pool; reload it and update the pool contract")
 	ErrEgressMutationFrozen      = infraerrors.New(http.StatusLocked, "ACCOUNT_EGRESS_MUTATION_FROZEN", "account egress mutations are temporarily frozen")
-	ErrOpenAIOAuthDefaultEgress  = infraerrors.BadRequest("OPENAI_OAUTH_DEFAULT_EGRESS_UNAVAILABLE", "configured OpenAI OAuth default proxy is not an eligible IPv4 egress route")
+	ErrOpenAIOAuthDefaultEgress  = infraerrors.BadRequest("OPENAI_OAUTH_DEFAULT_EGRESS_UNAVAILABLE", "default OpenAI OAuth direct egress is not an eligible verified IPv4 route")
 )
 
 // EgressIdentity is the durable normalized public IP used as one capacity unit.
@@ -221,31 +221,27 @@ func (s *EgressService) ListAssignableRoutes(ctx context.Context) ([]EgressRoute
 	return s.repo.ListAssignableRoutes(ctx)
 }
 
-// DefaultOpenAIOAuthEgressPool builds the server-authoritative pool used when
-// an OpenAI OAuth account does not provide an explicit route selection. Only
-// the configured OAuth proxy participates, with a verified IPv4 identity.
-func DefaultOpenAIOAuthEgressPool(routes []EgressRoute, defaultProxyID int64, now time.Time) (ReplaceAccountPoolInput, error) {
-	if defaultProxyID <= 0 {
-		return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
-	}
-
+// DefaultOpenAIOAuthDirectEgressPool builds the server-authoritative pool used
+// when an OpenAI OAuth account does not provide an explicit route selection.
+// The deployment's verified direct route is the only implicit egress.
+func DefaultOpenAIOAuthDirectEgressPool(routes []EgressRoute, now time.Time) (ReplaceAccountPoolInput, error) {
 	primaryRouteID := int64(0)
 	for i := range routes {
 		route := &routes[i]
 		eligible, _ := EgressRouteEligibility(route, now)
-		if !eligible || route.Kind != EgressRouteKindProxy || route.ID <= 0 {
-			continue
-		}
-		if route.ProxyID == nil || *route.ProxyID != defaultProxyID || route.ExpectedIdentity == nil {
+		if !eligible || route.Kind != EgressRouteKindDirect || route.ID <= 0 ||
+			route.RuntimeScope == nil || strings.TrimSpace(*route.RuntimeScope) != DefaultDirectEgressRuntimeScope ||
+			route.ExpectedIdentity == nil {
 			continue
 		}
 		identityIP, err := netip.ParseAddr(strings.TrimSpace(route.ExpectedIdentity.PublicIP))
-		if err == nil && identityIP.Unmap().Is4() {
-			if primaryRouteID != 0 && primaryRouteID != route.ID {
-				return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
-			}
-			primaryRouteID = route.ID
+		if err != nil || !identityIP.Unmap().Is4() {
+			continue
 		}
+		if primaryRouteID != 0 && primaryRouteID != route.ID {
+			return ReplaceAccountPoolInput{}, ErrOpenAIOAuthDefaultEgress
+		}
+		primaryRouteID = route.ID
 	}
 
 	if primaryRouteID == 0 {

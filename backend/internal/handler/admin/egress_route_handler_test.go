@@ -75,20 +75,17 @@ func TestEgressAssignableCatalogAdvertisesMutationCapability(t *testing.T) {
 func TestEgressAssignableCatalogAdvertisesAuthoritativeOAuthPrimary(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	now := time.Now()
-	proxyID := int64(9)
-	proxy := &service.Proxy{ID: proxyID, Status: service.StatusActive}
+	directScope := service.DefaultDirectEgressRuntimeScope
 	route := service.EgressRoute{
-		ID: 41, Kind: service.EgressRouteKindProxy, ProxyID: &proxyID,
-		State: service.EgressRouteStateActive, VerifiedAt: &now, Proxy: proxy,
+		ID: 41, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope,
+		State: service.EgressRouteStateActive, VerifiedAt: &now,
 		ExpectedIdentity: &service.EgressIdentity{
 			ID: 91, PublicIP: "203.0.113.9", Status: service.EgressIdentityStatusActive,
 		},
 	}
-	settings := service.NewSettingService(&egressCatalogSettingRepo{value: "9"}, nil)
-	settings.SetProxyRepository(&egressCatalogProxyRepo{proxy: proxy})
 	handler := NewEgressRouteHandler(service.NewEgressService(&accountDataEgressRepo{
 		routes: []service.EgressRoute{route},
-	}, nil), settings)
+	}, nil), nil)
 	router := gin.New()
 	router.GET("/assignable", handler.ListAssignable)
 

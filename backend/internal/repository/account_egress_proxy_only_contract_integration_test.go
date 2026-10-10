@@ -4,7 +4,6 @@ package repository
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -98,47 +97,18 @@ func TestEgressRepositoryApplyAccountPoolsReplacesTwoAccountsWithThreeProxyRoute
 	}
 }
 
-func TestAccountEgressProxyOnlyConcurrentPoolSwitchAndDirectBinding(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	accountID := insertProxyOnlyContractAccount(t, "legacy", nil)
+func TestAccountEgressAllowsPoolDirectBinding(t *testing.T) {
+	ctx := context.Background()
+	accountID := insertProxyOnlyContractAccount(t, service.EgressModePool, nil)
 	routeID := insertProxyOnlyContractDirectRoute(t)
-
-	poolTx, err := integrationDB.BeginTx(ctx, nil)
+	_, err := integrationDB.ExecContext(ctx, `
+		INSERT INTO account_egress_bindings
+			(account_id, route_id, position, is_primary, status, created_at, updated_at)
+		VALUES ($1, $2, 0, TRUE, 'active', NOW(), NOW())`, accountID, routeID)
 	require.NoError(t, err)
-	defer func() { _ = poolTx.Rollback() }()
-	_, err = poolTx.ExecContext(ctx, `UPDATE accounts SET egress_mode='pool' WHERE id=$1`, accountID)
-	require.NoError(t, err)
-
-	bindingTx, err := integrationDB.BeginTx(ctx, nil)
-	require.NoError(t, err)
-	defer func() { _ = bindingTx.Rollback() }()
-	var bindingPID int
-	require.NoError(t, bindingTx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&bindingPID))
-
-	insertResult := make(chan error, 1)
-	go func() {
-		_, insertErr := bindingTx.ExecContext(ctx, `
-			INSERT INTO account_egress_bindings
-				(account_id, route_id, position, is_primary, status, created_at, updated_at)
-			VALUES ($1, $2, 0, TRUE, 'active', NOW(), NOW())`, accountID, routeID)
-		insertResult <- insertErr
-	}()
-	waitForBlockedPostgresTransaction(t, ctx, bindingPID)
-	require.NoError(t, poolTx.Commit())
-
-	insertErr := <-insertResult
-	requirePostgresCheckViolation(t, insertErr)
-	require.NoError(t, bindingTx.Rollback())
-
-	var bindingCount int
-	require.NoError(t, integrationDB.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM account_egress_bindings WHERE account_id=$1 AND route_id=$2`,
-		accountID, routeID).Scan(&bindingCount))
-	require.Zero(t, bindingCount)
 }
 
-func TestAccountEgressProxyOnlyRejectsRouteBecomingDirect(t *testing.T) {
+func TestAccountEgressAllowsPoolRouteBecomingDirect(t *testing.T) {
 	ctx := context.Background()
 	accountID := insertProxyOnlyContractAccount(t, "pool", nil)
 	proxyID := insertProxyOnlyContractProxy(t)
@@ -158,10 +128,10 @@ func TestAccountEgressProxyOnlyRejectsRouteBecomingDirect(t *testing.T) {
 		UPDATE egress_routes
 		SET kind='direct', proxy_id=NULL, runtime_scope=$2
 		WHERE id=$1`, routeID, fmt.Sprintf("contract-route-update-%d", time.Now().UnixNano()))
-	requirePostgresCheckViolation(t, err)
+	require.NoError(t, err)
 }
 
-func TestAccountEgressProxyOnlyRejectsRestoringDeletedPoolAccountWithDirectBinding(t *testing.T) {
+func TestAccountEgressAllowsRestoringDeletedPoolAccountWithDirectBinding(t *testing.T) {
 	ctx := context.Background()
 	deletedAt := time.Now().UTC()
 	accountID := insertProxyOnlyContractAccount(t, "pool", &deletedAt)
@@ -177,52 +147,7 @@ func TestAccountEgressProxyOnlyRejectsRestoringDeletedPoolAccountWithDirectBindi
 	require.NoError(t, err)
 
 	_, err = integrationDB.ExecContext(ctx, `UPDATE accounts SET deleted_at=NULL WHERE id=$1`, accountID)
-	requirePostgresCheckViolation(t, err)
-}
-
-func TestAccountEgressProxyOnlySerializesRestoreAgainstRouteBecomingDirect(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	deletedAt := time.Now().UTC()
-	accountID := insertProxyOnlyContractAccount(t, "pool", &deletedAt)
-	proxyID := insertProxyOnlyContractProxy(t)
-	routeID := insertProxyOnlyContractProxyRoute(t, proxyID)
-	t.Cleanup(func() {
-		_, _ = integrationDB.Exec(`DELETE FROM accounts WHERE id=$1`, accountID)
-		_, _ = integrationDB.Exec(`DELETE FROM egress_routes WHERE id=$1`, routeID)
-		_, _ = integrationDB.Exec(`DELETE FROM proxies WHERE id=$1`, proxyID)
-	})
-	_, err := integrationDB.ExecContext(ctx, `
-		INSERT INTO account_egress_bindings
-			(account_id, route_id, position, is_primary, status, created_at, updated_at)
-		VALUES ($1, $2, 0, TRUE, 'active', NOW(), NOW())`, accountID, routeID)
 	require.NoError(t, err)
-
-	restoreTx, err := integrationDB.BeginTx(ctx, nil)
-	require.NoError(t, err)
-	defer func() { _ = restoreTx.Rollback() }()
-	_, err = restoreTx.ExecContext(ctx, `UPDATE accounts SET deleted_at=NULL WHERE id=$1`, accountID)
-	require.NoError(t, err)
-
-	routeTx, err := integrationDB.BeginTx(ctx, nil)
-	require.NoError(t, err)
-	defer func() { _ = routeTx.Rollback() }()
-	var routePID int
-	require.NoError(t, routeTx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&routePID))
-
-	updateResult := make(chan error, 1)
-	go func() {
-		_, updateErr := routeTx.ExecContext(ctx, `
-			UPDATE egress_routes
-			SET kind='direct', proxy_id=NULL, runtime_scope=$2
-			WHERE id=$1`, routeID, fmt.Sprintf("contract-restore-race-%d", time.Now().UnixNano()))
-		updateResult <- updateErr
-	}()
-	waitForBlockedPostgresTransaction(t, ctx, routePID)
-	require.NoError(t, restoreTx.Commit())
-
-	requirePostgresCheckViolation(t, <-updateResult)
-	require.NoError(t, routeTx.Rollback())
 }
 
 func TestAccountEgressProxyTargetValidationSeesDeleteCommittedWhileWaiting(t *testing.T) {
@@ -332,12 +257,4 @@ func waitForBlockedPostgresTransaction(t *testing.T, ctx context.Context, backen
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("concurrent transaction did not block on the account constraint lock")
-}
-
-func requirePostgresCheckViolation(t *testing.T, err error) {
-	t.Helper()
-	require.Error(t, err)
-	var postgresErr *pq.Error
-	require.True(t, errors.As(err, &postgresErr), "expected PostgreSQL error, got %T: %v", err, err)
-	require.Equal(t, pq.ErrorCode("23514"), postgresErr.Code)
 }

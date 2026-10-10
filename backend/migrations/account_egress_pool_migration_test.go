@@ -13,8 +13,9 @@ func TestAccountEgressPoolMigrations(t *testing.T) {
 	validation := compactMigrationSQL(t, "242_validate_account_egress_pool_constraints.sql")
 	permissions := compactMigrationSQL(t, "243_account_egress_pool_runtime_permissions.sql")
 	proxyOnly := compactMigrationSQL(t, "244_account_egress_proxy_only_contract.sql")
+	directDefault := compactMigrationSQL(t, "248_account_egress_direct_default.sql")
 
-	for _, sql := range []string{foundation, backfill, validation, permissions, proxyOnly} {
+	for _, sql := range []string{foundation, backfill, validation, permissions, proxyOnly, directDefault} {
 		require.Contains(t, sql, "SET LOCAL lock_timeout = '3s'")
 		require.Contains(t, sql, "SET LOCAL statement_timeout = '30s'")
 		require.NotContains(t, strings.ToUpper(sql), "DROP TABLE")
@@ -74,6 +75,17 @@ func TestAccountEgressPoolMigrations(t *testing.T) {
 	require.Contains(t, proxyOnly, "WHERE binding.route_id = OLD.id ORDER BY account.id FOR NO KEY UPDATE OF account")
 	require.Contains(t, proxyOnly, "route % cannot become direct while referenced by a pool account")
 	require.Contains(t, proxyOnly, "proxy-only egress repair incomplete: pool direct binding remains")
+
+	require.Contains(t, directDefault, "proxy.name = 'sys1-ipv4'")
+	require.Contains(t, directDefault, "UPDATE settings")
+	require.Contains(t, directDefault, "SET value = ''")
+	require.Contains(t, directDefault, "DROP TRIGGER IF EXISTS account_egress_bindings_proxy_only")
+	require.Contains(t, directDefault, "DROP FUNCTION IF EXISTS enforce_pool_binding_proxy_only()")
+	require.Contains(t, directDefault, "expected_identity_id = proxy_route.expected_identity_id")
+	require.Contains(t, directDefault, "account.egress_mode = 'pool'")
+	require.Contains(t, directDefault, "old_status")
+	require.Contains(t, directDefault, "status = EXCLUDED.status")
+	require.Contains(t, directDefault, "account_bulk_changed")
 }
 
 func compactMigrationSQL(t *testing.T, name string) string {
