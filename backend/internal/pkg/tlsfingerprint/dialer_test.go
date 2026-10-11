@@ -14,10 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -287,6 +289,90 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+type blockingCloseConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// delayedAfterFuncContext models a canceled context whose registered callback
+// has not started yet. Its stop function can still remove the queued callback.
+type delayedAfterFuncContext struct {
+	context.Context
+	done chan struct{}
+	err  error
+}
+
+func (c *delayedAfterFuncContext) Done() <-chan struct{} { return c.done }
+func (c *delayedAfterFuncContext) Err() error            { return c.err }
+func (c *delayedAfterFuncContext) AfterFunc(func()) func() bool {
+	return func() bool { return true }
+}
+
+func (c *blockingCloseConn) Close() error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return c.Conn.Close()
+}
+
+func TestBindConnContextWaitsForStartedCancelCallback(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	conn := &blockingCloseConn{
+		Conn: client, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanup := bindConnContext(ctx, conn)
+	cancel()
+
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not start closing the connection")
+	}
+	cleaned := make(chan bool, 1)
+	go func() { cleaned <- cleanup() }()
+	select {
+	case <-cleaned:
+		t.Fatal("cleanup returned while the cancellation callback could still close the connection")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(conn.release)
+	select {
+	case canceled := <-cleaned:
+		if !canceled {
+			t.Fatal("cleanup did not report the started cancellation callback")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not join the cancellation callback")
+	}
+}
+
+func TestBindConnContextReportsCancellationWhenStopWins(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	release := make(chan struct{})
+	close(release)
+	conn := &blockingCloseConn{
+		Conn: client, started: make(chan struct{}), release: release,
+	}
+	ctx := &delayedAfterFuncContext{Context: context.Background(), done: make(chan struct{})}
+	cleanup := bindConnContext(ctx, conn)
+
+	ctx.err = context.Canceled
+	close(ctx.done)
+	if !cleanup() {
+		t.Fatal("cleanup published a connection after its context was canceled")
+	}
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not close the canceled connection after stopping its pending callback")
+	}
 }
 
 // TestAllProfiles tests multiple TLS fingerprint profiles against tls.peet.ws.

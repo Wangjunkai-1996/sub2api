@@ -296,34 +296,33 @@ func cleanupUsageLogsBatchWithRollupInvalidation(ctx context.Context, db *sql.DB
 		return 0, err
 	}
 
-	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
-		return rollback(err)
-	}
+	// Lock the complete victim batch in its own statement before taking the
+	// rollup-state lock. Keeping the row identifiers in memory avoids TEMP-table
+	// privileges and prevents a data-modifying CTE from interleaving row locks
+	// with DELETE triggers under a nested-loop plan.
 	rows, err := tx.QueryContext(ctx, `
-		WITH victims AS (
-			SELECT tableoid, ctid
-			FROM usage_logs
-			WHERE created_at < $1
-			ORDER BY created_at ASC, id ASC
-			LIMIT $2
-		)
-		DELETE FROM usage_logs
-		WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM victims)
-		RETURNING created_at
+		SELECT tableoid::oid, ctid::text, created_at
+		FROM usage_logs
+		WHERE created_at < $1
+		ORDER BY created_at ASC, id ASC
+		LIMIT $2
+		FOR UPDATE
 	`, cutoff.UTC(), usageLogsCleanupBatchSize)
 	if err != nil {
 		return rollback(err)
 	}
 
-	var affected int64
+	victimsByTable := make(map[int64][]string)
 	var earliestDeletedAt time.Time
 	for rows.Next() {
+		var tableOID int64
+		var ctid string
 		var deletedAt time.Time
-		if err := rows.Scan(&deletedAt); err != nil {
+		if err := rows.Scan(&tableOID, &ctid, &deletedAt); err != nil {
 			_ = rows.Close()
 			return rollback(err)
 		}
-		affected++
+		victimsByTable[tableOID] = append(victimsByTable[tableOID], ctid)
 		if earliestDeletedAt.IsZero() || deletedAt.Before(earliestDeletedAt) {
 			earliestDeletedAt = deletedAt
 		}
@@ -334,6 +333,50 @@ func cleanupUsageLogsBatchWithRollupInvalidation(ctx context.Context, db *sql.DB
 	}
 	if err := rows.Close(); err != nil {
 		return rollback(err)
+	}
+	if len(victimsByTable) == 0 {
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+
+	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
+		return rollback(err)
+	}
+
+	tableOIDs := make([]int64, 0, len(victimsByTable))
+	for tableOID := range victimsByTable {
+		tableOIDs = append(tableOIDs, tableOID)
+	}
+	sort.Slice(tableOIDs, func(i, j int) bool { return tableOIDs[i] < tableOIDs[j] })
+
+	var affected int64
+	for _, tableOID := range tableOIDs {
+		deletedRows, err := tx.QueryContext(ctx, `
+			DELETE FROM usage_logs
+			WHERE tableoid = $1::oid
+				AND ctid = ANY($2::tid[])
+			RETURNING created_at
+		`, tableOID, pq.Array(victimsByTable[tableOID]))
+		if err != nil {
+			return rollback(err)
+		}
+		for deletedRows.Next() {
+			var deletedAt time.Time
+			if err := deletedRows.Scan(&deletedAt); err != nil {
+				_ = deletedRows.Close()
+				return rollback(err)
+			}
+			affected++
+		}
+		if err := deletedRows.Err(); err != nil {
+			_ = deletedRows.Close()
+			return rollback(err)
+		}
+		if err := deletedRows.Close(); err != nil {
+			return rollback(err)
+		}
 	}
 	if affected > 0 {
 		if err := invalidateGroupUsageRollupsAt(ctx, tx, earliestDeletedAt); err != nil {
@@ -656,6 +699,12 @@ func dropUsageLogsPartitionWithRollupInvalidation(ctx context.Context, db *sql.D
 		return err
 	}
 
+	// Acquire the partition relation lock before the rollup-state lock. A live
+	// usage insert already holds the relation lock when its trigger waits on the
+	// state row; keeping this order avoids the reverse lock cycle.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("LOCK TABLE %s IN ACCESS EXCLUSIVE MODE", pq.QuoteIdentifier(name))); err != nil {
+		return rollback(err)
+	}
 	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
 		return rollback(err)
 	}

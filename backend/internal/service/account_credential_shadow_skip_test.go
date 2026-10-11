@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/imroc/req/v3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,10 +19,12 @@ import (
 // 其他方法通过嵌入 nil 接口值满足编译，若被误调则 panic，便于发现意外调用路径。
 type shadowSkipTestRepo struct {
 	AccountRepository
-	account *Account
+	account   *Account
+	lookupIDs []int64
 }
 
 func (r *shadowSkipTestRepo) GetByID(_ context.Context, id int64) (*Account, error) {
+	r.lookupIDs = append(r.lookupIDs, id)
 	if r.account == nil || r.account.ID != id {
 		return nil, ErrAccountNotFound
 	}
@@ -65,7 +68,7 @@ func TestAccountTestServiceSkipsShadow(t *testing.T) {
 
 	err := svc.TestAccountConnection(c, 200, "", "", "")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "resolve spark shadow parent")
+	assert.Equal(t, []int64{shadow.ID, pid}, repo.lookupIDs, "connection testing must attempt to resolve the shadow's parent credentials")
 }
 
 // --- 3. EnsureOpenAIPrivacy 守卫 ---

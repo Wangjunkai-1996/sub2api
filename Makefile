@@ -26,6 +26,7 @@ FRONTEND_CRITICAL_VITEST := \
 	src/components/user/profile/__tests__/ProfileInfoCard.spec.ts \
 	src/components/user/profile/__tests__/ProfileIdentityBindingsSection.spec.ts \
 	src/views/admin/__tests__/SettingsView.spec.ts \
+	src/components/account/__tests__/CodexAccountTicketSettings.spec.ts \
 	src/features/channel-monitor-v2/__tests__/designSystem.structure.spec.ts \
 	src/features/channel-monitor-v2/__tests__/monitorFormat.spec.ts \
 	src/features/channel-monitor-v2/__tests__/monitorZoom.spec.ts \

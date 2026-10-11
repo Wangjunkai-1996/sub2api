@@ -101,6 +101,7 @@ func TestCreateUpstreamLiveCallPreservesSession(t *testing.T) {
 		httpUpstream: upstream,
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          7,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,

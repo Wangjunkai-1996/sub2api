@@ -165,20 +165,25 @@ type SystemSettings struct {
 	CustomMenuItems             string // JSON array of custom menu items
 	CustomEndpoints             string // JSON array of custom endpoints
 
-	DefaultConcurrency           int
-	DefaultBalance               float64
-	RiskControlEnabled           bool
-	CyberSessionBlockEnabled     bool
-	CyberPolicyUserAllowlist     string
-	CyberSessionBlockTTLSeconds  int
-	AffiliateEnabled             bool
-	AffiliateRebateRate          float64
-	AffiliateRebateFreezeHours   int
-	AffiliateRebateDurationDays  int
-	AffiliateRebatePerInviteeCap float64
-	AdminRechargeRebateEnabled   bool
-	DefaultUserRPMLimit          int
-	DefaultSubscriptions         []DefaultSubscriptionSetting
+	DefaultConcurrency                         int
+	DefaultBalance                             float64
+	RiskControlEnabled                         bool
+	CyberSessionBlockEnabled                   bool
+	CyberPolicyUserAllowlist                   string
+	CyberSessionBlockTTLSeconds                int
+	OpenAICyberAccountCooldownEnabled          bool
+	OpenAICyberAccountCooldownWindowSeconds    int
+	OpenAICyberAccountCooldownFirstSeconds     int
+	OpenAICyberAccountCooldownEscalatedSeconds int
+	OpenAICyberAccountCooldownGroupIDs         []int64
+	AffiliateEnabled                           bool
+	AffiliateRebateRate                        float64
+	AffiliateRebateFreezeHours                 int
+	AffiliateRebateDurationDays                int
+	AffiliateRebatePerInviteeCap               float64
+	AdminRechargeRebateEnabled                 bool
+	DefaultUserRPMLimit                        int
+	DefaultSubscriptions                       []DefaultSubscriptionSetting
 
 	// Model fallback configuration
 	EnableModelFallback      bool   `json:"enable_model_fallback"`
@@ -251,6 +256,8 @@ type SystemSettings struct {
 	OpenAICodexClientVersion               string // 出站声明的 Codex 客户端版本号（管理员覆写）；空值跟随自动同步值
 	OpenAICodexClientVersionSynced         string // 自动同步到的官方最新稳定版版本号（只读展示）
 	OpenAICodexVersionAutoSyncEnabled      bool   // 是否启用 Codex 客户端版本号自动同步（默认 true）
+	OpenAICodexTicketEnabled               bool   // Codex 账号打票主开关；关闭则不打票不注入
+	OpenAICodexTicketHarvestProxyURL       string // Codex 打票采集池 URL；空则回退 yaml/env
 	ClaudeCodeClientVersion                string // 出站声明的 Claude Code CLI 客户端版本号（管理员覆写）；空值跟随自动同步值
 	ClaudeCodeClientVersionSynced          string // 自动同步到的官方最新版本号（只读展示）
 	ClaudeCodeVersionAutoSyncEnabled       bool   // 是否启用 Claude Code 客户端版本号自动同步（默认 true）
@@ -260,6 +267,20 @@ type SystemSettings struct {
 	CodexCLIOnlyWhitelist                  string // codex_cli_only 全局白名单 JSON（[]AllowedClientEntry，AND allow）
 	CodexCLIOnlyAllowAppServerClients      bool   // codex_cli_only App Server 开关：对未列名客户端开闸（默认 false）
 	CodexCLIOnlyEngineFingerprintSignals   string // codex_cli_only 引擎指纹门信号列表 JSON（[]EngineFingerprintSignal）
+
+	// OpenAI Codex five-hour window warmup. Enabled is the global kill switch;
+	// false prevents workers from claiming or sending new probes.
+	OpenAIWindowWarmupEnabled               bool
+	OpenAIWindowWarmupDefaultPolicy         string
+	OpenAIWindowWarmupAllowlist             []int64
+	OpenAIWindowWarmupProbeModel            string
+	OpenAIWindowWarmupWorkerConcurrency     int
+	OpenAIWindowWarmupGlobalQPS             float64
+	OpenAIWindowWarmupBatchSize             int
+	OpenAIWindowWarmupScanSeconds           int
+	OpenAIWindowWarmupRequestTimeoutSeconds int
+	OpenAIWindowWarmupLeaseSeconds          int
+	OpenAIWindowWarmupResetGraceSeconds     int
 
 	// Web Search Emulation
 	WebSearchEmulationEnabled bool // 是否启用 web search 模拟

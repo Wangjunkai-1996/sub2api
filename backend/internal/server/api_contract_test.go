@@ -897,6 +897,10 @@ func TestAPIContracts(t *testing.T) {
 						"table_page_size_options": [10, 20, 50, 100],
 					"min_claude_code_version": "",
 					"max_claude_code_version": "",
+					"openai_codex_ticket_enabled": false,
+					"openai_codex_ticket_332_enabled": false,
+					"openai_codex_ticket_harvest_proxy_url": "",
+					"openai_codex_ticket_harvest_proxy_configured": false,
 					"min_codex_version": "",
 					"max_codex_version": "",
 					"codex_cli_only_blacklist": "",
@@ -924,6 +928,17 @@ func TestAPIContracts(t *testing.T) {
 					"openai_low_upstream_rate_priority_enabled": true,
 					"openai_oauth_scheduling_rate_multiplier": 0.05,
 					"openai_ttft_mode": "semantic",
+					"openai_window_warmup_allowlist": [],
+					"openai_window_warmup_batch_size": 20,
+					"openai_window_warmup_default_policy": "off",
+					"openai_window_warmup_enabled": false,
+					"openai_window_warmup_global_qps": 0.2,
+					"openai_window_warmup_lease_seconds": 120,
+					"openai_window_warmup_probe_model": "codex-auto-review",
+					"openai_window_warmup_request_timeout_seconds": 45,
+					"openai_window_warmup_reset_grace_seconds": 90,
+					"openai_window_warmup_scan_seconds": 30,
+					"openai_window_warmup_worker_concurrency": 1,
 					"openai_advanced_scheduler_enabled": true,
 					"openai_advanced_scheduler_sticky_weighted_enabled": false,
 					"openai_advanced_scheduler_subscription_priority_enabled": false,
@@ -1010,6 +1025,11 @@ func TestAPIContracts(t *testing.T) {
 					"cyber_policy_user_allowlist": "",
 					"cyber_session_block_enabled": false,
 					"cyber_session_block_ttl_seconds": 3600,
+					"openai_cyber_account_cooldown_enabled": false,
+					"openai_cyber_account_cooldown_window_seconds": 86400,
+					"openai_cyber_account_cooldown_first_seconds": 3600,
+					"openai_cyber_account_cooldown_escalated_seconds": 86400,
+					"openai_cyber_account_cooldown_group_ids": [12],
 					"affiliate_enabled": false,
 					"wechat_connect_enabled": false,
 					"wechat_connect_app_id": "",
@@ -1233,6 +1253,10 @@ func TestAPIContracts(t *testing.T) {
 					"rewrite_message_cache_control": false,
 					"enable_client_dateline_normalization": true,
 					"antigravity_user_agent_version": "",
+					"openai_codex_ticket_enabled": false,
+					"openai_codex_ticket_332_enabled": false,
+					"openai_codex_ticket_harvest_proxy_url": "",
+					"openai_codex_ticket_harvest_proxy_configured": false,
 					"min_codex_version": "",
 					"max_codex_version": "",
 					"codex_cli_only_blacklist": "",
@@ -1248,6 +1272,17 @@ func TestAPIContracts(t *testing.T) {
 					"openai_low_upstream_rate_priority_enabled": false,
 					"openai_oauth_scheduling_rate_multiplier": 1,
 					"openai_ttft_mode": "semantic",
+					"openai_window_warmup_allowlist": [],
+					"openai_window_warmup_batch_size": 20,
+					"openai_window_warmup_default_policy": "off",
+					"openai_window_warmup_enabled": false,
+					"openai_window_warmup_global_qps": 0.2,
+					"openai_window_warmup_lease_seconds": 120,
+					"openai_window_warmup_probe_model": "codex-auto-review",
+					"openai_window_warmup_request_timeout_seconds": 45,
+					"openai_window_warmup_reset_grace_seconds": 90,
+					"openai_window_warmup_scan_seconds": 30,
+					"openai_window_warmup_worker_concurrency": 1,
 					"openai_advanced_scheduler_enabled": false,
 					"openai_advanced_scheduler_sticky_weighted_enabled": false,
 					"openai_advanced_scheduler_subscription_priority_enabled": false,
@@ -1332,6 +1367,11 @@ func TestAPIContracts(t *testing.T) {
 					"cyber_policy_user_allowlist": "",
 					"cyber_session_block_enabled": false,
 					"cyber_session_block_ttl_seconds": 3600,
+					"openai_cyber_account_cooldown_enabled": false,
+					"openai_cyber_account_cooldown_window_seconds": 86400,
+					"openai_cyber_account_cooldown_first_seconds": 3600,
+					"openai_cyber_account_cooldown_escalated_seconds": 86400,
+					"openai_cyber_account_cooldown_group_ids": [12],
 					"affiliate_enabled": false,
 					"wechat_connect_enabled": true,
 					"wechat_connect_app_id": "wx-open-config",
@@ -1494,7 +1534,7 @@ func newContractDeps(t *testing.T) *contractDeps {
 	settingRepo := newStubSettingRepo()
 	settingService := service.NewSettingService(settingRepo, cfg)
 
-	adminService := service.NewAdminService(nil, userRepo, groupRepo, &accountRepo, proxyRepo, apiKeyRepo, redeemRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	adminService := service.NewAdminService(nil, userRepo, groupRepo, &accountRepo, proxyRepo, apiKeyRepo, redeemRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	authHandler := handler.NewAuthHandler(cfg, nil, userService, settingService, nil, redeemService, nil, nil)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
 	usageHandler := handler.NewUsageHandler(usageService, apiKeyService, nil, nil)
@@ -1910,6 +1950,14 @@ func (s *stubAccountRepo) UpdateWithAccountBillingSettings(
 	rateMultiplier *float64,
 ) error {
 	return errors.New("not implemented")
+}
+
+func (s *stubAccountRepo) UpdateAccountConfiguration(_ context.Context, mutation service.AccountConfigurationMutation) (*service.Account, error) {
+	if mutation.Desired == nil {
+		return nil, service.ErrAccountNilInput
+	}
+	account := *mutation.Desired
+	return &account, nil
 }
 
 func (s *stubAccountRepo) Delete(ctx context.Context, id int64) error {

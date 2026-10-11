@@ -52,6 +52,10 @@ export const buildOpenAIUsageRefreshKey = (account: Pick<Account, 'id' | 'platfo
   ].map(normalizeUsageRefreshValue).join('|')
 }
 
+export const buildOpenAIWarmupRefreshKey = (account: Pick<Account, 'openai_window_warmup'>): string => {
+  return serializeSnapshotRefreshValue(account.openai_window_warmup)
+}
+
 export const buildGrokUsageRefreshKey = (account: Pick<Account, 'platform' | 'extra'>): string => {
   if (account.platform !== 'grok') {
     return ''

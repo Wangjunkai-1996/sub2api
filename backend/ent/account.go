@@ -35,12 +35,18 @@ type Account struct {
 	Type string `json:"type,omitempty"`
 	// Credentials holds the value of the "credentials" field.
 	Credentials map[string]interface{} `json:"credentials,omitempty"`
+	// Monotonic OpenAI warmup identity generation; token refreshes do not advance it
+	OpenaiWarmupIdentityGeneration int64 `json:"openai_warmup_identity_generation,omitempty"`
 	// Extra holds the value of the "extra" field.
 	Extra map[string]interface{} `json:"extra,omitempty"`
 	// ProxyID holds the value of the "proxy_id" field.
 	ProxyID *int64 `json:"proxy_id,omitempty"`
 	// Original proxy id replaced by expiry-fallback; for manual revert. NULL = not in fallback.
 	ProxyFallbackOriginID *int64 `json:"proxy_fallback_origin_id,omitempty"`
+	// legacy uses proxy_id; pool uses account_egress_bindings
+	EgressMode account.EgressMode `json:"egress_mode,omitempty"`
+	// Monotonic egress configuration/cache fence
+	EgressRevision int64 `json:"egress_revision,omitempty"`
 	// Concurrency holds the value of the "concurrency" field.
 	Concurrency int `json:"concurrency,omitempty"`
 	// LoadFactor holds the value of the "load_factor" field.
@@ -93,6 +99,8 @@ type AccountEdges struct {
 	Groups []*Group `json:"groups,omitempty"`
 	// Proxy holds the value of the proxy edge.
 	Proxy *Proxy `json:"proxy,omitempty"`
+	// EgressRoutes holds the value of the egress_routes edge.
+	EgressRoutes []*EgressRoute `json:"egress_routes,omitempty"`
 	// Parent holds the value of the parent edge.
 	Parent *Account `json:"parent,omitempty"`
 	// Children holds the value of the children edge.
@@ -101,9 +109,11 @@ type AccountEdges struct {
 	UsageLogs []*UsageLog `json:"usage_logs,omitempty"`
 	// AccountGroups holds the value of the account_groups edge.
 	AccountGroups []*AccountGroup `json:"account_groups,omitempty"`
+	// EgressBindings holds the value of the egress_bindings edge.
+	EgressBindings []*AccountEgressBinding `json:"egress_bindings,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [6]bool
+	loadedTypes [8]bool
 }
 
 // GroupsOrErr returns the Groups value or an error if the edge
@@ -126,12 +136,21 @@ func (e AccountEdges) ProxyOrErr() (*Proxy, error) {
 	return nil, &NotLoadedError{edge: "proxy"}
 }
 
+// EgressRoutesOrErr returns the EgressRoutes value or an error if the edge
+// was not loaded in eager-loading.
+func (e AccountEdges) EgressRoutesOrErr() ([]*EgressRoute, error) {
+	if e.loadedTypes[2] {
+		return e.EgressRoutes, nil
+	}
+	return nil, &NotLoadedError{edge: "egress_routes"}
+}
+
 // ParentOrErr returns the Parent value or an error if the edge
 // was not loaded in eager-loading, or loaded but was not found.
 func (e AccountEdges) ParentOrErr() (*Account, error) {
 	if e.Parent != nil {
 		return e.Parent, nil
-	} else if e.loadedTypes[2] {
+	} else if e.loadedTypes[3] {
 		return nil, &NotFoundError{label: account.Label}
 	}
 	return nil, &NotLoadedError{edge: "parent"}
@@ -140,7 +159,7 @@ func (e AccountEdges) ParentOrErr() (*Account, error) {
 // ChildrenOrErr returns the Children value or an error if the edge
 // was not loaded in eager-loading.
 func (e AccountEdges) ChildrenOrErr() ([]*Account, error) {
-	if e.loadedTypes[3] {
+	if e.loadedTypes[4] {
 		return e.Children, nil
 	}
 	return nil, &NotLoadedError{edge: "children"}
@@ -149,7 +168,7 @@ func (e AccountEdges) ChildrenOrErr() ([]*Account, error) {
 // UsageLogsOrErr returns the UsageLogs value or an error if the edge
 // was not loaded in eager-loading.
 func (e AccountEdges) UsageLogsOrErr() ([]*UsageLog, error) {
-	if e.loadedTypes[4] {
+	if e.loadedTypes[5] {
 		return e.UsageLogs, nil
 	}
 	return nil, &NotLoadedError{edge: "usage_logs"}
@@ -158,10 +177,19 @@ func (e AccountEdges) UsageLogsOrErr() ([]*UsageLog, error) {
 // AccountGroupsOrErr returns the AccountGroups value or an error if the edge
 // was not loaded in eager-loading.
 func (e AccountEdges) AccountGroupsOrErr() ([]*AccountGroup, error) {
-	if e.loadedTypes[5] {
+	if e.loadedTypes[6] {
 		return e.AccountGroups, nil
 	}
 	return nil, &NotLoadedError{edge: "account_groups"}
+}
+
+// EgressBindingsOrErr returns the EgressBindings value or an error if the edge
+// was not loaded in eager-loading.
+func (e AccountEdges) EgressBindingsOrErr() ([]*AccountEgressBinding, error) {
+	if e.loadedTypes[7] {
+		return e.EgressBindings, nil
+	}
+	return nil, &NotLoadedError{edge: "egress_bindings"}
 }
 
 // scanValues returns the types for scanning values from sql.Rows.
@@ -175,9 +203,9 @@ func (*Account) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullBool)
 		case account.FieldRateMultiplier:
 			values[i] = new(sql.NullFloat64)
-		case account.FieldID, account.FieldProxyID, account.FieldProxyFallbackOriginID, account.FieldConcurrency, account.FieldLoadFactor, account.FieldPriority, account.FieldParentAccountID:
+		case account.FieldID, account.FieldOpenaiWarmupIdentityGeneration, account.FieldProxyID, account.FieldProxyFallbackOriginID, account.FieldEgressRevision, account.FieldConcurrency, account.FieldLoadFactor, account.FieldPriority, account.FieldParentAccountID:
 			values[i] = new(sql.NullInt64)
-		case account.FieldName, account.FieldNotes, account.FieldPlatform, account.FieldType, account.FieldStatus, account.FieldErrorMessage, account.FieldTempUnschedulableReason, account.FieldSessionWindowStatus, account.FieldQuotaDimension:
+		case account.FieldName, account.FieldNotes, account.FieldPlatform, account.FieldType, account.FieldEgressMode, account.FieldStatus, account.FieldErrorMessage, account.FieldTempUnschedulableReason, account.FieldSessionWindowStatus, account.FieldQuotaDimension:
 			values[i] = new(sql.NullString)
 		case account.FieldCreatedAt, account.FieldUpdatedAt, account.FieldDeletedAt, account.FieldLastUsedAt, account.FieldExpiresAt, account.FieldRateLimitedAt, account.FieldRateLimitResetAt, account.FieldOverloadUntil, account.FieldTempUnschedulableUntil, account.FieldSessionWindowStart, account.FieldSessionWindowEnd:
 			values[i] = new(sql.NullTime)
@@ -254,6 +282,12 @@ func (_m *Account) assignValues(columns []string, values []any) error {
 					return fmt.Errorf("unmarshal field credentials: %w", err)
 				}
 			}
+		case account.FieldOpenaiWarmupIdentityGeneration:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field openai_warmup_identity_generation", values[i])
+			} else if value.Valid {
+				_m.OpenaiWarmupIdentityGeneration = value.Int64
+			}
 		case account.FieldExtra:
 			if value, ok := values[i].(*[]byte); !ok {
 				return fmt.Errorf("unexpected type %T for field extra", values[i])
@@ -275,6 +309,18 @@ func (_m *Account) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ProxyFallbackOriginID = new(int64)
 				*_m.ProxyFallbackOriginID = value.Int64
+			}
+		case account.FieldEgressMode:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field egress_mode", values[i])
+			} else if value.Valid {
+				_m.EgressMode = account.EgressMode(value.String)
+			}
+		case account.FieldEgressRevision:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field egress_revision", values[i])
+			} else if value.Valid {
+				_m.EgressRevision = value.Int64
 			}
 		case account.FieldConcurrency:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
@@ -432,6 +478,11 @@ func (_m *Account) QueryProxy() *ProxyQuery {
 	return NewAccountClient(_m.config).QueryProxy(_m)
 }
 
+// QueryEgressRoutes queries the "egress_routes" edge of the Account entity.
+func (_m *Account) QueryEgressRoutes() *EgressRouteQuery {
+	return NewAccountClient(_m.config).QueryEgressRoutes(_m)
+}
+
 // QueryParent queries the "parent" edge of the Account entity.
 func (_m *Account) QueryParent() *AccountQuery {
 	return NewAccountClient(_m.config).QueryParent(_m)
@@ -450,6 +501,11 @@ func (_m *Account) QueryUsageLogs() *UsageLogQuery {
 // QueryAccountGroups queries the "account_groups" edge of the Account entity.
 func (_m *Account) QueryAccountGroups() *AccountGroupQuery {
 	return NewAccountClient(_m.config).QueryAccountGroups(_m)
+}
+
+// QueryEgressBindings queries the "egress_bindings" edge of the Account entity.
+func (_m *Account) QueryEgressBindings() *AccountEgressBindingQuery {
+	return NewAccountClient(_m.config).QueryEgressBindings(_m)
 }
 
 // Update returns a builder for updating this Account.
@@ -503,6 +559,9 @@ func (_m *Account) String() string {
 	builder.WriteString("credentials=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Credentials))
 	builder.WriteString(", ")
+	builder.WriteString("openai_warmup_identity_generation=")
+	builder.WriteString(fmt.Sprintf("%v", _m.OpenaiWarmupIdentityGeneration))
+	builder.WriteString(", ")
 	builder.WriteString("extra=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Extra))
 	builder.WriteString(", ")
@@ -515,6 +574,12 @@ func (_m *Account) String() string {
 		builder.WriteString("proxy_fallback_origin_id=")
 		builder.WriteString(fmt.Sprintf("%v", *v))
 	}
+	builder.WriteString(", ")
+	builder.WriteString("egress_mode=")
+	builder.WriteString(fmt.Sprintf("%v", _m.EgressMode))
+	builder.WriteString(", ")
+	builder.WriteString("egress_revision=")
+	builder.WriteString(fmt.Sprintf("%v", _m.EgressRevision))
 	builder.WriteString(", ")
 	builder.WriteString("concurrency=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Concurrency))

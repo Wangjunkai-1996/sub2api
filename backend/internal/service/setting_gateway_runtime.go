@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
@@ -285,6 +286,157 @@ func (s *SettingService) GetAntigravityUserAgentVersion(ctx context.Context) str
 		return version
 	}
 	return fallback
+}
+
+type cachedOpenAICodexTicketSettings struct {
+	enabled   bool
+	expiresAt int64
+}
+
+const openAICodexTicketEnabledCacheTTL = 5 * time.Second
+
+// codexTicketMasterSetting keeps v1 settings read-only for rollback instances.
+// A persisted legacy pair replaces the YAML pair as a whole. Invalid double
+// enable remains disabled; the explicit v2 master always takes precedence.
+func codexTicketMasterSetting(values map[string]string, fallback bool) bool {
+	if v := strings.TrimSpace(values[SettingKeyOpenAICodexTicketV2Enabled]); v != "" {
+		return v == "true"
+	}
+	legacy292 := strings.TrimSpace(values[SettingKeyOpenAICodexTicketEnabled])
+	legacy332 := strings.TrimSpace(values[SettingKeyOpenAICodexTicket332Enabled])
+	if legacy292 != "" || legacy332 != "" {
+		return (legacy292 == "true") != (legacy332 == "true")
+	}
+	return fallback
+}
+
+// GetOpenAICodexTicketEnabled reads the account-ticket master. The old switches
+// are only an upgrade fallback and do not select account plans or ticket length.
+func (s *SettingService) GetOpenAICodexTicketEnabled(ctx context.Context, fallback bool) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || s == nil || s.settingRepo == nil {
+		return fallback
+	}
+	if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
+		return cached.enabled
+	}
+	resultCh := s.openAICodexTicketEnabledSF.DoChan("openai_codex_ticket_master", func() (any, error) {
+		if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil && time.Now().UnixNano() < cached.expiresAt {
+			return cached, nil
+		}
+		dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		values, err := s.settingRepo.GetMultiple(dbCtx, []string{SettingKeyOpenAICodexTicketV2Enabled, SettingKeyOpenAICodexTicketEnabled, SettingKeyOpenAICodexTicket332Enabled})
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil {
+			if cached, ok := s.openAICodexTicketEnabledCache.Load().(*cachedOpenAICodexTicketSettings); ok && cached != nil {
+				return cached, nil
+			}
+			return &cachedOpenAICodexTicketSettings{enabled: fallback}, nil
+		}
+		cached := &cachedOpenAICodexTicketSettings{enabled: codexTicketMasterSetting(values, fallback), expiresAt: time.Now().Add(openAICodexTicketEnabledCacheTTL).UnixNano()}
+		s.openAICodexTicketEnabledCache.Store(cached)
+		return cached, nil
+	})
+	select {
+	case <-ctx.Done():
+		return fallback
+	case result := <-resultCh:
+		if v, ok := result.Val.(*cachedOpenAICodexTicketSettings); ok && result.Err == nil && v != nil {
+			return v.enabled
+		}
+		return fallback
+	}
+}
+
+func (s *SettingService) ResolveOpenAICodexTicketConfig(ctx context.Context, cfg config.OpenAICodexTicketConfig) config.OpenAICodexTicketConfig {
+	cfg.Enabled = s.GetOpenAICodexTicketEnabled(ctx, cfg.Enabled != cfg.Enabled332)
+	cfg.Enabled332 = false // legacy fallback is never a runtime mode
+	return cfg
+}
+
+func (s *SettingService) InvalidateOpenAICodexTicketEnabledCache() {
+	if s == nil {
+		return
+	}
+	s.openAICodexTicketEnabledSF.Forget("openai_codex_ticket_master")
+	s.openAICodexTicketEnabledCache.Store(&cachedOpenAICodexTicketSettings{expiresAt: 0})
+}
+
+type cachedOpenAICodexTicketHarvestProxy struct {
+	value     string
+	expiresAt int64
+}
+
+const openAICodexTicketHarvestProxyCacheTTL = 5 * time.Second
+
+// GetOpenAICodexTicketHarvestProxyURL 返回后台配置的 292/332 打票代理。空则调用方回退 yaml/env。
+func (s *SettingService) GetOpenAICodexTicketHarvestProxyURL(ctx context.Context) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ""
+	}
+	if s == nil || s.settingRepo == nil {
+		return ""
+	}
+	if cached, ok := s.openAICodexTicketHarvestProxyCache.Load().(*cachedOpenAICodexTicketHarvestProxy); ok && cached != nil {
+		if time.Now().UnixNano() < cached.expiresAt {
+			return cached.value
+		}
+	}
+	resultCh := s.openAICodexTicketHarvestProxySF.DoChan(SettingKeyOpenAICodexTicketHarvestProxyURL, func() (any, error) {
+		if cached, ok := s.openAICodexTicketHarvestProxyCache.Load().(*cachedOpenAICodexTicketHarvestProxy); ok && cached != nil {
+			if time.Now().UnixNano() < cached.expiresAt {
+				return cached.value, nil
+			}
+		}
+		dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		value, err := s.settingRepo.GetValue(dbCtx, SettingKeyOpenAICodexTicketHarvestProxyURL)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil && !errors.Is(err, ErrSettingNotFound) {
+			// Keep the last known proxy during transient storage failures.
+			if cached, ok := s.openAICodexTicketHarvestProxyCache.Load().(*cachedOpenAICodexTicketHarvestProxy); ok && cached != nil {
+				value = cached.value
+			}
+			s.openAICodexTicketHarvestProxyCache.Store(&cachedOpenAICodexTicketHarvestProxy{
+				value:     value,
+				expiresAt: time.Now().Add(time.Second).UnixNano(),
+			})
+			return value, nil
+		}
+		value = strings.TrimSpace(value)
+		s.openAICodexTicketHarvestProxyCache.Store(&cachedOpenAICodexTicketHarvestProxy{
+			value:     value,
+			expiresAt: time.Now().Add(openAICodexTicketHarvestProxyCacheTTL).UnixNano(),
+		})
+		return value, nil
+	})
+	select {
+	case <-ctx.Done():
+		return ""
+	case result := <-resultCh:
+		if v, ok := result.Val.(string); ok && result.Err == nil {
+			return v
+		}
+		return ""
+	}
+}
+
+func (s *SettingService) InvalidateOpenAICodexTicketHarvestProxyCache() {
+	if s == nil {
+		return
+	}
+	s.openAICodexTicketHarvestProxySF.Forget(SettingKeyOpenAICodexTicketHarvestProxyURL)
+	s.openAICodexTicketHarvestProxyCache.Store(&cachedOpenAICodexTicketHarvestProxy{expiresAt: 0})
 }
 
 // GetOpenAICodexUserAgent 返回 OpenAI Codex 上游请求使用的 User-Agent。

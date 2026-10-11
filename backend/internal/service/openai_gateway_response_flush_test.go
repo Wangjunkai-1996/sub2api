@@ -120,13 +120,16 @@ func (r *stagedOpenAISSEReadCloser) Close() error { return nil }
 type openAIResponseFlushReadError struct {
 	payload []byte
 	err     error
-	sent    bool
+	reader  *strings.Reader
 }
 
 func (r *openAIResponseFlushReadError) Read(data []byte) (int, error) {
-	if !r.sent {
-		r.sent = true
-		return copy(data, r.payload), nil
+	if r.reader == nil {
+		r.reader = strings.NewReader(string(r.payload))
+	}
+	if r.reader.Len() > 0 {
+		n, _ := r.reader.Read(data)
+		return n, nil
 	}
 	if r.err != nil {
 		return 0, r.err

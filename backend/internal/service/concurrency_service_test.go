@@ -16,6 +16,7 @@ import (
 
 // stubConcurrencyCacheForTest 用于并发服务单元测试的缓存桩
 type stubConcurrencyCacheForTest struct {
+	healthyOpenAI429TestCache
 	acquireResult        bool
 	acquireErr           error
 	releaseErr           error
@@ -58,6 +59,18 @@ type ingressLeaseCacheForTest struct {
 	acquireIngressCalls  int
 	refreshIngressCalls  int
 	releaseIngressCalls  int
+}
+
+type unboundedGateCacheForTest struct {
+	stubConcurrencyCacheForTest
+	gateResult bool
+	gateErr    error
+	gateCalls  int
+}
+
+func (c *unboundedGateCacheForTest) AcquireUnboundedAccountSlot(context.Context, int64, string) (bool, error) {
+	c.gateCalls++
+	return c.gateResult, c.gateErr
 }
 
 func (c *ingressLeaseCacheForTest) AcquireOpenAIWSIngressLease(ctx context.Context, apiKeyID int64, maxConnections int, leaseID string) (bool, error) {
@@ -222,6 +235,28 @@ func TestAcquireAccountSlot_UnlimitedConcurrency(t *testing.T) {
 		require.True(t, result.Acquired, "maxConcurrency=%d 应无限制通过", maxConcurrency)
 		require.NotNil(t, result.ReleaseFunc, "ReleaseFunc 应为 no-op 函数")
 	}
+}
+
+func TestAcquireAccountSlot_UnlimitedHonorsWarmupGateWithoutWaiting(t *testing.T) {
+	cache := &unboundedGateCacheForTest{gateResult: false}
+	svc := NewConcurrencyService(cache)
+
+	result, err := svc.AcquireAccountSlot(context.Background(), 1, 0)
+
+	require.NoError(t, err)
+	require.False(t, result.Acquired)
+	require.Equal(t, 1, cache.gateCalls)
+}
+
+func TestAcquireAccountSlot_UnlimitedWarmupGateRedisErrorFailsOpen(t *testing.T) {
+	cache := &unboundedGateCacheForTest{gateErr: errors.New("redis unavailable")}
+	svc := NewConcurrencyService(cache)
+
+	result, err := svc.AcquireAccountSlot(context.Background(), 1, 0)
+
+	require.NoError(t, err)
+	require.True(t, result.Acquired)
+	require.NotNil(t, result.ReleaseFunc)
 }
 
 func TestAcquireAccountSlot_CacheError(t *testing.T) {

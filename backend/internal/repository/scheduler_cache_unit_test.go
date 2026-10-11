@@ -110,7 +110,7 @@ func TestSchedulerCacheSnapshotAccountIDReusePreservesPayloadAndMembers(t *testi
 
 	wantFull, err := json.Marshal(validOne)
 	require.NoError(t, err)
-	wantMeta, err := json.Marshal(buildSchedulerMetadataAccount(validOne))
+	wantMeta, err := marshalSchedulerMetadataAccount(validOne)
 	require.NoError(t, err)
 	fullBefore, err := cache.rdb.Get(ctx, schedulerAccountKey("701")).Bytes()
 	require.NoError(t, err)
@@ -290,10 +290,217 @@ func TestMarshalSchedulerCacheAccountKeepsEncodingJSONWireFormat(t *testing.T) {
 			require.NoError(t, err)
 			wantFull, err := json.Marshal(tc.account)
 			require.NoError(t, err)
-			wantMeta, err := json.Marshal(buildSchedulerMetadataAccount(tc.account))
+			wantMeta, err := marshalSchedulerMetadataAccount(tc.account)
 			require.NoError(t, err)
 			require.Equal(t, wantFull, full)
 			require.Equal(t, wantMeta, meta)
+		})
+	}
+}
+
+func TestMarshalSchedulerCacheAccountRedactsEgressRuntimeAndTransport(t *testing.T) {
+	proxyID := int64(91)
+	identityID := int64(301)
+	observedIP := "203.0.113.91"
+	probeError := "dial proxy-secret.example:9443 as cache-user failed"
+	directScope := service.DefaultDirectEgressRuntimeScope
+	account := service.Account{
+		ID:             901,
+		Platform:       service.PlatformOpenAI,
+		Type:           service.AccountTypeOAuth,
+		EgressMode:     service.EgressModePool,
+		EgressRevision: 7,
+		Concurrency:    4,
+		Proxy: &service.Proxy{
+			ID:       proxyID,
+			Protocol: "http",
+			Host:     "existing-account-proxy.example",
+			Port:     8443,
+			Username: "existing-account-user",
+			Password: "existing-account-password",
+		},
+		EgressBindings: []service.AccountEgressBinding{{
+			BindingID: "901:41",
+			AccountID: 901,
+			RouteID:   41,
+			Position:  0,
+			IsPrimary: true,
+			Status:    service.AccountEgressBindingStatusActive,
+			Route: &service.EgressRoute{
+				ID:                 41,
+				Kind:               service.EgressRouteKindProxy,
+				ProxyID:            &proxyID,
+				ExpectedIdentityID: &identityID,
+				ExpectedIdentity: &service.EgressIdentity{
+					ID:       identityID,
+					PublicIP: observedIP,
+					Status:   service.EgressIdentityStatusActive,
+				},
+				State:          service.EgressRouteStateActive,
+				LastObservedIP: &observedIP,
+				Revision:       13,
+				LastError:      &probeError,
+				Proxy: &service.Proxy{
+					ID:       proxyID,
+					Protocol: "http",
+					Host:     "proxy-secret.example",
+					Port:     9443,
+					Username: "cache-user",
+					Password: "cache-password",
+				},
+			},
+		}, {
+			BindingID: "901:42",
+			AccountID: 901,
+			RouteID:   42,
+			Position:  1,
+			Status:    service.AccountEgressBindingStatusActive,
+			Route: &service.EgressRoute{
+				ID:                 42,
+				Kind:               service.EgressRouteKindDirect,
+				RuntimeScope:       &directScope,
+				ExpectedIdentityID: &identityID,
+				ExpectedIdentity: &service.EgressIdentity{
+					ID:     identityID,
+					Status: service.EgressIdentityStatusActive,
+				},
+				State:    service.EgressRouteStateActive,
+				Revision: 17,
+			},
+		}},
+		SelectedEgress: &service.ResolvedAccountEgress{
+			BindingID:     "901:41",
+			RouteID:       41,
+			IdentityID:    "301",
+			ConfigVersion: 99,
+			Lease:         &service.AccountEgressLease{ID: "request-lease-secret"},
+		},
+		EgressPoolWrite: &service.ReplaceAccountPoolInput{Mode: service.EgressModePool, RouteIDs: []int64{41}},
+	}
+
+	full, meta, err := marshalSchedulerCacheAccount(account)
+	require.NoError(t, err)
+	for _, payload := range [][]byte{full, meta} {
+		encoded := string(payload)
+		for _, secret := range []string{
+			"proxy-secret.example", "cache-user", "cache-password", observedIP,
+			probeError, "request-lease-secret", "SelectedEgress", "EgressPoolWrite",
+		} {
+			require.NotContains(t, encoded, secret)
+		}
+	}
+	require.Contains(t, string(full), "existing-account-proxy.example", "the pre-existing top-level Proxy cache contract remains intact")
+	require.NotContains(t, string(meta), "existing-account-proxy.example")
+
+	for _, payload := range [][]byte{full, meta} {
+		decoded, err := decodeCachedAccount(payload)
+		require.NoError(t, err)
+		require.Equal(t, service.EgressModePool, decoded.EgressMode)
+		require.Equal(t, int64(7), decoded.EgressRevision)
+		require.Equal(t, 4, decoded.Concurrency)
+		require.Len(t, decoded.EgressBindings, 2)
+		binding := decoded.EgressBindings[0]
+		require.Equal(t, "901:41", binding.BindingID)
+		require.True(t, binding.IsPrimary)
+		require.NotNil(t, binding.Route)
+		require.Equal(t, int64(13), binding.Route.Revision)
+		require.Nil(t, binding.Route.Proxy)
+		require.Nil(t, binding.Route.LastObservedIP)
+		require.Nil(t, binding.Route.LastError)
+		require.NotNil(t, binding.Route.ExpectedIdentity)
+		require.Equal(t, identityID, binding.Route.ExpectedIdentity.ID)
+		require.Empty(t, binding.Route.ExpectedIdentity.PublicIP)
+		require.NotNil(t, decoded.EgressBindings[1].Route.RuntimeScope)
+		require.Equal(t, service.DefaultDirectEgressRuntimeScope, *decoded.EgressBindings[1].Route.RuntimeScope)
+		require.Nil(t, decoded.SelectedEgress)
+		require.Nil(t, decoded.EgressPoolWrite)
+	}
+	decodedFull, err := decodeCachedAccount(full)
+	require.NoError(t, err)
+	require.NotNil(t, decodedFull.Proxy)
+	require.Equal(t, "existing-account-proxy.example", decodedFull.Proxy.Host)
+}
+
+func TestSchedulerCacheMetadataProjectionVersionSurvivesLegacyWriter(t *testing.T) {
+	for index, key := range []string{"openai_passthrough", "openai_oauth_passthrough"} {
+		t.Run(key, func(t *testing.T) {
+			ctx := context.Background()
+			cache := newSchedulerCacheUnit(t)
+			accountID := int64(383 + index)
+			bucket := service.SchedulerBucket{GroupID: accountID, Platform: service.PlatformOpenAI, Mode: service.SchedulerModeSingle}
+			account := service.Account{
+				ID:          accountID,
+				Platform:    service.PlatformOpenAI,
+				Type:        service.AccountTypeOAuth,
+				Status:      service.StatusActive,
+				Schedulable: true,
+				Credentials: map[string]any{
+					"model_mapping": map[string]any{"gpt-5.5": "gpt-5.5"},
+				},
+				Extra: map[string]any{key: true},
+			}
+
+			token, err := cache.CaptureBucketWriteToken(ctx, bucket)
+			require.NoError(t, err)
+			require.NoError(t, cache.SetSnapshot(ctx, bucket, token, []service.Account{account}))
+
+			metaKey := schedulerAccountMetaKey(strconv.FormatInt(account.ID, 10))
+			newPayload, err := cache.rdb.Get(ctx, metaKey).Bytes()
+			require.NoError(t, err)
+			var legacyReader service.Account
+			require.NoError(t, json.Unmarshal(newPayload, &legacyReader), "rollback slots must ignore the new top-level marker")
+			require.True(t, legacyReader.IsOpenAIPassthroughEnabled())
+
+			legacyProjection := buildSchedulerMetadataAccount(account)
+			delete(legacyProjection.Extra, key)
+			legacyPayload, err := json.Marshal(legacyProjection)
+			require.NoError(t, err)
+			require.NoError(t, cache.rdb.Set(ctx, metaKey, legacyPayload, 0).Err())
+
+			accounts, hit, err := cache.GetSnapshot(ctx, bucket)
+			require.NoError(t, err)
+			require.False(t, hit, "an unversioned rollback projection must trigger the existing database fallback")
+			require.Nil(t, accounts)
+
+			token, err = cache.CaptureBucketWriteToken(ctx, bucket)
+			require.NoError(t, err)
+			require.NoError(t, cache.SetSnapshot(ctx, bucket, token, []service.Account{account}), "fallback rebuild must restore a current projection")
+			accounts, hit, err = cache.GetSnapshot(ctx, bucket)
+			require.NoError(t, err)
+			require.True(t, hit)
+			require.Len(t, accounts, 1)
+			require.True(t, accounts[0].IsOpenAIPassthroughEnabled())
+			require.True(t, accounts[0].IsModelSupported("gpt-5.6-sol"))
+		})
+	}
+}
+
+func TestSchedulerCacheMetadataProjectionVersionKeepsExplicitPassthroughFalse(t *testing.T) {
+	for index, key := range []string{"openai_passthrough", "openai_oauth_passthrough"} {
+		t.Run(key, func(t *testing.T) {
+			ctx := context.Background()
+			cache := newSchedulerCacheUnit(t)
+			accountID := int64(385 + index)
+			bucket := service.SchedulerBucket{GroupID: accountID, Platform: service.PlatformOpenAI, Mode: service.SchedulerModeSingle}
+			account := service.Account{
+				ID:          accountID,
+				Platform:    service.PlatformOpenAI,
+				Type:        service.AccountTypeOAuth,
+				Status:      service.StatusActive,
+				Schedulable: true,
+				Extra:       map[string]any{key: false},
+			}
+
+			token, err := cache.CaptureBucketWriteToken(ctx, bucket)
+			require.NoError(t, err)
+			require.NoError(t, cache.SetSnapshot(ctx, bucket, token, []service.Account{account}))
+
+			accounts, hit, err := cache.GetSnapshot(ctx, bucket)
+			require.NoError(t, err)
+			require.True(t, hit, "a current projection with an explicit false switch is valid")
+			require.Len(t, accounts, 1)
+			require.Equal(t, false, accounts[0].Extra[key])
+			require.False(t, accounts[0].IsOpenAIPassthroughEnabled())
 		})
 	}
 }

@@ -111,6 +111,10 @@ func accountReadableSnapshotJSON(account *Account) []byte {
 	clone.Credentials = nil
 	clone.Groups = nil
 	clone.AccountGroups = nil
+	clone.OpenAIWarmupIdentityGeneration = 0
+	clone.EgressMode = ""
+	clone.EgressRevision = 0
+	clone.EgressBindings = nil
 	data, err := json.Marshal(&clone)
 	if err != nil {
 		return nil

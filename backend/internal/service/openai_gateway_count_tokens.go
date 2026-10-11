@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,8 +67,23 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 		return nil
 	}
 
-	token, _, err := s.GetAccessToken(ctx, account)
+	// Native token counting shares recovery admission, but does not acquire a
+	// generation slot or prove that generation capacity has recovered.
+	selection := &AccountSelectionResult{Account: account, Acquired: true}
+	if err := s.AdmitOpenAI429Selection(ctx, selection); err != nil {
+		return err
+	}
+	if selection.ReleaseFunc != nil {
+		defer selection.ReleaseFunc()
+	}
+	account = selection.Account
+
+	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
+		var failoverErr *UpstreamFailoverError
+		if errors.As(err, &failoverErr) && failoverErr.IsCredentialFailure() {
+			return err
+		}
 		writeOpenAIResponsesInputTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to get access token")
 		return fmt.Errorf("responses input_tokens: get access token: %w", err)
 	}
@@ -83,8 +99,12 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
+	upstreamReq, sendState := trackOpenAIUpstreamSend(upstreamReq)
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
+		if resp == nil && sendState.mayFailover(ctx, c, err) {
+			return s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
 		setOpsUpstreamError(c, 0, safeErr, "")
 		writeOpenAIResponsesInputTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
@@ -103,10 +123,14 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 			writeOpenAIResponsesInputTokensFallback(c, account, prepared, resp.StatusCode, "upstream_unsupported")
 			return nil
 		}
+		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+		if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody) {
+			shouldDisable := s.handleFailoverSideEffects(ctx, resp, account, respBody, prepared.UpstreamModel)
+			return s.newOpenAIAccountFailoverError(account, resp.StatusCode, resp.Header, respBody, upstreamMsg, shouldDisable, false)
+		}
 		if s.rateLimitService != nil {
 			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
 		}
-		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
 		setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, "")
 		writeOpenAIResponsesInputTokensError(c, resp.StatusCode, "upstream_error", "Upstream request failed")
 		if upstreamMsg == "" {
@@ -307,8 +331,12 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 		zap.String("upstream_model", prepared.UpstreamModel),
 	)
 
-	token, _, err := s.GetAccessToken(ctx, account)
+	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
+		var failoverErr *UpstreamFailoverError
+		if errors.As(err, &failoverErr) && failoverErr.IsCredentialFailure() {
+			return err
+		}
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to get access token")
 		return fmt.Errorf("get access token: %w", err)
 	}
@@ -323,26 +351,42 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
+	upstreamReq, sendState := trackOpenAIUpstreamSend(upstreamReq)
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
+		if resp == nil && sendState.mayFailover(ctx, c, err) {
+			return s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
 		setOpsUpstreamError(c, 0, safeErr, "")
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed")
 		return fmt.Errorf("openai input_tokens upstream request failed: %s", safeErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// Preserve every real upstream response, including a successful 2xx, so the
+	// health reporter can distinguish it from local estimation and conversion.
+	setOpsUpstreamError(c, resp.StatusCode, "", "")
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		setOpsUpstreamError(c, 0, "failed to read input_tokens upstream response", "")
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to read response")
 		return fmt.Errorf("read input_tokens response: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
 		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+		// Record the provider status before capability-specific fallbacks (such
+		// as OAuth/404 local estimation) so health reporting can distinguish a
+		// client/provider response from a successful upstream attempt.
+		setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, "")
 		if account.Type == AccountTypeOAuth && isOpenAIOAuthInputTokensUnsupported(resp.StatusCode, respBody) {
 			writeOpenAIOAuthInputTokensFallback(c, account, prepared, resp.StatusCode)
 			return nil
+		}
+		if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody) {
+			shouldDisable := s.handleFailoverSideEffects(ctx, resp, account, respBody, prepared.UpstreamModel)
+			return s.newOpenAIAccountFailoverError(account, resp.StatusCode, resp.Header, respBody, upstreamMsg, shouldDisable, false)
 		}
 
 		if s.rateLimitService != nil {
@@ -380,6 +424,10 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 
 	inputTokens := gjson.GetBytes(respBody, "input_tokens")
 	if !inputTokens.Exists() {
+		// A successful HTTP status with an unusable provider payload is still an
+		// upstream stream/protocol anomaly. Preserve that evidence before
+		// translating it into the client-facing error.
+		setOpsUpstreamError(c, resp.StatusCode, "stream error: upstream response missing input_tokens", "")
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream response missing input_tokens")
 		return fmt.Errorf("input_tokens response missing input_tokens field")
 	}

@@ -35,6 +35,13 @@ const (
 	// snapshotGraceTTLSeconds 旧快照过期的宽限期（秒）。
 	// 替代立即 DEL，让正在读取旧版本的 reader 有足够时间完成 ZRANGE。
 	snapshotGraceTTLSeconds = 60
+
+	// Version 1 includes the OpenAI passthrough switches required by candidate
+	// filtering. Production rollback writers predate this marker. Their payloads
+	// remain readable by old slots, while new readers treat them as cache misses
+	// and use the existing database fallback instead of interpreting omitted
+	// switches as false.
+	schedulerMetadataProjectionVersion = 1
 )
 
 const (
@@ -296,9 +303,12 @@ func (c *schedulerCache) GetSnapshot(ctx context.Context, bucket service.Schedul
 		if val == nil {
 			return nil, false, nil
 		}
-		account, err := decodeCachedAccount(val)
+		account, compatible, err := decodeSchedulerMetadataAccount(val)
 		if err != nil {
 			return nil, false, err
+		}
+		if !compatible {
+			return nil, false, nil
 		}
 		if err := applySchedulerLastUsed(account, lastUsedValues[i]); err != nil {
 			return nil, false, err
@@ -760,20 +770,46 @@ func applySchedulerLastUsed(account *service.Account, value any) error {
 }
 
 func decodeCachedAccount(val any) (*service.Account, error) {
-	var payload []byte
-	switch raw := val.(type) {
-	case string:
-		payload = []byte(raw)
-	case []byte:
-		payload = raw
-	default:
-		return nil, fmt.Errorf("unexpected account cache type: %T", val)
+	payload, err := schedulerCachePayload(val)
+	if err != nil {
+		return nil, err
 	}
 	var account service.Account
 	if err := json.Unmarshal(payload, &account); err != nil {
 		return nil, err
 	}
 	return &account, nil
+}
+
+type schedulerMetadataPayload struct {
+	service.Account
+	ProjectionVersion int `json:"_scheduler_metadata_projection_version"`
+}
+
+func decodeSchedulerMetadataAccount(val any) (*service.Account, bool, error) {
+	payload, err := schedulerCachePayload(val)
+	if err != nil {
+		return nil, false, err
+	}
+	var metadata schedulerMetadataPayload
+	if err := json.Unmarshal(payload, &metadata); err != nil {
+		return nil, false, err
+	}
+	if metadata.ProjectionVersion != schedulerMetadataProjectionVersion {
+		return nil, false, nil
+	}
+	return &metadata.Account, true, nil
+}
+
+func schedulerCachePayload(val any) ([]byte, error) {
+	switch raw := val.(type) {
+	case string:
+		return []byte(raw), nil
+	case []byte:
+		return raw, nil
+	default:
+		return nil, fmt.Errorf("unexpected account cache type: %T", val)
+	}
 }
 
 func (c *schedulerCache) writeAccountIDs(ctx context.Context, accounts []service.Account) ([]int64, error) {
@@ -827,15 +863,33 @@ func (c *schedulerCache) writeAccountIDs(ctx context.Context, accounts []service
 }
 
 func marshalSchedulerCacheAccount(account service.Account) ([]byte, []byte, error) {
-	fullPayload, err := json.Marshal(account)
+	fullPayload, err := json.Marshal(buildSchedulerFullAccount(account))
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal account: %w", err)
 	}
-	metaPayload, err := json.Marshal(buildSchedulerMetadataAccount(account))
+	metaPayload, err := marshalSchedulerMetadataAccount(account)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal account metadata: %w", err)
 	}
 	return fullPayload, metaPayload, nil
+}
+
+func marshalSchedulerMetadataAccount(account service.Account) ([]byte, error) {
+	return json.Marshal(schedulerMetadataPayload{
+		Account:           buildSchedulerMetadataAccount(account),
+		ProjectionVersion: schedulerMetadataProjectionVersion,
+	})
+}
+
+// buildSchedulerFullAccount keeps the full account payload used for request
+// hydration while replacing egress routes with the credential-free scheduler
+// projection. A selected lease and admin write intent are request-local and are
+// excluded by Account's JSON contract as a second line of defence.
+func buildSchedulerFullAccount(account service.Account) service.Account {
+	account.EgressBindings = buildSchedulerEgressBindings(account.EgressBindings)
+	account.SelectedEgress = nil
+	account.EgressPoolWrite = nil
+	return account
 }
 
 func (c *schedulerCache) mgetChunked(ctx context.Context, keys []string) ([]any, error) {
@@ -868,6 +922,9 @@ func buildSchedulerMetadataAccount(account service.Account) service.Account {
 		Name:                    account.Name,
 		Platform:                account.Platform,
 		Type:                    account.Type,
+		EgressMode:              account.EgressMode,
+		EgressRevision:          account.EgressRevision,
+		EgressBindings:          buildSchedulerEgressBindings(account.EgressBindings),
 		Concurrency:             account.Concurrency,
 		LoadFactor:              account.LoadFactor,
 		Priority:                account.Priority,
@@ -892,6 +949,65 @@ func buildSchedulerMetadataAccount(account service.Account) service.Account {
 		Credentials:             filterSchedulerCredentials(account.Credentials),
 		Extra:                   filterSchedulerExtra(account.Extra),
 	}
+}
+
+// buildSchedulerEgressBindings contains exactly the route state needed to
+// derive allocator candidates and its configuration version. It deliberately
+// omits public/observed IPs, probe errors, and the route's credential-bearing
+// Proxy. The authoritative account is reloaded after admission to resolve the
+// selected transport.
+func buildSchedulerEgressBindings(bindings []service.AccountEgressBinding) []service.AccountEgressBinding {
+	if bindings == nil {
+		return nil
+	}
+	projected := make([]service.AccountEgressBinding, 0, len(bindings))
+	for i := range bindings {
+		binding := bindings[i]
+		out := service.AccountEgressBinding{
+			BindingID: binding.BindingID,
+			AccountID: binding.AccountID,
+			RouteID:   binding.RouteID,
+			Position:  binding.Position,
+			IsPrimary: binding.IsPrimary,
+			Status:    binding.Status,
+		}
+		if binding.Route != nil {
+			route := binding.Route
+			out.Route = &service.EgressRoute{
+				ID:                 route.ID,
+				Kind:               route.Kind,
+				ProxyID:            cloneSchedulerInt64(route.ProxyID),
+				RuntimeScope:       cloneSchedulerString(route.RuntimeScope),
+				ExpectedIdentityID: cloneSchedulerInt64(route.ExpectedIdentityID),
+				State:              route.State,
+				Revision:           route.Revision,
+			}
+			if route.ExpectedIdentity != nil {
+				out.Route.ExpectedIdentity = &service.EgressIdentity{
+					ID:     route.ExpectedIdentity.ID,
+					Status: route.ExpectedIdentity.Status,
+				}
+			}
+		}
+		projected = append(projected, out)
+	}
+	return projected
+}
+
+func cloneSchedulerInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneSchedulerString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func filterSchedulerAccountGroups(accountGroups []service.AccountGroup) []service.AccountGroup {

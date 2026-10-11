@@ -411,6 +411,7 @@ func normalizeOpenAILongContextBillingUpdateExtra(account *Account, input *Updat
 // Grok media eligibility helpers live in account_grok_media_eligibility.go.
 
 func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]any) (*Account, error) {
+	accountExtra = MergeOpenAICodexTicketExtra(accountExtra, nil)
 	if input.Platform == PlatformTypeSafe && input.Type != AccountTypeAPIKey {
 		return nil, errors.New("typesafe accounts only support apikey credentials")
 	}
@@ -478,7 +479,88 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	return account, nil
 }
 
+func requestedProxyMatchesPoolMirror(current *int64, requested int64) bool {
+	if requested == 0 {
+		return current == nil
+	}
+	return current != nil && *current == requested
+}
+
+func currentAccountPoolWrite(account *Account, concurrency int) (*ReplaceAccountPoolInput, error) {
+	if account == nil || account.ID <= 0 || account.EgressMode != EgressModePool || account.EgressRevision <= 0 {
+		return nil, ErrEgressPoolInvalid
+	}
+	routeIDs := make([]int64, 0, len(account.EgressBindings))
+	primaryRouteID := int64(0)
+	for _, binding := range account.EgressBindings {
+		if binding.RouteID <= 0 {
+			return nil, ErrEgressPoolInvalid
+		}
+		routeIDs = append(routeIDs, binding.RouteID)
+		if binding.IsPrimary {
+			if primaryRouteID != 0 {
+				return nil, ErrEgressPoolInvalid
+			}
+			primaryRouteID = binding.RouteID
+		}
+	}
+	if len(routeIDs) == 0 || primaryRouteID == 0 {
+		return nil, ErrEgressPoolInvalid
+	}
+	revision := account.EgressRevision
+	return &ReplaceAccountPoolInput{
+		Mode:                 EgressModePool,
+		RouteIDs:             routeIDs,
+		PrimaryRouteID:       primaryRouteID,
+		ConcurrencyPerEgress: &concurrency,
+		ExpectedRevision:     &revision,
+	}, nil
+}
+
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	if input == nil {
+		return nil, ErrAccountNilInput
+	}
+	if input.EgressPool != nil && input.ProxyID != nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool")
+	}
+	if input.EgressPool != nil && (input.Platform != PlatformOpenAI || input.Type != AccountTypeOAuth) {
+		return nil, ErrEgressAccountUnsupported
+	}
+	// New OpenAI OAuth accounts inherit the verified deployment direct route
+	// when the caller did not explicitly choose a pool or legacy proxy.
+	// Explicit caller choices are never overwritten.
+	if input.EgressPool == nil && input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth && input.ProxyID == nil {
+		if s.egressService != nil {
+			route, err := s.egressService.EnsureDirectRoute(ctx, DefaultDirectEgressRuntimeScope)
+			if err != nil {
+				return nil, err
+			}
+			if route == nil {
+				return nil, ErrOpenAIOAuthDefaultEgress
+			}
+			pool, err := DefaultOpenAIOAuthDirectEgressPool([]EgressRoute{*route}, time.Now())
+			if err != nil {
+				return nil, err
+			}
+			if input.Concurrency > 0 {
+				concurrency := input.Concurrency
+				pool.ConcurrencyPerEgress = &concurrency
+			}
+			input.EgressPool = &pool
+		} else if s.settingService != nil {
+			// Keep the legacy path available to focused callers that have not
+			// installed the egress repository yet; production wiring always has it.
+			proxy, err := s.settingService.ResolveOpenAIOAuthDefaultProxy(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if proxy != nil {
+				input.ProxyID = &proxy.ID
+			}
+		}
+	}
+
 	accountExtra, err := normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
 	if err != nil {
 		return nil, err
@@ -535,14 +617,48 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err := s.ValidateAccountGroupBindings(ctx, groupIDs); err != nil {
 		return nil, err
 	}
-	if err := s.accountRepo.Create(ctx, account); err != nil {
-		return nil, err
-	}
+	if input.EgressPool != nil {
+		pool := *input.EgressPool
+		pool.RouteIDs = append([]int64(nil), input.EgressPool.RouteIDs...)
+		if strings.TrimSpace(pool.Mode) == "" {
+			pool.Mode = EgressModePool
+		}
+		if pool.ExpectedRevision != nil || pool.Mode != EgressModePool {
+			return nil, ErrEgressPoolInvalid
+		}
+		if pool.ConcurrencyPerEgress == nil {
+			concurrency := account.Concurrency
+			pool.ConcurrencyPerEgress = &concurrency
+		} else {
+			account.Concurrency = *pool.ConcurrencyPerEgress
+		}
+		if !validReplaceAccountPoolInput(pool) {
+			return nil, ErrEgressPoolInvalid
+		}
+		account.EgressMode = EgressModePool
+		account.EgressPoolWrite = &pool
+		account.ProxyID = nil
 
-	// 绑定分组
-	if len(groupIDs) > 0 {
-		if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
+		if s.accountDuplicateRepo == nil {
+			return nil, ErrEgressMutationFrozen
+		}
+		groups := make([]AccountGroup, 0, len(groupIDs))
+		for index, groupID := range groupIDs {
+			groups = append(groups, AccountGroup{GroupID: groupID, Priority: index + 1})
+		}
+		if err := s.accountDuplicateRepo.CreateWithAccountGroups(ctx, account, groups); err != nil {
 			return nil, err
+		}
+	} else {
+		if err := s.accountRepo.Create(ctx, account); err != nil {
+			return nil, err
+		}
+
+		// 绑定分组
+		if len(groupIDs) > 0 {
+			if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -575,12 +691,36 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 }
 
 func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *UpdateAccountInput) (*Account, error) {
+	if input == nil {
+		return nil, ErrAccountNilInput
+	}
+	credentialsPatch := maps.Clone(input.Credentials)
+	if input.EgressPool != nil && input.ProxyID != nil {
+		return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_PROXY_CONFLICT", "proxy_id cannot be set together with egress_pool")
+	}
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if account.Platform == PlatformTypeSafe && input.Type != "" && input.Type != AccountTypeAPIKey {
 		return nil, errors.New("typesafe accounts only support apikey credentials")
+	}
+	originalExtra := maps.Clone(account.Extra)
+	effectiveType := account.Type
+	if input.Type != "" {
+		effectiveType = input.Type
+	}
+	if (input.EgressPool != nil || account.EgressMode == EgressModePool) &&
+		(account.Platform != PlatformOpenAI || effectiveType != AccountTypeOAuth) {
+		return nil, ErrEgressAccountUnsupported
+	}
+	if account.EgressMode == EgressModePool && input.EgressPool == nil && input.ProxyID != nil {
+		if !requestedProxyMatchesPoolMirror(account.ProxyID, *input.ProxyID) {
+			return nil, ErrEgressPoolVersionRequired
+		}
+		// Old clients often echo the mirrored proxy_id. It is not an independent
+		// pool mutation and must not overwrite the authoritative primary route.
+		input.ProxyID = nil
 	}
 	var normalizedExtra map[string]any
 	if input.Extra != nil {
@@ -592,11 +732,11 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err != nil {
 			return nil, err
 		}
-		effectiveType := account.Type
+		effectiveTypeForExtra := account.Type
 		if input.Type != "" {
-			effectiveType = input.Type
+			effectiveTypeForExtra = input.Type
 		}
-		normalizedExtra, err = normalizeOpenAIAutoResetCreditExtra(account.Platform, effectiveType, account.IsShadow(), normalizedExtra)
+		normalizedExtra, err = normalizeOpenAIAutoResetCreditExtra(account.Platform, effectiveTypeForExtra, account.IsShadow(), normalizedExtra)
 		if err != nil {
 			return nil, err
 		}
@@ -707,6 +847,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 				normalizedExtra[key] = v
 			}
 		}
+		normalizedExtra = MergeOpenAICodexTicketExtra(normalizedExtra, account.Extra)
 		normalizedExtra = prepareCodexFingerprintExtraForUpdate(account, normalizedExtra)
 		account.Extra = normalizedExtra
 		if account.Platform == PlatformAntigravity && wasOveragesEnabled && !account.IsOveragesEnabled() {
@@ -803,6 +944,35 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if input.Concurrency != nil {
 		account.Concurrency = normalizeAccountConcurrency(account.Platform, account.Type, *input.Concurrency)
 	}
+	if input.EgressPool == nil && input.Concurrency != nil && account.EgressMode == EgressModePool && !account.IsCredentialShadow() {
+		input.EgressPool, err = currentAccountPoolWrite(account, account.Concurrency)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if input.EgressPool != nil {
+		pool := *input.EgressPool
+		pool.RouteIDs = append([]int64(nil), input.EgressPool.RouteIDs...)
+		if strings.TrimSpace(pool.Mode) == "" {
+			pool.Mode = EgressModePool
+		}
+		if pool.ExpectedRevision == nil {
+			return nil, ErrEgressPoolInvalid
+		}
+		if pool.ConcurrencyPerEgress == nil {
+			concurrency := account.Concurrency
+			pool.ConcurrencyPerEgress = &concurrency
+		} else {
+			if input.Concurrency != nil && account.Concurrency != *pool.ConcurrencyPerEgress {
+				return nil, infraerrors.BadRequest("ACCOUNT_EGRESS_POOL_CONCURRENCY_CONFLICT", "concurrency conflicts with egress_pool.concurrency_per_egress")
+			}
+			account.Concurrency = *pool.ConcurrencyPerEgress
+		}
+		if !validReplaceAccountPoolInput(pool) {
+			return nil, ErrEgressPoolInvalid
+		}
+		account.EgressPoolWrite = &pool
+	}
 	// 只在指针非 nil 时更新 Priority（支持设置为 0）
 	if input.Priority != nil {
 		account.Priority = *input.Priority
@@ -861,6 +1031,48 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 	}
 
+	configurationRepo := s.accountConfigRepo
+	if configurationRepo == nil {
+		configurationRepo, _ = s.accountRepo.(AccountConfigurationRepository)
+	}
+	if configurationRepo != nil {
+		fields := AccountConfigurationFieldMask{
+			Name:               input.Name != "",
+			Notes:              input.Notes != nil,
+			Type:               input.Type != "",
+			Credentials:        (account.IsCredentialShadow() && input.Credentials != nil) || len(input.Credentials) > 0,
+			Extra:              input.Extra != nil || !reflect.DeepEqual(originalExtra, account.Extra),
+			ProxyID:            input.ProxyID != nil && !account.IsCredentialShadow(),
+			Concurrency:        input.Concurrency != nil || account.EgressPoolWrite != nil,
+			Priority:           input.Priority != nil,
+			RateMultiplier:     input.RateMultiplier != nil,
+			LoadFactor:         input.LoadFactor != nil,
+			Status:             input.Status != "",
+			ExpiresAt:          input.ExpiresAt != nil,
+			AutoPauseOnExpired: input.AutoPauseOnExpired != nil,
+		}
+		var groupIDs *[]int64
+		if input.GroupIDs != nil {
+			copy := append([]int64(nil), (*input.GroupIDs)...)
+			groupIDs = &copy
+		}
+		return configurationRepo.UpdateAccountConfiguration(ctx, AccountConfigurationMutation{
+			Desired:          account,
+			Fields:           fields,
+			CredentialsPatch: credentialsPatch,
+			ProbeEnabled:     requestedProbeEnabledUpdate,
+			RateSyncEnabled:  requestedRateSyncEnabledUpdate,
+			EgressPool:       account.EgressPoolWrite,
+			GroupIDs:         groupIDs,
+		})
+	}
+	if account.EgressPoolWrite != nil {
+		return nil, ErrEgressMutationFrozen
+	}
+
+	// Compatibility for narrow in-memory service test doubles. Production wiring
+	// requires AccountConfigurationRepository through AdminAccountRepository and
+	// therefore always returns from the atomic path above.
 	billingSettingsAppliedAtomically := false
 	updater := s.accountBillingRepo
 	if updater == nil {
@@ -926,6 +1138,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 // UpdateAccountExtra 仅对 Extra JSONB 做 key 级合并，避免覆盖其它运行态键
 // （如 model_rate_limits / passive_usage_* 等）。
 func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, updates map[string]any) error {
+	updates = MergeOpenAICodexTicketExtra(updates, nil)
 	updates = sanitizedCodexFingerprintExtraUpdates(updates)
 	updates = stripOpenAIAutoResetCreditManagedExtra(updates, true)
 	delete(updates, UpstreamBillingProbeEnabledExtraKey)
@@ -955,6 +1168,7 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 // It merges credentials/extra keys instead of overwriting the whole object.
 func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error) {
 	// Managed probe/session state may only enter through dedicated typed endpoints.
+	input.Extra = MergeOpenAICodexTicketExtra(input.Extra, nil)
 	input.Extra = sanitizedCodexFingerprintExtraUpdates(input.Extra)
 	input.Extra = stripOpenAIAutoResetCreditManagedExtra(input.Extra, true)
 	delete(input.Extra, UpstreamBillingProbeEnabledExtraKey)

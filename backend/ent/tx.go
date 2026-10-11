@@ -18,6 +18,8 @@ type Tx struct {
 	APIKey *APIKeyClient
 	// Account is the client for interacting with the Account builders.
 	Account *AccountClient
+	// AccountEgressBinding is the client for interacting with the AccountEgressBinding builders.
+	AccountEgressBinding *AccountEgressBindingClient
 	// AccountGroup is the client for interacting with the AccountGroup builders.
 	AccountGroup *AccountGroupClient
 	// Announcement is the client for interacting with the Announcement builders.
@@ -44,6 +46,10 @@ type Tx struct {
 	ChannelMonitorRequestTemplate *ChannelMonitorRequestTemplateClient
 	// CompositeModelRoute is the client for interacting with the CompositeModelRoute builders.
 	CompositeModelRoute *CompositeModelRouteClient
+	// EgressIdentity is the client for interacting with the EgressIdentity builders.
+	EgressIdentity *EgressIdentityClient
+	// EgressRoute is the client for interacting with the EgressRoute builders.
+	EgressRoute *EgressRouteClient
 	// ErrorPassthroughRule is the client for interacting with the ErrorPassthroughRule builders.
 	ErrorPassthroughRule *ErrorPassthroughRuleClient
 	// Group is the client for interacting with the Group builders.
@@ -225,6 +231,7 @@ func (tx *Tx) Client() *Client {
 func (tx *Tx) init() {
 	tx.APIKey = NewAPIKeyClient(tx.config)
 	tx.Account = NewAccountClient(tx.config)
+	tx.AccountEgressBinding = NewAccountEgressBindingClient(tx.config)
 	tx.AccountGroup = NewAccountGroupClient(tx.config)
 	tx.Announcement = NewAnnouncementClient(tx.config)
 	tx.AnnouncementRead = NewAnnouncementReadClient(tx.config)
@@ -238,6 +245,8 @@ func (tx *Tx) init() {
 	tx.ChannelMonitorHistory = NewChannelMonitorHistoryClient(tx.config)
 	tx.ChannelMonitorRequestTemplate = NewChannelMonitorRequestTemplateClient(tx.config)
 	tx.CompositeModelRoute = NewCompositeModelRouteClient(tx.config)
+	tx.EgressIdentity = NewEgressIdentityClient(tx.config)
+	tx.EgressRoute = NewEgressRouteClient(tx.config)
 	tx.ErrorPassthroughRule = NewErrorPassthroughRuleClient(tx.config)
 	tx.Group = NewGroupClient(tx.config)
 	tx.IdempotencyRecord = NewIdempotencyRecordClient(tx.config)
