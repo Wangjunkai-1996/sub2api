@@ -45,16 +45,28 @@ type probeSequenceResponse struct {
 type probeSequenceProber struct {
 	responses []probeSequenceResponse
 	calls     int
+	urls      []string
 }
 
-func (p *probeSequenceProber) ProbeProxy(context.Context, string) (*ProxyExitInfo, int64, error) {
+func (p *probeSequenceProber) ProbeProxy(_ context.Context, proxyURL string) (*ProxyExitInfo, int64, error) {
 	index := p.calls
 	p.calls++
+	p.urls = append(p.urls, proxyURL)
 	if index >= len(p.responses) {
 		return nil, 1, errors.New("unexpected probe call")
 	}
 	response := p.responses[index]
 	return response.info, 1, response.err
+}
+
+func directProbeRouteForTest(state, ip string) EgressRoute {
+	scope := DefaultDirectEgressRuntimeScope
+	identity := &EgressIdentity{ID: 1, PublicIP: ip, Status: EgressIdentityStatusActive}
+	return EgressRoute{
+		ID: 1, Kind: EgressRouteKindDirect, State: state, Revision: 1,
+		RuntimeScope: &scope,
+		ExpectedIdentity: identity, ExpectedIdentityID: &identity.ID,
+	}
 }
 
 func probeRouteForTest(state, ip string) EgressRoute {
@@ -138,6 +150,17 @@ func TestProbeRouteSuccessReflectsPersistedIdentityMismatch(t *testing.T) {
 	require.False(t, result.Success)
 	require.Equal(t, EgressProbeReasonIdentityMismatch, result.ReasonCode)
 	require.Equal(t, EgressRouteStateIdentityMismatch, result.Route.State)
+}
+
+func TestProbeRouteDirectUsesDeploymentEgressWithoutProxy(t *testing.T) {
+	repo := &probeRouteRepositoryStub{route: directProbeRouteForTest(EgressRouteStateActive, "198.51.100.10")}
+	prober := &probeSequenceProber{responses: []probeSequenceResponse{{info: &ProxyExitInfo{IP: "198.51.100.10"}}}}
+	result := NewEgressService(repo, prober).probeRoute(context.Background(), 1)
+
+	require.True(t, result.Success)
+	require.Equal(t, []string{""}, prober.urls)
+	require.Len(t, repo.observations, 1)
+	require.Equal(t, "198.51.100.10", repo.observations[0].ObservedIP)
 }
 
 type unavailableEgressProbeRepository struct {

@@ -68,6 +68,17 @@ func activeVerificationProxyRoute(id int64, lastProbedAt *time.Time, now time.Ti
 	}
 }
 
+func activeVerificationDirectRoute(id int64, lastProbedAt *time.Time) EgressRoute {
+	scope := DefaultDirectEgressRuntimeScope
+	return EgressRoute{
+		ID:           id,
+		Kind:         EgressRouteKindDirect,
+		State:        EgressRouteStateActive,
+		RuntimeScope: &scope,
+		LastProbedAt: lastProbedAt,
+	}
+}
+
 func TestEgressIdentityVerificationTimingContract(t *testing.T) {
 	require.Greater(t, EgressIdentityFreshness, EgressIdentityReverifyInterval)
 	require.Less(t, egressIdentityReverifyTimeout, EgressIdentityReverifyInterval)
@@ -81,7 +92,7 @@ func TestSelectEgressIdentityVerificationRoutesFiltersAndOrdersOldestFirst(t *te
 		activeVerificationProxyRoute(3, &newest, now),
 		activeVerificationProxyRoute(1, nil, now),
 		activeVerificationProxyRoute(2, &oldest, now),
-		{ID: 4, Kind: EgressRouteKindDirect, State: EgressRouteStateActive},
+		activeVerificationDirectRoute(4, &oldest),
 		activeVerificationProxyRoute(5, nil, now),
 		activeVerificationProxyRoute(6, nil, now),
 		activeVerificationProxyRoute(7, nil, now),
@@ -99,7 +110,19 @@ func TestSelectEgressIdentityVerificationRoutesFiltersAndOrdersOldestFirst(t *te
 	})
 
 	worker := newEgressIdentityVerificationWorker(nil)
-	require.Equal(t, []int64{1, 2, 3}, worker.selectEgressIdentityVerificationRouteIDs(routes, now))
+	require.Equal(t, []int64{1, 2, 4, 3}, worker.selectEgressIdentityVerificationRouteIDs(routes, now))
+}
+
+func TestSelectEgressIdentityVerificationRoutesIncludesDirectRoutes(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	oldest := now.Add(-10 * time.Minute)
+	routes := []EgressRoute{
+		activeVerificationDirectRoute(11, &oldest),
+		activeVerificationProxyRoute(12, nil, now),
+	}
+
+	worker := newEgressIdentityVerificationWorker(nil)
+	require.Equal(t, []int64{12, 11}, worker.selectEgressIdentityVerificationRouteIDs(routes, now))
 }
 
 func TestSelectEgressIdentityVerificationRoutesReturnsEntireSortedBacklog(t *testing.T) {

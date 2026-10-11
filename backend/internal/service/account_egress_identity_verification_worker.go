@@ -29,9 +29,9 @@ type egressIdentityVerificationService interface {
 	ProbeRoutes(ctx context.Context, routeIDs []int64) ([]EgressProbeResult, error)
 }
 
-// EgressIdentityVerificationWorker periodically revalidates proxy exit
-// identities. ProbeRoutes owns probing and persistence; this worker only picks
-// a fair backlog, submits bounded batches, and manages its lifecycle.
+// EgressIdentityVerificationWorker periodically revalidates proxy and direct
+// exit identities. ProbeRoutes owns probing and persistence; this worker only
+// picks a fair backlog, submits bounded batches, and manages its lifecycle.
 type EgressIdentityVerificationWorker struct {
 	service  egressIdentityVerificationService
 	interval time.Duration
@@ -232,7 +232,7 @@ func (w *EgressIdentityVerificationWorker) selectEgressIdentityVerificationRoute
 	eligible := make(map[int64]struct{}, len(routes))
 	for i := range routes {
 		route := &routes[i]
-		if route.ID <= 0 || route.Kind != EgressRouteKindProxy ||
+		if route.ID <= 0 || (route.Kind != EgressRouteKindProxy && route.Kind != EgressRouteKindDirect) ||
 			route.State == EgressRouteStateRetired || route.State == EgressRouteStateExpired ||
 			!routeCanBeProbed(route, now) {
 			continue
