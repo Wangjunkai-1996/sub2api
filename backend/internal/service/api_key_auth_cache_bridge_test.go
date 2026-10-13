@@ -16,17 +16,12 @@ type legacyV24APIKeyAuthCacheEntry struct {
 		Version  int   `json:"version"`
 		APIKeyID int64 `json:"api_key_id"`
 		Group    *struct {
-			SchedulerType              string                     `json:"scheduler_type"`
-			AdvancedSchedulerOverrides AdvancedSchedulerOverrides `json:"advanced_scheduler_overrides"`
 		} `json:"group,omitempty"`
 	} `json:"snapshot,omitempty"`
 }
 
 func TestAPIKeyAuthSnapshotBridgeRoundTrip(t *testing.T) {
 	groupID := int64(50)
-	stickyWeighted := false
-	lbTopK := 7
-	weightLoad := 0.35
 	apiKey := &APIKey{
 		ID:          82,
 		UserID:      40,
@@ -67,12 +62,6 @@ func TestAPIKeyAuthSnapshotBridgeRoundTrip(t *testing.T) {
 			ProfitControlEnabled: true,
 			ProfitMinMargin:      0.2,
 			ProfitSafetyBuffer:   0.05,
-			SchedulerType:        GroupSchedulerTypeAdvanced,
-			AdvancedSchedulerOverrides: AdvancedSchedulerOverrides{
-				StickyWeightedEnabled: &stickyWeighted,
-				LBTopK:                &lbTopK,
-				WeightLoad:            &weightLoad,
-			},
 		},
 	}
 
@@ -91,8 +80,16 @@ func TestAPIKeyAuthSnapshotBridgeRoundTrip(t *testing.T) {
 	require.Equal(t, 24, legacy.Snapshot.Version)
 	require.Equal(t, apiKey.ID, legacy.Snapshot.APIKeyID)
 	require.NotNil(t, legacy.Snapshot.Group)
-	require.Equal(t, GroupSchedulerTypeAdvanced, legacy.Snapshot.Group.SchedulerType)
-	require.Equal(t, apiKey.Group.AdvancedSchedulerOverrides, legacy.Snapshot.Group.AdvancedSchedulerOverrides)
+
+	// A cache written by the retired fork still contains group overrides.
+	// Decode it without restoring the feature or dropping ordinary group policy.
+	var oldPayload map[string]any
+	require.NoError(t, json.Unmarshal(payload, &oldPayload))
+	oldGroup := oldPayload["snapshot"].(map[string]any)["group"].(map[string]any)
+	oldGroup["scheduler_type"] = "advanced"
+	oldGroup["advanced_scheduler_overrides"] = map[string]any{"lb_top_k": 7}
+	payload, err = json.Marshal(oldPayload)
+	require.NoError(t, err)
 
 	var restored APIKeyAuthCacheEntry
 	require.NoError(t, json.Unmarshal(payload, &restored))
@@ -117,8 +114,10 @@ func TestAPIKeyAuthSnapshotBridgeRoundTrip(t *testing.T) {
 	require.Equal(t, apiKey.Group.MaxReasoningEffort, materialized.Group.MaxReasoningEffort)
 	require.Equal(t, apiKey.Group.MaxReasoningEffortOverLimit, materialized.Group.MaxReasoningEffortOverLimit)
 	require.Equal(t, apiKey.Group.ReasoningEffortMappings, materialized.Group.ReasoningEffortMappings)
-	require.Equal(t, apiKey.Group.SchedulerType, materialized.Group.SchedulerType)
-	require.Equal(t, apiKey.Group.AdvancedSchedulerOverrides, materialized.Group.AdvancedSchedulerOverrides)
+	cleanPayload, err := json.Marshal(restored)
+	require.NoError(t, err)
+	require.NotContains(t, string(cleanPayload), "scheduler_type")
+	require.NotContains(t, string(cleanPayload), "advanced_scheduler_overrides")
 }
 
 func TestAPIKeyAuthSnapshotVersionCompatibility(t *testing.T) {

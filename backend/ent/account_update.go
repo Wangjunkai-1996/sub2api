@@ -126,27 +126,6 @@ func (_u *AccountUpdate) SetCredentials(v map[string]interface{}) *AccountUpdate
 	return _u
 }
 
-// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
-func (_u *AccountUpdate) SetOpenaiWarmupIdentityGeneration(v int64) *AccountUpdate {
-	_u.mutation.ResetOpenaiWarmupIdentityGeneration()
-	_u.mutation.SetOpenaiWarmupIdentityGeneration(v)
-	return _u
-}
-
-// SetNillableOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field if the given value is not nil.
-func (_u *AccountUpdate) SetNillableOpenaiWarmupIdentityGeneration(v *int64) *AccountUpdate {
-	if v != nil {
-		_u.SetOpenaiWarmupIdentityGeneration(*v)
-	}
-	return _u
-}
-
-// AddOpenaiWarmupIdentityGeneration adds value to the "openai_warmup_identity_generation" field.
-func (_u *AccountUpdate) AddOpenaiWarmupIdentityGeneration(v int64) *AccountUpdate {
-	_u.mutation.AddOpenaiWarmupIdentityGeneration(v)
-	return _u
-}
-
 // SetExtra sets the "extra" field.
 func (_u *AccountUpdate) SetExtra(v map[string]interface{}) *AccountUpdate {
 	_u.mutation.SetExtra(v)
@@ -865,11 +844,6 @@ func (_u *AccountUpdate) check() error {
 			return &ValidationError{Name: "type", err: fmt.Errorf(`ent: validator failed for field "Account.type": %w`, err)}
 		}
 	}
-	if v, ok := _u.mutation.OpenaiWarmupIdentityGeneration(); ok {
-		if err := account.OpenaiWarmupIdentityGenerationValidator(v); err != nil {
-			return &ValidationError{Name: "openai_warmup_identity_generation", err: fmt.Errorf(`ent: validator failed for field "Account.openai_warmup_identity_generation": %w`, err)}
-		}
-	}
 	if v, ok := _u.mutation.EgressMode(); ok {
 		if err := account.EgressModeValidator(v); err != nil {
 			return &ValidationError{Name: "egress_mode", err: fmt.Errorf(`ent: validator failed for field "Account.egress_mode": %w`, err)}
@@ -936,12 +910,6 @@ func (_u *AccountUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.Credentials(); ok {
 		_spec.SetField(account.FieldCredentials, field.TypeJSON, value)
-	}
-	if value, ok := _u.mutation.OpenaiWarmupIdentityGeneration(); ok {
-		_spec.SetField(account.FieldOpenaiWarmupIdentityGeneration, field.TypeInt64, value)
-	}
-	if value, ok := _u.mutation.AddedOpenaiWarmupIdentityGeneration(); ok {
-		_spec.AddField(account.FieldOpenaiWarmupIdentityGeneration, field.TypeInt64, value)
 	}
 	if value, ok := _u.mutation.Extra(); ok {
 		_spec.SetField(account.FieldExtra, field.TypeJSON, value)
@@ -1442,27 +1410,6 @@ func (_u *AccountUpdateOne) SetNillableType(v *string) *AccountUpdateOne {
 // SetCredentials sets the "credentials" field.
 func (_u *AccountUpdateOne) SetCredentials(v map[string]interface{}) *AccountUpdateOne {
 	_u.mutation.SetCredentials(v)
-	return _u
-}
-
-// SetOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field.
-func (_u *AccountUpdateOne) SetOpenaiWarmupIdentityGeneration(v int64) *AccountUpdateOne {
-	_u.mutation.ResetOpenaiWarmupIdentityGeneration()
-	_u.mutation.SetOpenaiWarmupIdentityGeneration(v)
-	return _u
-}
-
-// SetNillableOpenaiWarmupIdentityGeneration sets the "openai_warmup_identity_generation" field if the given value is not nil.
-func (_u *AccountUpdateOne) SetNillableOpenaiWarmupIdentityGeneration(v *int64) *AccountUpdateOne {
-	if v != nil {
-		_u.SetOpenaiWarmupIdentityGeneration(*v)
-	}
-	return _u
-}
-
-// AddOpenaiWarmupIdentityGeneration adds value to the "openai_warmup_identity_generation" field.
-func (_u *AccountUpdateOne) AddOpenaiWarmupIdentityGeneration(v int64) *AccountUpdateOne {
-	_u.mutation.AddOpenaiWarmupIdentityGeneration(v)
 	return _u
 }
 
@@ -2197,11 +2144,6 @@ func (_u *AccountUpdateOne) check() error {
 			return &ValidationError{Name: "type", err: fmt.Errorf(`ent: validator failed for field "Account.type": %w`, err)}
 		}
 	}
-	if v, ok := _u.mutation.OpenaiWarmupIdentityGeneration(); ok {
-		if err := account.OpenaiWarmupIdentityGenerationValidator(v); err != nil {
-			return &ValidationError{Name: "openai_warmup_identity_generation", err: fmt.Errorf(`ent: validator failed for field "Account.openai_warmup_identity_generation": %w`, err)}
-		}
-	}
 	if v, ok := _u.mutation.EgressMode(); ok {
 		if err := account.EgressModeValidator(v); err != nil {
 			return &ValidationError{Name: "egress_mode", err: fmt.Errorf(`ent: validator failed for field "Account.egress_mode": %w`, err)}
@@ -2285,12 +2227,6 @@ func (_u *AccountUpdateOne) sqlSave(ctx context.Context) (_node *Account, err er
 	}
 	if value, ok := _u.mutation.Credentials(); ok {
 		_spec.SetField(account.FieldCredentials, field.TypeJSON, value)
-	}
-	if value, ok := _u.mutation.OpenaiWarmupIdentityGeneration(); ok {
-		_spec.SetField(account.FieldOpenaiWarmupIdentityGeneration, field.TypeInt64, value)
-	}
-	if value, ok := _u.mutation.AddedOpenaiWarmupIdentityGeneration(); ok {
-		_spec.AddField(account.FieldOpenaiWarmupIdentityGeneration, field.TypeInt64, value)
 	}
 	if value, ok := _u.mutation.Extra(); ok {
 		_spec.SetField(account.FieldExtra, field.TypeJSON, value)

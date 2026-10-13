@@ -97,20 +97,15 @@ type Config struct {
 	UsageCleanup            UsageCleanupConfig            `mapstructure:"usage_cleanup"`
 	Concurrency             ConcurrencyConfig             `mapstructure:"concurrency"`
 	TokenRefresh            TokenRefreshConfig            `mapstructure:"token_refresh"`
-	// OpenAIWindowWarmupWorkerEnabled controls whether this process runs the
-	// durable Codex five-hour warmup worker. Text/API slots keep the default
-	// enabled; image-only slots must set OPENAI_WINDOW_WARMUP_WORKER_ENABLED=false
-	// so they cannot compete for shared warmup jobs.
-	OpenAIWindowWarmupWorkerEnabled bool               `mapstructure:"openai_window_warmup_worker_enabled"`
-	SimpleMode                      SimpleModeConfig   `mapstructure:"simple_mode" yaml:"simple_mode"`
-	RunMode                         string             `mapstructure:"run_mode" yaml:"run_mode"`
-	Timezone                        string             `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
-	Gemini                          GeminiConfig       `mapstructure:"gemini"`
-	Update                          UpdateConfig       `mapstructure:"update"`
-	Idempotency                     IdempotencyConfig  `mapstructure:"idempotency"`
-	BatchImage                      BatchImageConfig   `mapstructure:"batch_image"`
-	ImageStorage                    ImageStorageConfig `mapstructure:"image_storage"`
-	Plugins                         PluginConfig       `mapstructure:"plugins"`
+	SimpleMode              SimpleModeConfig              `mapstructure:"simple_mode" yaml:"simple_mode"`
+	RunMode                 string                        `mapstructure:"run_mode" yaml:"run_mode"`
+	Timezone                string                        `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
+	Gemini                  GeminiConfig                  `mapstructure:"gemini"`
+	Update                  UpdateConfig                  `mapstructure:"update"`
+	Idempotency             IdempotencyConfig             `mapstructure:"idempotency"`
+	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
+	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
+	Plugins                 PluginConfig                  `mapstructure:"plugins"`
 
 	// Enforce only API-key spending windows in simple mode.
 	SimpleModeKeyRateLimitEnabled bool `mapstructure:"simple_mode_key_rate_limit_enabled" yaml:"simple_mode_key_rate_limit_enabled"`
@@ -1018,10 +1013,6 @@ type GatewayConfig struct {
 	// OpenAIRetryBudgetSeconds: 请求入口后的错误重试/换号资格窗口（秒）。
 	// 0 自动使用 min(300, OpenAIRequestBudgetSeconds 的有效值)，不会禁用重试窗口。
 	OpenAIRetryBudgetSeconds int `mapstructure:"openai_retry_budget_seconds"`
-	// OpenAIAtomicStreamFailover: native HTTP Responses 流式请求在最终成功事件前
-	// 是否暂存整段 SSE，以便上游晚到的失败可以安全重试或切换账号。
-	// 通过 Load 加载时默认关闭；仅在明确需要原子 failover 时开启。
-	OpenAIAtomicStreamFailover bool `mapstructure:"openai_atomic_stream_failover"`
 	// 请求体最大字节数，用于网关请求体大小限制
 	MaxBodySize int64 `mapstructure:"max_body_size"`
 	// TextMaxBodySize limits endpoints that cannot carry inline image/video payloads.
@@ -1066,9 +1057,6 @@ type GatewayConfig struct {
 	// OpenAICompactModel: /responses/compact 上游使用的模型。
 	// compact 端点支持模型滞后于普通 /responses 时，可用该配置降级规避上游错误。
 	OpenAICompactModel string `mapstructure:"openai_compact_model"`
-	// OpenAICodexTicket: ChatGPT OAuth 账号按 (账号, 模型) 捕获 292 长度
-	// x-codex-turn-state，并在住宅 IP 业务请求中注入该头。默认关闭。
-	OpenAICodexTicket OpenAICodexTicketConfig `mapstructure:"openai_codex_ticket"`
 	// OpenAIWS: OpenAI Responses WebSocket 配置（默认开启，可按需回滚到 HTTP）
 	OpenAIWS GatewayOpenAIWSConfig `mapstructure:"openai_ws"`
 	// Live: ChatGPT Frameless Live 会话配置。
@@ -1303,24 +1291,6 @@ func (c *UserMessageQueueConfig) GetEffectiveMode() string {
 		return UMQModeSerialize // 向后兼容
 	}
 	return ""
-}
-
-// OpenAICodexTicketConfig 控制 ChatGPT OAuth 的 x-codex-turn-state 门票。
-// 打票走 harvest_proxy_url（SOCKS），业务出站仍用账号住宅 proxy_id，只替换该请求头。
-// Enabled 是主开关；Enabled332 仅用于读取旧配置。票据长度由账号 Pro/Team 控制。
-// 门票默认有效 3600 秒，临近过期前 refresh_before_seconds 重新打票。
-type OpenAICodexTicketConfig struct {
-	Enabled                      bool     `mapstructure:"enabled"`
-	Enabled332                   bool     `mapstructure:"enabled_332"`
-	TargetLength                 int      `mapstructure:"target_length"`
-	TTLSeconds                   int      `mapstructure:"ttl_seconds"`
-	RefreshBeforeSeconds         int      `mapstructure:"refresh_before_seconds"`
-	HarvestProxyURL              string   `mapstructure:"harvest_proxy_url"`
-	HarvestDialProxyURL          string   `mapstructure:"harvest_dial_proxy_url"`
-	HarvestProbeIntervalSeconds  int      `mapstructure:"harvest_probe_interval_seconds"`
-	HarvestAttemptTimeoutSeconds int      `mapstructure:"harvest_attempt_timeout_seconds"`
-	FailClosed                   bool     `mapstructure:"fail_closed"`
-	Models                       []string `mapstructure:"models"`
 }
 
 // DefaultOpenAIWSClientFirstMessageTimeoutSeconds preserves the legacy ingress deadline.
@@ -1913,9 +1883,6 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if err := viper.BindEnv("server.enable_server_timing", "ENABLE_SERVER_TIMING"); err != nil {
 		return nil, fmt.Errorf("bind ENABLE_SERVER_TIMING: %w", err)
 	}
-	if err := viper.BindEnv("openai_window_warmup_worker_enabled", "OPENAI_WINDOW_WARMUP_WORKER_ENABLED"); err != nil {
-		return nil, fmt.Errorf("bind OPENAI_WINDOW_WARMUP_WORKER_ENABLED: %w", err)
-	}
 
 	// 默认值
 	setDefaults()
@@ -2503,7 +2470,6 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_retry_budget_seconds", 0)
 	// Keep real-time SSE as the default. Strict atomic replay remains opt-in for
 	// operators who prefer late-failure retry over first-token latency.
-	viper.SetDefault("gateway.openai_atomic_stream_failover", false)
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
@@ -2516,17 +2482,6 @@ func setDefaults() {
 	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
 	viper.SetDefault("gateway.openai_compact_model", "gpt-5.5")
-	viper.SetDefault("gateway.openai_codex_ticket.enabled", false)
-	viper.SetDefault("gateway.openai_codex_ticket.enabled_332", false)
-	viper.SetDefault("gateway.openai_codex_ticket.target_length", 292)
-	viper.SetDefault("gateway.openai_codex_ticket.ttl_seconds", 3600)
-	viper.SetDefault("gateway.openai_codex_ticket.refresh_before_seconds", 600)
-	viper.SetDefault("gateway.openai_codex_ticket.harvest_proxy_url", "")
-	viper.SetDefault("gateway.openai_codex_ticket.harvest_dial_proxy_url", "")
-	viper.SetDefault("gateway.openai_codex_ticket.harvest_probe_interval_seconds", 6)
-	viper.SetDefault("gateway.openai_codex_ticket.harvest_attempt_timeout_seconds", 25)
-	viper.SetDefault("gateway.openai_codex_ticket.fail_closed", true)
-	viper.SetDefault("gateway.openai_codex_ticket.models", []string{"gpt-6-astra", "gpt-5.6-sol"})
 	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.openai_ws.enabled", true)
@@ -2736,7 +2691,6 @@ func setEnvReachableDefaults() {
 	// This is an effective true default: existing single-container and text
 	// deployments must continue to run the worker unless they opt into the
 	// image-only role explicitly.
-	viper.SetDefault("openai_window_warmup_worker_enabled", true)
 	viper.SetDefault("gateway.forced_codex_instructions_template_file", "")
 	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
 	viper.SetDefault("gateway.user_message_queue.mode", "")
@@ -2801,9 +2755,7 @@ func setEnvReachableDefaults() {
 }
 
 func (c *Config) Validate() error {
-	if c.Gateway.OpenAICodexTicket.Enabled && c.Gateway.OpenAICodexTicket.Enabled332 {
-		return fmt.Errorf("gateway.openai_codex_ticket.enabled and enabled_332 are mutually exclusive")
-	}
+
 	forwardedClientIPHeaders, err := NormalizeForwardedClientIPHeaders(c.Security.ForwardedClientIPHeaders)
 	if err != nil {
 		return fmt.Errorf("security.forwarded_client_ip_headers: %w", err)

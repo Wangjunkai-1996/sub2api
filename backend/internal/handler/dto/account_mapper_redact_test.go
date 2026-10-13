@@ -100,7 +100,14 @@ func TestAccountFromServiceShallow_RedactsCodexTurnTicketState(t *testing.T) {
 	src := &service.Account{
 		ID: 41, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
 		Extra: map[string]any{
-			"codex_harvest_proxy_url": "http://user:legacy-proxy-secret@proxy.example.com:8080",
+			"codex_harvest_proxy_url":                      "http://user:legacy-proxy-secret@proxy.example.com:8080",
+			"codex_turn_ticket:v2:old-binding:gpt-6-astra": map[string]any{"state": blob},
+			"codex_ticket_config":                          map[string]any{"enabled": true},
+			"codex_ticket_watchdog":                        map[string]any{"enabled": true},
+			"openai_codex_warmup_policy":                   map[string]any{"enabled": true},
+			"codex_warmup_policy":                          map[string]any{"enabled": true},
+			"openai_window_warmup_policy":                  map[string]any{"enabled": true},
+			"ordinary":                                     "retained",
 			"codex_turn_ticket:gpt-6-astra": map[string]any{
 				"state":       blob,
 				"length":      292,
@@ -119,6 +126,7 @@ func TestAccountFromServiceShallow_RedactsCodexTurnTicketState(t *testing.T) {
 	require.NotContains(t, string(raw), "legacy-proxy-secret")
 	require.NotContains(t, got.Extra, "codex_harvest_proxy_url")
 	require.Contains(t, src.Extra, "codex_harvest_proxy_url")
+	require.Equal(t, map[string]any{"ordinary": "retained"}, got.Extra)
 }
 
 func TestAccountFromServiceShallow_NilCredentialsOmitsStatus(t *testing.T) {

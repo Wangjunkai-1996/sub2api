@@ -133,34 +133,6 @@ func (s *AccountEgressCacheSuite) TestConfigVersionBatchLoadAndImmediateCapacity
 	releaseAccountEgressTest(s.T(), s.cache, config, secondLease)
 }
 
-func (s *AccountEgressCacheSuite) TestLegacyLiveAndWarmupGates() {
-	config := accountEgressTestConfig(20301, 1, 0, accountEgressTestCandidate(0, 10301, "ip:a"))
-	syncAccountEgressTestConfig(s.T(), s.cache, config)
-
-	legacy, err := s.cache.AcquireLiveLease(s.ctx, config.AccountID, 1, 20302, 1, 20303, "legacy-live", false)
-	require.NoError(s.T(), err)
-	require.True(s.T(), legacy)
-	require.Equal(s.T(), service.AccountEgressStatusLegacyDraining, acquireAccountEgressTest(s.T(), s.cache, config, "pool-blocked", "", "").Status)
-	require.NoError(s.T(), s.cache.ReleaseLiveLease(s.ctx, config.AccountID, 20302, 20303, "legacy-live"))
-
-	pool := acquireAccountEgressTest(s.T(), s.cache, config, "pool", "", "")
-	require.Equal(s.T(), service.AccountEgressStatusAcquired, pool.Status)
-	legacy, err = s.cache.AcquireLiveLease(s.ctx, config.AccountID, 1, 20302, 1, 20303, "legacy-blocked", false)
-	require.NoError(s.T(), err)
-	require.False(s.T(), legacy)
-	warmup, err := s.cache.AcquireAccountExclusive(s.ctx, config.AccountID, "warmup", time.Minute)
-	require.NoError(s.T(), err)
-	require.False(s.T(), warmup)
-	releaseAccountEgressTest(s.T(), s.cache, config, pool)
-	warmup, err = s.cache.AcquireAccountExclusive(s.ctx, config.AccountID, "warmup", time.Minute)
-	require.NoError(s.T(), err)
-	require.True(s.T(), warmup)
-	require.Equal(s.T(), service.AccountEgressStatusExclusive, acquireAccountEgressTest(s.T(), s.cache, config, "pool-exclusive", "", "").Status)
-	released, err := s.cache.ReleaseAccountExclusive(s.ctx, config.AccountID, "warmup")
-	require.NoError(s.T(), err)
-	require.True(s.T(), released)
-}
-
 func (s *AccountEgressCacheSuite) TestConcurrentCacheInstancesNeverExceedIdentityLimit() {
 	config := accountEgressTestConfig(20401, 4, 0, accountEgressTestCandidate(0, 10401, "ip:a"))
 	syncAccountEgressTestConfig(s.T(), s.cache, config)

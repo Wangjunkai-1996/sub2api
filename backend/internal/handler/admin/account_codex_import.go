@@ -42,7 +42,6 @@ type CodexSessionImportRequest struct {
 	UpdateExisting          *bool                     `json:"update_existing"`
 	SkipDefaultGroupBind    *bool                     `json:"skip_default_group_bind"`
 	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"`
-	OpenAICodexWarmupPolicy *string                   `json:"openai_codex_warmup_policy"`
 	parsedEgressPool        *service.ReplaceAccountPoolInput
 }
 
@@ -58,13 +57,11 @@ type CodexSessionImportResult struct {
 }
 
 type CodexSessionImportItem struct {
-	Index        int    `json:"index"`
-	Name         string `json:"name,omitempty"`
-	Action       string `json:"action"`
-	AccountID    int64  `json:"account_id,omitempty"`
-	Message      string `json:"message,omitempty"`
-	WarmupQueued bool   `json:"warmup_queued"`
-	WarmupStatus string `json:"warmup_status"`
+	Index     int    `json:"index"`
+	Name      string `json:"name,omitempty"`
+	Action    string `json:"action"`
+	AccountID int64  `json:"account_id,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 type CodexSessionImportMessage struct {
@@ -178,13 +175,6 @@ func (h *AccountHandler) ImportCodexSession(c *gin.Context) {
 		response.BadRequest(c, "请输入 accessToken 或 Codex session JSON")
 		return
 	}
-	policy, err := resolveOpenAIWindowWarmupImportPolicy(c.Request.Context(), req.OpenAICodexWarmupPolicy, h.settingService)
-	if err != nil {
-		response.ErrorFrom(c, err)
-		return
-	}
-	policyValue := string(policy)
-	req.OpenAICodexWarmupPolicy = &policyValue
 
 	executeAdminIdempotentJSON(c, "admin.accounts.import_codex_session", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
 		return h.importCodexSessions(ctx, req, entries)
@@ -218,10 +208,6 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 		priority = *req.Priority
 	}
 	credentialExtras := sanitizeCodexImportCredentialExtras(req.CredentialExtras)
-	warmupPolicy, err := validateOpenAIWindowWarmupPolicy(stringValueOrDefault(req.OpenAICodexWarmupPolicy, service.OpenAIWindowWarmupPolicyOff))
-	if err != nil {
-		return result, err
-	}
 	skipDefaultGroupBind := false
 	if req.SkipDefaultGroupBind != nil {
 		skipDefaultGroupBind = *req.SkipDefaultGroupBind
@@ -266,7 +252,7 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 			item.Credentials["expires_at"] = credentialExpiresAt.Format(time.RFC3339)
 		}
 		credentials := mergeCodexImportMap(item.Credentials, credentialExtras)
-		extra := withOpenAIWindowWarmupPolicy(mergeCodexImportMap(req.Extra, item.Extra), warmupPolicy)
+		extra := mergeCodexImportMap(req.Extra, item.Extra)
 		for _, warning := range item.WarningTexts {
 			result.Warnings = append(result.Warnings, CodexSessionImportMessage{
 				Index:   entry.Index,
@@ -315,10 +301,7 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 				autoPauseOnExpired = nil
 			}
 			mergedCredentials := mergeCodexImportCredentials(existing.Credentials, credentials, item)
-			mergedExtra := withOpenAIWindowWarmupPolicy(
-				mergeCodexImportMap(existing.Extra, extra),
-				warmupPolicy,
-			)
+			mergedExtra := mergeCodexImportMap(existing.Extra, extra)
 			updateInput := &service.UpdateAccountInput{
 				Credentials:        mergedCredentials,
 				Extra:              mergedExtra,
@@ -362,17 +345,6 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 			if h.tokenCacheInvalidator != nil && updated != nil {
 				_ = h.tokenCacheInvalidator.InvalidateToken(ctx, updated)
 			}
-			warmupStatus, warmupErr := h.scheduleOpenAIWindowWarmup(ctx, updated, service.OpenAIWindowWarmupTriggerImport)
-			if warmupErr != nil {
-				message := "账号已更新，但暖机任务持久化失败: " + redactedWarmupError(warmupErr.Error())
-				result.Failed++
-				result.Items = append(result.Items, CodexSessionImportItem{
-					Index: entry.Index, Name: accountName, Action: "failed", AccountID: updated.ID,
-					Message: message, WarmupStatus: "failed",
-				})
-				result.Errors = append(result.Errors, CodexSessionImportMessage{Index: entry.Index, Name: accountName, Message: message})
-				continue
-			}
 			result.Updated++
 			accountID := existing.ID
 			if updated != nil {
@@ -381,8 +353,6 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 			}
 			result.Items = append(result.Items, CodexSessionImportItem{
 				Index: entry.Index, Name: accountName, Action: "updated", AccountID: accountID,
-				WarmupQueued: warmupStatus != nil && warmupStatus.Queued,
-				WarmupStatus: openAIWindowWarmupImportStatus(warmupStatus),
 			})
 			continue
 		}
@@ -424,21 +394,6 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 		if account != nil {
 			index.Add(*account)
 		}
-		warmupStatus, warmupErr := h.scheduleOpenAIWindowWarmup(ctx, account, service.OpenAIWindowWarmupTriggerImport)
-		if warmupErr != nil {
-			accountID := int64(0)
-			if account != nil {
-				accountID = account.ID
-			}
-			message := "账号已创建，但暖机任务持久化失败: " + redactedWarmupError(warmupErr.Error())
-			result.Failed++
-			result.Items = append(result.Items, CodexSessionImportItem{
-				Index: entry.Index, Name: accountName, Action: "failed", AccountID: accountID,
-				Message: message, WarmupStatus: "failed",
-			})
-			result.Errors = append(result.Errors, CodexSessionImportMessage{Index: entry.Index, Name: accountName, Message: message})
-			continue
-		}
 		result.Created++
 		accountID := int64(0)
 		if account != nil {
@@ -446,8 +401,6 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 		}
 		result.Items = append(result.Items, CodexSessionImportItem{
 			Index: entry.Index, Name: accountName, Action: "created", AccountID: accountID,
-			WarmupQueued: warmupStatus != nil && warmupStatus.Queued,
-			WarmupStatus: openAIWindowWarmupImportStatus(warmupStatus),
 		})
 	}
 
@@ -459,16 +412,6 @@ func stringValueOrDefault(value *string, fallback string) string {
 		return fallback
 	}
 	return *value
-}
-
-func openAIWindowWarmupImportStatus(status *OpenAIWindowWarmupStatusResponse) string {
-	if status == nil {
-		return service.OpenAIWindowWarmupPolicyOff
-	}
-	if status.State != "" {
-		return status.State
-	}
-	return string(status.Policy)
 }
 
 func parseCodexSessionImportEntries(req CodexSessionImportRequest) ([]codexImportEntry, error) {

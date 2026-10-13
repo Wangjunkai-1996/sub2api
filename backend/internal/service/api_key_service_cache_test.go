@@ -249,7 +249,7 @@ func TestAPIKeyService_GetByKey_RejectsPreMergeSnapshotsAndReloads(t *testing.T)
 						User: &User{ID: 2, Status: StatusActive, Role: RoleUser, RestrictPublicGroups: true},
 						Group: &Group{
 							ID: groupID, Name: "database", Platform: PlatformOpenAI, Status: StatusActive,
-							SchedulerType: GroupSchedulerTypeAdvanced, ForceOpenAIFast: true,
+							ForceOpenAIFast: true,
 						},
 					}, nil
 				},
@@ -273,7 +273,6 @@ func TestAPIKeyService_GetByKey_RejectsPreMergeSnapshotsAndReloads(t *testing.T)
 			require.EqualValues(t, 1, repoCalls.Load())
 			require.True(t, apiKey.User.RestrictPublicGroups)
 			require.True(t, apiKey.Group.ForceOpenAIFast)
-			require.Equal(t, GroupSchedulerTypeAdvanced, apiKey.Group.SchedulerType)
 			require.Len(t, cache.setAuthKeys, 1, "the incomplete snapshot must be replaced from the database")
 		})
 	}
@@ -291,7 +290,7 @@ func TestAPIKeyService_GetByKey_RepairsLegacyL2SnapshotOnce(t *testing.T) {
 				User: &User{ID: 2, Status: StatusActive, RestrictPublicGroups: true},
 				Group: &Group{
 					ID: groupID, Name: "database", Platform: PlatformOpenAI, Status: StatusActive,
-					SchedulerType: GroupSchedulerTypeAdvanced, ForceOpenAIFast: true,
+					ForceOpenAIFast: true,
 				},
 			}, nil
 		},
@@ -327,7 +326,6 @@ func TestAPIKeyService_GetByKey_RepairsLegacyL2SnapshotOnce(t *testing.T) {
 	require.EqualValues(t, 1, repoCalls.Load(), "the repaired bridge must hit without another database lookup")
 	require.Len(t, cache.setAuthValues, 1, "the repaired bridge must not be rewritten on every read")
 	require.True(t, second.User.RestrictPublicGroups)
-	require.Equal(t, GroupSchedulerTypeAdvanced, second.Group.SchedulerType)
 }
 
 func TestAPIKeyService_SnapshotRoundTrip_PreservesMessagesDispatchModelConfig(t *testing.T) {

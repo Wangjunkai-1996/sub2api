@@ -89,12 +89,11 @@ var (
 		local configKey = KEYS[1]
 		local waitersKey = KEYS[2]
 		local rrKey = KEYS[3]
-		local exclusiveKey = KEYS[4]
-		local metadataKey = KEYS[5]
-		local modeKey = KEYS[6]
-		local poolTotalKey = KEYS[7]
-		local legacyRegularKey = KEYS[8]
-		local legacyLiveKey = KEYS[9]
+		local metadataKey = KEYS[4]
+		local modeKey = KEYS[5]
+		local poolTotalKey = KEYS[6]
+		local legacyRegularKey = KEYS[7]
+		local legacyLiveKey = KEYS[8]
 
 		local expectedVersion = tonumber(ARGV[1])
 		local expectedAuthorityRevision = ARGV[2]
@@ -139,7 +138,7 @@ var (
 		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', leaseCutoff)
 		redis.call('ZREMRANGEBYSCORE', legacyRegularKey, '-inf', nowSeconds - legacyRegularTTL)
 		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
-		local identityKeyCount = #KEYS - 9
+		local identityKeyCount = #KEYS - 8
 		if identityKeyCount % 3 ~= 0 then
 			return {'CONFIG_STALE', '', '0', '', 0, 0, 0, nowMillis, storedVersion, storedAuthorityRevision}
 		end
@@ -149,9 +148,9 @@ var (
 		local activeTotal = 0
 		local mappedLegacyTotal = 0
 		for identityIndex = 1, identityCount do
-			local identityKey = KEYS[9 + identityIndex]
-			local legacyRegularIdentityKey = KEYS[9 + identityCount + identityIndex]
-			local legacyLiveIdentityKey = KEYS[9 + identityCount * 2 + identityIndex]
+			local identityKey = KEYS[8 + identityIndex]
+			local legacyRegularIdentityKey = KEYS[8 + identityCount + identityIndex]
+			local legacyLiveIdentityKey = KEYS[8 + identityCount * 2 + identityIndex]
 			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', leaseCutoff)
 			redis.call('ZREMRANGEBYSCORE', legacyRegularIdentityKey, '-inf', nowSeconds - legacyRegularTTL)
 			redis.call('ZREMRANGEBYSCORE', legacyLiveIdentityKey, '-inf', nowSeconds - legacyLiveTTL)
@@ -328,7 +327,7 @@ var (
 			if metadataCandidate == nil or metadataCandidate.identityIndex <= 0 then
 				return result('CONFIG_STALE', nil)
 			end
-			local identityKey = KEYS[9 + metadataCandidate.identityIndex]
+			local identityKey = KEYS[8 + metadataCandidate.identityIndex]
 			if redis.call('ZSCORE', identityKey, leaseMember) ~= false and redis.call('ZSCORE', poolTotalKey, leaseMember) ~= false then
 				redis.call('ZADD', identityKey, 'XX', nowMillis, leaseMember)
 				redis.call('ZADD', poolTotalKey, 'XX', nowMillis, leaseMember)
@@ -342,7 +341,7 @@ var (
 		end
 
 		for identityIndex = 1, identityCount do
-			if redis.call('ZSCORE', KEYS[9 + identityIndex], leaseMember) ~= false then
+			if redis.call('ZSCORE', KEYS[8 + identityIndex], leaseMember) ~= false then
 				return result('CONFIG_STALE', nil)
 			end
 		end
@@ -361,9 +360,6 @@ var (
 		end
 		if waiterScore == false and head ~= nil then
 			return enqueue('NOT_QUEUE_HEAD')
-		end
-		if redis.call('EXISTS', exclusiveKey) == 1 then
-			return enqueue('EXCLUSIVE')
 		end
 
 		local selected = nil
@@ -429,7 +425,7 @@ var (
 			redis.call('ZREM', waitersKey, leaseMember)
 			return result('NO_ELIGIBLE_EGRESS', nil)
 		end
-		local selectedIdentityKey = KEYS[9 + selected.identityIndex]
+		local selectedIdentityKey = KEYS[8 + selected.identityIndex]
 		if redis.call('ZADD', selectedIdentityKey, 'NX', nowMillis, leaseMember) ~= 1 then
 			return result('CONFIG_STALE', nil)
 		end
@@ -660,7 +656,6 @@ var (
 		local legacyLiveKey = KEYS[4]
 		local modeKey = KEYS[5]
 		local waitersKey = KEYS[6]
-		local exclusiveKey = KEYS[7]
 		local leaseTTL = tonumber(ARGV[1])
 		local waiterTTL = tonumber(ARGV[2])
 		local legacyRegularTTL = tonumber(ARGV[3])
@@ -695,23 +690,22 @@ var (
 			legacyRegularCount,
 			legacyLiveCount,
 			redis.call('ZCARD', waitersKey),
-			redis.call('EXISTS', exclusiveKey)
 		}
-		local identityKeyCount = #KEYS - 7
+		local identityKeyCount = #KEYS - 6
 		if identityKeyCount % 3 ~= 0 then return result end
 		local identityCount = identityKeyCount / 3
 		for identityIndex = 1, identityCount do
-			local identityKey = KEYS[7 + identityIndex]
+			local identityKey = KEYS[6 + identityIndex]
 			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowMillis - leaseTTL)
 			table.insert(result, redis.call('ZCARD', identityKey))
 		end
 		for identityIndex = 1, identityCount do
-			local identityKey = KEYS[7 + identityCount + identityIndex]
+			local identityKey = KEYS[6 + identityCount + identityIndex]
 			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowSeconds - legacyRegularTTL)
 			table.insert(result, redis.call('ZCARD', identityKey))
 		end
 		for identityIndex = 1, identityCount do
-			local identityKey = KEYS[7 + identityCount * 2 + identityIndex]
+			local identityKey = KEYS[6 + identityCount * 2 + identityIndex]
 			redis.call('ZREMRANGEBYSCORE', identityKey, '-inf', nowSeconds - legacyLiveTTL)
 			table.insert(result, redis.call('ZCARD', identityKey))
 		end
@@ -747,10 +741,6 @@ func accountEgressWaitersKey(accountID int64) string {
 
 func accountEgressRRKey(accountID int64) string {
 	return accountEgressBaseKey(accountID) + ":rr"
-}
-
-func accountEgressExclusiveKey(accountID int64) string {
-	return accountEgressBaseKey(accountID) + ":exclusive"
 }
 
 func accountEgressModeKey(accountID int64) string {
@@ -898,7 +888,6 @@ func (c *concurrencyCache) AcquireAccountEgress(
 		accountEgressConfigKey(request.Config.AccountID),
 		accountEgressWaitersKey(request.Config.AccountID),
 		accountEgressRRKey(request.Config.AccountID),
-		accountEgressExclusiveKey(request.Config.AccountID),
 		accountEgressLeaseKey(request.Config.AccountID, request.LeaseID),
 		accountEgressModeKey(request.Config.AccountID),
 		accountEgressTotalKey(request.Config.AccountID),
@@ -1260,7 +1249,6 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			accountEgressLegacyLiveKey(config.AccountID),
 			accountEgressModeKey(config.AccountID),
 			accountEgressWaitersKey(config.AccountID),
-			accountEgressExclusiveKey(config.AccountID),
 		}
 		for _, identityID := range orderedIdentities {
 			keys = append(keys, accountEgressIdentityKey(config.AccountID, identityID))
@@ -1293,8 +1281,8 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		if err != nil {
 			return nil, fmt.Errorf("read account %d egress load snapshot: %w", command.config.AccountID, err)
 		}
-		if len(values) != 9+len(command.identityIDs)*3 {
-			return nil, fmt.Errorf("invalid account %d egress load snapshot length: got %d, want %d", command.config.AccountID, len(values), 9+len(command.identityIDs)*3)
+		if len(values) != 8+len(command.identityIDs)*3 {
+			return nil, fmt.Errorf("invalid account %d egress load snapshot length: got %d, want %d", command.config.AccountID, len(values), 8+len(command.identityIDs)*3)
 		}
 		if fmt.Sprint(values[0]) == "" {
 			results[command.config.AccountID] = service.AccountEgressLoadInfo{
@@ -1324,7 +1312,7 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		poolActiveTotal := 0
 		identityLoads := make(map[string]int, len(command.identityIDs))
 		for index, identityID := range command.identityIDs {
-			active, parseErr := intAt(9+index, "identity load")
+			active, parseErr := intAt(8+index, "identity load")
 			if parseErr != nil {
 				return nil, parseErr
 			}
@@ -1355,11 +1343,11 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 		mappedLegacyTotal := 0
 		identityCount := len(command.identityIDs)
 		for index, identityID := range command.identityIDs {
-			legacyRegularLoad, parseErr := intAt(9+identityCount+index, "legacy regular identity load")
+			legacyRegularLoad, parseErr := intAt(8+identityCount+index, "legacy regular identity load")
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			legacyLiveLoad, parseErr := intAt(9+identityCount*2+index, "legacy live identity load")
+			legacyLiveLoad, parseErr := intAt(8+identityCount*2+index, "legacy live identity load")
 			if parseErr != nil {
 				return nil, parseErr
 			}
@@ -1374,16 +1362,6 @@ func (c *concurrencyCache) GetAccountEgressLoadsBatch(
 			status = service.AccountEgressStatusNoEligibleEgress
 		} else {
 			loadRate = (activeTotal + waitingCount) * 100 / effectiveCapacity
-		}
-		exclusiveCount, err := intAt(8, "exclusive count")
-		if err != nil {
-			return nil, err
-		}
-		if exclusiveCount > 0 {
-			status = service.AccountEgressStatusExclusive
-			if loadRate < 100 {
-				loadRate = 100
-			}
 		}
 		mode := fmt.Sprint(values[3])
 		if mode != "" && mode != "legacy" && mode != "transition" && mode != "to_legacy" && mode != "pool" {

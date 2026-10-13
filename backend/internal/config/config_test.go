@@ -79,23 +79,6 @@ func TestLoadServerTimingConfig(t *testing.T) {
 	})
 }
 
-func TestLoadOpenAIWindowWarmupWorkerRoleFromEnvironment(t *testing.T) {
-	t.Run("enabled by default", func(t *testing.T) {
-		resetViperWithJWTSecret(t)
-		cfg, err := Load()
-		require.NoError(t, err)
-		require.True(t, cfg.OpenAIWindowWarmupWorkerEnabled)
-	})
-
-	t.Run("can disable image-only role", func(t *testing.T) {
-		resetViperWithJWTSecret(t)
-		t.Setenv("OPENAI_WINDOW_WARMUP_WORKER_ENABLED", "false")
-		cfg, err := Load()
-		require.NoError(t, err)
-		require.False(t, cfg.OpenAIWindowWarmupWorkerEnabled)
-	})
-}
-
 func TestLoadSimpleModeKeyRateLimitEnabledFromEnvironment(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("SIMPLE_MODE_KEY_RATE_LIMIT_ENABLED", "true")
@@ -439,7 +422,6 @@ func TestLoadDefaultOpenAIResponseTimeouts(t *testing.T) {
 	require.Equal(t, 600, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
 	require.Equal(t, 900, cfg.Gateway.OpenAIRequestBudgetSeconds)
 	require.Equal(t, 0, cfg.Gateway.OpenAIRetryBudgetSeconds)
-	require.False(t, cfg.Gateway.OpenAIAtomicStreamFailover)
 }
 
 func TestLoadOpenAIFirstOutputTimeoutsFromEnv(t *testing.T) {
@@ -448,7 +430,6 @@ func TestLoadOpenAIFirstOutputTimeoutsFromEnv(t *testing.T) {
 	t.Setenv("GATEWAY_OPENAI_HIGH_EFFORT_FIRST_OUTPUT_TIMEOUT_SECONDS", "240")
 	t.Setenv("GATEWAY_OPENAI_REQUEST_BUDGET_SECONDS", "180")
 	t.Setenv("GATEWAY_OPENAI_RETRY_BUDGET_SECONDS", "120")
-	t.Setenv("GATEWAY_OPENAI_ATOMIC_STREAM_FAILOVER", "false")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -456,7 +437,6 @@ func TestLoadOpenAIFirstOutputTimeoutsFromEnv(t *testing.T) {
 	require.Equal(t, 240, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
 	require.Equal(t, 180, cfg.Gateway.OpenAIRequestBudgetSeconds)
 	require.Equal(t, 120, cfg.Gateway.OpenAIRetryBudgetSeconds)
-	require.False(t, cfg.Gateway.OpenAIAtomicStreamFailover)
 }
 
 func TestValidateOpenAIBudgetCompatibility(t *testing.T) {
@@ -486,17 +466,6 @@ func TestEffectiveOpenAIBudgets(t *testing.T) {
 	require.Equal(t, 300, (GatewayConfig{}).EffectiveOpenAIRetryBudgetSeconds())
 	require.Equal(t, 180, (GatewayConfig{OpenAIRequestBudgetSeconds: 180}).EffectiveOpenAIRetryBudgetSeconds())
 	require.Equal(t, 120, (GatewayConfig{OpenAIRequestBudgetSeconds: 180, OpenAIRetryBudgetSeconds: 120}).EffectiveOpenAIRetryBudgetSeconds())
-}
-
-func TestLoadOpenAIAtomicStreamFailoverFromYAML(t *testing.T) {
-	resetViperWithJWTSecret(t)
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	require.NoError(t, os.WriteFile(configPath, []byte("gateway:\n  openai_atomic_stream_failover: true\n"), 0o600))
-	t.Setenv("CONFIG_FILE", configPath)
-
-	cfg, err := Load()
-	require.NoError(t, err)
-	require.True(t, cfg.Gateway.OpenAIAtomicStreamFailover)
 }
 
 func TestValidateOpenAIFirstOutputTimeoutMinimum(t *testing.T) {
@@ -1648,20 +1617,11 @@ func TestValidateConfigErrors(t *testing.T) {
 		name    string
 		mutate  func(*Config)
 		wantErr string
-	}{
-		{
-			name: "codex ticket modes are mutually exclusive",
-			mutate: func(c *Config) {
-				c.Gateway.OpenAICodexTicket.Enabled = true
-				c.Gateway.OpenAICodexTicket.Enabled332 = true
-			},
-			wantErr: "gateway.openai_codex_ticket.enabled and enabled_332",
-		},
-		{
-			name:    "server read header timeout",
-			mutate:  func(c *Config) { c.Server.ReadHeaderTimeout = 0 },
-			wantErr: "server.read_header_timeout",
-		},
+	}{{
+		name:    "server read header timeout",
+		mutate:  func(c *Config) { c.Server.ReadHeaderTimeout = 0 },
+		wantErr: "server.read_header_timeout",
+	},
 		{
 			name:    "server max header bytes too small",
 			mutate:  func(c *Config) { c.Server.MaxHeaderBytes = 4096 },

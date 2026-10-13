@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -32,6 +32,14 @@ func (w *openAIResponsesCancelOnWrite) Write(data []byte) (int, error) {
 
 func TestOpenAIResponsesStreamFailureClientCancellationAttribution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	// This test needs advanced scheduling, now controlled only by global settings.
+	settingsService := service.NewSettingService(&contentModerationHandlerSettingRepo{values: map[string]string{}}, &config.Config{})
+	settings, err := settingsService.GetAllSettings(context.Background())
+	require.NoError(t, err)
+	original := *settings
+	settings.OpenAIAdvancedSchedulerEnabled = true
+	require.NoError(t, settingsService.UpdateSettings(context.Background(), settings))
+	t.Cleanup(func() { require.NoError(t, settingsService.UpdateSettings(context.Background(), &original)) })
 	for _, tc := range []struct {
 		name              string
 		cancelOn          string
@@ -43,11 +51,6 @@ func TestOpenAIResponsesStreamFailureClientCancellationAttribution(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			group := &service.Group{
-				ID: 3131, Platform: service.PlatformOpenAI, Status: service.StatusActive,
-				Hydrated: true, SchedulerType: service.GroupSchedulerTypeAdvanced,
-			}
-			ctx = context.WithValue(ctx, ctxkey.Group, group)
 			upstream := &openAICompatFailoverUpstream{failure: "after_text"}
 			h := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, []service.Account{{
 				ID: 1, Name: "stream-error-account", Platform: service.PlatformOpenAI,

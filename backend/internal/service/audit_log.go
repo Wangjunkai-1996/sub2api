@@ -161,7 +161,7 @@ var auditBodySensitiveSubstrings = []string{
 }
 
 func isAuditSensitiveBodyKey(key string) bool {
-	if IsOpenAICodexTicketPrivateExtraKey(key) {
+	if IsRetiredAccountExtraKey(key) {
 		return true
 	}
 	k := auditNormalizeBodyKey(key)

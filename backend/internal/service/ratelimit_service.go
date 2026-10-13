@@ -49,10 +49,6 @@ type AccountRuntimeBlocker interface {
 	ClearAccountSchedulingBlock(accountID int64)
 }
 
-type openAIAuthErrorConditionalRepository interface {
-	SetOpenAIAuthErrorIfCredentialsUnchanged(context.Context, int64, map[string]any, string) (bool, error)
-}
-
 // SuccessfulTestRecoveryResult 表示测试成功后恢复了哪些运行时状态。
 type SuccessfulTestRecoveryResult struct {
 	ClearedError     bool
@@ -979,116 +975,6 @@ func (s *RateLimitService) handleAuthError(ctx context.Context, account *Account
 		return
 	}
 	slog.Warn("account_disabled_auth_error", "account_id", account.ID, "error", errorMsg)
-}
-
-// HandleOpenAIWindowWarmupAuthFailure adapts sanitized warmup evidence to the
-// existing account 401/403 policy. Permanent 401 mutations use a credentials
-// CAS so a stale worker cannot quarantine an account that was reauthorized
-// while the upstream request was in flight.
-func (s *RateLimitService) HandleOpenAIWindowWarmupAuthFailure(ctx context.Context, failure OpenAIWindowWarmupAuthFailure) error {
-	if s == nil || s.accountRepo == nil || failure.AccountID <= 0 {
-		return fmt.Errorf("openai warmup auth handler is not configured")
-	}
-	account, err := s.accountRepo.GetByID(ctx, failure.AccountID)
-	if err != nil {
-		return err
-	}
-	if account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
-		return nil
-	}
-	if !openAIWarmupCredentialsMatch(account.Credentials, failure.ExpectedCredentials) {
-		slog.Info("openai_window_warmup_auth_state_skipped_stale_credentials",
-			"account_id", failure.AccountID,
-			"status", failure.StatusCode,
-			"disposition", failure.Disposition,
-		)
-		return ErrOpenAIWindowWarmupCredentialsChanged
-	}
-
-	switch failure.Disposition {
-	case OpenAIWindowWarmupAuthRefreshTransient:
-		if account.IsOpenAIAgentIdentity() {
-			until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
-			s.notifyAccountSchedulingBlocked(account, until, "openai_window_warmup:openai_agent_identity_recovery")
-			return s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, "OpenAI Agent Identity recovery temporarily failed")
-		}
-		// Keep the warmup path independent from HandleUpstreamError's legacy
-		// bool-only API. In particular, do not swallow a failed durable
-		// SetTempUnschedulable write: after a process restart that would otherwise
-		// leave the account active and repeatedly refresh the same credentials.
-		return s.persistOpenAIWarmupTransientAuthState(ctx, account)
-	case OpenAIWindowWarmupAuthRefreshInProgress, OpenAIWindowWarmupAuthForbiddenHTML:
-		return nil
-	case OpenAIWindowWarmupAuthForbidden:
-		// Reuse HTML exemption, 403 counter, temporary cooldown and threshold
-		// semantics without passing the real warmup response body into raw logging.
-		var permanentErr error
-		s.handleOpenAI403WithPermanentHandler(ctx, account, "", []byte(`{"error":{"message":"access forbidden"}}`), "openai_window_warmup:openai_403_temp", func(message string) {
-			_, permanentErr = s.setOpenAIWindowAuthError(ctx, account, failure.ExpectedCredentials, message)
-		})
-		return permanentErr
-	case OpenAIWindowWarmupAuthNotRefreshable, OpenAIWindowWarmupAuthReplayRejected,
-		OpenAIWindowWarmupAuthRefreshTerminal:
-		message := "OpenAI authentication failed (401): reauthorization required"
-		_, err = s.setOpenAIWindowAuthError(ctx, account, failure.ExpectedCredentials, message)
-		return err
-	}
-	return nil
-}
-
-// persistOpenAIWarmupTransientAuthState applies the OAuth-401 temporary state
-// transition used by ordinary traffic and returns the persistence error to the
-// durable warmup worker. The in-memory notification happens before the DB write
-// so a failed write still takes effect for the current process, while callers
-// can retry the state transition on a later job attempt.
-func (s *RateLimitService) persistOpenAIWarmupTransientAuthState(ctx context.Context, account *Account) error {
-	if s == nil || s.accountRepo == nil || account == nil {
-		return fmt.Errorf("openai warmup auth state repository is unavailable")
-	}
-	if s.tokenCacheInvalidator != nil {
-		if err := s.tokenCacheInvalidator.InvalidateToken(ctx, account); err != nil {
-			slog.Warn("openai_window_warmup_auth_cache_invalidate_failed", "account_id", account.ID, "error", err)
-		}
-	}
-	cooldownMinutes := openAI403CooldownMinutesDefault
-	if s.cfg != nil && s.cfg.RateLimit.OAuth401CooldownMinutes > 0 {
-		cooldownMinutes = s.cfg.RateLimit.OAuth401CooldownMinutes
-	}
-	until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
-	message := "OAuth 401: credential refresh temporarily failed"
-	s.notifyAccountSchedulingBlocked(account, until, "openai_window_warmup:oauth_401")
-	return s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, message)
-}
-
-func (s *RateLimitService) setOpenAIWindowAuthError(ctx context.Context, account *Account, expectedCredentials map[string]any, message string) (bool, error) {
-	conditionalRepo, ok := s.accountRepo.(openAIAuthErrorConditionalRepository)
-	if !ok {
-		return false, fmt.Errorf("openai auth credentials CAS repository is not configured")
-	}
-	applied, err := conditionalRepo.SetOpenAIAuthErrorIfCredentialsUnchanged(ctx, account.ID, expectedCredentials, message)
-	if err != nil {
-		return applied, err
-	}
-	if !applied {
-		return false, ErrOpenAIWindowWarmupCredentialsChanged
-	}
-	s.notifyAccountSchedulingBlocked(account, time.Time{}, "openai_window_warmup:auth_error")
-	if s.tokenCacheInvalidator != nil {
-		if invalidateErr := s.tokenCacheInvalidator.InvalidateToken(ctx, account); invalidateErr != nil {
-			slog.Warn("openai_window_warmup_auth_cache_invalidate_failed", "account_id", account.ID, "error", invalidateErr)
-		}
-	}
-	slog.Warn("account_disabled_auth_error", "account_id", account.ID, "source", "openai_window_warmup")
-	return true, nil
-}
-
-func openAIWarmupCredentialsMatch(current, expected map[string]any) bool {
-	if expected == nil {
-		return false
-	}
-	currentJSON, currentErr := json.Marshal(current)
-	expectedJSON, expectedErr := json.Marshal(expected)
-	return currentErr == nil && expectedErr == nil && bytes.Equal(currentJSON, expectedJSON)
 }
 
 func buildForbiddenErrorMessage(prefix string, upstreamMsg string, responseBody []byte, fallback string) string {

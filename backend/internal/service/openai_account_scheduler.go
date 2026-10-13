@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -845,7 +844,6 @@ func classifyOpenAIEgressSchedulingAdmission(load *AccountLoadInfo) openAIEgress
 		return openAIEgressSchedulingAdmissionWaitable
 	case AccountEgressStatusFull,
 		AccountEgressStatusNotQueueHead,
-		AccountEgressStatusExclusive,
 		AccountEgressStatusLegacyDraining:
 		return openAIEgressSchedulingAdmissionWaitable
 	default:
@@ -2518,104 +2516,6 @@ func cloneOpenAIAdvancedSchedulerRuntimeSettings(settings openAIAdvancedSchedule
 	return settings
 }
 
-func (s *OpenAIGatewayService) openAIAdvancedSchedulerEffectiveRuntimeSettings(
-	ctx context.Context,
-	groupID *int64,
-	platform string,
-) openAIAdvancedSchedulerRuntimeSettings {
-	settings := cloneOpenAIAdvancedSchedulerRuntimeSettings(s.openAIAdvancedSchedulerRuntimeSettings(ctx))
-	if platform != PlatformOpenAI || groupID == nil || *groupID <= 0 {
-		return settings
-	}
-
-	var group *Group
-	if ctxGroup, ok := ctx.Value(ctxkey.Group).(*Group); ok && IsGroupContextValid(ctxGroup) && ctxGroup.ID == *groupID {
-		group = ctxGroup
-	} else if s != nil && s.schedulerSnapshot != nil {
-		loaded, err := s.schedulerSnapshot.GetGroupByIDLite(ctx, *groupID)
-		if err != nil {
-			slog.Warn("openai_group_scheduler_settings_load_failed", "group_id", *groupID, "error", err)
-			return settings
-		}
-		group = loaded
-	}
-	if group == nil || group.Platform != PlatformOpenAI {
-		return settings
-	}
-
-	schedulerType, err := NormalizeGroupSchedulerType(group.SchedulerType)
-	if err != nil {
-		slog.Warn("openai_group_scheduler_type_invalid", "group_id", group.ID, "scheduler_type", group.SchedulerType, "error", err)
-		return settings
-	}
-	switch schedulerType {
-	case GroupSchedulerTypeBasic:
-		settings.enabled = false
-		return settings
-	case GroupSchedulerTypeAdvanced:
-		settings.enabled = true
-	case GroupSchedulerTypeInherit:
-		if !settings.enabled {
-			return settings
-		}
-	}
-
-	overrides := group.AdvancedSchedulerOverrides
-	if err := ValidateAdvancedSchedulerOverrides(overrides); err != nil {
-		slog.Warn("openai_group_scheduler_overrides_invalid", "group_id", group.ID, "error", err)
-		return settings
-	}
-	if overrides.StickyWeightedEnabled != nil {
-		settings.stickyWeightedEnabled = *overrides.StickyWeightedEnabled
-	}
-	if overrides.SubscriptionPriorityEnabled != nil {
-		settings.subscriptionPriorityEnabled = *overrides.SubscriptionPriorityEnabled
-	}
-	if overrides.LBTopK != nil {
-		settings.lbTopKOverride = *overrides.LBTopK
-	}
-	groupWeightOverrides := []struct {
-		name  string
-		value *float64
-	}{
-		{name: "priority", value: overrides.WeightPriority},
-		{name: "load", value: overrides.WeightLoad},
-		{name: "queue", value: overrides.WeightQueue},
-		{name: "error_rate", value: overrides.WeightErrorRate},
-		{name: "ttft", value: overrides.WeightTTFT},
-		{name: "reset", value: overrides.WeightReset},
-		{name: "quota_headroom", value: overrides.WeightQuotaHeadroom},
-		{name: "upstream_cost", value: overrides.WeightUpstreamCost},
-		{name: "previous_response", value: overrides.WeightPreviousResponse},
-		{name: "session_sticky", value: overrides.WeightSessionSticky},
-	}
-	var globalWeightOverrides map[string]float64
-	groupWeightOverridesApplied := false
-	for _, override := range groupWeightOverrides {
-		if override.value == nil {
-			continue
-		}
-		if !groupWeightOverridesApplied {
-			globalWeightOverrides = cloneOpenAIAdvancedSchedulerWeightOverrides(settings.weightOverrides)
-			groupWeightOverridesApplied = true
-		}
-		if settings.weightOverrides == nil {
-			settings.weightOverrides = make(map[string]float64)
-		}
-		settings.weightOverrides[override.name] = *override.value
-	}
-	if groupWeightOverridesApplied {
-		effectiveWeights := applyOpenAIAdvancedSchedulerWeightOverrides(
-			s.openAIWSSchedulerWeights(),
-			settings.weightOverrides,
-		).configWeights()
-		if !effectiveWeights.IsValid() {
-			settings.weightOverrides = globalWeightOverrides
-		}
-	}
-	return settings
-}
-
 func (s *OpenAIGatewayService) withOpenAIAdvancedSchedulerRequestSettings(
 	ctx context.Context,
 	groupID *int64,
@@ -2630,7 +2530,7 @@ func (s *OpenAIGatewayService) withOpenAIAdvancedSchedulerRequestSettings(
 		existing != nil && existing.groupID == requestSettings.groupID && existing.hasGroupID == requestSettings.hasGroupID && existing.platform == platform {
 		return ctx
 	}
-	requestSettings.settings = s.openAIAdvancedSchedulerEffectiveRuntimeSettings(ctx, groupID, platform)
+	requestSettings.settings = cloneOpenAIAdvancedSchedulerRuntimeSettings(s.openAIAdvancedSchedulerRuntimeSettings(ctx))
 	return context.WithValue(ctx, openAIAdvancedSchedulerRequestSettingsContextKey{}, &requestSettings)
 }
 

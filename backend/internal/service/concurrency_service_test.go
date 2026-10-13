@@ -237,7 +237,7 @@ func TestAcquireAccountSlot_UnlimitedConcurrency(t *testing.T) {
 	}
 }
 
-func TestAcquireAccountSlot_UnlimitedHonorsWarmupGateWithoutWaiting(t *testing.T) {
+func TestAcquireAccountSlot_UnlimitedHonorsAdmissionFenceWithoutWaiting(t *testing.T) {
 	cache := &unboundedGateCacheForTest{gateResult: false}
 	svc := NewConcurrencyService(cache)
 
@@ -248,7 +248,7 @@ func TestAcquireAccountSlot_UnlimitedHonorsWarmupGateWithoutWaiting(t *testing.T
 	require.Equal(t, 1, cache.gateCalls)
 }
 
-func TestAcquireAccountSlot_UnlimitedWarmupGateRedisErrorFailsOpen(t *testing.T) {
+func TestAcquireAccountSlot_UnlimitedAdmissionRedisErrorFailsOpen(t *testing.T) {
 	cache := &unboundedGateCacheForTest{gateErr: errors.New("redis unavailable")}
 	svc := NewConcurrencyService(cache)
 

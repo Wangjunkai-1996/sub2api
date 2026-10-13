@@ -292,54 +292,6 @@
               <AccountStatusIndicator :account="row" @show-temp-unsched="handleShowTempUnsched" />
             </div>
           </template>
-          <template #cell-openai_window_warmup="{ row }">
-            <div v-if="isOpenAIWindowWarmupAccount(row)" class="flex min-w-[11rem] flex-col gap-1 text-xs">
-              <div class="flex items-center gap-1.5">
-                <span :class="['inline-flex rounded px-1.5 py-0.5 font-medium', openAIWindowWarmupStateClass(row)]">
-                  {{ openAIWindowWarmupStateLabel(row) }}
-                </span>
-                <button
-                  v-if="openAIWindowWarmupState(row) !== 'off' && isOpenAIWindowWarmupActionable(row)"
-                  type="button"
-                  class="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-primary-600 disabled:opacity-50 dark:hover:bg-dark-700"
-                  :disabled="warmupActionAccountID === row.id"
-                  :title="t('admin.accounts.openai.windowWarmup.requeue')"
-                  :aria-label="t('admin.accounts.openai.windowWarmup.requeue')"
-                  @click="handleOpenAIWindowWarmupRequeue(row)"
-                >
-                  <Icon name="refresh" size="xs" :class="{ 'animate-spin': warmupActionAccountID === row.id }" />
-                </button>
-                <button
-                  v-if="isOpenAIWindowWarmupBlocked(row) && isOpenAIWindowWarmupActionable(row)"
-                  type="button"
-                  class="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-emerald-600 disabled:opacity-50 dark:hover:bg-dark-700"
-                  :disabled="warmupActionAccountID === row.id"
-                  :title="t('admin.accounts.openai.windowWarmup.unblock')"
-                  :aria-label="t('admin.accounts.openai.windowWarmup.unblock')"
-                  @click="handleOpenAIWindowWarmupUnblock(row)"
-                >
-                  <Icon name="play" size="xs" />
-                </button>
-              </div>
-              <span v-if="openAIWindowWarmupNextRun(row)" class="text-gray-500 dark:text-dark-400">
-                {{ t('admin.accounts.openai.windowWarmup.nextRun') }}: {{ formatDateTime(openAIWindowWarmupNextRun(row) || '') }}
-              </span>
-              <span v-if="row.openai_window_warmup?.last_success_at" class="text-gray-500 dark:text-dark-400">
-                {{ t('admin.accounts.openai.windowWarmup.lastSuccess') }}: {{ formatDateTime(row.openai_window_warmup.last_success_at) }}
-              </span>
-              <span v-if="row.openai_window_warmup?.observed_reset_at" class="text-gray-500 dark:text-dark-400">
-                {{ t('admin.accounts.openai.windowWarmup.observedReset') }}: {{ formatDateTime(row.openai_window_warmup.observed_reset_at) }}
-              </span>
-              <span
-                v-if="row.openai_window_warmup?.last_error"
-                class="max-w-[14rem] truncate text-red-600 dark:text-red-400"
-                :title="row.openai_window_warmup.last_error"
-              >
-                {{ row.openai_window_warmup.last_error_code || row.openai_window_warmup.last_error }}
-              </span>
-            </div>
-            <span v-else class="text-sm text-gray-400 dark:text-dark-500">-</span>
-          </template>
           <template #cell-schedulable="{ row }">
             <button @click="handleToggleSchedulable(row)" :disabled="togglingSchedulable === row.id" class="relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-dark-800" :class="[row.schedulable ? 'bg-primary-500 hover:bg-primary-600' : 'bg-gray-200 hover:bg-gray-300 dark:bg-dark-600 dark:hover:bg-dark-500']" :title="row.schedulable ? t('admin.accounts.schedulableEnabled') : t('admin.accounts.schedulableDisabled')">
               <span class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out" :class="[row.schedulable ? 'translate-x-4' : 'translate-x-0']" />
@@ -640,7 +592,7 @@ import Icon from '@/components/icons/Icon.vue'
 import ErrorPassthroughRulesModal from '@/components/admin/ErrorPassthroughRulesModal.vue'
 import TLSFingerprintProfilesModal from '@/components/admin/TLSFingerprintProfilesModal.vue'
 import { fetchAllAccountIds } from '@/utils/accountSelection'
-import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey, buildOpenAIWarmupRefreshKey } from '@/utils/accountUsageRefresh'
+import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { formatDateTime, formatRelativeTime } from '@/utils/format'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
@@ -742,7 +694,6 @@ const showSchedulePanel = ref(false)
 const scheduleAcc = ref<Account | null>(null)
 const scheduleModelOptions = ref<SelectOption[]>([])
 const togglingSchedulable = ref<number | null>(null)
-const warmupActionAccountID = ref<number | null>(null)
 const menu = reactive<{show:boolean, acc:Account|null, anchorRect:DOMRect|null}>({ show: false, acc: null, anchorRect: null })
 const exportingData = ref(false)
 const probingUpstreamBilling = reactive(new Set<number>())
@@ -1580,7 +1531,6 @@ const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
     current.overload_until !== next.overload_until ||
     current.temp_unschedulable_until !== next.temp_unschedulable_until ||
     buildOpenAIUsageRefreshKey(current) !== buildOpenAIUsageRefreshKey(next) ||
-    buildOpenAIWarmupRefreshKey(current) !== buildOpenAIWarmupRefreshKey(next) ||
     buildGrokUsageRefreshKey(current) !== buildGrokUsageRefreshKey(next)
   )
 }
@@ -1955,65 +1905,6 @@ function getOpenAICompactTitle(row: any): string {
   return `${label} | ${t('admin.accounts.openai.compactLastChecked')}: ${formatDateTime(new Date(checkedAt))}`
 }
 
-const isOpenAIWindowWarmupAccount = (row: Account): boolean =>
-  row.platform === 'openai' && row.type === 'oauth' && row.parent_account_id == null &&
-  (row.quota_dimension == null || row.quota_dimension === '' || row.quota_dimension === 'global')
-
-const openAIWindowWarmupState = (row: Account): string => {
-  const policy = row.openai_window_warmup?.policy ?? row.openai_codex_warmup_policy ?? 'off'
-  if (policy === 'off') return 'off'
-  const state = row.openai_window_warmup?.state || 'pending'
-  return state === 'queued_by_trigger' ? 'pending' : state
-}
-
-const isOpenAIWindowWarmupActionable = (row: Account): boolean => {
-  if (row.status !== 'active' || !row.schedulable) return false
-  if (row.expires_at != null && row.expires_at > 0 && row.expires_at * 1000 <= Date.now()) return false
-  if (row.temp_unschedulable_until && new Date(row.temp_unschedulable_until).getTime() > Date.now()) return false
-  return true
-}
-
-const isOpenAIWindowWarmupFiveHourUnsupported = (row: Account): boolean =>
-  openAIWindowWarmupState(row) === 'failed' &&
-  row.openai_window_warmup?.last_error_code === 'five_hour_window_unsupported'
-
-const openAIWindowWarmupStateLabel = (row: Account): string => {
-  const state = isOpenAIWindowWarmupFiveHourUnsupported(row)
-    ? 'five_hour_window_unsupported'
-    : openAIWindowWarmupState(row)
-  return t(`admin.accounts.openai.windowWarmup.states.${state}`)
-}
-
-const openAIWindowWarmupStateClass = (row: Account): string => {
-  switch (openAIWindowWarmupState(row)) {
-    case 'completed': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
-    case 'running': return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
-    case 'blocked':
-    case 'blocked_config': return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
-    case 'failed':
-      return isOpenAIWindowWarmupFiveHourUnsupported(row)
-        ? 'bg-gray-100 text-gray-600 dark:bg-dark-700 dark:text-dark-300'
-        : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
-    case 'uncertain':
-    case 'possibly_sent': return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
-    case 'paused':
-    case 'off': return 'bg-gray-100 text-gray-600 dark:bg-dark-700 dark:text-dark-300'
-    default: return 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300'
-  }
-}
-
-const isOpenAIWindowWarmupBlocked = (row: Account): boolean =>
-  ['paused', 'blocked', 'blocked_config'].includes(openAIWindowWarmupState(row))
-
-const openAIWindowWarmupActiveStates = new Set([
-  'pending', 'armed', 'due', 'running', 'retrying', 'uncertain', 'possibly_sent'
-])
-
-const openAIWindowWarmupNextRun = (row: Account): string | null | undefined => {
-  if (!openAIWindowWarmupActiveStates.has(openAIWindowWarmupState(row))) return null
-  return row.openai_window_warmup?.next_run_at ?? row.openai_window_warmup?.next_attempt_at
-}
-
 function getAntigravityTierClass(row: any): string {
   const tier = getAntigravityTierFromRow(row)
   switch (tier) {
@@ -2033,7 +1924,6 @@ const allColumns = computed(() => {
     { key: 'platform_type', label: t('admin.accounts.columns.platformType'), sortable: false },
     { key: 'capacity', label: t('admin.accounts.columns.capacity'), sortable: false },
     { key: 'status', label: t('admin.accounts.columns.status'), sortable: true },
-    { key: 'openai_window_warmup', label: t('admin.accounts.columns.openaiWindowWarmup'), sortable: false },
     { key: 'schedulable', label: t('admin.accounts.columns.schedulable'), sortable: true },
     { key: 'today_stats', label: t('admin.accounts.columns.todayStats'), sortable: false }
   ]
@@ -2482,7 +2372,6 @@ const mergeRuntimeFields = (oldAccount: Account, updatedAccount: Account): Accou
   egress_pool: updatedAccount.egress_pool ?? oldAccount.egress_pool,
   current_window_cost: updatedAccount.current_window_cost ?? oldAccount.current_window_cost,
   active_sessions: updatedAccount.active_sessions ?? oldAccount.active_sessions,
-  openai_window_warmup: updatedAccount.openai_window_warmup ?? oldAccount.openai_window_warmup
 })
 
 const syncPaginationAfterLocalRemoval = () => {
@@ -2519,43 +2408,6 @@ const patchAccountInList = (updatedAccount: Account) => {
   syncAccountRefs(mergedAccount)
 }
 
-const patchOpenAIWindowWarmupStatus = (accountID: number, status: NonNullable<Account['openai_window_warmup']>) => {
-  const account = accounts.value.find(item => item.id === accountID)
-  if (!account) return
-  patchAccountInList({
-    ...account,
-    openai_codex_warmup_policy: status.policy,
-    openai_window_warmup: status
-  })
-}
-
-const handleOpenAIWindowWarmupRequeue = async (account: Account) => {
-  warmupActionAccountID.value = account.id
-  try {
-    const status = await adminAPI.accounts.requeueCodexWarmup(account.id)
-    patchOpenAIWindowWarmupStatus(account.id, status)
-    enterAutoRefreshSilentWindow()
-    appStore.showSuccess(t('admin.accounts.openai.windowWarmup.requeueSuccess'))
-  } catch (error: any) {
-    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.openai.windowWarmup.actionFailed')))
-  } finally {
-    warmupActionAccountID.value = null
-  }
-}
-
-const handleOpenAIWindowWarmupUnblock = async (account: Account) => {
-  warmupActionAccountID.value = account.id
-  try {
-    const status = await adminAPI.accounts.unblockCodexWarmup(account.id)
-    patchOpenAIWindowWarmupStatus(account.id, status)
-    enterAutoRefreshSilentWindow()
-    appStore.showSuccess(t('admin.accounts.openai.windowWarmup.unblockSuccess'))
-  } catch (error: any) {
-    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.openai.windowWarmup.actionFailed')))
-  } finally {
-    warmupActionAccountID.value = null
-  }
-}
 const patchUpstreamBillingSnapshot = (accountID: number, snapshot: UpstreamBillingProbeSnapshot) => {
   const account = accounts.value.find(item => item.id === accountID)
   if (!account) return

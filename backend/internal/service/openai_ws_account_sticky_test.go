@@ -391,68 +391,6 @@ func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_CapabilityMismat
 	require.Equal(t, account.ID, boundAccountID)
 }
 
-func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_Codex332RuntimeGateWithoutSnapshot(t *testing.T) {
-	ctx := context.Background()
-	groupID := int64(332)
-	responseID := "resp_prev_codex_332"
-
-	newService := func(t *testing.T) (*OpenAIGatewayService, OpenAIWSStateStore, Account) {
-		t.Helper()
-		account := *ticketTestAccount(332)
-		account.Schedulable = true
-		account.Concurrency = 1
-		ac := codexAccountTicketConfigOf(&account)
-		ac.TicketPlan = codexTicketPlanTeam
-		account.Extra[codexAccountTicketConfigKey] = ac
-		account.Extra["responses_websockets_v2_enabled"] = true
-		cache := &stubGatewayCache{}
-		store := NewOpenAIWSStateStore(cache)
-		cfg := newOpenAIWSV2TestConfig()
-		cfg.Gateway.OpenAICodexTicket = config.OpenAICodexTicketConfig{
-			Enabled:      true,
-			TargetLength: 292, // Account Team plan determines the required length.
-			FailClosed:   true,
-			Models:       []string{"gpt-6-astra"},
-		}
-		service := &OpenAIGatewayService{
-			accountRepo:        stubOpenAIAccountRepo{accounts: []Account{account}},
-			cache:              cache,
-			cfg:                cfg,
-			concurrencyService: NewConcurrencyService(stubConcurrencyCache{}),
-			openaiWSStateStore: store,
-		}
-		require.Nil(t, service.schedulerSnapshot)
-		require.NoError(t, store.BindResponseAccount(ctx, groupID, responseID, account.ID, time.Hour))
-		return service, store, account
-	}
-
-	t.Run("without ticket rejects and clears sticky binding", func(t *testing.T) {
-		service, store, _ := newService(t)
-
-		selection, err := service.SelectAccountByPreviousResponseID(ctx, &groupID, responseID, "gpt-6-astra", nil, false)
-		require.NoError(t, err)
-		require.Nil(t, selection)
-		boundAccountID, getErr := store.GetResponseAccount(ctx, groupID, responseID)
-		require.NoError(t, getErr)
-		require.Zero(t, boundAccountID)
-	})
-
-	t.Run("valid 332 ticket succeeds", func(t *testing.T) {
-		service, _, account := newService(t)
-		account.Extra[openAICodexTicketExtraKey("gpt-6-astra")] = verifiedTestTicket(&account, 332)
-
-		selection, err := service.SelectAccountByPreviousResponseID(ctx, &groupID, responseID, "gpt-6-astra", nil, false)
-		require.NoError(t, err)
-		require.NotNil(t, selection)
-		require.NotNil(t, selection.Account)
-		require.Equal(t, account.ID, selection.Account.ID)
-		require.True(t, selection.Acquired)
-		if selection.ReleaseFunc != nil {
-			selection.ReleaseFunc()
-		}
-	})
-}
-
 func newOpenAIWSV2TestConfig() *config.Config {
 	cfg := &config.Config{}
 	cfg.Gateway.OpenAIWS.Enabled = true

@@ -112,7 +112,7 @@ func TestGetAccountLoadsForSchedulingPreservesAuthoritativeEgressLoad(t *testing
 	account := openAISchedulerEgressOverflowAccount(accountID, groupID)
 	authoritative := AccountEgressLoadInfo{
 		AccountID:         accountID,
-		Status:            AccountEgressStatusExclusive,
+		Status:            AccountEgressStatusFull,
 		ActiveTotal:       2,
 		WaitingCount:      4,
 		EffectiveCapacity: 9,
@@ -148,7 +148,6 @@ func TestClassifyOpenAIEgressSchedulingAdmission(t *testing.T) {
 		{name: "acquired behind waiter", load: AccountLoadInfo{EgressStatus: AccountEgressStatusAcquired, EffectiveCapacity: 2, WaitingCount: 1}, want: openAIEgressSchedulingAdmissionWaitable},
 		{name: "full", load: AccountLoadInfo{EgressStatus: AccountEgressStatusFull}, want: openAIEgressSchedulingAdmissionWaitable},
 		{name: "not queue head", load: AccountLoadInfo{EgressStatus: AccountEgressStatusNotQueueHead}, want: openAIEgressSchedulingAdmissionWaitable},
-		{name: "exclusive", load: AccountLoadInfo{EgressStatus: AccountEgressStatusExclusive}, want: openAIEgressSchedulingAdmissionWaitable},
 		{name: "legacy draining", load: AccountLoadInfo{EgressStatus: AccountEgressStatusLegacyDraining}, want: openAIEgressSchedulingAdmissionWaitable},
 		{name: "no eligible", load: AccountLoadInfo{EgressStatus: AccountEgressStatusNoEligibleEgress}, want: openAIEgressSchedulingAdmissionHardBlocked},
 		{name: "required binding unavailable", load: AccountLoadInfo{EgressStatus: AccountEgressStatusRequiredBindingUnavailable}, want: openAIEgressSchedulingAdmissionHardBlocked},

@@ -53,7 +53,7 @@ func TestOpenAITTFTCommentWriteFailureDoesNotRetryAndDrainsUsage(t *testing.T) {
 					c.Writer = &openAITTFTCommentFailingWriter{ResponseWriter: c.Writer, failOnMarker: failOnMarker}
 					svc := &OpenAIGatewayService{cfg: &config.Config{}}
 					resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(output + terminal))}
-					account := newOpenAIAtomicStreamTestAccount(73021)
+					account := newOpenAIStreamTestAccount(73021)
 					var usage *OpenAIUsage
 					var err error
 					if passthrough {
@@ -90,24 +90,19 @@ func TestOpenAITTFTCommentResponsesCommit(t *testing.T) {
 	const output = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
 	const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ttft\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}}\n\n"
 	const failed = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}}\n\n"
-	for _, path := range []string{"native", "passthrough", "atomic"} {
+	for _, path := range []string{"native", "passthrough"} {
 		for _, failure := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/failure=%t", path, failure), func(t *testing.T) {
 				recorder := newOpenAIResponseFlushRecorder()
 				c, _ := gin.CreateTestContext(recorder)
 				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 				c.Request.Header.Set("X-Sub2-TTFT", "1")
-				account := newOpenAIAtomicStreamTestAccount(73020)
-				svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
-					MaxLineSize: defaultMaxLineSize, OpenAIAtomicStreamFailover: path == "atomic",
-				}}}
+				account := newOpenAIStreamTestAccount(73020)
+				svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{}}}
 				waiting, release := make(chan struct{}), make(chan struct{})
 				defer close(release)
 				initial, remaining := metadata, output+terminal
-				if path == "atomic" {
-					initial += output
-					remaining = terminal
-				}
+
 				if failure {
 					remaining = failed
 				}
@@ -237,5 +232,66 @@ func TestOpenAITTFTCommentVisibleAfterStructuralOutput(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func newOpenAIStreamTestAccount(id int64) *Account {
+	return &Account{
+		ID:          id,
+		Name:        "stream-test",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+	}
+}
+
+func TestOpenAIStreamsFirstSemanticOutputBeforeTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, passthrough := range []bool{false, true} {
+		t.Run(fmt.Sprintf("passthrough=%t", passthrough), func(t *testing.T) {
+			recorder := newOpenAIResponseFlushRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			waiting, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+			body := &stagedOpenAISSEReadCloser{
+				segments: [][]byte{
+					[]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"visible-now\"}\n\n"),
+					[]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"),
+				},
+				gates: []<-chan struct{}{nil, release}, waiting: []chan struct{}{nil, waiting},
+			}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}}
+			done := make(chan error, 1)
+			go func() {
+				account := newOpenAIStreamTestAccount(73022)
+				if passthrough {
+					_, err := svc.handleStreamingResponsePassthrough(context.Background(), resp, c, account, time.Now(), "test", "test")
+					done <- err
+				} else {
+					_, err := svc.handleStreamingResponse(context.Background(), resp, c, account, time.Now(), "test", "test")
+					done <- err
+				}
+			}()
+			require.Eventually(t, func() bool {
+				output, flushes := recorder.snapshot()
+				return strings.Contains(output, "visible-now") && len(flushes) > 0
+			}, 2*time.Second, time.Millisecond)
+			select {
+			case <-done:
+				t.Fatal("stream finished before upstream terminal was released")
+			default:
+			}
+			release <- struct{}{}
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("stream did not finish after upstream terminal")
+			}
+		})
 	}
 }

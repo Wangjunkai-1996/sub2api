@@ -515,7 +515,7 @@ func (s *AccountUsageService) GetUsageForAccount(ctx context.Context, account *A
 // GetCachedUsage returns the locally persisted usage snapshot without making
 // any upstream request.  This is the read-only path used by the account table:
 // a refresh of the display must never submit a real Codex Responses request or
-// overwrite the reset baseline established by the warmup worker.
+// overwrite the authoritative reset baseline.
 func (s *AccountUsageService) GetCachedUsage(ctx context.Context, accountID int64) (*UsageInfo, error) {
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil {

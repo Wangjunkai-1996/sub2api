@@ -474,28 +474,6 @@ export default {
         accountSchedulingThresholdsDisabledHint: '100 disables platform auto-pause. Values 1–99 pause scheduling once utilization reaches that percent.',
         accountSchedulingThresholdsRangeHint: 'Integer 1–100 (percent). OpenAI/Anthropic/Grok only.'
       },
-      openAIWindowWarmup: {
-        title: 'OpenAI Codex Five-Hour Window Warmup',
-        description: 'When the global switch is off, no new warmup jobs are claimed or sent.',
-        enabled: 'Enable automatic warmup',
-        defaultPolicy: 'Default import policy',
-        policyOff: 'Off',
-        policyOnce: 'Once',
-        policyContinuous: 'Continuous',
-        allowlist: 'Account scope (empty = all eligible)',
-        allowlistPlaceholder: 'e.g. 101, 205, 309',
-        allowlistInvalid: 'The account allowlist must contain positive integer IDs separated by commas or spaces.',
-        probeModel: 'Probe model',
-        workerConcurrency: 'Worker concurrency',
-        globalQPS: 'Global QPS',
-        batchSize: 'Scan batch',
-        scanSeconds: 'Scan interval (seconds)',
-        requestTimeoutSeconds: 'Request timeout (seconds)',
-        leaseSeconds: 'Lease (seconds)',
-        resetGraceSeconds: 'Reset grace (seconds)',
-        runtimeApplyHint: 'The global switch and account scope apply immediately. Restart the service after changing the probe model or worker parameters.',
-        leaseInvalid: 'The lease must be longer than the request timeout.'
-      },
       upstreamBillingProbe: {
         title: 'Upstream Rate Auto Detection',
         description: 'Periodically retrieve rates declared by upstream Sub2API sites. Account rates change only when the separate sync switch is enabled.',
@@ -601,16 +579,6 @@ export default {
         claudeCodeVersionAutoSyncHint: 'Fetches the latest Claude Code client version from the official release channel every hour, so you never need to upgrade this service just to keep the version current. When disabled, fetching stops but the previously synced version remains available. The manual version above always takes priority.',
         claudeCodeVersionSyncedValue: 'Currently synced: {version}',
         codexHardeningTitle: "Codex Settings",
-        codexTicketEnabled: "STATE ticket master switch",
-        codexTicketEnabledDesc:
-          "Only accounts explicitly enabled in their account settings can harvest and use STATE. The master switch alone does not opt in any account. When off, all accounts use normal forwarding.",
-        codexTicketAccountHint: "After saving the global pool, go to Accounts → Edit account → STATE ticket to select a plan and enable the accounts that need it.",
-        codexTicketAccountsLink: "Open accounts",
-        codexTicketHarvestProxy: "Global dynamic IP pool",
-        codexTicketHarvestProxyDesc:
-          "Shared by accounts with STATE enabled; normal requests keep each account's configured business egress. Paste a full HTTP / SOCKS5h proxy URL including credentials. A username {'{'}sid{'}'} placeholder or 1024proxy SID is replaced on every attempt. Changing the pool preserves valid tickets. Leave blank to keep the saved pool.",
-        codexTicketHarvestProxyPlaceholder: "http://user:pass{'@'}proxy.example.com:1080",
-        codexTicketHarvestProxyConfigured: "Configured (password hidden). Paste a full new proxy URL to replace it.",
         codexClientRestrictionTitle: "Codex client restriction",
         codexHardeningDesc:
           "Only affects OpenAI OAuth accounts with 'Codex official clients only' enabled (global). Beyond User-Agent/Originator, harden the decision with a version range, an engine-fingerprint gate, and black/whitelists.",

@@ -4502,30 +4502,6 @@
               </h2>
             </div>
             <div class="p-6 space-y-4">
-                <div class="flex items-center justify-between gap-4">
-                  <div class="min-w-0">
-                    <h3 class="text-base font-semibold text-gray-900 dark:text-white">
-                      {{ t("admin.settings.gatewayForwarding.codexTicketEnabled") }}
-                    </h3>
-                    <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                      {{ t("admin.settings.gatewayForwarding.codexTicketEnabledDesc") }}
-                    </p>
-                  </div>
-                  <Toggle
-                    id="codex-ticket-enabled"
-                    v-model="form.openai_codex_ticket_enabled"
-                  />
-                </div>
-                <div>
-                  <label for="codex-ticket-harvest-proxy" class="input-label">{{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxy") }}</label>
-                  <input id="codex-ticket-harvest-proxy" v-model="form.openai_codex_ticket_harvest_proxy_url" type="password" class="input w-full font-mono text-sm" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore="true" :placeholder="t('admin.settings.gatewayForwarding.codexTicketHarvestProxyPlaceholder')" />
-                  <p v-if="form.openai_codex_ticket_harvest_proxy_configured" class="mt-1 text-xs text-emerald-600 dark:text-emerald-400" data-testid="codex-ticket-global-pool-configured">{{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxyConfigured") }}</p>
-                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t("admin.settings.gatewayForwarding.codexTicketHarvestProxyDesc") }}</p>
-                </div>
-                <p class="text-sm text-gray-500 dark:text-gray-400">
-                  {{ t("admin.settings.gatewayForwarding.codexTicketAccountHint") }}
-                  <a href="/admin/accounts" class="font-medium text-primary-600 underline dark:text-primary-400">{{ t("admin.settings.gatewayForwarding.codexTicketAccountsLink") }}</a>
-                </p>
                 <div>
                   <h3 class="text-base font-semibold text-gray-900 dark:text-white">
                     {{ t("admin.settings.gatewayForwarding.codexClientRestrictionTitle") }}
@@ -4931,105 +4907,6 @@
                   </button>
                 </div>
               </template>
-            </div>
-          </div>
-
-          <!-- OpenAI Codex five-hour window warmup -->
-          <div class="card" data-testid="openai-window-warmup-settings">
-            <div class="border-b border-gray-100 px-6 py-4 dark:border-dark-700">
-              <div class="flex items-center justify-between gap-4">
-                <div>
-                  <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
-                    {{ t("admin.settings.openAIWindowWarmup.title") }}
-                  </h2>
-                  <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                    {{ t("admin.settings.openAIWindowWarmup.description") }}
-                  </p>
-                </div>
-                <Toggle
-                  v-model="form.openai_window_warmup_enabled"
-                  :aria-label="t('admin.settings.openAIWindowWarmup.enabled')"
-                  data-testid="openai-window-warmup-enabled"
-                />
-              </div>
-            </div>
-            <div class="space-y-5 p-6">
-              <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
-                <label class="block">
-                  <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    {{ t("admin.settings.openAIWindowWarmup.defaultPolicy") }}
-                  </span>
-                  <Select
-                    v-model="form.openai_window_warmup_default_policy"
-                    :options="openAIWindowWarmupPolicyOptions"
-                    class="mt-2"
-                    data-testid="openai-window-warmup-default-policy"
-                  />
-                </label>
-                <label class="block lg:col-span-2">
-                  <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    {{ t("admin.settings.openAIWindowWarmup.allowlist") }}
-                  </span>
-                  <input
-                    v-model.trim="openAIWindowWarmupAllowlistInput"
-                    type="text"
-                    inputmode="numeric"
-                    class="input mt-2 w-full"
-                    :placeholder="t('admin.settings.openAIWindowWarmup.allowlistPlaceholder')"
-                    data-testid="openai-window-warmup-allowlist"
-                  />
-                </label>
-              </div>
-
-              <label class="block">
-                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  {{ t("admin.settings.openAIWindowWarmup.probeModel") }}
-                </span>
-                <input
-                  v-model.trim="form.openai_window_warmup_probe_model"
-                  type="text"
-                  class="input mt-2 w-full"
-                  required
-                  data-testid="openai-window-warmup-probe-model"
-                />
-              </label>
-
-              <div class="grid grid-cols-2 gap-4 md:grid-cols-4">
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.workerConcurrency") }}</span>
-                  <input v-model.number="form.openai_window_warmup_worker_concurrency" type="number" min="1" max="8" step="1" class="input mt-1" data-testid="openai-window-warmup-concurrency" />
-                </label>
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.globalQPS") }}</span>
-                  <input v-model.number="form.openai_window_warmup_global_qps" type="number" min="0.01" max="0.2" step="0.01" class="input mt-1" data-testid="openai-window-warmup-qps" />
-                </label>
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.batchSize") }}</span>
-                  <input v-model.number="form.openai_window_warmup_batch_size" type="number" min="1" max="100" step="1" class="input mt-1" data-testid="openai-window-warmup-batch" />
-                </label>
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.scanSeconds") }}</span>
-                  <input v-model.number="form.openai_window_warmup_scan_seconds" type="number" min="5" max="3600" step="1" class="input mt-1" data-testid="openai-window-warmup-scan" />
-                </label>
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.requestTimeoutSeconds") }}</span>
-                  <input v-model.number="form.openai_window_warmup_request_timeout_seconds" type="number" min="5" max="300" step="1" class="input mt-1" data-testid="openai-window-warmup-timeout" />
-                </label>
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.leaseSeconds") }}</span>
-                  <input v-model.number="form.openai_window_warmup_lease_seconds" type="number" min="10" max="600" step="1" class="input mt-1" data-testid="openai-window-warmup-lease" />
-                </label>
-                <label class="block">
-                  <span class="text-xs font-medium text-gray-600 dark:text-gray-400">{{ t("admin.settings.openAIWindowWarmup.resetGraceSeconds") }}</span>
-                  <input v-model.number="form.openai_window_warmup_reset_grace_seconds" type="number" min="0" max="900" step="1" class="input mt-1" data-testid="openai-window-warmup-grace" />
-                </label>
-              </div>
-              <p
-                class="text-xs text-gray-500 dark:text-gray-400"
-                data-testid="openai-window-warmup-runtime-apply-hint"
-              >
-                {{ t("admin.settings.openAIWindowWarmup.runtimeApplyHint") }}
-              </p>
             </div>
           </div>
 
@@ -9975,7 +9852,6 @@ function resetClaudeOAuthSystemPromptBlocks(): void {
   syncClaudeOAuthSystemPromptBlocksFormField();
 }
 
-
 interface DefaultSubscriptionGroupOption {
   value: number;
   label: string;
@@ -10042,12 +9918,6 @@ type SettingsForm = Omit<
 };
 
 const schedulingThresholdPlatforms = SCHEDULING_THRESHOLD_PLATFORMS;
-const openAIWindowWarmupPolicyOptions = computed(() => [
-  { value: "off", label: t("admin.settings.openAIWindowWarmup.policyOff") },
-  { value: "initial_once", label: t("admin.settings.openAIWindowWarmup.policyOnce") },
-  { value: "continuous", label: t("admin.settings.openAIWindowWarmup.policyContinuous") },
-]);
-const openAIWindowWarmupAllowlistInput = ref("");
 
 // 平台限额表格的行：平台清单顺序中、已在归一化 map 里的平台（清单晚于设置加载时
 // 不渲染尚未归一化的平台，保持模板非空绑定）。
@@ -10319,9 +10189,6 @@ const form = reactive<SettingsForm>({
   // 只读展示：自动同步任务写入的官方最新稳定版，不参与提交（提交载荷按字段显式构造）
   openai_codex_client_version_synced: "",
   openai_codex_version_auto_sync_enabled: true,
-  openai_codex_ticket_enabled: false,
-  openai_codex_ticket_harvest_proxy_url: "",
-  openai_codex_ticket_harvest_proxy_configured: false,
   claude_code_client_version: "",
   // 只读展示：自动同步任务写入的官方最新稳定版，不参与提交（提交载荷按字段显式构造）
   claude_code_client_version_synced: "",
@@ -10333,17 +10200,6 @@ const form = reactive<SettingsForm>({
   codex_cli_only_whitelist: "",
   codex_cli_only_allow_app_server_clients: false,
   codex_cli_only_engine_fingerprint_signals: "",
-  openai_window_warmup_enabled: false,
-  openai_window_warmup_default_policy: "off",
-  openai_window_warmup_allowlist: [],
-  openai_window_warmup_probe_model: "codex-auto-review",
-  openai_window_warmup_worker_concurrency: 1,
-  openai_window_warmup_global_qps: 0.2,
-  openai_window_warmup_batch_size: 20,
-  openai_window_warmup_scan_seconds: 30,
-  openai_window_warmup_request_timeout_seconds: 45,
-  openai_window_warmup_lease_seconds: 120,
-  openai_window_warmup_reset_grace_seconds: 90,
   // 余额、订阅到期与账号限额通知
   balance_low_notify_enabled: false,
   balance_low_notify_threshold: 0,
@@ -11358,7 +11214,6 @@ async function loadSettings() {
         (form as Record<string, unknown>)[key] = value;
       }
     }
-    form.openai_codex_ticket_harvest_proxy_url = "";
     // For this optional override, null explicitly selects per-account rates.
     if (settings.openai_oauth_scheduling_rate_multiplier === null) {
       form.openai_oauth_scheduling_rate_multiplier = null;
@@ -11382,11 +11237,6 @@ async function loadSettings() {
     codexFingerprintRows.value = form.codex_cli_only_engine_fingerprint_signals
       ? parseFingerprintSignalsToRows(form.codex_cli_only_engine_fingerprint_signals)
       : defaultFingerprintSignalRows();
-    openAIWindowWarmupAllowlistInput.value = Array.isArray(
-      settings.openai_window_warmup_allowlist,
-    )
-      ? settings.openai_window_warmup_allowlist.join(", ")
-      : "";
     form.login_agreement_mode =
       settings.login_agreement_mode === "checkbox" ? "checkbox" : "modal";
     form.channel_monitor_mode =
@@ -11841,33 +11691,6 @@ async function saveSettings() {
     form.claude_oauth_system_prompt_blocks =
       claudeOAuthSystemPromptBlocksJSON;
 
-    const warmupAllowlistTokens = openAIWindowWarmupAllowlistInput.value
-      .split(/[\s,]+/)
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const warmupAllowlist = Array.from(
-      new Set(warmupAllowlistTokens.map((value) => Number(value))),
-    );
-    if (
-      warmupAllowlist.some(
-        (value) => !Number.isSafeInteger(value) || value <= 0,
-      )
-    ) {
-      appStore.showError(
-        t("admin.settings.openAIWindowWarmup.allowlistInvalid"),
-      );
-      return;
-    }
-    if (
-      Number(form.openai_window_warmup_lease_seconds) <=
-      Number(form.openai_window_warmup_request_timeout_seconds)
-    ) {
-      appStore.showError(
-        t("admin.settings.openAIWindowWarmup.leaseInvalid"),
-      );
-      return;
-    }
-
     const oauthSchedulingRate = form.openai_oauth_scheduling_rate_multiplier;
     if (
       oauthSchedulingRate !== "" &&
@@ -12085,8 +11908,6 @@ async function saveSettings() {
         form.openai_codex_client_version?.trim() || "",
       openai_codex_version_auto_sync_enabled:
         form.openai_codex_version_auto_sync_enabled,
-      openai_codex_ticket_enabled: form.openai_codex_ticket_enabled,
-      openai_codex_ticket_harvest_proxy_url: form.openai_codex_ticket_harvest_proxy_url.trim() || undefined,
       claude_code_client_version: form.claude_code_client_version?.trim() || "",
       claude_code_version_auto_sync_enabled:
         form.claude_code_version_auto_sync_enabled,
@@ -12102,33 +11923,6 @@ async function saveSettings() {
       ),
       codex_cli_only_whitelist: serializeCodexRowsToJSON(
         codexWhitelistRows.value,
-      ),
-      openai_window_warmup_enabled: form.openai_window_warmup_enabled,
-      openai_window_warmup_default_policy:
-        form.openai_window_warmup_default_policy,
-      openai_window_warmup_allowlist: warmupAllowlist,
-      openai_window_warmup_probe_model:
-        form.openai_window_warmup_probe_model.trim(),
-      openai_window_warmup_worker_concurrency: Number(
-        form.openai_window_warmup_worker_concurrency,
-      ),
-      openai_window_warmup_global_qps: Number(
-        form.openai_window_warmup_global_qps,
-      ),
-      openai_window_warmup_batch_size: Number(
-        form.openai_window_warmup_batch_size,
-      ),
-      openai_window_warmup_scan_seconds: Number(
-        form.openai_window_warmup_scan_seconds,
-      ),
-      openai_window_warmup_request_timeout_seconds: Number(
-        form.openai_window_warmup_request_timeout_seconds,
-      ),
-      openai_window_warmup_lease_seconds: Number(
-        form.openai_window_warmup_lease_seconds,
-      ),
-      openai_window_warmup_reset_grace_seconds: Number(
-        form.openai_window_warmup_reset_grace_seconds,
       ),
       // Payment configuration
       payment_enabled: form.payment_enabled,
@@ -12293,7 +12087,6 @@ async function saveSettings() {
         (form as Record<string, unknown>)[key] = value;
       }
     }
-    form.openai_codex_ticket_harvest_proxy_url = "";
     if (updated.openai_oauth_scheduling_rate_multiplier === null) {
       form.openai_oauth_scheduling_rate_multiplier = null;
     }
@@ -12302,11 +12095,6 @@ async function saveSettings() {
     form.account_scheduling_thresholds = normalizeAccountSchedulingThresholdsMap(
       updated.account_scheduling_thresholds,
     );
-    openAIWindowWarmupAllowlistInput.value = Array.isArray(
-      updated.openai_window_warmup_allowlist,
-    )
-      ? updated.openai_window_warmup_allowlist.join(", ")
-      : "";
     registrationEmailSuffixWhitelistTags.value =
       normalizeRegistrationEmailSuffixDomains(
         updated.registration_email_suffix_whitelist,

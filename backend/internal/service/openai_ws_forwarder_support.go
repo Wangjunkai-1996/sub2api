@@ -165,7 +165,7 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 			// cancelled, and contradictory nested statuses must stay on the
 			// fallback path; treating them as prewarmed would bind an unusable
 			// response id and contaminate the next business request.
-			terminalType := warmupTerminalTypeWithStatus(message, eventType)
+			terminalType := openAIWSTerminalTypeWithStatus(message, eventType)
 			if terminalType != "response.completed" && terminalType != "response.done" {
 				lease.MarkBroken()
 				return wrapOpenAIWSFallback(
@@ -750,11 +750,7 @@ func (s *OpenAIGatewayService) acquirePreviousResponseAccountSlot(
 		}
 
 		// Recovery admission belongs to the request, not this temporary wait.
-		admissionCtx, ticketErr := s.codexTicketSelectionContext(waitCtx, account, requestedModel, requireCompact)
-		if ticketErr != nil {
-			return nil, ticketErr
-		}
-		result, err = acquireAccountSlotForSelection(admissionCtx, s.concurrencyService, s.settingService, account)
+		result, err = acquireAccountSlotForSelection(waitCtx, s.concurrencyService, s.settingService, account)
 		if err == nil && result != nil && result.Acquired {
 			return result, nil
 		}
@@ -1129,4 +1125,35 @@ func (s *OpenAIGatewayService) clearOpenAIWSFallbackCooling(accountID int64) {
 		return
 	}
 	s.openaiWSFallbackUntil.Delete(accountID)
+}
+
+func openAIWSTerminalTypeWithStatus(payload []byte, eventType string) string {
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
+	status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()))
+	if status == "" {
+		status = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "status").String()))
+	}
+	// An explicit failed/incomplete/cancelled event is stronger than a stale or
+	// contradictory nested status. Only completed/done aliases are normalized
+	// from nested status so a failed event cannot be promoted to success.
+	switch eventType {
+	case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		return eventType
+	}
+	switch status {
+	case "failed", "error":
+		return "response.failed"
+	case "incomplete", "cancelled", "canceled":
+		return "response." + status
+	case "completed", "complete":
+		return "response.completed"
+	default:
+		if status != "" && (eventType == "response.done" || eventType == "response.completed") {
+			// A terminal alias paired with an unknown non-empty status is not
+			// success evidence. Keep the cycle retryable/uncertain instead of
+			// allowing an in_progress or queued response to advance it.
+			return "response.incomplete"
+		}
+		return eventType
+	}
 }

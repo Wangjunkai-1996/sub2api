@@ -242,21 +242,6 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		SettingKeyCodexCLIOnlyAllowAppServerClients:    "false",
 		SettingKeyCodexCLIOnlyEngineFingerprintSignals: openai.DefaultEngineFingerprintSignalsJSON(),
 
-		// OpenAI Codex five-hour window warmup defaults. Production enables this
-		// only after the HTTP release has completed and an allowlist is selected.
-		SettingKeyOpenAIWindowWarmupEnabled:               "false",
-		SettingKeyOpenAIWindowWarmupDefaultPolicy:         OpenAIWindowWarmupPolicyOff,
-		SettingKeyOpenAIWindowWarmupAllowlist:             "[]",
-		SettingKeyOpenAIWindowWarmupProbeModel:            "codex-auto-review",
-		SettingKeyOpenAIWindowWarmupWorkerConcurrency:     "1",
-		SettingKeyOpenAIWindowWarmupGlobalQPS:             "0.2",
-		SettingKeyOpenAIWindowWarmupBatchSize:             "20",
-		SettingKeyOpenAIWindowWarmupScanSeconds:           "30",
-		SettingKeyOpenAIWindowWarmupRequestTimeoutSeconds: "45",
-		SettingKeyOpenAIWindowWarmupLeaseSeconds:          "120",
-		SettingKeyOpenAIWindowWarmupResetGraceSeconds:     "90",
-
-		// 分组隔离（默认不允许未分组 Key 调度）
 		SettingKeyAllowUngroupedKeyScheduling:                        "false",
 		SettingKeyOpenAILowUpstreamRatePriorityEnabled:               "false",
 		SettingKeyOpenAIOAuthSchedulingRateMultiplier:                "1",
@@ -268,7 +253,6 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		SettingKeyOpenAICodexClientVersion:                           "",
 		SettingKeyOpenAICodexClientVersionSynced:                     "",
 		SettingKeyOpenAICodexVersionAutoSyncEnabled:                  "true",
-		SettingKeyOpenAICodexTicketHarvestProxyURL:                   "",
 		SettingKeyClaudeCodeClientVersion:                            "",
 		SettingKeyClaudeCodeClientVersionSynced:                      "",
 		SettingKeyClaudeCodeVersionAutoSyncEnabled:                   "true",
@@ -942,9 +926,6 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	} else {
 		result.OpenAICodexVersionAutoSyncEnabled = true
 	}
-	legacyFallback := s != nil && s.cfg != nil && (s.cfg.Gateway.OpenAICodexTicket.Enabled != s.cfg.Gateway.OpenAICodexTicket.Enabled332)
-	result.OpenAICodexTicketEnabled = codexTicketMasterSetting(settings, legacyFallback)
-	result.OpenAICodexTicketHarvestProxyURL = strings.TrimSpace(settings[SettingKeyOpenAICodexTicketHarvestProxyURL])
 	result.ClaudeCodeClientVersion = NormalizeClaudeCodeClientVersion(settings[SettingKeyClaudeCodeClientVersion])
 	result.ClaudeCodeClientVersionSynced = NormalizeClaudeCodeClientVersion(settings[SettingKeyClaudeCodeClientVersionSynced])
 	// 自动同步默认开启：缺失/空值一律视为开启，与 openai_codex_version_auto_sync_enabled 同一惯例。
@@ -964,7 +945,6 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	} else {
 		result.CodexCLIOnlyEngineFingerprintSignals = openai.DefaultEngineFingerprintSignalsJSON() // 缺失/空 → 展示默认种子
 	}
-	applyOpenAIWindowWarmupSettings(result, settings)
 
 	// Web search emulation: quick enabled check from the JSON config
 	if raw := settings[SettingKeyWebSearchEmulationConfig]; raw != "" {

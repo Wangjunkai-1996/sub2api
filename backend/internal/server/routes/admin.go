@@ -45,7 +45,6 @@ func RegisterAdminRoutes(
 
 		// 账号管理
 		registerAccountRoutes(admin, h, stepUpAuth)
-		registerOpenAIWindowWarmupRoutes(admin, h)
 
 		// 公告管理
 		registerAnnouncementRoutes(admin, h)
@@ -384,9 +383,6 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.GET("/:id/claude/reset-credits", h.Admin.Account.ClaudeResetCredits)
 		// Same protection as the Codex reset-quota route (admin auth, audit, compliance guard).
 		accounts.POST("/:id/claude/reset-credits/redeem", h.Admin.Account.RedeemClaudeResetCredit)
-		accounts.GET("/:id/codex-warmup", h.Admin.Account.GetOpenAIWindowWarmup)
-		accounts.POST("/:id/codex-warmup/requeue", h.Admin.Account.RequeueOpenAIWindowWarmup)
-		accounts.POST("/:id/codex-warmup/unblock", h.Admin.Account.UnblockOpenAIWindowWarmup)
 		accounts.POST("", h.Admin.Account.Create)
 		accounts.POST("/:id/duplicate", h.Admin.Account.Duplicate)
 		accounts.POST("/check-mixed-channel", h.Admin.Account.CheckMixedChannel)
@@ -394,9 +390,6 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.POST("/sync/crs", h.Admin.Account.SyncFromCRS)
 		accounts.POST("/sync/crs/preview", h.Admin.Account.PreviewFromCRS)
 		accounts.PUT("/:id", h.Admin.Account.Update)
-		accounts.GET("/:id/codex-ticket", h.Admin.Account.GetCodexAccountTicket)
-		accounts.PUT("/:id/codex-ticket", h.Admin.Account.UpdateCodexAccountTicket)
-		accounts.POST("/:id/codex-ticket/harvest", h.Admin.Account.HarvestCodexAccountTicket)
 		accounts.GET("/:id/grok-media-eligibility", h.Admin.Account.GetGrokMediaEligibility)
 		accounts.PUT("/:id/grok-media-eligibility", h.Admin.Account.UpdateGrokMediaEligibility)
 		accounts.PUT("/:id/upstream-billing-probe", h.Admin.Account.SetUpstreamBillingProbeEnabled)
@@ -455,16 +448,6 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.POST("/exchange-setup-token-code", h.Admin.OAuth.ExchangeSetupTokenCode)
 		accounts.POST("/cookie-auth", h.Admin.OAuth.CookieAuth)
 		accounts.POST("/setup-token-cookie-auth", h.Admin.OAuth.SetupTokenCookieAuth)
-	}
-}
-
-func registerOpenAIWindowWarmupRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
-	warmup := admin.Group("/codex-window-warmup")
-	{
-		warmup.GET("/metrics", h.Admin.Account.GetOpenAIWindowWarmupMetrics)
-		warmup.GET("/jobs", h.Admin.Account.ListOpenAIWindowWarmupJobs)
-		warmup.POST("/requeue-batch", h.Admin.Account.RequeueOpenAIWindowWarmupBatch)
-		warmup.POST("/policy-batch", h.Admin.Account.UpdateOpenAIWindowWarmupPolicyBatch)
 	}
 }
 

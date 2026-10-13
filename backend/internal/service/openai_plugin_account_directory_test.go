@@ -91,7 +91,7 @@ func TestAccountReadableSnapshot_DenylistTripwire(t *testing.T) {
 	// (refresh_token) not handed out by ResolveOutboundIdentity. Groups/AccountGroups
 	// = relational graphs with back-references that would cycle under encoding/json.
 	stripped := map[string]struct{}{
-		"Credentials": {}, "Groups": {}, "AccountGroups": {}, "OpenAIWarmupIdentityGeneration": {},
+		"Credentials": {}, "Groups": {}, "AccountGroups": {},
 		"EgressMode": {}, "EgressRevision": {}, "EgressBindings": {},
 		"SelectedEgress": {}, "LegacyEgressAdmission": {}, "OpenAI429Attempt": {}, "EgressPoolWrite": {},
 	}
@@ -127,7 +127,7 @@ func TestAccountReadableSnapshot_DenylistTripwire(t *testing.T) {
 	acct := &Account{
 		ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
 		Credentials: map[string]any{"access_token": "AT", "refresh_token": "LEAK-REFRESH"},
-		Extra:       map[string]any{"opaque": "extra-released"},
+		Extra:       map[string]any{"opaque": "extra-released", "codex_turn_ticket:v2:state": "RETIRED-STATE-SECRET"},
 		Proxy:       &Proxy{Host: "host", Port: 1, Username: "user", Password: "pw-released"},
 	}
 	snap := accountReadableSnapshotJSON(acct)
@@ -135,6 +135,7 @@ func TestAccountReadableSnapshot_DenylistTripwire(t *testing.T) {
 	var m map[string]any
 	require.NoError(t, json.Unmarshal(snap, &m))
 	assert.NotContains(t, string(snap), "LEAK-REFRESH", "raw Credentials must never appear in metadata")
+	assert.NotContains(t, string(snap), "RETIRED-STATE-SECRET", "retired tickets must never appear in plugin metadata")
 	assert.Contains(t, string(snap), "extra-released", "Extra is intentionally released")
 	assert.Contains(t, string(snap), "pw-released", "proxy is intentionally released (already exposed via 打票)")
 
@@ -152,6 +153,7 @@ func TestAccountReadableSnapshot_DenylistTripwire(t *testing.T) {
 
 	// Shallow-copy safety: the source account must be untouched.
 	assert.NotNil(t, acct.Credentials, "snapshot must not mutate the source account")
+	assert.Equal(t, "RETIRED-STATE-SECRET", acct.Extra["codex_turn_ticket:v2:state"], "snapshot must not mutate the source extra")
 	assert.NotNil(t, acct.Proxy, "snapshot must not mutate the source account")
 	assert.Len(t, acct.Groups, 1, "snapshot must not mutate the source account's Groups")
 }

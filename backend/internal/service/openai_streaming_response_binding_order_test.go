@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -121,16 +120,7 @@ func TestOpenAIHTTPStreamingBindsRoutingPairBeforeCompletedEvent(t *testing.T) {
 				_, err := s.handleStreamingResponse(ctx, resp, c, account, time.Now(), "gpt-5", "gpt-5")
 				return err
 			},
-		},
-		{
-			name: "atomic",
-			run: func(s *OpenAIGatewayService, ctx context.Context, resp *http.Response, c *gin.Context, account *Account) error {
-				s.cfg = &config.Config{Gateway: config.GatewayConfig{OpenAIAtomicStreamFailover: true}}
-				_, err := s.handleStreamingResponse(ctx, resp, c, account, time.Now(), "gpt-5", "gpt-5")
-				return err
-			},
-		},
-		{
+		}, {
 			name: "passthrough",
 			run: func(s *OpenAIGatewayService, ctx context.Context, resp *http.Response, c *gin.Context, account *Account) error {
 				_, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, time.Now(), "gpt-5", "gpt-5")

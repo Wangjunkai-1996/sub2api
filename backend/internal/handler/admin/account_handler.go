@@ -68,11 +68,7 @@ type AccountHandler struct {
 	grokImportProber        grokImportProber
 	upstreamBillingProbe    *service.UpstreamBillingProbeService
 	ollamaCloudUsage        *service.OllamaCloudUsageService
-	codexTicketSettings     *service.SettingService
-	openAIWindowWarmup      *service.OpenAIWindowWarmupService
-	settingService          *service.SettingService
 	egressService           *service.EgressService
-	codexAccountTickets     codexAccountTicketManager
 	cfg                     *config.Config
 	opencodeGoUsage         *service.OpenCodeGoUsageService
 }
@@ -99,16 +95,6 @@ func (h *AccountHandler) SetUpstreamBillingProbeService(probe *service.UpstreamB
 
 func (h *AccountHandler) SetOllamaCloudUsageService(usage *service.OllamaCloudUsageService) {
 	h.ollamaCloudUsage = usage
-}
-
-// SetCodexTicketSettings supplies the live policy without mutating shared config.
-func (h *AccountHandler) SetCodexTicketSettings(settings *service.SettingService) {
-	h.codexTicketSettings = settings
-}
-
-func (h *AccountHandler) SetOpenAIWindowWarmupService(warmup *service.OpenAIWindowWarmupService, settings *service.SettingService) {
-	h.openAIWindowWarmup = warmup
-	h.settingService = settings
 }
 
 // SetEgressService attaches the account egress mutation service.  It is kept
@@ -179,7 +165,6 @@ type CreateAccountRequest struct {
 	AutoPauseOnExpired      *bool                     `json:"auto_pause_on_expired"`
 	ProbeEnabled            *bool                     `json:"upstream_billing_probe_enabled"`
 	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
-	OpenAICodexWarmupPolicy *string                   `json:"openai_codex_warmup_policy"`
 }
 
 // UpdateAccountRequest represents update account request
@@ -204,7 +189,6 @@ type UpdateAccountRequest struct {
 	ProbeEnabled            *bool                     `json:"upstream_billing_probe_enabled"`
 	RateSyncEnabled         *bool                     `json:"upstream_billing_rate_sync_enabled"`
 	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
-	OpenAICodexWarmupPolicy *string                   `json:"openai_codex_warmup_policy"`
 }
 
 // BulkUpdateAccountsRequest represents the payload for bulk editing accounts
@@ -271,10 +255,9 @@ type AccountWithConcurrency struct {
 	SchedulerScore     *AccountSchedulerScore       `json:"scheduler_score,omitempty"`
 	SchedulerScores    []AccountSchedulerGroupScore `json:"scheduler_scores,omitempty"`
 	// 以下字段仅对 Anthropic OAuth/SetupToken 账号有效，且仅在启用相应功能时返回
-	CurrentWindowCost  *float64                          `json:"current_window_cost,omitempty"` // 当前窗口费用
-	ActiveSessions     *int                              `json:"active_sessions,omitempty"`     // 当前活跃会话数
-	CurrentRPM         *int                              `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
-	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
+	CurrentWindowCost *float64 `json:"current_window_cost,omitempty"` // 当前窗口费用
+	ActiveSessions    *int     `json:"active_sessions,omitempty"`     // 当前活跃会话数
+	CurrentRPM        *int     `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
 }
 
 // AccountListItemWithConcurrency is the compact account-list envelope used
@@ -282,13 +265,12 @@ type AccountWithConcurrency struct {
 // so groups/account_groups never appear in the list payload.
 type AccountListItemWithConcurrency struct {
 	*dto.AccountListItem
-	CurrentConcurrency int                               `json:"current_concurrency"`
-	SchedulerScore     *AccountSchedulerScore            `json:"scheduler_score,omitempty"`
-	SchedulerScores    []AccountSchedulerGroupScore      `json:"scheduler_scores,omitempty"`
-	CurrentWindowCost  *float64                          `json:"current_window_cost,omitempty"`
-	ActiveSessions     *int                              `json:"active_sessions,omitempty"`
-	CurrentRPM         *int                              `json:"current_rpm,omitempty"`
-	OpenAIWindowWarmup *OpenAIWindowWarmupStatusResponse `json:"openai_window_warmup,omitempty"`
+	CurrentConcurrency int                          `json:"current_concurrency"`
+	SchedulerScore     *AccountSchedulerScore       `json:"scheduler_score,omitempty"`
+	SchedulerScores    []AccountSchedulerGroupScore `json:"scheduler_scores,omitempty"`
+	CurrentWindowCost  *float64                     `json:"current_window_cost,omitempty"`
+	ActiveSessions     *int                         `json:"active_sessions,omitempty"`
+	CurrentRPM         *int                         `json:"current_rpm,omitempty"`
 }
 
 type simpleModeGroupReference struct {
@@ -413,7 +395,6 @@ const accountListGroupUngroupedQueryValue = "ungrouped"
 
 func (h *AccountHandler) accountResponseFromService(account *service.Account) *dto.Account {
 	out := dto.AccountFromService(account)
-	h.enrichCodexTicketStatus(account, out)
 	if h != nil && h.ollamaCloudUsage != nil && out != nil {
 		h.ollamaCloudUsage.EnrichState(out.OllamaCloudUsage)
 	}
@@ -422,7 +403,6 @@ func (h *AccountHandler) accountResponseFromService(account *service.Account) *d
 
 func (h *AccountHandler) accountListResponseFromService(account *service.Account) *dto.Account {
 	out := dto.AccountFromServiceShallow(account)
-	h.enrichCodexTicketStatus(account, out)
 	if out != nil && account != nil {
 		out.Proxy = dto.ProxyFromService(account.Proxy)
 	}
@@ -430,16 +410,6 @@ func (h *AccountHandler) accountListResponseFromService(account *service.Account
 		h.ollamaCloudUsage.EnrichState(out.OllamaCloudUsage)
 	}
 	return out
-}
-
-func (h *AccountHandler) enrichCodexTicketStatus(account *service.Account, out *dto.Account) {
-	if h != nil && h.cfg != nil && out != nil {
-		cfg := h.cfg.Gateway.OpenAICodexTicket
-		if h.codexTicketSettings != nil {
-			cfg = h.codexTicketSettings.ResolveOpenAICodexTicketConfig(context.Background(), cfg)
-		}
-		out.CodexTurnTickets = service.OpenAICodexTicketStatuses(account, cfg, time.Now())
-	}
 }
 
 func (h *AccountHandler) isSimpleMode() bool {
@@ -496,7 +466,6 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 
 	items := []AccountWithConcurrency{item}
 	h.enrichShadowParents(ctx, items)
-	h.enrichOpenAIWindowWarmup(ctx, []service.Account{*account}, items)
 
 	return items[0]
 }
@@ -937,7 +906,6 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	h.enrichShadowParents(c.Request.Context(), result)
-	h.enrichOpenAIWindowWarmup(c.Request.Context(), accounts, result)
 
 	if lite {
 		compact := make([]AccountListItemWithConcurrency, len(result))
@@ -951,7 +919,6 @@ func (h *AccountHandler) List(c *gin.Context) {
 				CurrentWindowCost:  item.CurrentWindowCost,
 				ActiveSessions:     item.ActiveSessions,
 				CurrentRPM:         item.CurrentRPM,
-				OpenAIWindowWarmup: item.OpenAIWindowWarmup,
 			}
 		}
 		etag := buildAccountsListETag(compact, total, page, pageSize, platform, accountType, status, search, true)
@@ -1187,19 +1154,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "rate_multiplier must be >= 0")
 		return
 	}
-	if req.Platform == service.PlatformOpenAI && req.Type == service.AccountTypeOAuth {
-		policy, policyErr := resolveOpenAIWindowWarmupImportPolicy(c.Request.Context(), req.OpenAICodexWarmupPolicy, h.settingService)
-		if policyErr != nil {
-			response.ErrorFrom(c, policyErr)
-			return
-		}
-		policyValue := string(policy)
-		req.OpenAICodexWarmupPolicy = &policyValue
-		req.Extra = withOpenAIWindowWarmupPolicy(req.Extra, policy)
-	} else if req.OpenAICodexWarmupPolicy != nil {
-		response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
-		return
-	}
+
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 	if err := service.ValidateUpstreamRequestIDHeaderExtra(req.Extra); err != nil {
@@ -1242,9 +1197,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		h.adminService.ForceAntigravityPrivacy(ctx, account)
 		// OpenAI OAuth: 新账号直接设置隐私
 		h.adminService.ForceOpenAIPrivacy(ctx, account)
-		if _, scheduleErr := h.scheduleOpenAIWindowWarmup(ctx, account, service.OpenAIWindowWarmupTriggerImport); scheduleErr != nil {
-			return nil, scheduleErr
-		}
+
 		return h.buildAccountResponseWithRuntime(ctx, account), nil
 	})
 	if err != nil {
@@ -1373,27 +1326,7 @@ func (h *AccountHandler) Update(c *gin.Context) {
 		response.BadRequest(c, "rate_multiplier must be >= 0")
 		return
 	}
-	if req.OpenAICodexWarmupPolicy != nil {
-		policy, policyErr := validateOpenAIWindowWarmupPolicy(*req.OpenAICodexWarmupPolicy)
-		if policyErr != nil {
-			response.ErrorFrom(c, policyErr)
-			return
-		}
-		current, currentErr := h.adminService.GetAccount(c.Request.Context(), accountID)
-		if currentErr != nil {
-			response.ErrorFrom(c, currentErr)
-			return
-		}
-		if !isOpenAIWindowWarmupAccount(current) {
-			response.ErrorFrom(c, infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts"))
-			return
-		}
-		baseExtra := current.Extra
-		if req.Extra != nil {
-			baseExtra = req.Extra
-		}
-		req.Extra = withOpenAIWindowWarmupPolicy(baseExtra, policy)
-	}
+
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 	if err := service.ValidateUpstreamRequestIDHeaderExtra(req.Extra); err != nil {
@@ -1444,10 +1377,6 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	// 异步执行，探测失败不影响账号更新响应。
 	if len(req.Credentials) > 0 {
 		h.scheduleOpenAIResponsesProbe(account)
-	}
-	if _, scheduleErr := h.scheduleOpenAIWindowWarmup(c.Request.Context(), account, service.OpenAIWindowWarmupTriggerImport); scheduleErr != nil {
-		response.ErrorFrom(c, scheduleErr)
-		return
 	}
 
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
@@ -2319,10 +2248,7 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 			return
 		}
 	}
-	if err := h.prepareOpenAIWindowWarmupBatchCreate(c.Request.Context(), req.Accounts); err != nil {
-		response.ErrorFrom(c, err)
-		return
-	}
+
 	groupIDs := make([]int64, 0)
 	for _, item := range req.Accounts {
 		groupIDs = append(groupIDs, item.GroupIDs...)
@@ -2447,48 +2373,6 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 			"results": results,
 		}, nil
 	})
-}
-
-// prepareOpenAIWindowWarmupBatchCreate resolves the complete batch before the
-// idempotent write closure starts. Eligible requests that omit the field share
-// one settings read; explicit values are validated without consulting settings.
-func (h *AccountHandler) prepareOpenAIWindowWarmupBatchCreate(ctx context.Context, accounts []CreateAccountRequest) error {
-	policies := make(map[int]service.OpenAIWindowWarmupPolicy)
-	missing := make([]int, 0)
-	for i := range accounts {
-		eligible := accounts[i].Platform == service.PlatformOpenAI && accounts[i].Type == service.AccountTypeOAuth
-		if !eligible {
-			if accounts[i].OpenAICodexWarmupPolicy != nil {
-				return infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_ACCOUNT_INELIGIBLE", "Warmup policy is only valid for OpenAI OAuth parent accounts")
-			}
-			continue
-		}
-		if accounts[i].OpenAICodexWarmupPolicy == nil {
-			missing = append(missing, i)
-			continue
-		}
-		policy, err := validateOpenAIWindowWarmupPolicy(*accounts[i].OpenAICodexWarmupPolicy)
-		if err != nil {
-			return err
-		}
-		policies[i] = policy
-	}
-
-	if len(missing) > 0 {
-		policy, err := resolveOpenAIWindowWarmupImportPolicy(ctx, nil, h.settingService)
-		if err != nil {
-			return err
-		}
-		for _, i := range missing {
-			policies[i] = policy
-		}
-	}
-	for i, policy := range policies {
-		policyValue := string(policy)
-		accounts[i].OpenAICodexWarmupPolicy = &policyValue
-		accounts[i].Extra = withOpenAIWindowWarmupPolicy(accounts[i].Extra, policy)
-	}
-	return nil
 }
 
 // BatchUpdateCredentialsRequest represents batch credentials update request

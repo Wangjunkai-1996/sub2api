@@ -184,7 +184,6 @@ func TestAccountEgressKeysShareAccountHashTag(t *testing.T) {
 		accountEgressConfigKey(accountID),
 		accountEgressWaitersKey(accountID),
 		accountEgressRRKey(accountID),
-		accountEgressExclusiveKey(accountID),
 		accountEgressModeKey(accountID),
 		accountEgressTotalKey(accountID),
 		accountEgressLegacyRegularKey(accountID),
@@ -952,39 +951,6 @@ func TestForcePoolIgnoresExpiredLegacyPrimaryLease(t *testing.T) {
 	require.Equal(t, int64(0), cache.rdb.ZCard(ctx, accountSlotKey(config.AccountID)).Val())
 	require.Equal(t, int64(1), cache.rdb.ZCard(ctx, accountEgressTotalKey(config.AccountID)).Val())
 	releaseAccountEgressTest(t, cache, config, result)
-}
-
-func TestAccountEgressWarmupGateCoversPoolLeasesAndWaiters(t *testing.T) {
-	cache, _ := newAccountEgressCacheTest(t)
-	candidate := accountEgressTestCandidate(0, 81, "ip:a")
-	config := accountEgressTestConfig(1008, 1, 2, candidate)
-	syncAccountEgressTestConfig(t, cache, config)
-	ctx := context.Background()
-
-	owner := acquireAccountEgressTest(t, cache, config, "warmup-owner", "", "")
-	warmup, err := cache.AcquireAccountExclusive(ctx, config.AccountID, "warmup-token", time.Minute)
-	require.NoError(t, err)
-	require.False(t, warmup)
-	require.Equal(t, service.AccountEgressStatusFull, acquireAccountEgressTest(t, cache, config, "warmup-waiter", "", "").Status)
-	releaseAccountEgressTest(t, cache, config, owner)
-	warmup, err = cache.AcquireAccountExclusive(ctx, config.AccountID, "warmup-token", time.Minute)
-	require.NoError(t, err)
-	require.False(t, warmup, "queued pool demand must prevent maintenance from taking the account")
-	require.NoError(t, cache.RemoveAccountEgressWaiter(ctx, config.AccountID, "warmup-waiter"))
-	warmup, err = cache.AcquireAccountExclusive(ctx, config.AccountID, "warmup-token", time.Minute)
-	require.NoError(t, err)
-	require.True(t, warmup)
-	require.Equal(t, "warmup-token", cache.rdb.Get(ctx, accountEgressExclusiveKey(config.AccountID)).Val())
-
-	blockedCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
-	defer cancel()
-	allocator := service.NewAccountEgressAllocator(cache)
-	defer allocator.Close()
-	_, err = allocator.Acquire(blockedCtx, service.AccountEgressAcquireRequest{Config: config, LeaseID: "warmup-blocked"})
-	require.ErrorIs(t, err, service.ErrAccountEgressCapacityFull)
-	released, err := cache.ReleaseAccountExclusive(ctx, config.AccountID, "warmup-token")
-	require.NoError(t, err)
-	require.True(t, released)
 }
 
 func TestAccountEgressBatchLoadAndConcurrentHardCap(t *testing.T) {

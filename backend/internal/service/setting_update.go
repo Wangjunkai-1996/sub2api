@@ -503,11 +503,7 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyOpenAICodexUserAgent] = strings.TrimSpace(settings.OpenAICodexUserAgent)
 	updates[SettingKeyOpenAICodexClientVersion] = NormalizeCodexClientVersion(settings.OpenAICodexClientVersion)
 	updates[SettingKeyOpenAICodexVersionAutoSyncEnabled] = strconv.FormatBool(settings.OpenAICodexVersionAutoSyncEnabled)
-	updates[SettingKeyOpenAICodexTicketV2Enabled] = strconv.FormatBool(settings.OpenAICodexTicketEnabled)
-	if err := ValidateOpenAICodexTicketHarvestProxyURL(settings.OpenAICodexTicketHarvestProxyURL); err != nil {
-		return nil, infraerrors.BadRequest("INVALID_CODEX_HARVEST_PROXY", err.Error())
-	}
-	updates[SettingKeyOpenAICodexTicketHarvestProxyURL] = strings.TrimSpace(settings.OpenAICodexTicketHarvestProxyURL)
+
 	// SettingKeyOpenAICodexClientVersionSynced 由自动同步任务独占写入，此处不得覆盖，
 	// 否则面板保存会把同步结果清空。
 	updates[SettingKeyClaudeCodeClientVersion] = NormalizeClaudeCodeClientVersion(settings.ClaudeCodeClientVersion)
@@ -521,24 +517,7 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyCodexCLIOnlyWhitelist] = strings.TrimSpace(settings.CodexCLIOnlyWhitelist)
 	updates[SettingKeyCodexCLIOnlyAllowAppServerClients] = strconv.FormatBool(settings.CodexCLIOnlyAllowAppServerClients)
 	updates[SettingKeyCodexCLIOnlyEngineFingerprintSignals] = strings.TrimSpace(settings.CodexCLIOnlyEngineFingerprintSignals)
-	if err := validateOpenAIWindowWarmupSettings(settings); err != nil {
-		return nil, err
-	}
-	warmupAllowlist, err := json.Marshal(settings.OpenAIWindowWarmupAllowlist)
-	if err != nil {
-		return nil, fmt.Errorf("marshal OpenAI window warmup allowlist: %w", err)
-	}
-	updates[SettingKeyOpenAIWindowWarmupEnabled] = strconv.FormatBool(settings.OpenAIWindowWarmupEnabled)
-	updates[SettingKeyOpenAIWindowWarmupDefaultPolicy] = settings.OpenAIWindowWarmupDefaultPolicy
-	updates[SettingKeyOpenAIWindowWarmupAllowlist] = string(warmupAllowlist)
-	updates[SettingKeyOpenAIWindowWarmupProbeModel] = strings.TrimSpace(settings.OpenAIWindowWarmupProbeModel)
-	updates[SettingKeyOpenAIWindowWarmupWorkerConcurrency] = strconv.Itoa(settings.OpenAIWindowWarmupWorkerConcurrency)
-	updates[SettingKeyOpenAIWindowWarmupGlobalQPS] = strconv.FormatFloat(settings.OpenAIWindowWarmupGlobalQPS, 'f', -1, 64)
-	updates[SettingKeyOpenAIWindowWarmupBatchSize] = strconv.Itoa(settings.OpenAIWindowWarmupBatchSize)
-	updates[SettingKeyOpenAIWindowWarmupScanSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupScanSeconds)
-	updates[SettingKeyOpenAIWindowWarmupRequestTimeoutSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupRequestTimeoutSeconds)
-	updates[SettingKeyOpenAIWindowWarmupLeaseSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupLeaseSeconds)
-	updates[SettingKeyOpenAIWindowWarmupResetGraceSeconds] = strconv.Itoa(settings.OpenAIWindowWarmupResetGraceSeconds)
+
 	updates[SettingPaymentVisibleMethodAlipaySource] = settings.PaymentVisibleMethodAlipaySource
 	updates[SettingPaymentVisibleMethodWxpaySource] = settings.PaymentVisibleMethodWxpaySource
 	updates[SettingPaymentVisibleMethodAlipayEnabled] = strconv.FormatBool(settings.PaymentVisibleMethodAlipayEnabled)
@@ -798,8 +777,6 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 	// 版本号缓存只做失效，不在此重算：生效值还取决于自动同步写入的 synced 键，
 	// 这里没有它的最新值，重算会把同步结果覆盖成陈旧值。
 	s.InvalidateOpenAICodexClientVersionCache()
-	s.InvalidateOpenAICodexTicketEnabledCache()
-	s.InvalidateOpenAICodexTicketHarvestProxyCache()
 	s.InvalidateClaudeCodeClientVersionCache()
 	openAIAdvancedSchedulerSettingSF.Forget(openAIAdvancedSchedulerSettingKey)
 	openAIAdvancedSchedulerSettingCache.Store(&cachedOpenAIAdvancedSchedulerSetting{

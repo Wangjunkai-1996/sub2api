@@ -54,7 +54,6 @@ const (
 	AccountEgressStatusRequiredBindingUnavailable AccountEgressStatus = "REQUIRED_BINDING_UNAVAILABLE"
 	AccountEgressStatusConfigStale                AccountEgressStatus = "CONFIG_STALE"
 	AccountEgressStatusConfigUnavailable          AccountEgressStatus = "CONFIG_UNAVAILABLE"
-	AccountEgressStatusExclusive                  AccountEgressStatus = "EXCLUSIVE"
 	AccountEgressStatusQueueFull                  AccountEgressStatus = "QUEUE_FULL"
 	AccountEgressStatusLegacyDraining             AccountEgressStatus = "LEGACY_DRAINING"
 )
@@ -531,7 +530,7 @@ func accountEgressWaitContextError(ctx, waitCtx context.Context) error {
 
 func accountEgressStatusError(status AccountEgressStatus) error {
 	switch status {
-	case AccountEgressStatusFull, AccountEgressStatusNotQueueHead, AccountEgressStatusExclusive, AccountEgressStatusQueueFull, AccountEgressStatusLegacyDraining:
+	case AccountEgressStatusFull, AccountEgressStatusNotQueueHead, AccountEgressStatusQueueFull, AccountEgressStatusLegacyDraining:
 		return fmt.Errorf("%w: %s", ErrAccountEgressCapacityFull, status)
 	case AccountEgressStatusNoEligibleEgress, AccountEgressStatusRequiredBindingUnavailable:
 		return fmt.Errorf("%w: %s", ErrAccountEgressNoRoute, status)
@@ -544,7 +543,7 @@ func accountEgressStatusError(status AccountEgressStatus) error {
 
 func accountEgressStatusCanWait(status AccountEgressStatus) bool {
 	switch status {
-	case AccountEgressStatusFull, AccountEgressStatusNotQueueHead, AccountEgressStatusExclusive, AccountEgressStatusLegacyDraining:
+	case AccountEgressStatusFull, AccountEgressStatusNotQueueHead, AccountEgressStatusLegacyDraining:
 		return true
 	default:
 		return false

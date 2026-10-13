@@ -257,9 +257,6 @@ type UpdateSettingsRequest struct {
 	OpenAICodexUserAgent                   *string `json:"openai_codex_user_agent"`
 	OpenAICodexClientVersion               *string `json:"openai_codex_client_version"`
 	OpenAICodexVersionAutoSyncEnabled      *bool   `json:"openai_codex_version_auto_sync_enabled"`
-	OpenAICodexTicketEnabled               *bool   `json:"openai_codex_ticket_enabled"`
-	OpenAICodexTicket332Enabled            *bool   `json:"openai_codex_ticket_332_enabled"`
-	OpenAICodexTicketHarvestProxyURL       string  `json:"openai_codex_ticket_harvest_proxy_url"`
 	ClaudeCodeClientVersion                *string `json:"claude_code_client_version"`
 	ClaudeCodeVersionAutoSyncEnabled       *bool   `json:"claude_code_version_auto_sync_enabled"`
 
@@ -270,18 +267,6 @@ type UpdateSettingsRequest struct {
 	CodexCLIOnlyWhitelist                string `json:"codex_cli_only_whitelist"`
 	CodexCLIOnlyAllowAppServerClients    *bool  `json:"codex_cli_only_allow_app_server_clients"`
 	CodexCLIOnlyEngineFingerprintSignals string `json:"codex_cli_only_engine_fingerprint_signals"`
-
-	OpenAIWindowWarmupEnabled               *bool    `json:"openai_window_warmup_enabled"`
-	OpenAIWindowWarmupDefaultPolicy         *string  `json:"openai_window_warmup_default_policy"`
-	OpenAIWindowWarmupAllowlist             *[]int64 `json:"openai_window_warmup_allowlist"`
-	OpenAIWindowWarmupProbeModel            *string  `json:"openai_window_warmup_probe_model"`
-	OpenAIWindowWarmupWorkerConcurrency     *int     `json:"openai_window_warmup_worker_concurrency"`
-	OpenAIWindowWarmupGlobalQPS             *float64 `json:"openai_window_warmup_global_qps"`
-	OpenAIWindowWarmupBatchSize             *int     `json:"openai_window_warmup_batch_size"`
-	OpenAIWindowWarmupScanSeconds           *int     `json:"openai_window_warmup_scan_seconds"`
-	OpenAIWindowWarmupRequestTimeoutSeconds *int     `json:"openai_window_warmup_request_timeout_seconds"`
-	OpenAIWindowWarmupLeaseSeconds          *int     `json:"openai_window_warmup_lease_seconds"`
-	OpenAIWindowWarmupResetGraceSeconds     *int     `json:"openai_window_warmup_reset_grace_seconds"`
 
 	// Payment visible method routing
 	PaymentVisibleMethodAlipaySource  *string `json:"payment_visible_method_alipay_source"`
@@ -516,15 +501,18 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	for key := range sentFields {
+		if strings.HasPrefix(key, "openai_codex_ticket_") || strings.HasPrefix(key, "openai_window_warmup_") {
+			response.BadRequest(c, "Codex ticket and window warmup settings have been retired; refresh the admin page")
+			return
+		}
+	}
 	var req UpdateSettingsRequest
 	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
-	if req.OpenAICodexTicket332Enabled != nil {
-		response.BadRequest(c, "Global 332 mode has been replaced by per-account Pro/Team settings; refresh the settings page")
-		return
-	}
+
 	auditReq := settingsAuditRequest(req)
 	omitted := omittedSettingKeys(sentFields)
 
@@ -1815,19 +1803,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAICodexVersionAutoSyncEnabled
 		}(),
-		OpenAICodexTicketEnabled: func() bool {
-			if req.OpenAICodexTicketEnabled != nil {
-				return *req.OpenAICodexTicketEnabled
-			}
-			return previousSettings.OpenAICodexTicketEnabled
-		}(),
-		OpenAICodexTicketHarvestProxyURL: func() string {
-			next := strings.TrimSpace(req.OpenAICodexTicketHarvestProxyURL)
-			if service.IsMaskedProxyURL(next) {
-				return previousSettings.OpenAICodexTicketHarvestProxyURL
-			}
-			return next
-		}(),
+
 		ClaudeCodeClientVersion: func() string {
 			if req.ClaudeCodeClientVersion != nil {
 				return *req.ClaudeCodeClientVersion
@@ -1853,54 +1829,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			return previousSettings.CodexCLIOnlyAllowAppServerClients
 		}(),
 		CodexCLIOnlyEngineFingerprintSignals: strings.TrimSpace(req.CodexCLIOnlyEngineFingerprintSignals),
-		OpenAIWindowWarmupEnabled: func() bool {
-			if req.OpenAIWindowWarmupEnabled != nil {
-				return *req.OpenAIWindowWarmupEnabled
-			}
-			return previousSettings.OpenAIWindowWarmupEnabled
-		}(),
-		OpenAIWindowWarmupDefaultPolicy: stringSetting(
-			req.OpenAIWindowWarmupDefaultPolicy,
-			previousSettings.OpenAIWindowWarmupDefaultPolicy,
-		),
-		OpenAIWindowWarmupAllowlist: func() []int64 {
-			if req.OpenAIWindowWarmupAllowlist != nil {
-				return append([]int64(nil), (*req.OpenAIWindowWarmupAllowlist)...)
-			}
-			return append([]int64(nil), previousSettings.OpenAIWindowWarmupAllowlist...)
-		}(),
-		OpenAIWindowWarmupProbeModel: stringSetting(
-			req.OpenAIWindowWarmupProbeModel,
-			previousSettings.OpenAIWindowWarmupProbeModel,
-		),
-		OpenAIWindowWarmupWorkerConcurrency: intValueOrDefault(
-			req.OpenAIWindowWarmupWorkerConcurrency,
-			previousSettings.OpenAIWindowWarmupWorkerConcurrency,
-		),
-		OpenAIWindowWarmupGlobalQPS: float64ValueOrDefault(
-			req.OpenAIWindowWarmupGlobalQPS,
-			previousSettings.OpenAIWindowWarmupGlobalQPS,
-		),
-		OpenAIWindowWarmupBatchSize: intValueOrDefault(
-			req.OpenAIWindowWarmupBatchSize,
-			previousSettings.OpenAIWindowWarmupBatchSize,
-		),
-		OpenAIWindowWarmupScanSeconds: intValueOrDefault(
-			req.OpenAIWindowWarmupScanSeconds,
-			previousSettings.OpenAIWindowWarmupScanSeconds,
-		),
-		OpenAIWindowWarmupRequestTimeoutSeconds: intValueOrDefault(
-			req.OpenAIWindowWarmupRequestTimeoutSeconds,
-			previousSettings.OpenAIWindowWarmupRequestTimeoutSeconds,
-		),
-		OpenAIWindowWarmupLeaseSeconds: intValueOrDefault(
-			req.OpenAIWindowWarmupLeaseSeconds,
-			previousSettings.OpenAIWindowWarmupLeaseSeconds,
-		),
-		OpenAIWindowWarmupResetGraceSeconds: intValueOrDefault(
-			req.OpenAIWindowWarmupResetGraceSeconds,
-			previousSettings.OpenAIWindowWarmupResetGraceSeconds,
-		),
+
 		PaymentVisibleMethodAlipaySource: func() string {
 			if req.PaymentVisibleMethodAlipaySource != nil {
 				return strings.TrimSpace(*req.PaymentVisibleMethodAlipaySource)
@@ -2464,9 +2393,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAICodexClientVersion:                               updatedSettings.OpenAICodexClientVersion,
 		OpenAICodexClientVersionSynced:                         updatedSettings.OpenAICodexClientVersionSynced,
 		OpenAICodexVersionAutoSyncEnabled:                      updatedSettings.OpenAICodexVersionAutoSyncEnabled,
-		OpenAICodexTicketEnabled:                               updatedSettings.OpenAICodexTicketEnabled,
-		OpenAICodexTicketHarvestProxyURL:                       service.MaskProxyURL(updatedSettings.OpenAICodexTicketHarvestProxyURL),
-		OpenAICodexTicketHarvestProxyConfigured:                strings.TrimSpace(updatedSettings.OpenAICodexTicketHarvestProxyURL) != "",
 		ClaudeCodeClientVersion:                                updatedSettings.ClaudeCodeClientVersion,
 		ClaudeCodeClientVersionSynced:                          updatedSettings.ClaudeCodeClientVersionSynced,
 		ClaudeCodeVersionAutoSyncEnabled:                       updatedSettings.ClaudeCodeVersionAutoSyncEnabled,
@@ -2476,17 +2402,6 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		CodexCLIOnlyWhitelist:                                  updatedSettings.CodexCLIOnlyWhitelist,
 		CodexCLIOnlyAllowAppServerClients:                      updatedSettings.CodexCLIOnlyAllowAppServerClients,
 		CodexCLIOnlyEngineFingerprintSignals:                   updatedSettings.CodexCLIOnlyEngineFingerprintSignals,
-		OpenAIWindowWarmupEnabled:                              updatedSettings.OpenAIWindowWarmupEnabled,
-		OpenAIWindowWarmupDefaultPolicy:                        updatedSettings.OpenAIWindowWarmupDefaultPolicy,
-		OpenAIWindowWarmupAllowlist:                            updatedSettings.OpenAIWindowWarmupAllowlist,
-		OpenAIWindowWarmupProbeModel:                           updatedSettings.OpenAIWindowWarmupProbeModel,
-		OpenAIWindowWarmupWorkerConcurrency:                    updatedSettings.OpenAIWindowWarmupWorkerConcurrency,
-		OpenAIWindowWarmupGlobalQPS:                            updatedSettings.OpenAIWindowWarmupGlobalQPS,
-		OpenAIWindowWarmupBatchSize:                            updatedSettings.OpenAIWindowWarmupBatchSize,
-		OpenAIWindowWarmupScanSeconds:                          updatedSettings.OpenAIWindowWarmupScanSeconds,
-		OpenAIWindowWarmupRequestTimeoutSeconds:                updatedSettings.OpenAIWindowWarmupRequestTimeoutSeconds,
-		OpenAIWindowWarmupLeaseSeconds:                         updatedSettings.OpenAIWindowWarmupLeaseSeconds,
-		OpenAIWindowWarmupResetGraceSeconds:                    updatedSettings.OpenAIWindowWarmupResetGraceSeconds,
 		PaymentVisibleMethodAlipaySource:                       updatedSettings.PaymentVisibleMethodAlipaySource,
 		PaymentVisibleMethodWxpaySource:                        updatedSettings.PaymentVisibleMethodWxpaySource,
 		PaymentVisibleMethodAlipayEnabled:                      updatedSettings.PaymentVisibleMethodAlipayEnabled,

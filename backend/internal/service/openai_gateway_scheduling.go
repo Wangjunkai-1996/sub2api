@@ -987,7 +987,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 }
 
 // selectAccountForModelWithExclusionsStickyHit preserves the official sticky-hit
-// metadata while reusing KKAI's ticket/egress-aware selector. The durable
+// metadata while reusing KKAI's egress-aware selector. The durable
 // binding flag remains controlled by the caller-specific wrapper above.
 func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, bool, error) {
 	account, err := s.selectAccountForModelWithExclusions(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability, preferLowUpstreamRate, false)
@@ -1695,10 +1695,6 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 }
 
 func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, account *Account, requestedModel string, requireCompact bool) (*AcquireResult, error) {
-	ctx, err := s.codexTicketSelectionContext(ctx, account, requestedModel, requireCompact)
-	if err != nil {
-		return nil, err
-	}
 	result, err := acquireAccountSlotForSelection(ctx, s.concurrencyService, s.settingService, account)
 	if err != nil || result == nil || !result.Acquired {
 		return result, err

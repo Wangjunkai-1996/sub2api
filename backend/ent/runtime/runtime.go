@@ -225,50 +225,44 @@ func init() {
 	accountDescCredentials := accountFields[4].Descriptor()
 	// account.DefaultCredentials holds the default value on creation for the credentials field.
 	account.DefaultCredentials = accountDescCredentials.Default.(func() map[string]interface{})
-	// accountDescOpenaiWarmupIdentityGeneration is the schema descriptor for openai_warmup_identity_generation field.
-	accountDescOpenaiWarmupIdentityGeneration := accountFields[5].Descriptor()
-	// account.DefaultOpenaiWarmupIdentityGeneration holds the default value on creation for the openai_warmup_identity_generation field.
-	account.DefaultOpenaiWarmupIdentityGeneration = accountDescOpenaiWarmupIdentityGeneration.Default.(int64)
-	// account.OpenaiWarmupIdentityGenerationValidator is a validator for the "openai_warmup_identity_generation" field. It is called by the builders before save.
-	account.OpenaiWarmupIdentityGenerationValidator = accountDescOpenaiWarmupIdentityGeneration.Validators[0].(func(int64) error)
 	// accountDescExtra is the schema descriptor for extra field.
-	accountDescExtra := accountFields[6].Descriptor()
+	accountDescExtra := accountFields[5].Descriptor()
 	// account.DefaultExtra holds the default value on creation for the extra field.
 	account.DefaultExtra = accountDescExtra.Default.(func() map[string]interface{})
 	// accountDescEgressRevision is the schema descriptor for egress_revision field.
-	accountDescEgressRevision := accountFields[10].Descriptor()
+	accountDescEgressRevision := accountFields[9].Descriptor()
 	// account.DefaultEgressRevision holds the default value on creation for the egress_revision field.
 	account.DefaultEgressRevision = accountDescEgressRevision.Default.(int64)
 	// account.EgressRevisionValidator is a validator for the "egress_revision" field. It is called by the builders before save.
 	account.EgressRevisionValidator = accountDescEgressRevision.Validators[0].(func(int64) error)
 	// accountDescConcurrency is the schema descriptor for concurrency field.
-	accountDescConcurrency := accountFields[11].Descriptor()
+	accountDescConcurrency := accountFields[10].Descriptor()
 	// account.DefaultConcurrency holds the default value on creation for the concurrency field.
 	account.DefaultConcurrency = accountDescConcurrency.Default.(int)
 	// accountDescPriority is the schema descriptor for priority field.
-	accountDescPriority := accountFields[13].Descriptor()
+	accountDescPriority := accountFields[12].Descriptor()
 	// account.DefaultPriority holds the default value on creation for the priority field.
 	account.DefaultPriority = accountDescPriority.Default.(int)
 	// accountDescRateMultiplier is the schema descriptor for rate_multiplier field.
-	accountDescRateMultiplier := accountFields[14].Descriptor()
+	accountDescRateMultiplier := accountFields[13].Descriptor()
 	// account.DefaultRateMultiplier holds the default value on creation for the rate_multiplier field.
 	account.DefaultRateMultiplier = accountDescRateMultiplier.Default.(float64)
 	// accountDescStatus is the schema descriptor for status field.
-	accountDescStatus := accountFields[15].Descriptor()
+	accountDescStatus := accountFields[14].Descriptor()
 	// account.DefaultStatus holds the default value on creation for the status field.
 	account.DefaultStatus = accountDescStatus.Default.(string)
 	// account.StatusValidator is a validator for the "status" field. It is called by the builders before save.
 	account.StatusValidator = accountDescStatus.Validators[0].(func(string) error)
 	// accountDescAutoPauseOnExpired is the schema descriptor for auto_pause_on_expired field.
-	accountDescAutoPauseOnExpired := accountFields[19].Descriptor()
+	accountDescAutoPauseOnExpired := accountFields[18].Descriptor()
 	// account.DefaultAutoPauseOnExpired holds the default value on creation for the auto_pause_on_expired field.
 	account.DefaultAutoPauseOnExpired = accountDescAutoPauseOnExpired.Default.(bool)
 	// accountDescSchedulable is the schema descriptor for schedulable field.
-	accountDescSchedulable := accountFields[20].Descriptor()
+	accountDescSchedulable := accountFields[19].Descriptor()
 	// account.DefaultSchedulable holds the default value on creation for the schedulable field.
 	account.DefaultSchedulable = accountDescSchedulable.Default.(bool)
 	// accountDescSessionWindowStatus is the schema descriptor for session_window_status field.
-	accountDescSessionWindowStatus := accountFields[28].Descriptor()
+	accountDescSessionWindowStatus := accountFields[27].Descriptor()
 	// account.SessionWindowStatusValidator is a validator for the "session_window_status" field. It is called by the builders before save.
 	account.SessionWindowStatusValidator = accountDescSessionWindowStatus.Validators[0].(func(string) error)
 	accountegressbindingFields := schema.AccountEgressBinding{}.Fields()
@@ -1318,16 +1312,6 @@ func init() {
 	groupDescProfitSafetyBuffer := groupFields[62].Descriptor()
 	// group.DefaultProfitSafetyBuffer holds the default value on creation for the profit_safety_buffer field.
 	group.DefaultProfitSafetyBuffer = groupDescProfitSafetyBuffer.Default.(float64)
-	// groupDescSchedulerType is the schema descriptor for scheduler_type field.
-	groupDescSchedulerType := groupFields[63].Descriptor()
-	// group.DefaultSchedulerType holds the default value on creation for the scheduler_type field.
-	group.DefaultSchedulerType = groupDescSchedulerType.Default.(string)
-	// group.SchedulerTypeValidator is a validator for the "scheduler_type" field. It is called by the builders before save.
-	group.SchedulerTypeValidator = groupDescSchedulerType.Validators[0].(func(string) error)
-	// groupDescAdvancedSchedulerOverrides is the schema descriptor for advanced_scheduler_overrides field.
-	groupDescAdvancedSchedulerOverrides := groupFields[64].Descriptor()
-	// group.DefaultAdvancedSchedulerOverrides holds the default value on creation for the advanced_scheduler_overrides field.
-	group.DefaultAdvancedSchedulerOverrides = groupDescAdvancedSchedulerOverrides.Default.(domain.AdvancedSchedulerOverrides)
 	idempotencyrecordMixin := schema.IdempotencyRecord{}.Mixin()
 	idempotencyrecordMixinFields0 := idempotencyrecordMixin[0].Fields()
 	_ = idempotencyrecordMixinFields0

@@ -109,9 +109,9 @@ func accountReadableSnapshotJSON(account *Account) []byte {
 	}
 	clone := *account
 	clone.Credentials = nil
+	clone.Extra = FilterRetiredAccountExtra(account.Extra)
 	clone.Groups = nil
 	clone.AccountGroups = nil
-	clone.OpenAIWarmupIdentityGeneration = 0
 	clone.EgressMode = ""
 	clone.EgressRevision = 0
 	clone.EgressBindings = nil

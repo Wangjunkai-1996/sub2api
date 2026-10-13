@@ -154,8 +154,6 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 		ProfitControlEnabled:        g.ProfitControlEnabled,
 		ProfitMinMargin:             g.ProfitMinMargin,
 		ProfitSafetyBuffer:          g.ProfitSafetyBuffer,
-		SchedulerType:               g.SchedulerType,
-		AdvancedSchedulerOverrides:  g.AdvancedSchedulerOverrides.Clone(),
 		ModelPricing:                g.ModelPricing,
 		ModelRouting:                g.ModelRouting,
 		ModelRoutingEnabled:         g.ModelRoutingEnabled,
@@ -290,10 +288,6 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		GroupIDs:                a.GroupIDs,
 		ParentAccountID:         a.ParentAccountID,
 		QuotaDimension:          a.QuotaDimension,
-	}
-	if a.Platform == service.PlatformOpenAI && a.Type == service.AccountTypeOAuth && !a.IsShadow() &&
-		a.QuotaDimensionOrDefault() == service.QuotaDimensionGlobal {
-		out.OpenAICodexWarmupPolicy = string(service.OpenAIWindowWarmupPolicyForAccount(a))
 	}
 
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
@@ -436,7 +430,7 @@ func redactAccountManagedExtra(extra map[string]any) map[string]any {
 			key == service.OllamaCloudUsageAutoRefreshExtraKey,
 			key == service.OllamaCloudUsageSnapshotExtraKey:
 			continue
-		case service.IsOpenAICodexTicketPrivateExtraKey(key):
+		case service.IsRetiredAccountExtraKey(key):
 			continue
 		case key == service.OpenCodeGoUsageAutoRefreshExtraKey,
 			key == service.OpenCodeGoUsageSnapshotExtraKey:
@@ -480,8 +474,8 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 	return &AccountListItem{
 		ID: a.ID, Name: a.Name, Notes: a.Notes, Platform: a.Platform, Type: a.Type,
 		Credentials: a.Credentials, CredentialsStatus: a.CredentialsStatus, Extra: a.Extra,
-		OllamaCloudUsage: a.OllamaCloudUsage, CodexTurnTickets: a.CodexTurnTickets,
-		ProxyID: a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		OllamaCloudUsage: a.OllamaCloudUsage,
+		ProxyID:          a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
 		EgressMode: a.EgressMode, EgressRevision: a.EgressRevision, EgressPool: a.EgressPool, EgressSummary: a.EgressSummary,
 		OpenCodeGoUsage: a.OpenCodeGoUsage,
 		Concurrency:     a.Concurrency, LoadFactor: a.LoadFactor, Priority: a.Priority, RateMultiplier: a.RateMultiplier,
@@ -509,8 +503,8 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 		QuotaNotifyTotalThreshold: a.QuotaNotifyTotalThreshold, ParentAccountID: a.ParentAccountID,
 		QuotaDimension: a.QuotaDimension, ParentEmail: a.ParentEmail, ParentPlanType: a.ParentPlanType,
 		ParentPrivacyMode: a.ParentPrivacyMode, ParentSubscriptionExpiresAt: a.ParentSubscriptionExpiresAt,
-		ParentChatGPTAccountID: a.ParentChatGPTAccountID, OpenAICodexWarmupPolicy: a.OpenAICodexWarmupPolicy,
-		Proxy: a.Proxy, GroupIDs: a.GroupIDs,
+		ParentChatGPTAccountID: a.ParentChatGPTAccountID,
+		Proxy:                  a.Proxy, GroupIDs: a.GroupIDs,
 	}
 }
 

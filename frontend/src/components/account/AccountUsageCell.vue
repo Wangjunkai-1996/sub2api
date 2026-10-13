@@ -124,18 +124,6 @@
 
     <!-- OpenAI Codex accounts: ticket status; usage querying remains OAuth-only. -->
     <template v-else-if="account.platform === 'openai' && (account.type === 'oauth' || account.type === 'setup-token')">
-      <div v-if="codexTurnTickets.length" class="mb-1 space-y-0.5">
-        <div
-          v-for="ticket in codexTurnTickets"
-          :key="ticket.model"
-          class="flex items-center gap-1 text-[10px] leading-4"
-        >
-          <span class="truncate font-medium text-gray-500 dark:text-gray-400" :title="ticket.model">STATE · {{ shortCodexTicketModel(ticket.model) }}</span>
-          <span v-if="ticket.ready" class="text-emerald-600 dark:text-emerald-400">{{ formatCodexTicketRemaining(ticket.remaining_seconds) }}</span>
-          <span v-else-if="ticket.blocked" class="text-amber-600 dark:text-amber-400">{{ formatCodexTicketStatus(ticket, 'paused') }}</span>
-          <span v-else class="text-gray-500">{{ formatCodexTicketStatus(ticket, 'missing') }}</span>
-        </div>
-      </div>
       <template v-if="account.type === 'oauth'">
         <div v-if="loading && !usageInfo" class="space-y-1.5">
           <div class="flex items-center gap-1">
@@ -854,29 +842,6 @@ const hasOpenAIUsageFallback = computed(() => {
   if (props.account.platform !== 'openai' || props.account.type !== 'oauth') return false
   return !!usageInfo.value?.five_hour || !!usageInfo.value?.seven_day
 })
-
-const codexTurnTickets = computed(() => props.account.codex_turn_tickets ?? [])
-
-function shortCodexTicketModel(model: string) {
-  if (model === 'gpt-6-astra') return 'astra'
-  if (model === 'gpt-5.6-sol') return 'sol'
-  return model
-}
-
-function formatCodexTicketRemaining(seconds: number) {
-  const total = Math.max(0, Math.floor(seconds || 0))
-  const m = Math.floor(total / 60)
-  const s = total % 60
-  return `${m}m${String(s).padStart(2, '0')}s`
-}
-
-function formatCodexTicketStatus(ticket: { target_length?: number }, state: 'paused' | 'missing') {
-  const targetLength = Number(ticket.target_length)
-  if (Number.isFinite(targetLength) && targetLength > 0) {
-    return t(state === 'paused' ? 'admin.accounts.openai.codexTurnTicketPaused' : 'admin.accounts.openai.codexTurnTicketMissing', { length: targetLength })
-  }
-  return t(state === 'paused' ? 'admin.accounts.openai.codexTurnTicketPausedGeneric' : 'admin.accounts.openai.codexTurnTicketMissingGeneric')
-}
 
 const openAISevenDayEstimatedTotalCost = computed(() => {
   const sevenDay = usageInfo.value?.seven_day

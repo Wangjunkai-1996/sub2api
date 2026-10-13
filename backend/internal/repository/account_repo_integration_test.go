@@ -187,6 +187,53 @@ func (s *AccountRepoSuite) TestUpdate() {
 	s.Require().Equal("updated", got.Name)
 }
 
+func (s *AccountRepoSuite) TestRetiredAccountExtraCannotBeRestored() {
+	legacyExtra := map[string]any{
+		"codex_turn_ticket:v2:old-binding:gpt-6-astra": map[string]any{"state": "retired-secret"},
+		"codex_ticket_config":                          map[string]any{"enabled": true},
+		"openai_window_warmup_policy":                  map[string]any{"enabled": true},
+		"ordinary":                                     "kept",
+	}
+	account := &service.Account{
+		Name: "retired-extra", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Status: service.StatusActive, Schedulable: true, Concurrency: 3,
+		Credentials: map[string]any{"access_token": "test-token"}, Extra: legacyExtra,
+	}
+	s.Require().NoError(s.repo.Create(s.ctx, account))
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal("kept", got.Extra["ordinary"])
+	for key := range legacyExtra {
+		if service.IsRetiredAccountExtraKey(key) {
+			s.Require().NotContains(got.Extra, key)
+		}
+	}
+	s.Require().NoError(s.repo.UpdateExtra(s.ctx, account.ID, legacyExtra))
+	_, err = s.repo.BulkUpdate(s.ctx, []int64{account.ID}, service.AccountBulkUpdate{Extra: legacyExtra})
+	s.Require().NoError(err)
+	got, err = s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().NotContains(got.Extra, "codex_ticket_config")
+	s.Require().NotContains(got.Extra, "openai_window_warmup_policy")
+
+	// Simulate a row written by the previous binary. Historical triggers still
+	// exist, and an ordinary edit must succeed while dropping retired metadata.
+	_, err = s.repo.sql.ExecContext(s.ctx, `UPDATE accounts SET extra = extra || '{"codex_turn_ticket:v2:old-binding:gpt-6-astra":{"state":"retired-secret"},"openai_window_warmup_policy":{"enabled":true}}'::jsonb WHERE id = $1`, account.ID)
+	s.Require().NoError(err)
+	got, err = s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	got.Name = "edited"
+	s.Require().NoError(s.repo.Update(s.ctx, got))
+	got, err = s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal("edited", got.Name)
+	s.Require().Equal("kept", got.Extra["ordinary"])
+	for key := range got.Extra {
+		s.Require().False(service.IsRetiredAccountExtraKey(key), key)
+	}
+	s.Require().Contains(legacyExtra, "codex_ticket_config", "input map must not be mutated")
+}
+
 func (s *AccountRepoSuite) TestUpdate_SyncSchedulerSnapshotOnDisabled() {
 	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "sync-update", Status: service.StatusActive, Schedulable: true})
 	cacheRecorder := &schedulerCacheRecorder{}
@@ -1187,77 +1234,6 @@ func (s *AccountRepoSuite) TestSetGrokOAuthErrorIfCredentialsUnchanged_AppliesAn
 	)
 	s.Require().NoError(err)
 	s.Require().Equal(1, outboxCount)
-}
-
-func (s *AccountRepoSuite) TestSetOpenAIAuthErrorIfCredentialsUnchanged_AppliesAndSyncsSchedulerState() {
-	account := mustCreateAccount(s.T(), s.client, &service.Account{
-		Name: "openai-conditional-auth-error-applied", Platform: service.PlatformOpenAI,
-		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
-		Credentials: map[string]any{"access_token": "observed", "refresh_token": "refresh", "_token_version": int64(7)},
-	})
-	observed, err := s.repo.GetByID(s.ctx, account.ID)
-	s.Require().NoError(err)
-	cacheRecorder := &schedulerCacheRecorder{}
-	s.repo.schedulerCache = cacheRecorder
-	_, err = s.repo.sql.ExecContext(s.ctx, "TRUNCATE scheduler_outbox")
-	s.Require().NoError(err)
-
-	applied, err := s.repo.SetOpenAIAuthErrorIfCredentialsUnchanged(
-		s.ctx, account.ID, observed.Credentials, "reauthorization required",
-	)
-
-	s.Require().NoError(err)
-	s.Require().True(applied)
-	got, err := s.repo.GetByID(s.ctx, account.ID)
-	s.Require().NoError(err)
-	s.Require().Equal(service.StatusError, got.Status)
-	s.Require().False(got.Schedulable)
-	s.Require().Equal("reauthorization required", got.ErrorMessage)
-	s.Require().Len(cacheRecorder.setAccounts, 1)
-	var outboxCount int
-	s.Require().NoError(scanSingleRow(
-		s.ctx, s.repo.sql,
-		"SELECT COUNT(*) FROM scheduler_outbox WHERE event_type = $1 AND account_id = $2",
-		[]any{service.SchedulerOutboxEventAccountChanged, account.ID}, &outboxCount,
-	))
-	s.Require().Equal(1, outboxCount)
-}
-
-func (s *AccountRepoSuite) TestSetOpenAIAuthErrorIfCredentialsUnchanged_SkipsConcurrentReauthorization() {
-	account := mustCreateAccount(s.T(), s.client, &service.Account{
-		Name: "openai-conditional-auth-error-stale", Platform: service.PlatformOpenAI,
-		Type: service.AccountTypeOAuth, Status: service.StatusActive, Schedulable: true,
-		Credentials: map[string]any{"access_token": "observed", "refresh_token": "old-refresh", "_token_version": int64(7)},
-	})
-	observed, err := s.repo.GetByID(s.ctx, account.ID)
-	s.Require().NoError(err)
-	s.Require().NoError(s.repo.UpdateCredentials(s.ctx, account.ID, map[string]any{
-		"access_token": "fresh-access", "refresh_token": "fresh-refresh", "_token_version": int64(8),
-	}))
-	cacheRecorder := &schedulerCacheRecorder{}
-	s.repo.schedulerCache = cacheRecorder
-	_, err = s.repo.sql.ExecContext(s.ctx, "TRUNCATE scheduler_outbox")
-	s.Require().NoError(err)
-
-	applied, err := s.repo.SetOpenAIAuthErrorIfCredentialsUnchanged(
-		s.ctx, account.ID, observed.Credentials, "stale warmup failure",
-	)
-
-	s.Require().NoError(err)
-	s.Require().False(applied)
-	got, err := s.repo.GetByID(s.ctx, account.ID)
-	s.Require().NoError(err)
-	s.Require().Equal(service.StatusActive, got.Status)
-	s.Require().True(got.Schedulable)
-	s.Require().Equal("fresh-refresh", got.GetOpenAIRefreshToken())
-	s.Require().Empty(cacheRecorder.setAccounts)
-	var outboxCount int
-	s.Require().NoError(scanSingleRow(
-		s.ctx, s.repo.sql,
-		"SELECT COUNT(*) FROM scheduler_outbox WHERE event_type = $1 AND account_id = $2",
-		[]any{service.SchedulerOutboxEventAccountChanged, account.ID}, &outboxCount,
-	))
-	s.Require().Zero(outboxCount)
 }
 
 func (s *AccountRepoSuite) TestSetGrokOAuthErrorIfCredentialsUnchanged_SkipsConcurrentReauthorization() {

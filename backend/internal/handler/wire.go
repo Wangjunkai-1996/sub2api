@@ -51,19 +51,12 @@ func ProvideAdminHandlers(
 	egressService *service.EgressService,
 	upstreamBillingProbe *service.UpstreamBillingProbeService,
 	ollamaCloudUsage *service.OllamaCloudUsageService,
-	openAIWindowWarmup *service.OpenAIWindowWarmupService,
-	settingService *service.SettingService,
-	codexTicketGateway *service.OpenAIGatewayService,
 	opencodeGoUsage *service.OpenCodeGoUsageService,
 	claudeResetCredits *service.ClaudeResetCreditService,
 ) *AdminHandlers {
 	accountHandler.SetEgressService(egressService)
 	accountHandler.SetUpstreamBillingProbeService(upstreamBillingProbe)
 	accountHandler.SetOllamaCloudUsageService(ollamaCloudUsage)
-	accountHandler.SetCodexTicketSettings(settingService)
-	accountHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
-	openaiOAuthHandler.SetOpenAIWindowWarmupService(openAIWindowWarmup, settingService)
-	accountHandler.SetCodexAccountTicketService(codexTicketGateway)
 	accountHandler.SetOpenCodeGoUsageService(opencodeGoUsage)
 	accountHandler.SetClaudeResetCreditService(claudeResetCredits)
 	return &AdminHandlers{

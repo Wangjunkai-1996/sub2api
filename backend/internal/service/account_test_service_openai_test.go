@@ -165,55 +165,25 @@ func TestAccountTestService_OpenAIOAuthTestNormalizesGPT56Alias(t *testing.T) {
 	require.Equal(t, "gpt-5.6-sol", gjson.GetBytes(body, "model").String())
 }
 
-func TestAccountTestService_OpenAICodexTicket332(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		model        string
-		ticketLength int
-		shadow       bool
-		wantBlocked  bool
-	}{
-		{name: "valid ticket is sent", model: "gpt-5.6-sol", ticketLength: 332},
-		{name: "missing ticket blocks upstream", model: "gpt-5.6-sol", wantBlocked: true},
-		{name: "292 ticket cannot satisfy 332 mode", model: "gpt-5.6-sol", ticketLength: 292, wantBlocked: true},
-		{name: "ungated model remains allowed", model: "gpt-5.5"},
-		{name: "credential shadow preserves forwarding policy", model: "gpt-5.6-sol", shadow: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, recorder := newTestContext()
-			resp := newJSONResponse(http.StatusOK, "data: {\"type\":\"response.completed\"}\n\n")
-			upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
-			gateway := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: true, FailClosed: true}, nil)
-			account := ticketTestAccount(91)
-			ac := codexAccountTicketConfigOf(account)
-			ac.TicketPlan = codexTicketPlanTeam
-			ac.Model = "gpt-5.6-sol"
-			account.Extra[codexAccountTicketConfigKey] = ac
-			if tc.ticketLength > 0 {
-				account.Extra[openAICodexTicketExtraKey(ac.Model)] = verifiedTestTicket(account, tc.ticketLength)
+func TestAccountTestService_OpenAIRetiredTicketsNeverGateOrInject(t *testing.T) {
+	for _, legacyState := range []string{"", "retired-state"} {
+		t.Run(legacyState, func(t *testing.T) {
+			ctx, _ := newTestContext()
+			upstream := &queuedHTTPUpstream{responses: []*http.Response{
+				newJSONResponse(http.StatusOK, "data: {\"type\":\"response.completed\"}\n\n"),
+			}}
+			svc := &AccountTestService{httpUpstream: upstream, openaiGatewayService: &OpenAIGatewayService{}}
+			account := &Account{
+				ID: 91, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+				Credentials: map[string]any{"access_token": "test-token"},
+				Extra: map[string]any{
+					"codex_ticket_config":           map[string]any{"enabled": true, "model": "gpt-6-astra"},
+					"codex_turn_ticket:gpt-6-astra": map[string]any{"state": legacyState},
+				},
 			}
-			svc := &AccountTestService{httpUpstream: upstream, openaiGatewayService: gateway}
-			if tc.shadow {
-				parent := *account
-				account = &Account{ID: 92, Platform: PlatformOpenAI, Type: AccountTypeOAuth, ParentAccountID: &parent.ID}
-				svc.accountRepo = &snapshotUpdateAccountRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{parent}}}
-			}
-
-			err := svc.testOpenAIAccountConnection(ctx, account, tc.model, "", "")
-			if tc.wantBlocked {
-				require.ErrorContains(t, err, "缺少有效验证门票")
-				require.Empty(t, upstream.requests)
-				require.Contains(t, recorder.Body.String(), "缺少有效验证门票")
-				return
-			}
-			require.NoError(t, err)
+			require.NoError(t, svc.testOpenAIAccountConnection(ctx, account, "gpt-6-astra", "", ""))
 			require.Len(t, upstream.requests, 1)
-			if tc.ticketLength > 0 {
-				require.Equal(t, fakeCodexTicketState(332), upstream.requests[0].Header.Get(openAICodexTurnStateHeader))
-			} else {
-				require.Empty(t, upstream.requests[0].Header.Get(openAICodexTurnStateHeader))
-			}
-			require.Contains(t, recorder.Body.String(), `"success":true`)
+			require.Empty(t, upstream.requests[0].Header.Get(openAICodexTurnStateHeader))
 		})
 	}
 }

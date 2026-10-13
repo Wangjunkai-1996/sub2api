@@ -240,7 +240,7 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 			Platform:           acc.Platform,
 			Type:               acc.Type,
 			Credentials:        acc.Credentials,
-			Extra:              service.RedactOpenAICodexTicketExtra(acc.Extra),
+			Extra:              service.FilterRetiredAccountExtra(acc.Extra),
 			ProxyKey:           proxyKey,
 			EgressMode:         egressMode,
 			EgressPool:         egressPool,
@@ -289,10 +289,6 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 
 	dataPayload := req.Data
 	result := DataImportResult{}
-	warmupPolicies, err := h.resolveDataImportOpenAIWindowWarmupPolicies(ctx, dataPayload.Accounts)
-	if err != nil {
-		return result, err
-	}
 
 	existingProxies, err := h.listAllProxies(ctx)
 	if err != nil {
@@ -481,9 +477,6 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 
 		enrichCredentialsFromIDToken(&item)
-		if policy, ok := warmupPolicies[i]; ok {
-			item.Extra = withDataImportOpenAIWindowWarmupPolicy(item.Extra, policy)
-		}
 
 		accountInput := &service.CreateAccountInput{
 			Name:                 item.Name,
@@ -491,7 +484,7 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			Platform:             item.Platform,
 			Type:                 item.Type,
 			Credentials:          item.Credentials,
-			Extra:                item.Extra,
+			Extra:                service.FilterRetiredAccountExtra(item.Extra),
 			ProxyID:              legacyProxyID,
 			EgressPool:           egressPool,
 			Concurrency:          item.Concurrency,
@@ -706,80 +699,6 @@ func newDataImportEgressFallbackWarning(accountName string) *DataImportWarning {
 		Code:    "EGRESS_POOL_NOT_RESTORED",
 		Message: "egress pool routes are not all present, verified, and active in this environment; account imported in legacy mode",
 	}
-}
-
-// DataAccount intentionally cannot encode parent_account_id or quota_dimension,
-// so a newly created OpenAI OAuth account on this path is always a global parent.
-func isDataImportOpenAIWindowWarmupAccount(item DataAccount) bool {
-	return item.Platform == service.PlatformOpenAI && item.Type == service.AccountTypeOAuth
-}
-
-func explicitDataImportOpenAIWindowWarmupPolicy(extra map[string]any) (service.OpenAIWindowWarmupPolicy, bool, error) {
-	for _, key := range []string{
-		service.OpenAICodexWarmupPolicyExtraKey,
-		service.CodexWarmupPolicyExtraKey,
-		service.OpenAIWindowWarmupPolicyExtraKey,
-	} {
-		value, ok := extra[key]
-		if !ok {
-			continue
-		}
-		raw, ok := value.(string)
-		if !ok {
-			return service.OpenAIWindowWarmupPolicyOff, false,
-				infraerrors.BadRequest("OPENAI_WINDOW_WARMUP_POLICY_INVALID", "OpenAI window warmup policy must be a string")
-		}
-		policy, err := validateOpenAIWindowWarmupPolicy(raw)
-		if err != nil {
-			return service.OpenAIWindowWarmupPolicyOff, false, err
-		}
-		return policy, true, nil
-	}
-	return service.OpenAIWindowWarmupPolicyOff, false, nil
-}
-
-// resolveDataImportOpenAIWindowWarmupPolicies preflights the whole batch before
-// any proxy or account write. The global default is fetched at most once and
-// only when an eligible account omitted all supported policy keys.
-func (h *AccountHandler) resolveDataImportOpenAIWindowWarmupPolicies(ctx context.Context, accounts []DataAccount) (map[int]service.OpenAIWindowWarmupPolicy, error) {
-	policies := make(map[int]service.OpenAIWindowWarmupPolicy)
-	missing := make([]int, 0)
-	for i := range accounts {
-		if !isDataImportOpenAIWindowWarmupAccount(accounts[i]) {
-			continue
-		}
-		policy, explicit, err := explicitDataImportOpenAIWindowWarmupPolicy(accounts[i].Extra)
-		if err != nil {
-			return nil, err
-		}
-		if explicit {
-			policies[i] = policy
-			continue
-		}
-		missing = append(missing, i)
-	}
-	if len(missing) == 0 {
-		return policies, nil
-	}
-	if h == nil || h.settingService == nil {
-		return nil, infraerrors.ServiceUnavailable("OPENAI_WINDOW_WARMUP_SETTINGS_UNAVAILABLE", "OpenAI window warmup settings are unavailable")
-	}
-	defaultPolicy, err := resolveOpenAIWindowWarmupImportPolicy(ctx, nil, h.settingService)
-	if err != nil {
-		return nil, err
-	}
-	for _, i := range missing {
-		policies[i] = defaultPolicy
-	}
-	return policies, nil
-}
-
-func withDataImportOpenAIWindowWarmupPolicy(extra map[string]any, policy service.OpenAIWindowWarmupPolicy) map[string]any {
-	out := withOpenAIWindowWarmupPolicy(extra, policy)
-	// Keep explicit off distinguishable from an omitted policy in exported data.
-	// The migration trigger reads this canonical field and ignores off accounts.
-	out[service.OpenAICodexWarmupPolicyExtraKey] = string(policy)
-	return out
 }
 
 func (h *AccountHandler) listAllProxies(ctx context.Context) ([]service.Proxy, error) {
