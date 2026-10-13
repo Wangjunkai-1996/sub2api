@@ -370,6 +370,21 @@ describe('EditAccountModal', () => {
 
   afterEach(() => vi.useRealTimers())
 
+  it('allows renaming an Anthropic API key account', async () => {
+    const account = { ...buildAccount(), platform: 'anthropic', name: 'Old name' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+
+    const nameInput = wrapper.get('[data-tour="edit-account-form-name"]')
+    expect((nameInput.element as HTMLInputElement).value).toBe('Old name')
+    await nameInput.setValue('New name')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    await vi.waitFor(() => expect(updateAccountMock).toHaveBeenCalledWith(account.id, expect.objectContaining({ name: 'New name' })))
+    wrapper.unmount()
+  })
+
   it('passes existing non-identity mappings to the whitelist selector and preserves them on save', async () => {
     const account = buildAccount()
     account.credentials.model_mapping = { 'gpt-5.2': 'gpt-5.2', 'gpt-latest': 'deepseek-chat' }

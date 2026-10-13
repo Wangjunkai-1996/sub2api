@@ -11,7 +11,7 @@
       @submit.prevent="handleSubmit"
       class="space-y-5"
     >
-      <div v-if="account?.platform === 'openai'">
+      <div>
         <label class="input-label">{{ t('common.name') }}</label>
         <input v-model="form.name" type="text" required class="input" data-tour="edit-account-form-name" />
       </div>
