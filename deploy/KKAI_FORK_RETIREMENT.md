@@ -2,7 +2,7 @@
 
 日期：2026-10-13。工作分支：`release/v0.2.15-kkai`。修改前 HEAD：`5c709885b0c92c8c40e8780eb230df50b5c24f2c`；本地官方对照：`v0.2.15`。
 
-**阶段 A 的应用代码已完成退场，已进入用户授权的提交推送与蓝绿发布流程。阶段 B 的物理数据清理尚未实施。** 历史数据库结构保留用于兼容旧镜像，不能将本次结果理解成生产数据库已完成清理。
+**阶段 A 的应用代码已完成退场并发布；阶段 B 的物理数据清理尚未实施。** 历史数据库结构仍在，不能将应用功能退场理解成生产数据库已完成清理。
 
 ## 1. 实际改动
 
@@ -114,9 +114,9 @@ pnpm exec vue-tsc --noEmit --project /tmp/kkai-retirement-tsconfig.json
 
 工作目录：仓库根目录。`git diff --check` 通过；对 338 个 `backend/migrations` 已跟踪文件逐一与 `git show HEAD:<path>` 比较字节相同；依赖清单和锁文件同样相同。扫描生成 Ent、运行代码、前端和部署示例：退场实现已清除，剩余命中仅为历史迁移、旧输入拒绝、敏感值过滤、测试和明确的历史鉴权冷却保护。
 
-## 4. 发布前门禁与阶段 B
+## 4. 原发布门禁与阶段 B
 
-以下为发布门禁，实际完成状态见第 5 节及基础设施仓库本次 release 的操作证据。
+以下保留当时的发布前门禁；实际发布状态见第 5 节、基础设施仓库的操作证据，以及第 6 节的当前只读盘点。
 
 1. 按维护中的 Sub2API runbook 读取当次生产状态和实际 router，确认所有应用角色、worker 和当前回滚版本。当前未连接生产，不能推断槽位/镜像/健康状态。
 2. 在旧程序仍可管理配置时，备份并将组调度覆盖归零；关闭原子流式启动配置、暖机/采票总开关及账号 opt-in。确认没有在途采集/暖机发送，并停掉旧 worker。总开关关闭不能代替停止旧 scanner。
@@ -152,3 +152,25 @@ go test -tags unit ./internal/service -run '^Test(AccountReadableSnapshot|ListPl
 生产过渡配置已通过旧版正常管理 API 停用（带审计和缓存失效）：暖机 master=false、默认 policy=off；132 个未软删除账号的 policy 改为 off。STATE 三个 master 原本均为 false，启用账号数为零；35 个分组原本全部 inherit、无 overrides。没有修改 soft-deleted 历史账号。备份保存于 sys1 root-only `/var/lib/kkai/sub2api-release/operator-evidence/retirement-20261013T061815Z/disabled-config-before.json`。
 
 停用后有效暖机 lease、global-send permit、普通暖机 Redis 独占键均为零；最近已记录合成发送为 2026-10-12。旧 rollback 的 scanner 可继续做非发送维护，不能为停 scanner 破坏保留旧容器身份的蓝绿门禁；发送通过总开关及所有有效账号策略双重关闭。遗留启动 env 和历史数据库结构留待阶段 B；新程序不再消费它们。生产业务基线已有上游 502、客户端取消和旧账号轮询 404，灰度必须完整保留并归因实际窗口错误。
+
+## 6. 阶段 B 物理清理清单（2026-10-13 只读盘点）
+
+`sys1` 控制器状态为 `complete`、`runtime_gate=passed`。以下只读查询未读取票据、代理或设置值；计数在执行清理前必须重新确认。
+
+| 对象 | 当前盘点 | 清理动作 |
+| --- | --- | --- |
+| 暖机数据 | `openai_window_warmup_jobs` 198 行、`attempts` 28 行、`runtime` 1 行 | 备份并核对保留要求后，追加迁移删除三张专用表 |
+| 暖机数据库逻辑 | 5 个 `trg_openai_window_warmup_*` 触发器、8 个 `openai_window_warmup_*` 函数 | 先删除触发器，再删除表和函数；确认账号写入不再产生暖机记录 |
+| 专用列 | `accounts.openai_warmup_identity_generation`；`groups.scheduler_type`、`groups.advanced_scheduler_overrides` | 先改写 `enqueue_group_auth_cache_invalidation()`，移除对分组旧列的引用，再删除三列及相关约束 |
+| 专用设置 | 4 个 `openai_codex_ticket_*`、11 个 `openai_window_warmup_*` 键 | 只按核准的精确键删除；采集代理设置属于敏感数据，不记录其值 |
+| 账号历史 `extra` | `codex_turn_ticket:gpt-5.6-sol` 99 个、`codex_turn_ticket:gpt-6-astra` 99 个、`openai_codex_warmup_policy` 3142 个 | 包含软删除账号，按退休键白名单清理；保留正常用量和客户端原生 STATE 字段 |
+| 启动配置 | 两个当前应用容器仍带 `OPENAI_WINDOW_WARMUP_WORKER_ENABLED` 环境变量 | 在受控部署配置中删除，不直接手改运行容器 |
+
+执行顺序：
+
+1. 确认所有可能承载请求的应用版本都不再依赖这些表、列和触发器；旧版本仍可运行时，不执行破坏性 DDL。核对生产对象、依赖、精确行数和受影响账号范围，取得受限备份并验证可恢复。
+2. 单独审查追加迁移。先停用五个专用触发器，并改写分组鉴权缓存失效函数；随后删除暖机表、函数、专用列和约束。历史迁移文件保持原字节，不能删改。对账号 `extra` 和设置只使用已审查的键白名单，分批处理并记录实际影响行数。
+3. 从受控生产配置移除废弃环境变量，核对 Redis 中仅属于这四项功能的精确键；不得清空数据库、Redis、备份或其他服务配置。历史备份中的票据按既定保留策略到期销毁，避免把备份误当成当前运行数据。
+4. 用生产对象清单、精确键计数、账号和分组写入、鉴权缓存失效、文本与图片请求验证结果收尾。确认触发器/表/列已消失，设置和 `extra` 退休键计数为零，且无新增错误。旧请求拒绝、导入过滤、审计脱敏和历史鉴权冷却保护继续保留，以防旧客户端或备份重新写入退休字段。
+
+阶段 B 属于独立的破坏性数据迁移，不能用普通无迁移的应用蓝绿流程顺带执行。标准 integration 入口的既有编译错误和空库 fixture 缺口也必须在迁移验证前修好，不能靠临时 overlay 或跳过迁移证明阶段 B 可发布。

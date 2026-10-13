@@ -2468,8 +2468,6 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_request_budget_seconds", DefaultOpenAIRequestBudgetSeconds)
 	// Zero preserves compatibility with older configs and derives min(300, effective hard budget).
 	viper.SetDefault("gateway.openai_retry_budget_seconds", 0)
-	// Keep real-time SSE as the default. Strict atomic replay remains opt-in for
-	// operators who prefer late-failure retry over first-token latency.
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
