@@ -2,7 +2,7 @@
 
 日期：2026-10-13。工作分支：`release/v0.2.15-kkai`。修改前 HEAD：`5c709885b0c92c8c40e8780eb230df50b5c24f2c`；本地官方对照：`v0.2.15`。
 
-**阶段 A 的应用代码已完成退场并发布；阶段 B 的物理数据清理仍需生产执行。** 历史数据库结构仍在，不能将应用功能退场理解成生产数据库已完成清理。
+**阶段 A 应用退场与阶段 B 生产数据清理均已完成。** 2026-10-13 的最终蓝绿发布状态为 `complete / runtime_gate=passed`；当前蓝槽承载文本和图片，绿色同为兼容新 schema 的运行版本。
 
 ## 1. 实际改动
 
@@ -179,6 +179,10 @@ go test -tags unit ./internal/service -run '^Test(AccountReadableSnapshot|ListPl
 
 在 `sys1` 的 root-only `operator-evidence/retire-phase-b-20261013T101155Z/` 内保存生产完整 schema 的 `pg_dump -Fc` 与受影响 7 表的 data-only `pg_dump -Fc`，模式 `0600`，SHA-256 分别为 `f2ba4548230f18db0e3a3300028a84035582f03b0fd346094c00af359c3bec4c` 和 `31b71e2061da0df112378258f32772ed14c2446fa5746e385e17bc6c9c328c69`。数据备份只是此项迁移的受限恢复材料，不是全库 PITR 或生产数据库通用恢复能力。
 
-使用生产相同 PostgreSQL 18.4 镜像，在 `--network none` 的隔离容器中恢复两个归档（data-only 用 `pg_restore --disable-triggers` 处理循环外键）并实际执行 `249`、`250`。恢复时 16,982 个账号、35 个组、187 个暖机 job、28 个 attempt 和 310 个历史 migration；演练后账号/组行数不变，3 表、退休列、198 个票据键、3,141 个暖机策略键、15 个旧 setting 键均消失。两个 SQL 均需以显式单事务执行并在同事务记录 runner 规则的 trimmed SHA-256；不可用默认 autocommit 的 `psql -f`。当前生产迁移仍停在 `248`，不得把演练当成已完成生产清理。
+使用生产相同 PostgreSQL 18.4 镜像，在 `--network none` 的隔离容器中恢复两个归档（data-only 用 `pg_restore --disable-triggers` 处理循环外键）并实际执行 `249`、`250`。恢复时 16,982 个账号、35 个组、187 个暖机 job、28 个 attempt 和 310 个历史 migration；演练后账号/组行数不变，3 表、退休列、198 个票据键、3,141 个暖机策略键、15 个旧 setting 键均消失。两个 SQL 在生产也各以单事务执行，并在同事务记录 runner 规则的 trimmed SHA-256：`249` 为 `3d33057c380d5462e62ca56d586bad2d725390dc29f0366a06f1dd527f0a97f5`，`250` 为 `c52a84f2a6a4ef67787c044b69315496be726cce7827b0ccacfb81cfbad01d96`。这些值与正式镜像 `-migration-contract` 一致。
 
-阶段 B 属于独立的破坏性数据迁移，不能用普通无迁移的应用蓝绿流程顺带执行。标准 integration 入口的既有编译错误和空库 fixture 缺口也必须在迁移验证前修好，不能靠临时 overlay 或跳过迁移证明阶段 B 可发布。
+生产只读复核：3 张暖机表、5 个触发器、8 个函数、3 个专用列、198 个票据键、3,141 个策略键和 15 个旧 setting 键均为零；账号 16,982、分组 35 的总行数未变。Redis 专用 `concurrency:warmup:account:*` 键的认证扫描为零。四个文本/图片容器均健康，均无 `OPENAI_WINDOW_WARMUP_WORKER_ENABLED`。隔离恢复容器及其匿名卷已删除；root-only 归档按保留策略保存，不能等同于全库 PITR。
+
+最终镜像 `kkai/sub2api:0.2.15-kkai-clean-db-0cf84489a6` 由源码提交 `0cf84489a649cacf159696eb42f534d1edf27a25` 在 Mac 构建，第二轮发布 ID 为 `sub2api-0.2.15-kkai-clean-db-0cf84489a6-text-blue-image-blue-20261013T103654Z`。经 `plan -> stage -> 10% -> 50% -> 100% -> complete`，最终有效路由和 `apps-current` 指向蓝槽，router inode 保持 `919629`，绿槽文本/图片均健康。蓝侧直连与经 router 的 `gpt-6.1-sol` Responses SSE 均有 HTTP 200 正常终态；延迟观察仍有提供方 502/503 和客户端 499。各级错误窗按用户已授权的归因接受，控制器明确标记 `operator_accepted / passed=false`，不代表自动错误门禁全绿。图片账号测试在候选与稳定两侧同样出现上游错误终态，需作为现存上游/账号问题单独跟踪。
+
+本次定向检查：`go test -tags integration ./migrations -run '^TestTrafficDirectorCleanupMigration_PostgresPaths$' -count=1 -timeout 180s`、`go test -tags integration ./internal/repository -run 'Test(GroupRepoSuite/TestRetiredSchedulerColumnsAreAbsentAndOrdinaryEditsWork|AccountRepoSuite/TestRetired|MigrationsRunner_IsIdempotent_AndSchemaIsUpToDate)' -count=1 -timeout 180s` 和 `git diff --check` 均通过；未运行全仓测试。历史 integration 入口的代理测试签名和空库 `sys1-ipv4` fixture 已修复，不再依赖临时 overlay。生产镜像构建包含完整前端构建。源码已独立同步到 `fork/release/v0.2.15-kkai`，代码托管同步不参与生产发布门禁。
