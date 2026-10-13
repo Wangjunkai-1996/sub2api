@@ -2,7 +2,7 @@
 
 日期：2026-10-13。工作分支：`release/v0.2.15-kkai`。修改前 HEAD：`5c709885b0c92c8c40e8780eb230df50b5c24f2c`；本地官方对照：`v0.2.15`。
 
-**阶段 A 的应用代码已完成退场并发布；阶段 B 的物理数据清理尚未实施。** 历史数据库结构仍在，不能将应用功能退场理解成生产数据库已完成清理。
+**阶段 A 的应用代码已完成退场并发布；阶段 B 的物理数据清理仍需生产执行。** 历史数据库结构仍在，不能将应用功能退场理解成生产数据库已完成清理。
 
 ## 1. 实际改动
 
@@ -29,7 +29,7 @@
 
 没有删除 Anthropic `intercept_warmup_requests`、正常 WS generate prewarm 或 Codex CLI-only 策略。这些不是此次退休的五小时自动暖机/主动采票功能。
 
-`backend/migrations` 的 **338 个已跟踪文件与修改前逐字相同**；没有新增 pending migration。`backend/go.mod`、`backend/go.sum`、`frontend/package.json` 和 `frontend/pnpm-lock.yaml` 均未改变。
+阶段 A 的 `backend/migrations` **338 个已跟踪文件与修改前逐字相同**，当时没有 pending migration。阶段 B 追加 `249_retire_kkai_fork_features.sql` 与 `250_purge_retired_kkai_fork_data.sql`；历史迁移保持原字节。`backend/go.mod`、`backend/go.sum`、`frontend/package.json` 和 `frontend/pnpm-lock.yaml` 均未改变。
 
 ## 3. 验证结果及精确命令
 
@@ -169,8 +169,16 @@ go test -tags unit ./internal/service -run '^Test(AccountReadableSnapshot|ListPl
 执行顺序：
 
 1. 确认所有可能承载请求的应用版本都不再依赖这些表、列和触发器；旧版本仍可运行时，不执行破坏性 DDL。核对生产对象、依赖、精确行数和受影响账号范围，取得受限备份并验证可恢复。
-2. 单独审查追加迁移。先停用五个专用触发器，并改写分组鉴权缓存失效函数；随后删除暖机表、函数、专用列和约束。历史迁移文件保持原字节，不能删改。对账号 `extra` 和设置只使用已审查的键白名单，分批处理并记录实际影响行数。
+2. 单独审查追加迁移。`249` 在短事务中停用五个专用触发器、改写分组鉴权缓存失效函数、删除暖机表/函数/专用列与约束；`250` 在独立事务中清理账号 `extra` 和精确设置键，避免将账号 GIN 更新放在 DDL 表锁事务内。历史迁移文件保持原字节，不能删改。`250` 有 90 秒语句上限，执行前必须在生产规模恢复副本上演练并记录耗时；超限时停止，不扩大超时或手工部分执行。
 3. 从受控生产配置移除废弃环境变量，核对 Redis 中仅属于这四项功能的精确键；不得清空数据库、Redis、备份或其他服务配置。历史备份中的票据按既定保留策略到期销毁，避免把备份误当成当前运行数据。
 4. 用生产对象清单、精确键计数、账号和分组写入、鉴权缓存失效、文本与图片请求验证结果收尾。确认触发器/表/列已消失，设置和 `extra` 退休键计数为零，且无新增错误。旧请求拒绝、导入过滤、审计脱敏和历史鉴权冷却保护继续保留，以防旧客户端或备份重新写入退休字段。
+
+### 阶段 B 恢复演练与执行边界
+
+2026-10-13 第一轮 `895110988f` 镜像蓝绿发布已 `complete`，绿槽为 active，蓝槽为 `6cd367c0c0` rollback；四个容器均为退场后的代码。绿槽已无废弃 `OPENAI_WINDOW_WARMUP_WORKER_ENABLED`，蓝槽仍带该旧环境变量，需在下一轮受控替换清除。第一轮发布的 10%、50%、100% 错误窗均经人工归因接受，并非自动错误门禁通过；证据保存在基础设施仓库对应 release 的 ignored artifacts 目录。
+
+在 `sys1` 的 root-only `operator-evidence/retire-phase-b-20261013T101155Z/` 内保存生产完整 schema 的 `pg_dump -Fc` 与受影响 7 表的 data-only `pg_dump -Fc`，模式 `0600`，SHA-256 分别为 `f2ba4548230f18db0e3a3300028a84035582f03b0fd346094c00af359c3bec4c` 和 `31b71e2061da0df112378258f32772ed14c2446fa5746e385e17bc6c9c328c69`。数据备份只是此项迁移的受限恢复材料，不是全库 PITR 或生产数据库通用恢复能力。
+
+使用生产相同 PostgreSQL 18.4 镜像，在 `--network none` 的隔离容器中恢复两个归档（data-only 用 `pg_restore --disable-triggers` 处理循环外键）并实际执行 `249`、`250`。恢复时 16,982 个账号、35 个组、187 个暖机 job、28 个 attempt 和 310 个历史 migration；演练后账号/组行数不变，3 表、退休列、198 个票据键、3,141 个暖机策略键、15 个旧 setting 键均消失。两个 SQL 均需以显式单事务执行并在同事务记录 runner 规则的 trimmed SHA-256；不可用默认 autocommit 的 `psql -f`。当前生产迁移仍停在 `248`，不得把演练当成已完成生产清理。
 
 阶段 B 属于独立的破坏性数据迁移，不能用普通无迁移的应用蓝绿流程顺带执行。标准 integration 入口的既有编译错误和空库 fixture 缺口也必须在迁移验证前修好，不能靠临时 overlay 或跳过迁移证明阶段 B 可发布。

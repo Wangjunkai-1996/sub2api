@@ -58,8 +58,8 @@ func TestTrafficDirectorCleanupMigration_PostgresPaths(t *testing.T) {
 	require.NoError(t, db.PingContext(ctx))
 
 	t.Run("empty database full migration", func(t *testing.T) {
-		require.NoError(t, repository.ApplyMigrations(ctx, db))
-		assertTrafficDirectorRemoved(t, ctx, db)
+		require.NoError(t, applyTrafficDirectorTestMigrations(ctx, db))
+		assertTrafficDirectorRemoved(t, ctx, db, false)
 
 		var applied bool
 		require.NoError(t, db.QueryRowContext(ctx, `
@@ -75,6 +75,12 @@ SELECT EXISTS (
 	})
 
 	t.Run("database with migration 228 already applied", func(t *testing.T) {
+		// Reconstruct the historical scheduler columns before replaying 228/239.
+		_, err := db.ExecContext(ctx, `
+ALTER TABLE groups
+    ADD COLUMN scheduler_type VARCHAR(16) NOT NULL DEFAULT 'inherit',
+    ADD COLUMN advanced_scheduler_overrides JSONB NOT NULL DEFAULT '{}'::jsonb`)
+		require.NoError(t, err)
 		migration228, err := dbmigrations.FS.ReadFile("228_traffic_director.sql")
 		require.NoError(t, err)
 		execMigrationSQL(t, ctx, db, string(migration228))
@@ -104,7 +110,7 @@ DELETE FROM schema_migrations
 WHERE filename = '239_remove_traffic_director.sql'`)
 		require.NoError(t, err)
 		require.NoError(t, repository.ApplyMigrations(ctx, db))
-		assertTrafficDirectorRemoved(t, ctx, db)
+		assertTrafficDirectorRemoved(t, ctx, db, true)
 
 		// Exercise the surviving groups trigger after its referenced columns
 		// have been removed. A stale migration-228 function body errors here.
@@ -117,11 +123,77 @@ WHERE id = $1`, groupID)
 		cleanup, err := dbmigrations.FS.ReadFile("239_remove_traffic_director.sql")
 		require.NoError(t, err)
 		execMigrationSQL(t, ctx, db, string(cleanup))
-		assertTrafficDirectorRemoved(t, ctx, db)
+		assertTrafficDirectorRemoved(t, ctx, db, true)
+
+		var legacyAccountID, scalarAccountID int64
+		require.NoError(t, db.QueryRowContext(ctx, `
+INSERT INTO accounts (name, platform, type, extra, deleted_at)
+VALUES ('retired-soft-deleted', 'openai', 'oauth',
+        '{"codex_turn_ticket:model":"secret","codexXturnYticket:keep":"safe","openai_codex_warmup_policy":{"enabled":false},"usage":"keep"}'::jsonb,
+        now())
+RETURNING id`).Scan(&legacyAccountID))
+		require.NoError(t, db.QueryRowContext(ctx, `
+INSERT INTO accounts (name, platform, type, extra)
+VALUES ('legacy-scalar', 'gemini', 'oauth', '"legacy"'::jsonb)
+RETURNING id`).Scan(&scalarAccountID))
+		_, err = db.ExecContext(ctx, `
+INSERT INTO settings (key, value)
+VALUES ('openai_window_warmup_enabled', 'false'),
+       ('openai_window_warmup_enabled_other', 'keep')`)
+		require.NoError(t, err)
+
+		retirement, err := dbmigrations.FS.ReadFile("249_retire_kkai_fork_features.sql")
+		require.NoError(t, err)
+		execMigrationSQL(t, ctx, db, string(retirement))
+		assertTrafficDirectorRemoved(t, ctx, db, false)
+		purge, err := dbmigrations.FS.ReadFile("250_purge_retired_kkai_fork_data.sql")
+		require.NoError(t, err)
+		execMigrationSQL(t, ctx, db, string(purge))
+
+		var extra string
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT extra::text FROM accounts WHERE id = $1`, legacyAccountID).Scan(&extra))
+		require.JSONEq(t, `{"codexXturnYticket:keep":"safe","usage":"keep","openai_long_context_billing_enabled":false}`, extra)
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT extra::text FROM accounts WHERE id = $1`, scalarAccountID).Scan(&extra))
+		require.JSONEq(t, `"legacy"`, extra)
+		var remaining int
+		require.NoError(t, db.QueryRowContext(ctx, `
+SELECT count(*) FROM settings WHERE key IN
+('openai_window_warmup_enabled', 'openai_window_warmup_enabled_other')`).Scan(&remaining))
+		require.Equal(t, 1, remaining)
 	})
 }
 
-func assertTrafficDirectorRemoved(t *testing.T, ctx context.Context, db *sql.DB) {
+func applyTrafficDirectorTestMigrations(ctx context.Context, db *sql.DB) error {
+	err := repository.ApplyMigrations(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "248_account_egress_direct_default.sql: pq: sys1-ipv4 proxy route is required") {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `
+WITH proxy AS (
+    INSERT INTO proxies (name, protocol, host, port)
+    VALUES ('sys1-ipv4', 'http', '192.0.2.248', 80)
+    RETURNING id
+), identity AS (
+    INSERT INTO egress_identities (public_ip, status)
+    VALUES ('192.0.2.248', 'active')
+    RETURNING id
+)
+INSERT INTO egress_routes (
+    kind, proxy_id, state, expected_identity_id,
+    last_observed_ip, last_probed_at, verified_at
+)
+SELECT 'proxy', proxy.id, 'active', identity.id,
+       '192.0.2.248', now(), now()
+FROM proxy CROSS JOIN identity`)
+	if err != nil {
+		return err
+	}
+	return repository.ApplyMigrations(ctx, db)
+}
+
+func assertTrafficDirectorRemoved(t *testing.T, ctx context.Context, db *sql.DB, legacySchedulerColumns bool) {
 	t.Helper()
 
 	var historyTable sql.NullString
@@ -175,7 +247,11 @@ SELECT pg_get_functiondef(
     'public.enqueue_group_auth_cache_invalidation()'::regprocedure
 )`).Scan(&groupFunctionDefinition))
 	require.NotContains(t, groupFunctionDefinition, "traffic_director_")
-	require.Contains(t, groupFunctionDefinition, "advanced_scheduler_overrides")
+	if legacySchedulerColumns {
+		require.Contains(t, groupFunctionDefinition, "advanced_scheduler_overrides")
+	} else {
+		require.NotContains(t, groupFunctionDefinition, "advanced_scheduler_overrides")
+	}
 }
 
 func execMigrationSQL(t *testing.T, ctx context.Context, db *sql.DB, migrationSQL string) {

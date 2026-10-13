@@ -305,15 +305,19 @@ func (s *GroupRepoSuite) TestUpdate() {
 	s.Require().Equal("updated", got.Name)
 }
 
-func (s *GroupRepoSuite) TestRetiredSchedulerColumnsDoNotAffectOrdinaryEdits() {
+func (s *GroupRepoSuite) TestRetiredSchedulerColumnsAreAbsentAndOrdinaryEditsWork() {
 	group := &service.Group{
 		Name: "legacy-group", Platform: service.PlatformOpenAI,
 		RateMultiplier: 1, Status: service.StatusActive,
 		SubscriptionType: service.SubscriptionTypeStandard,
 	}
 	s.Require().NoError(s.repo.Create(s.ctx, group))
-	_, err := s.repo.sql.ExecContext(s.ctx, `UPDATE groups SET scheduler_type = 'advanced', advanced_scheduler_overrides = '{"lb_top_k":7}'::jsonb WHERE id = $1`, group.ID)
-	s.Require().NoError(err)
+	var remaining int
+	s.Require().NoError(scanSingleRow(s.ctx, s.repo.sql, `
+SELECT count(*) FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'groups'
+  AND column_name IN ('scheduler_type', 'advanced_scheduler_overrides')`, nil, &remaining))
+	s.Require().Zero(remaining)
 	got, err := s.repo.GetByID(s.ctx, group.ID)
 	s.Require().NoError(err)
 	got.Name = "edited"
