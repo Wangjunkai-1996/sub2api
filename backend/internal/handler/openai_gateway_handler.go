@@ -4600,14 +4600,19 @@ type cyberPolicyOpsErrorMeta struct {
 	ClientIP        string
 	CreatedAt       time.Time
 	SessionBlockKey string
+	IdentityStatus  service.CyberSessionIdentityStatus
 }
 
-func cyberPolicyVerifiedIdentity(meta cyberPolicyOpsErrorMeta) string {
-	if meta.NewAPIUserID <= 0 || meta.NewAPITokenID <= 0 || meta.NewAPIOrigin == "" {
-		return ""
+func cyberPolicyIdentityDetails(meta cyberPolicyOpsErrorMeta) string {
+	details := ""
+	if meta.NewAPIUserID > 0 && meta.NewAPITokenID > 0 && meta.NewAPIOrigin != "" {
+		details = fmt.Sprintf(" verified_newapi_origin=%s verified_newapi_user_id=%d verified_newapi_token_id=%d newapi_request_id=%s",
+			meta.NewAPIOrigin, meta.NewAPIUserID, meta.NewAPITokenID, meta.NewAPIRequestID)
 	}
-	return fmt.Sprintf(" verified_newapi_origin=%s verified_newapi_user_id=%d verified_newapi_token_id=%d newapi_request_id=%s",
-		meta.NewAPIOrigin, meta.NewAPIUserID, meta.NewAPITokenID, meta.NewAPIRequestID)
+	if meta.IdentityStatus != "" {
+		details += " session_identity_status=" + string(meta.IdentityStatus)
+	}
+	return details
 }
 
 // buildCyberPolicyOpsErrorEntry builds the ops_error_logs entry for an upstream
@@ -4631,7 +4636,7 @@ func buildCyberPolicyOpsErrorEntry(meta cyberPolicyOpsErrorMeta, mark *service.C
 		Severity:          "P3",
 		StatusCode:        mark.UpstreamStatus,
 		IsBusinessLimited: true,
-		ErrorMessage:      "cyber_policy:" + cyberPolicyVerifiedIdentity(meta) + " " + mark.Message,
+		ErrorMessage:      "cyber_policy:" + cyberPolicyIdentityDetails(meta) + " " + mark.Message,
 		// 原始 body 直接入队；ops service 落库前统一走 sanitizeErrorBodyForStorage 脱敏与截断。
 		ErrorBody:   mark.Body,
 		ErrorSource: "upstream_http",
@@ -4679,7 +4684,7 @@ func buildCyberSessionBlockedOpsEntry(meta cyberPolicyOpsErrorMeta) *service.Ops
 		Severity:          "P3",
 		StatusCode:        http.StatusForbidden,
 		IsBusinessLimited: true,
-		ErrorMessage:      "cyber_policy_session_blocked: request rejected locally by session block" + cyberPolicyVerifiedIdentity(meta),
+		ErrorMessage:      "cyber_policy_session_blocked: request rejected locally by session block" + cyberPolicyIdentityDetails(meta),
 		ErrorSource:       "gateway_local",
 		ErrorOwner:        "platform",
 		CreatedAt:         meta.CreatedAt,
@@ -4771,6 +4776,7 @@ func (h *OpenAIGatewayHandler) enqueueCyberSessionBlockedOpsEntry(c *gin.Context
 	// request; suppress the generic middleware record of the same 403 response.
 	c.Set(opsDedicatedErrorRecordedKey, true)
 	meta := cyberPolicyOpsErrorMeta{Model: model, InboundEndpoint: GetInboundEndpoint(c), CreatedAt: time.Now(), SessionBlockKey: sessionBlockKey}
+	_, meta.IdentityStatus = service.ResolveCyberSessionBlockIdentity(apiKey.ID, c)
 	meta.RequestID = c.Writer.Header().Get("X-Request-Id")
 	if c.Request != nil && c.Request.URL != nil {
 		meta.RequestPath = c.Request.URL.Path
@@ -4800,7 +4806,9 @@ func (h *OpenAIGatewayHandler) enqueueCyberSessionBlockedOpsEntry(c *gin.Context
 	if apiKey.User != nil {
 		meta.UserID = apiKey.User.ID
 	}
-	enqueueOpsErrorLog(h.opsService, buildCyberSessionBlockedOpsEntry(meta))
+	entry := buildCyberSessionBlockedOpsEntry(meta)
+	entry.DurationMs = getOpsRequestDurationMs(c)
+	enqueueOpsErrorLog(h.opsService, entry)
 }
 
 // recordCyberPolicyIfMarked 在 gateway forward 返回后检查 cyber 标记，异步写风控日志/邮件，
@@ -4877,6 +4885,8 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 	newAPIOrigin, _ := requestCtx.Value(ctxkey.NewAPIOrigin).(string)
 	newAPIUserID, _ := requestCtx.Value(ctxkey.NewAPIUserID).(int64)
 	newAPITokenID, _ := requestCtx.Value(ctxkey.NewAPITokenID).(int64)
+	opsDurationMs := getOpsRequestDurationMs(c)
+	sessionBlockKey, sessionIdentityStatus := service.ResolveCyberSessionBlockIdentity(apiKeyID, c)
 	opsMeta := cyberPolicyOpsErrorMeta{
 		RequestID:       requestID,
 		ClientRequestID: clientRequestID,
@@ -4897,12 +4907,13 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 		GroupID:         groupID,
 		ClientIP:        clientIPStr,
 		CreatedAt:       time.Now(),
+		IdentityStatus:  sessionIdentityStatus,
 	}
 	cyberAllowlisted := h.cyberPolicyLogOnly(c, apiKey)
 	if gwSvc != nil && apiKey != nil && !cyberAllowlisted {
-		if key := service.CyberSessionExplicitBlockKey(apiKey.ID, c, cyberBlockBody); key != "" {
+		if sessionBlockKey != "" {
 			blockCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			gwSvc.MarkCyberSessionBlocked(blockCtx, key)
+			gwSvc.MarkCyberSessionBlocked(blockCtx, sessionBlockKey)
 			cancel()
 		}
 	}
@@ -4967,7 +4978,9 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 			})
 		}
 		if opsSvc != nil {
-			enqueueOpsErrorLog(opsSvc, buildCyberPolicyOpsErrorEntry(opsMeta, mark))
+			entry := buildCyberPolicyOpsErrorEntry(opsMeta, mark)
+			entry.DurationMs = opsDurationMs
+			enqueueOpsErrorLog(opsSvc, entry)
 		}
 	}()
 }

@@ -264,6 +264,11 @@ gateway:
   # Enable Gemini upstream response header debug logs (default: false)
   # 是否开启 Gemini 上游响应头调试日志（默认 false）
   gemini_debug_response_headers: false
+  # Temporary OpenAI gateway HTTP transport diagnostics (standard logs only).
+  # 按需排障：记录 DNS/TCP/TLS、连接获取/复用及首字节耗时；不记录地址、正文或凭据。
+  # 仅覆盖原生 HTTP 出站（不含插件和原生 WS）；总耗时到传输适配器返回，不等同于模型首 token 耗时。
+  # 环境变量 GATEWAY_OPENAI_NETWORK_TRACE_ENABLED=true；改配置后重启生效，排障后关闭。
+  openai_network_trace_enabled: false
   # Maximum TTL (seconds) a Gemini explicit context cache may be created or extended to (default: 86400)
   # Gemini 显式上下文缓存单次可设置的最长有效期（秒，默认 86400）；存储费在创建/延长请求中一次性收取
   gemini_cached_content_max_ttl_seconds: 86400

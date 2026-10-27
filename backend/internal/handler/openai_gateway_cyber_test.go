@@ -184,3 +184,62 @@ func TestCyberOpsEntriesKeepBillingAndVerifiedUserDistinct(t *testing.T) {
 	unsigned := buildCyberPolicyOpsErrorEntry(cyberPolicyOpsErrorMeta{UserID: 1}, &service.CyberPolicyMark{})
 	require.NotContains(t, unsigned.ErrorMessage, "verified_newapi_user_id")
 }
+
+func TestCyberOpsIdentityDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		verified  bool
+		session   string
+		websocket bool
+		local     bool
+		want      string
+	}{
+		{name: "unverified", session: "private-session", want: "unverified_relay"},
+		{name: "missing", verified: true, want: "missing_session"},
+		{name: "invalid", verified: true, session: "private\tsession", want: "invalid_session"},
+		{name: "ready", verified: true, session: "private-session", want: "ready"},
+		{name: "websocket uses handshake identity", verified: true, session: "private-session", websocket: true, want: "ready"},
+		{name: "local block", verified: true, session: "private-session", local: true, want: "ready"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupOpsErrorLogTestQueue(t, 1)
+			t.Cleanup(func() { resetOpsErrorLoggerStateForTest(t) })
+			repo := &ingressRejectOpsRepo{}
+			ops := service.NewOpsService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+			h := &OpenAIGatewayHandler{opsService: ops}
+			c := newTestGinContext()
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Request.Header.Set("X-Session-Id", tc.session)
+			c.Request.Header.Set("Session_Id", "different-hint")
+			if tc.verified {
+				ctx := context.WithValue(c.Request.Context(), ctxkey.NewAPIUserID, int64(42))
+				ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(77))
+				ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "https://newapi.internal")
+				c.Request = c.Request.WithContext(ctx)
+			}
+			if tc.websocket {
+				service.SetOpenAIClientTransport(c, service.OpenAIClientTransportWS)
+			}
+			apiKey := &service.APIKey{ID: 21}
+			if tc.local {
+				key := service.CyberSessionExplicitBlockKey(apiKey.ID, c, nil)
+				h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, "gpt-5", key)
+			} else {
+				service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Code: "cyber_policy", Message: "blocked", UpstreamStatus: 403})
+				h.recordCyberPolicyIfMarked(c, apiKey, nil, nil, "gpt-5", false, nil, service.ChannelUsageFields{}, "")
+			}
+			// The asynchronous event must use the frozen identity status.
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			select {
+			case job := <-opsErrorLogQueue:
+				flushOpsErrorLogBatch([]opsErrorLogJob{job})
+			case <-time.After(time.Second):
+				t.Fatal("cyber event was not queued")
+			}
+			require.Len(t, repo.entries, 1)
+			require.Contains(t, repo.entries[0].ErrorMessage, "session_identity_status="+tc.want)
+			require.NotContains(t, repo.entries[0].ErrorMessage, "private")
+			require.NotContains(t, repo.entries[0].ErrorBody, "private")
+		})
+	}
+}

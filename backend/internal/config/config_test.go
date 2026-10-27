@@ -31,6 +31,33 @@ func TestLoadDefaultModelsListReadMaxBytes(t *testing.T) {
 	require.Equal(t, DefaultModelsListReadMaxBytes, cfg.Gateway.ModelsListReadMaxBytes)
 }
 
+func TestLoadOpenAINetworkTraceConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		file string
+		want bool
+	}{
+		{name: "disabled by default"},
+		{name: "enabled by environment", env: "true", want: true},
+		{name: "enabled by config", file: "gateway:\n  openai_network_trace_enabled: true\n", want: true},
+		{name: "environment can disable", env: "false", file: "gateway:\n  openai_network_trace_enabled: true\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			t.Setenv("GATEWAY_OPENAI_NETWORK_TRACE_ENABLED", tc.env)
+			if tc.file != "" {
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				require.NoError(t, os.WriteFile(path, []byte(tc.file), 0o600))
+				t.Setenv("CONFIG_FILE", path)
+			}
+			cfg, err := Load()
+			require.NoError(t, err)
+			require.Equal(t, tc.want, cfg.Gateway.OpenAINetworkTraceEnabled)
+		})
+	}
+}
+
 func TestLoadDefaultMinOutputTokens(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	cfg, err := Load()

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
@@ -19,27 +20,54 @@ type CyberSessionBlockStore interface {
 	FindCyberSessionBlocked(ctx context.Context, key string) (bool, error)
 }
 
+// CyberSessionIdentityStatus describes only whether a block key can be derived.
+// Ready does not imply that blocking is enabled or that a store write succeeded.
+type CyberSessionIdentityStatus string
+
+const (
+	CyberSessionIdentityReady           CyberSessionIdentityStatus = "ready"
+	CyberSessionIdentityMissingAPIKey   CyberSessionIdentityStatus = "missing_api_key"
+	CyberSessionIdentityInvalidRequest  CyberSessionIdentityStatus = "invalid_request"
+	CyberSessionIdentityUnverifiedRelay CyberSessionIdentityStatus = "unverified_relay"
+	CyberSessionIdentityMissingSession  CyberSessionIdentityStatus = "missing_session"
+	CyberSessionIdentityInvalidSession  CyberSessionIdentityStatus = "invalid_session"
+)
+
 // CyberSessionExplicitBlockKey requires a verified relay identity and a
 // client-provided X-Session-Id. Other session hints and prompt-cache keys do not
 // establish a unique conversation and must not authorize persistent blocking.
 func CyberSessionExplicitBlockKey(apiKeyID int64, c *gin.Context, _ []byte) string {
-	if apiKeyID <= 0 || c == nil || c.Request == nil {
-		return ""
+	key, _ := ResolveCyberSessionBlockIdentity(apiKeyID, c)
+	return key
+}
+
+// ResolveCyberSessionBlockIdentity returns the existing key and a fixed diagnostic
+// status. It does not use body hints, log session IDs, or change admission policy.
+func ResolveCyberSessionBlockIdentity(apiKeyID int64, c *gin.Context) (string, CyberSessionIdentityStatus) {
+	if apiKeyID <= 0 {
+		return "", CyberSessionIdentityMissingAPIKey
+	}
+	if c == nil || c.Request == nil {
+		return "", CyberSessionIdentityInvalidRequest
 	}
 	ctx := c.Request.Context()
 	userID, _ := ctx.Value(ctxkey.NewAPIUserID).(int64)
 	tokenID, _ := ctx.Value(ctxkey.NewAPITokenID).(int64)
 	origin, _ := ctx.Value(ctxkey.NewAPIOrigin).(string)
 	if userID <= 0 || tokenID <= 0 || origin == "" {
-		return ""
+		return "", CyberSessionIdentityUnverifiedRelay
 	}
-	sessionID := sanitizeSessionID(c.GetHeader(openCodeSessionIDHeader))
+	rawSessionID := c.GetHeader(openCodeSessionIDHeader)
+	if strings.TrimSpace(rawSessionID) == "" {
+		return "", CyberSessionIdentityMissingSession
+	}
+	sessionID := sanitizeSessionID(rawSessionID)
 	if sessionID == "" {
-		return ""
+		return "", CyberSessionIdentityInvalidSession
 	}
 	raw := fmt.Sprintf("cyber-session:v2|api=%d|origin=%d:%s|user=%d|token=%d|session=%s", apiKeyID, len(origin), origin, userID, tokenID, sessionID)
 	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), CyberSessionIdentityReady
 }
 
 func (s *OpenAIGatewayService) cyberSessionBlockStore() CyberSessionBlockStore {

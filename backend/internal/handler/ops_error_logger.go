@@ -31,6 +31,7 @@ const (
 	opsAccountIDKey              = "ops_account_id"
 	opsRoutingCapacityLimitedKey = "ops_routing_capacity_limited"
 	opsDedicatedErrorRecordedKey = "ops_dedicated_error_recorded"
+	opsRequestDurationMsKey      = "ops_request_duration_ms"
 
 	opsUpstreamModelKey = service.OpsUpstreamModelKey
 	opsRequestTypeKey   = "ops_request_type"
@@ -1076,6 +1077,9 @@ func (state *opsCaptureWriterState) shouldCapture() bool {
 // - Streaming errors after the response has started (SSE) may still need explicit logging.
 func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if start, ok := c.Request.Context().Value(ctxkey.RequestStartTime).(time.Time); !ok || start.IsZero() {
+			c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), ctxkey.RequestStartTime, time.Now()))
+		}
 		originalWriter := c.Writer
 		w := acquireOpsCaptureWriter(originalWriter)
 		w.setContext(c)
@@ -1089,6 +1093,10 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 		}()
 		c.Writer = w
 		c.Next()
+		// Freeze before monitoring lookups, response parsing and asynchronous persistence.
+		if duration := getOpsRequestDurationMs(c); duration != nil {
+			c.Set(opsRequestDurationMsKey, *duration)
+		}
 		w.finalizeCapture()
 
 		if _, rejected := middleware2.GetIngressRejectReason(c); rejected {
@@ -1672,11 +1680,35 @@ func applyOpsLatencyFieldsFromContext(c *gin.Context, entry *service.OpsInsertEr
 	if c == nil || entry == nil {
 		return
 	}
+	entry.DurationMs = getOpsRequestDurationMs(c)
 	entry.AuthLatencyMs = getContextLatencyMs(c, service.OpsAuthLatencyMsKey)
 	entry.RoutingLatencyMs = getContextLatencyMs(c, service.OpsRoutingLatencyMsKey)
 	entry.UpstreamLatencyMs = getContextLatencyMs(c, service.OpsUpstreamLatencyMsKey)
 	entry.ResponseLatencyMs = getContextLatencyMs(c, service.OpsResponseLatencyMsKey)
 	entry.TimeToFirstTokenMs = getContextLatencyMs(c, service.OpsTimeToFirstTokenMsKey)
+}
+
+func getOpsRequestDurationMs(c *gin.Context) *int64 {
+	if c == nil || c.Request == nil {
+		return nil
+	}
+	// WS errors can describe earlier turns collected until connection close.
+	// A connection's ingress clock cannot measure those individual requests.
+	if service.GetOpenAIClientTransport(c) == service.OpenAIClientTransportWS || c.IsWebsocket() {
+		return nil
+	}
+	if duration := getContextLatencyMs(c, opsRequestDurationMsKey); duration != nil {
+		return duration
+	}
+	// Dedicated errors may be queued before the middleware unwinds: capture
+	// elapsed time now, never inside the asynchronous worker.
+	if start, ok := c.Request.Context().Value(ctxkey.RequestStartTime).(time.Time); ok && !start.IsZero() {
+		if elapsed := time.Since(start); elapsed >= 0 {
+			ms := elapsed.Milliseconds()
+			return &ms
+		}
+	}
+	return nil
 }
 
 // applyOpsUpstreamFieldsFromContext captures attempt-level upstream context.

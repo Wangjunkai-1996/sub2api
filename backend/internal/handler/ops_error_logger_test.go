@@ -704,6 +704,7 @@ func TestLogOpsStreamError_RecordsOneFailurePerWebSocketTurn(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	service.SetOpenAIClientTransport(c, service.OpenAIClientTransportWS)
+	c.Set(opsRequestDurationMsKey, int64(3600000)) // Connection lifetime is not a turn duration.
 
 	service.BeginOpsStreamTurn(c, 1)
 	service.MarkOpsStreamFailure(c, "rate_limit_error", "rate_limit_exceeded", "turn one failed", http.StatusTooManyRequests)
@@ -721,6 +722,8 @@ func TestLogOpsStreamError_RecordsOneFailurePerWebSocketTurn(t *testing.T) {
 	require.Equal(t, int64(2), OpsErrorLogQueueLength())
 	first := <-opsErrorLogQueue
 	second := <-opsErrorLogQueue
+	require.Nil(t, first.entry.DurationMs)
+	require.Nil(t, second.entry.DurationMs)
 	require.Equal(t, "turn one failed", first.entry.ErrorMessage)
 	require.Equal(t, http.StatusTooManyRequests, first.entry.StatusCode)
 	require.Equal(t, "turn two failed", second.entry.ErrorMessage)

@@ -4,6 +4,8 @@ import (
 	"io"
 	"net/http"
 	"sync"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 )
 
 type accountEgressUseBody struct {
@@ -86,7 +88,14 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 			return finish(response, err)
 		}
 	}
+	var networkTrace *openAINetworkTrace
+	if s.cfg != nil && s.cfg.Gateway.OpenAINetworkTraceEnabled {
+		request, networkTrace = startOpenAINetworkTrace(request, account.ID)
+	}
 	response, err = s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	if networkTrace != nil {
+		networkTrace.log(logger.L(), response, err)
+	}
 	return finish(response, err)
 }
 

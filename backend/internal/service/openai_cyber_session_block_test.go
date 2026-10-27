@@ -36,7 +36,7 @@ func TestCyberSessionBlockKeyRequiresVerifiedIdentityAndConversation(t *testing.
 	headers := map[string]string{"X-Session-Id": "conversation-1"}
 	c, body := newCyberBlockTestCtx(headers, `{}`, 42, 77)
 	key := CyberSessionExplicitBlockKey(21, c, body)
-	require.NotEmpty(t, key)
+	require.Equal(t, "4ab14784414bcd152799cb5a44849733a868d56fe95827b2120ad3a887a83a02", key, "the persisted v2 namespace must remain compatible")
 	require.Equal(t, key, CyberSessionExplicitBlockKey(21, c, body))
 	c.Request.Header.Set("Session_Id", "different-session")
 	c.Request.Header.Set("Conversation_Id", "another-session")
@@ -81,6 +81,45 @@ func TestCyberSessionBlockKeyRequiresVerifiedIdentityAndConversation(t *testing.
 			require.Empty(t, CyberSessionExplicitBlockKey(21, other, payload))
 		})
 	}
+}
+
+func TestResolveCyberSessionBlockIdentityDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		apiKey  int64
+		user    int64
+		token   int64
+		session string
+		want    CyberSessionIdentityStatus
+	}{
+		{name: "missing key", session: "private-session", want: CyberSessionIdentityMissingAPIKey},
+		{name: "unsigned", apiKey: 21, session: "private-session", want: CyberSessionIdentityUnverifiedRelay},
+		{name: "missing token", apiKey: 21, user: 42, session: "private-session", want: CyberSessionIdentityUnverifiedRelay},
+		{name: "missing session", apiKey: 21, user: 42, token: 77, want: CyberSessionIdentityMissingSession},
+		{name: "blank session", apiKey: 21, user: 42, token: 77, session: " \t ", want: CyberSessionIdentityMissingSession},
+		{name: "invalid session", apiKey: 21, user: 42, token: 77, session: "private\tsession", want: CyberSessionIdentityInvalidSession},
+		{name: "ready", apiKey: 21, user: 42, token: 77, session: "private-session", want: CyberSessionIdentityReady},
+		{name: "trim preserved", apiKey: 21, user: 42, token: 77, session: " \tprivate-session\r\n", want: CyberSessionIdentityReady},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, body := newCyberBlockTestCtx(map[string]string{
+				"X-Session-Id": tc.session,
+				"Session_Id":   "different-hint",
+			}, `{"session_id":"body-must-not-authorize"}`, tc.user, tc.token)
+			key, status := ResolveCyberSessionBlockIdentity(tc.apiKey, c)
+			require.Equal(t, tc.want, status)
+			require.Equal(t, key, CyberSessionExplicitBlockKey(tc.apiKey, c, body))
+			if status == CyberSessionIdentityReady {
+				require.Len(t, key, 64)
+			} else {
+				require.Empty(t, key)
+			}
+			require.NotContains(t, string(status), "private")
+		})
+	}
+	key, status := ResolveCyberSessionBlockIdentity(21, nil)
+	require.Empty(t, key)
+	require.Equal(t, CyberSessionIdentityInvalidRequest, status)
 }
 
 type fakeCyberBlockStore struct {
