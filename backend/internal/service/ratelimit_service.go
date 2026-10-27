@@ -1052,6 +1052,19 @@ func (s *RateLimitService) handle403(ctx context.Context, account *Account, upst
 }
 
 func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account, upstreamMsg string, responseBody []byte) (shouldDisable bool) {
+	return s.handleOpenAI403WithPermanentHandler(ctx, account, upstreamMsg, responseBody, "openai_403_temp", func(message string) {
+		s.handleAuthError(ctx, account, message)
+	})
+}
+
+func (s *RateLimitService) handleOpenAI403WithPermanentHandler(
+	ctx context.Context,
+	account *Account,
+	upstreamMsg string,
+	responseBody []byte,
+	runtimeBlockReason string,
+	handlePermanent func(string),
+) (shouldDisable bool) {
 	// 上游代理 / CDN 在请求到达 OpenAI API 之前就拦下时，回的是 HTML 403 页面而不是
 	// {"error":{...}} 结构化错误。这类响应描述的是「这条链路 / 这个端点被挡了」，
 	// 不构成账号凭据或权限失效的证据——例如无效的 /v1/responses 子路径（#5334）。
@@ -1081,29 +1094,29 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 	)
 
 	if s.openAI403CounterCache == nil {
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
 	count, err := s.openAI403CounterCache.IncrementOpenAI403Count(ctx, account.ID, openAI403CounterWindowMinutes)
 	if err != nil {
 		slog.Warn("openai_403_increment_failed", "account_id", account.ID, "error", err)
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
 	if count >= openAI403DisableThreshold {
 		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, openAI403DisableThreshold)
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
 	until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
 	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, openAI403DisableThreshold, msg)
-	s.notifyAccountSchedulingBlocked(account, until, "openai_403_temp")
+	s.notifyAccountSchedulingBlocked(account, until, runtimeBlockReason)
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
 		slog.Warn("openai_403_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
-		s.handleAuthError(ctx, account, msg)
+		handlePermanent(msg)
 		return true
 	}
 
@@ -1238,15 +1251,10 @@ func (s *RateLimitService) handleCustomErrorCode(ctx context.Context, account *A
 // handle429 处理429限流错误
 // 解析响应头获取重置时间，标记账号为限流状态
 func (s *RateLimitService) handle429(ctx context.Context, account *Account, headers http.Header, responseBody []byte) {
-	// OpenAI OAuth stays on the same account for the gateway's bounded retry
-	// window. Persisting a rate-limit reset on the first 429 would make the next
-	// retry ineligible and silently turn same-account recovery into a switch.
-	if account != nil && isOpenAIOAuthAccount(account) && s.runtimeBlocker != nil {
-		if checker, ok := s.runtimeBlocker.(interface {
-			ShouldRetryOpenAIOAuth429(*Account, http.Header, []byte) bool
-		}); ok && checker.ShouldRetryOpenAIOAuth429(account, headers, responseBody) {
-			return
-		}
+	// Shared recovery already owns transient OAuth 429 admission. Do not stack
+	// the generic persistent fallback on top of its short recovery rounds.
+	if usesOpenAI429RecoveryAdmission(ctx, account, headers, responseBody) {
+		return
 	}
 	// Spark 影子：限流/熔断状态 100% 由 QueryUsage(/wham/usage body 的 codex_bengalfox)驱动。
 	// /responses 的 429 携带的 x-codex-*/usage_limit_reached 是 global codex 道(plan/spec §8),

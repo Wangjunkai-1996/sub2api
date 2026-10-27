@@ -364,6 +364,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 			trimmedPayload := strings.TrimSpace(payload)
 			terminal.ObserveDataLine(trimmedPayload)
 			if trimmedPayload != "[DONE]" {
+				observeOpenAI429RecoveryOutput(c.Request.Context(), account, []byte(payload), "")
 				observer.ObserveOpenAI([]byte(payload), strings.TrimSpace(gjson.Get(payload, "type").String()))
 				usageOnlyChunk := isOpenAIChatUsageOnlyStreamChunk(payload)
 				if u := extractCCStreamUsage(payload); u != nil {
@@ -432,6 +433,10 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		if cause == nil {
 			cause = ErrOpenAIUpstreamStreamTruncated
 		}
+		// A raw CC stream can fail before the Responses passthrough handler
+		// sees it. Feed the same request-local egress into the proxy circuit so
+		// repeated failures on one pool route are quarantined consistently.
+		s.recordOpenAIProxyStreamDisconnect(account, cause, requestID)
 		logger.L().Warn("openai chat_completions raw: upstream stream truncated before terminal chunk",
 			zap.Error(cause),
 			zap.String("request_id", requestID),
@@ -549,6 +554,7 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 		return nil, newGrokMissingUsageFailoverError(c, account, upstreamRequestID)
 	}
 	respBody = applyOllamaCloudRawChatCompletionsResponse(account, respBody)
+	observeOpenAI429RecoveryOutput(c.Request.Context(), account, respBody, "")
 	respBody = s.replaceModelInResponseBody(respBody, upstreamModel, originalModel)
 
 	if s.responseHeaderFilter != nil {

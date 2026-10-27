@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
@@ -138,9 +140,83 @@ func NewSOCKS5ProxyDialer(profile *Profile, proxyURL *url.URL) *SOCKS5ProxyDiale
 	return &SOCKS5ProxyDialer{profile: profile, proxyURL: proxyURL}
 }
 
+// dialProxyContext keeps SOCKS5 setup on the context-aware path. The dialer
+// returned by x/net/proxy.SOCKS5 implements proxy.ContextDialer; fail closed if
+// that contract ever changes instead of silently restoring an unbounded Dial.
+func dialProxyContext(ctx context.Context, dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, addr)
+	}
+	return nil, fmt.Errorf("SOCKS5 dialer does not support context")
+}
+
+// bindConnContext applies a context deadline to an established connection and
+// closes it when the context is canceled. net.Conn operations used for proxy
+// CONNECT do not accept a context, so this bridge is required to make their
+// cancellation behavior match DialContext/TLS HandshakeContext.
+func bindConnContext(ctx context.Context, conn net.Conn) func() bool {
+	if conn == nil {
+		return func() bool { return false }
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	hasDeadline := false
+	if contextDeadline, ok := ctx.Deadline(); ok {
+		hasDeadline = true
+		_ = conn.SetDeadline(contextDeadline)
+	}
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(callbackDone)
+	})
+	var (
+		cleanupOnce sync.Once
+		canceled    bool
+	)
+	return func() bool {
+		cleanupOnce.Do(func() {
+			stopped := stop()
+			if !stopped {
+				// AfterFunc.Stop does not wait for a callback that already started.
+				// Join it before a successful dial can publish this connection.
+				<-callbackDone
+			}
+			// Stop may win after ctx is already done but before the callback starts.
+			// The context state, not callback scheduling, decides whether the dial
+			// may publish the connection.
+			canceled = ctx.Err() != nil
+			if canceled && stopped {
+				// The pending callback was removed, so cleanup owns the close.
+				_ = conn.Close()
+			}
+			if hasDeadline {
+				_ = conn.SetDeadline(time.Time{})
+			}
+		})
+		return canceled
+	}
+}
+
+func contextErrorOr(ctx context.Context, err error) error {
+	if ctx != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+	}
+	return err
+}
+
 // DialTLSContext establishes a TLS connection through SOCKS5 proxy with the configured fingerprint.
 // Flow: SOCKS5 CONNECT to target -> TLS handshake with utls on the tunnel
 func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	slog.Debug("tls_fingerprint_socks5_connecting", "proxy", d.proxyURL.Host, "target", addr)
 
 	// Step 1: Create SOCKS5 dialer
@@ -168,7 +244,7 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 
 	// Step 2: Establish SOCKS5 tunnel to target
 	slog.Debug("tls_fingerprint_socks5_establishing_tunnel", "target", addr)
-	conn, err := socksDialer.Dial("tcp", addr)
+	conn, err := dialProxyContext(ctx, socksDialer, network, addr)
 	if err != nil {
 		slog.Debug("tls_fingerprint_socks5_connect_failed", "error", err)
 		return nil, fmt.Errorf("SOCKS5 connect: %w", err)
@@ -182,6 +258,9 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 // DialTLSContext establishes a TLS connection through HTTP proxy with the configured fingerprint.
 // Flow: TCP connect to proxy -> CONNECT tunnel -> TLS handshake with utls
 func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	slog.Debug("tls_fingerprint_http_proxy_connecting", "proxy", d.proxyURL.Host, "target", addr)
 
 	// Step 1: TCP connect to proxy server
@@ -204,6 +283,12 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 		return nil, fmt.Errorf("connect to proxy: %w", err)
 	}
 	slog.Debug("tls_fingerprint_http_proxy_connected", "proxy_addr", proxyAddr)
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	stopConnContext := bindConnContext(ctx, conn)
+	defer stopConnContext()
 
 	// Step 2: Send CONNECT request to establish tunnel
 	req := &http.Request{
@@ -225,7 +310,7 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 	if err := req.Write(conn); err != nil {
 		_ = conn.Close()
 		slog.Debug("tls_fingerprint_http_proxy_write_failed", "error", err)
-		return nil, fmt.Errorf("write CONNECT request: %w", err)
+		return nil, contextErrorOr(ctx, fmt.Errorf("write CONNECT request: %w", err))
 	}
 
 	// Step 3: Read CONNECT response
@@ -234,7 +319,7 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 	if err != nil {
 		_ = conn.Close()
 		slog.Debug("tls_fingerprint_http_proxy_read_response_failed", "error", err)
-		return nil, fmt.Errorf("read CONNECT response: %w", err)
+		return nil, contextErrorOr(ctx, fmt.Errorf("read CONNECT response: %w", err))
 	}
 	// CONNECT response has no body; do not defer resp.Body.Close() as it wraps the
 	// same conn that will be used for the TLS handshake.
@@ -245,6 +330,9 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
 	}
 	slog.Debug("tls_fingerprint_http_proxy_tunnel_established")
+	if stopConnContext() {
+		return nil, ctx.Err()
+	}
 
 	// Step 4: Perform TLS handshake on the tunnel with utls fingerprint
 	return performTLSHandshake(ctx, conn, d.profile, addr)
@@ -253,6 +341,9 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 // DialTLSContext establishes a TLS connection with the configured fingerprint.
 // This method is designed to be used as http.Transport.DialTLSContext.
 func (d *Dialer) DialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Establish TCP connection using base dialer (supports proxy)
 	slog.Debug("tls_fingerprint_dialing_tcp", "addr", addr)
 	conn, err := d.baseDialer(ctx, network, addr)
@@ -270,6 +361,9 @@ func (d *Dialer) DialTLSContext(ctx context.Context, network, addr string) (net.
 // It builds a ClientHello spec from the profile, applies it, and completes the handshake.
 // On failure, conn is closed and an error is returned.
 func performTLSHandshake(ctx context.Context, conn net.Conn, profile *Profile, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr

@@ -51,8 +51,39 @@ type ConcurrencyCache interface {
 	CleanupExpiredAccountSlots(ctx context.Context, accountID int64) error
 	CleanupExpiredAccountSlotKeys(ctx context.Context) error
 
-	// 启动时清理旧进程遗留槽位与等待计数
+	// 保留用于兼容旧调用方；实现不得清理其他进程槽位或共享等待计数
 	CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error
+}
+
+// AccountUnboundedSlotCache keeps an otherwise-unlimited account aware of the
+// account accounting without imposing a numerical concurrency limit.
+type AccountUnboundedSlotCache interface {
+	AcquireUnboundedAccountSlot(context.Context, int64, string) (bool, error)
+}
+
+// AccountEgressLegacySlotCache mirrors a rollout-off regular admission into
+// the exact public identity selected at admission time. It is optional so
+// caches used by tests and non-OpenAI paths preserve their legacy contract.
+type AccountEgressLegacySlotCache interface {
+	AcquireAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		maxConcurrency int,
+		requestID string,
+		identityID string,
+	) (bool, error)
+	RefreshAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		requestID string,
+		identityID string,
+	) (bool, error)
+	ReleaseAccountSlotForEgress(
+		ctx context.Context,
+		accountID int64,
+		requestID string,
+		identityID string,
+	) error
 }
 
 type APIKeyConcurrencyCache interface {
@@ -229,7 +260,8 @@ const (
 
 // ConcurrencyService 管理账号和用户的并发限制。
 type ConcurrencyService struct {
-	cache ConcurrencyCache
+	cache                  ConcurrencyCache
+	accountEgressAllocator *AccountEgressAllocator
 
 	accountLoadCacheTTL atomic.Int64
 	accountLoadCacheMu  sync.RWMutex
@@ -243,10 +275,13 @@ type cachedAccountLoadBatch struct {
 }
 
 // NewConcurrencyService 创建并发控制服务。
-func NewConcurrencyService(cache ConcurrencyCache) *ConcurrencyService {
+func NewConcurrencyService(cache ConcurrencyCache, authorityReaders ...AccountEgressAuthorityReader) *ConcurrencyService {
 	svc := &ConcurrencyService{
 		cache:            cache,
 		accountLoadCache: make(map[string]cachedAccountLoadBatch),
+	}
+	if egressCache, ok := cache.(AccountEgressCache); ok {
+		svc.accountEgressAllocator = NewAccountEgressAllocator(egressCache, authorityReaders...)
 	}
 	svc.SetAccountLoadBatchCacheTTL(defaultAccountLoadBatchCacheTTL)
 	return svc
@@ -308,8 +343,11 @@ func (s *ConcurrencyService) SetAccountLoadBatchCacheTTL(ttl time.Duration) {
 
 // AcquireResult represents the result of acquiring a concurrency slot
 type AcquireResult struct {
-	Acquired    bool
-	ReleaseFunc func() // Must be called when done (typically via defer)
+	Acquired              bool
+	ReleaseFunc           func() // Must be called when done (typically via defer)
+	Account               *Account
+	Egress                *ResolvedAccountEgress
+	LegacyEgressAdmission *LegacyAccountEgressAdmission
 }
 
 type AccountWithConcurrency struct {
@@ -327,6 +365,8 @@ type AccountLoadInfo struct {
 	CurrentConcurrency int
 	WaitingCount       int
 	LoadRate           int // 0-100+ (percent)
+	EgressStatus       AccountEgressStatus
+	EffectiveCapacity  int
 }
 
 type UserLoadInfo struct {
@@ -342,6 +382,31 @@ type UserLoadInfo struct {
 func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int) (*AcquireResult, error) {
 	// If maxConcurrency is 0 or negative, no limit
 	if maxConcurrency <= 0 {
+		if s != nil && s.cache != nil {
+			if cache, ok := s.cache.(AccountUnboundedSlotCache); ok {
+				requestID := generateRequestID()
+				acquired, err := cache.AcquireUnboundedAccountSlot(ctx, accountID, requestID)
+				if err != nil {
+					// Preserve the historical fail-open contract for unlimited
+					// accounts when Redis is unavailable.
+					logger.LegacyPrintf("service.concurrency", "Warning: failed to track unlimited account %d: %v", accountID, err)
+					return &AcquireResult{Acquired: true, ReleaseFunc: func() {}}, nil
+				}
+				if !acquired {
+					return &AcquireResult{Acquired: false}, nil
+				}
+				return &AcquireResult{
+					Acquired: true,
+					ReleaseFunc: func() {
+						bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						if err := s.cache.ReleaseAccountSlot(bgCtx, accountID, requestID); err != nil {
+							logger.LegacyPrintf("service.concurrency", "Warning: failed to release unlimited account slot for %d (req=%s): %v", accountID, requestID, err)
+						}
+					},
+				}, nil
+			}
+		}
 		return &AcquireResult{
 			Acquired:    true,
 			ReleaseFunc: func() {}, // no-op
@@ -350,6 +415,41 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 
 	// Generate unique request ID for this slot
 	requestID := generateRequestID()
+	legacyEgressAdmission := legacyAccountEgressAdmissionFromContext(ctx, accountID)
+	if legacyEgressAdmission != nil && s != nil && s.cache != nil {
+		if cache, ok := s.cache.(AccountEgressLegacySlotCache); ok {
+			acquired, err := cache.AcquireAccountSlotForEgress(
+				ctx,
+				accountID,
+				maxConcurrency,
+				requestID,
+				legacyEgressAdmission.IdentityID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !acquired {
+				return &AcquireResult{
+					Acquired:              false,
+					LegacyEgressAdmission: legacyEgressAdmission,
+				}, nil
+			}
+
+			lease := newLegacyAccountEgressLease(
+				legacyEgressAdmission.leaseContext(ctx),
+				cache,
+				accountID,
+				requestID,
+				legacyEgressAdmission.IdentityID,
+			)
+			legacyEgressAdmission.Lease = lease
+			return &AcquireResult{
+				Acquired:              true,
+				ReleaseFunc:           lease.Release,
+				LegacyEgressAdmission: legacyEgressAdmission,
+			}, nil
+		}
+	}
 
 	acquired, err := s.cache.AcquireAccountSlot(ctx, accountID, maxConcurrency, requestID)
 	if err != nil {

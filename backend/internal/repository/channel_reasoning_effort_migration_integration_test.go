@@ -27,7 +27,7 @@ VALUES ($1, '["custom-model"]', 2.5) RETURNING id`, channelID).Scan(&configuredI
 INSERT INTO channel_model_pricing (channel_id, models)
 VALUES ($1, '["claude-fable-5-1"]') RETURNING id`, channelID).Scan(&unsetID))
 
-	migrationSQL, err := dbmigrations.FS.ReadFile("239_channel_reasoning_effort_multipliers.sql")
+	migrationSQL, err := dbmigrations.FS.ReadFile("246_channel_reasoning_effort_multipliers.sql")
 	require.NoError(t, err)
 	_, err = tx.ExecContext(ctx, string(migrationSQL))
 	require.NoError(t, err)
@@ -68,7 +68,7 @@ VALUES ('migration-group-reasoning', 'anthropic', '[
     {"models":["claude-fable-5-1"],"max_reasoning_effort_multiplier":null}
 ]'::jsonb) RETURNING id`).Scan(&groupID))
 
-	migrationSQL, err := dbmigrations.FS.ReadFile("239_channel_reasoning_effort_multipliers.sql")
+	migrationSQL, err := dbmigrations.FS.ReadFile("246_channel_reasoning_effort_multipliers.sql")
 	require.NoError(t, err)
 	for range 2 {
 		_, err = tx.ExecContext(ctx, string(migrationSQL))
@@ -76,8 +76,8 @@ VALUES ('migration-group-reasoning', 'anthropic', '[
 		var actual string
 		require.NoError(t, tx.QueryRowContext(ctx, `SELECT model_pricing::text FROM groups WHERE id = $1`, groupID).Scan(&actual))
 		require.JSONEq(t, `[
-            {"models":["custom-model"],"input_price":2,"reasoning_effort_multipliers":{"max":2.5}},
-            {"models":["existing-map"],"reasoning_effort_multipliers":{"high":1.5,"max":4}},
+            {"models":["custom-model"],"input_price":2,"max_reasoning_effort_multiplier":2.5,"reasoning_effort_multipliers":{"max":2.5}},
+            {"models":["existing-map"],"max_reasoning_effort_multiplier":3,"reasoning_effort_multipliers":{"high":1.5,"max":4}},
             {"models":["cleared-map"],"reasoning_effort_multipliers":{}},
             {"models":["claude-fable-5-1"]}
         ]`, actual)

@@ -1305,3 +1305,38 @@ func (s *GroupRepoSuite) TestDelete_SoftDeletedGroup_lockForUpdate() {
 	s.Require().Error(err, "should fail to get soft-deleted group")
 	s.Require().ErrorIs(err, service.ErrGroupNotFound)
 }
+
+func TestGroupRepositoryUpdateRejectsStaleOrdinarySnapshot(t *testing.T) {
+	ctx := context.Background()
+	created := mustCreateGroup(t, integrationEntClient, &service.Group{
+		Name:             uniqueTestValue(t, "stale-ordinary-update"),
+		Platform:         service.PlatformOpenAI,
+		RateMultiplier:   1.0,
+		Status:           service.StatusActive,
+		SubscriptionType: service.SubscriptionTypeStandard,
+	})
+	t.Cleanup(func() {
+		_, _ = integrationDB.ExecContext(context.Background(), "DELETE FROM groups WHERE id = $1", created.ID)
+	})
+	repo := newGroupRepositoryWithSQL(integrationEntClient, integrationDB)
+
+	profitUpdate, err := repo.GetByIDLite(ctx, created.ID)
+	require.NoError(t, err)
+	staleNameUpdate, err := repo.GetByIDLite(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, profitUpdate.UpdatedAt, staleNameUpdate.UpdatedAt)
+
+	profitUpdate.ProfitControlEnabled = true
+	profitUpdate.ProfitMinMargin = 0.25
+	require.NoError(t, repo.Update(ctx, profitUpdate))
+
+	staleNameUpdate.Name = uniqueTestValue(t, "must-not-overwrite-profit")
+	err = repo.Update(ctx, staleNameUpdate)
+	require.ErrorIs(t, err, service.ErrGroupUpdateConflict)
+
+	got, err := repo.GetByIDLite(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, created.Name, got.Name)
+	require.True(t, got.ProfitControlEnabled)
+	require.InDelta(t, 0.25, got.ProfitMinMargin, 1e-12)
+}

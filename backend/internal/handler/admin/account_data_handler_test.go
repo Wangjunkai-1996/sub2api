@@ -2,15 +2,59 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type accountDataSettingRepo struct {
+	values      map[string]string
+	getAllErr   error
+	getAllCalls int
+}
+
+func (r *accountDataSettingRepo) Get(context.Context, string) (*service.Setting, error) {
+	panic("unexpected Get call")
+}
+
+func (r *accountDataSettingRepo) GetValue(context.Context, string) (string, error) {
+	panic("unexpected GetValue call")
+}
+
+func (r *accountDataSettingRepo) Set(context.Context, string, string) error {
+	panic("unexpected Set call")
+}
+
+func (r *accountDataSettingRepo) GetMultiple(context.Context, []string) (map[string]string, error) {
+	panic("unexpected GetMultiple call")
+}
+
+func (r *accountDataSettingRepo) SetMultiple(context.Context, map[string]string) error {
+	panic("unexpected SetMultiple call")
+}
+
+func (r *accountDataSettingRepo) GetAll(context.Context) (map[string]string, error) {
+	r.getAllCalls++
+	if r.getAllErr != nil {
+		return nil, r.getAllErr
+	}
+	out := make(map[string]string, len(r.values))
+	for key, value := range r.values {
+		out[key] = value
+	}
+	return out, nil
+}
+
+func (r *accountDataSettingRepo) Delete(context.Context, string) error {
+	panic("unexpected Delete call")
+}
 
 type dataResponse struct {
 	Code int         `json:"code"`
@@ -37,17 +81,37 @@ type dataProxy struct {
 }
 
 type dataAccount struct {
-	Name        string         `json:"name"`
-	Platform    string         `json:"platform"`
-	Type        string         `json:"type"`
-	Credentials map[string]any `json:"credentials"`
-	Extra       map[string]any `json:"extra"`
-	ProxyKey    *string        `json:"proxy_key"`
-	Concurrency int            `json:"concurrency"`
-	Priority    int            `json:"priority"`
+	Name        string                 `json:"name"`
+	Platform    string                 `json:"platform"`
+	Type        string                 `json:"type"`
+	Credentials map[string]any         `json:"credentials"`
+	Extra       map[string]any         `json:"extra"`
+	ProxyKey    *string                `json:"proxy_key"`
+	EgressMode  string                 `json:"egress_mode"`
+	EgressPool  *DataAccountEgressPool `json:"egress_pool"`
+	Concurrency int                    `json:"concurrency"`
+	Priority    int                    `json:"priority"`
+}
+
+type accountDataEgressRepo struct {
+	service.EgressRepository
+	routes  []service.EgressRoute
+	listErr error
+}
+
+func (r *accountDataEgressRepo) ListAssignableRoutes(context.Context) ([]service.EgressRoute, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return append([]service.EgressRoute(nil), r.routes...), nil
 }
 
 func setupAccountDataRouter() (*gin.Engine, *stubAdminService) {
+	router, adminSvc, _ := setupAccountDataRouterWithSettings(&accountDataSettingRepo{values: map[string]string{}})
+	return router, adminSvc
+}
+
+func setupAccountDataRouterWithSettings(settingRepo *accountDataSettingRepo) (*gin.Engine, *stubAdminService, *AccountHandler) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	adminSvc := newStubAdminService()
@@ -71,7 +135,7 @@ func setupAccountDataRouter() (*gin.Engine, *stubAdminService) {
 
 	router.GET("/api/v1/admin/accounts/data", h.ExportData)
 	router.POST("/api/v1/admin/accounts/data", h.ImportData)
-	return router, adminSvc
+	return router, adminSvc, h
 }
 
 func TestExportDataIncludesSecrets(t *testing.T) {
@@ -123,12 +187,97 @@ func TestExportDataIncludesSecrets(t *testing.T) {
 	var resp dataResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	require.Equal(t, 0, resp.Code)
-	require.Empty(t, resp.Data.Type)
-	require.Equal(t, 0, resp.Data.Version)
+	require.Equal(t, dataType, resp.Data.Type)
+	require.Equal(t, accountDataVersion, resp.Data.Version)
 	require.Len(t, resp.Data.Proxies, 1)
 	require.Equal(t, "pass", resp.Data.Proxies[0].Password)
 	require.Len(t, resp.Data.Accounts, 1)
 	require.Equal(t, "secret", resp.Data.Accounts[0].Credentials["token"])
+}
+
+func TestExportDataV2UsesPortableKeysForOpenAIOAuthPool(t *testing.T) {
+	router, adminSvc := setupAccountDataRouter()
+
+	primaryProxyID := int64(11)
+	secondaryProxyID := int64(12)
+	adminSvc.proxies = []service.Proxy{
+		{ID: primaryProxyID, Name: "primary", Protocol: "http", Host: "proxy-a.internal", Port: 8080, Username: "user-a", Password: "pass-a", Status: service.StatusActive},
+		{ID: secondaryProxyID, Name: "secondary", Protocol: "socks5", Host: "proxy-b.internal", Port: 1080, Username: "user-b", Password: "pass-b", Status: service.StatusActive},
+	}
+	directScope := service.DefaultDirectEgressRuntimeScope
+	adminSvc.accounts = []service.Account{{
+		ID:          21,
+		Name:        "pooled-oauth",
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeOAuth,
+		Credentials: map[string]any{"token": "secret"},
+		ProxyID:     &primaryProxyID,
+		EgressMode:  service.EgressModePool,
+		EgressBindings: []service.AccountEgressBinding{
+			{RouteID: 501, Position: 0, IsPrimary: true, Route: &service.EgressRoute{ID: 501, Kind: service.EgressRouteKindProxy, ProxyID: &primaryProxyID}},
+			{RouteID: 502, Position: 1, Route: &service.EgressRoute{ID: 502, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope}},
+			{RouteID: 503, Position: 2, Route: &service.EgressRoute{ID: 503, Kind: service.EgressRouteKindProxy, ProxyID: &secondaryProxyID}},
+		},
+		Concurrency: 4,
+		Priority:    50,
+	}}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/data", nil)
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp dataResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, dataType, resp.Data.Type)
+	require.Equal(t, accountDataVersion, resp.Data.Version)
+	require.Len(t, resp.Data.Proxies, 2, "all proxy bindings, not only the primary mirror, must be exported")
+	require.Len(t, resp.Data.Accounts, 1)
+	account := resp.Data.Accounts[0]
+	require.Equal(t, service.EgressModePool, account.EgressMode)
+	require.NotNil(t, account.EgressPool)
+	require.Equal(t, []string{
+		buildProxyKey("http", "proxy-a.internal", 8080, "user-a", "pass-a"),
+		dataDirectDefaultRouteKey,
+		buildProxyKey("socks5", "proxy-b.internal", 1080, "user-b", "pass-b"),
+	}, account.EgressPool.RouteKeys)
+	require.Equal(t, account.EgressPool.RouteKeys[0], account.EgressPool.PrimaryRouteKey)
+	require.Equal(t, 4, account.EgressPool.ConcurrencyPerEgress)
+
+	raw := rec.Body.String()
+	require.NotContains(t, raw, "route_id")
+	require.NotContains(t, raw, "identity_id")
+	require.NotContains(t, raw, "public_ip")
+	require.NotContains(t, raw, "http://user-a:pass-a@")
+}
+
+func TestExportDataV2KeepsOpenAIAPIKeyAccountLegacy(t *testing.T) {
+	router, adminSvc := setupAccountDataRouter()
+	proxyID := int64(11)
+	adminSvc.proxies = []service.Proxy{{
+		ID: proxyID, Name: "proxy", Protocol: "http", Host: "proxy.internal", Port: 8080, Status: service.StatusActive,
+	}}
+	adminSvc.accounts = []service.Account{{
+		ID: 22, Name: "api-key", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "secret"}, ProxyID: &proxyID, EgressMode: service.EgressModePool,
+		EgressBindings: []service.AccountEgressBinding{{
+			RouteID: 601, Position: 0, IsPrimary: true,
+			Route: &service.EgressRoute{ID: 601, Kind: service.EgressRouteKindProxy, ProxyID: &proxyID},
+		}},
+		Concurrency: 3,
+	}}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/data", nil)
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp dataResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Data.Accounts, 1)
+	require.Empty(t, resp.Data.Accounts[0].EgressMode)
+	require.Nil(t, resp.Data.Accounts[0].EgressPool)
+	require.NotNil(t, resp.Data.Accounts[0].ProxyKey)
 }
 
 func TestExportDataWithoutProxies(t *testing.T) {
@@ -316,4 +465,172 @@ func TestImportDataReusesProxyAndSkipsDefaultGroup(t *testing.T) {
 	require.Len(t, adminSvc.createdProxies, 0)
 	require.Len(t, adminSvc.createdAccounts, 1)
 	require.True(t, adminSvc.createdAccounts[0].SkipDefaultGroupBind)
+}
+
+func TestExportDataExcludesCodexTicketMaterial(t *testing.T) {
+	router, adminSvc := setupAccountDataRouter()
+	extra := map[string]any{
+		"codex_turn_ticket:gpt-6-astra":                map[string]any{"state": "private-ticket-blob", "length": 292},
+		"codex_harvest_proxy_url":                      "http://user:legacy-proxy-secret@proxy.example.com:8080",
+		"codex_turn_ticket:v2:old-binding:gpt-6-astra": map[string]any{"state": "private-v2-ticket"},
+		"codex_ticket_config":                          map[string]any{"enabled": true},
+		"codex_ticket_watchdog":                        map[string]any{"enabled": true},
+		"openai_codex_warmup_policy":                   map[string]any{"enabled": true},
+		"codex_warmup_policy":                          map[string]any{"enabled": true},
+		"openai_window_warmup_policy":                  map[string]any{"enabled": true},
+		"ordinary":                                     "retained",
+	}
+	adminSvc.accounts = []service.Account{{ID: 21, Name: "account", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Credentials: map[string]any{"access_token": "backup-token"}, Extra: extra}}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/data?include_proxies=false", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp dataResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Data.Accounts, 1)
+	require.Equal(t, map[string]any{"ordinary": "retained"}, resp.Data.Accounts[0].Extra)
+	require.Equal(t, "backup-token", resp.Data.Accounts[0].Credentials["access_token"])
+	require.NotContains(t, rec.Body.String(), "private-ticket-blob")
+	require.NotContains(t, rec.Body.String(), "legacy-proxy-secret")
+	require.Contains(t, extra, "codex_turn_ticket:gpt-6-astra")
+	require.Contains(t, extra, "codex_harvest_proxy_url")
+
+	// Old backups can contain these fields even though new exports omit them.
+	payload := map[string]any{"data": map[string]any{
+		"type": dataType, "version": dataVersion,
+		"proxies": []any{},
+		"accounts": []map[string]any{{
+			"name": "restored", "platform": service.PlatformOpenAI, "type": service.AccountTypeOAuth,
+			"credentials": map[string]any{"access_token": "backup-token"}, "extra": extra,
+			"concurrency": 3, "priority": 50,
+		}},
+	}}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/data", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, adminSvc.createdAccounts, 1)
+	require.Equal(t, map[string]any{"ordinary": "retained"}, adminSvc.createdAccounts[0].Extra)
+}
+
+func TestImportDataV2RestoresVerifiedOpenAIOAuthPool(t *testing.T) {
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(&accountDataSettingRepo{values: map[string]string{}})
+	proxyID := int64(41)
+	proxy := service.Proxy{
+		ID: proxyID, Name: "proxy", Protocol: "http", Host: "proxy.internal", Port: 8080,
+		Username: "user", Password: "pass", Status: service.StatusActive,
+	}
+	adminSvc.proxies = []service.Proxy{proxy}
+	now := time.Now()
+	directScope := service.DefaultDirectEgressRuntimeScope
+	identity := &service.EgressIdentity{ID: 91, Status: service.EgressIdentityStatusActive}
+	handler.SetEgressService(service.NewEgressService(&accountDataEgressRepo{routes: []service.EgressRoute{
+		{
+			ID: 101, Kind: service.EgressRouteKindProxy, ProxyID: &proxyID, Proxy: &proxy,
+			State: service.EgressRouteStateActive, VerifiedAt: &now, ExpectedIdentity: identity,
+		},
+		{
+			ID: 102, Kind: service.EgressRouteKindDirect, RuntimeScope: &directScope,
+			State: service.EgressRouteStateActive, VerifiedAt: &now,
+			ExpectedIdentity: &service.EgressIdentity{ID: 92, Status: service.EgressIdentityStatusActive},
+		},
+	}}, nil))
+
+	proxyKey := buildProxyKey(proxy.Protocol, proxy.Host, proxy.Port, proxy.Username, proxy.Password)
+	result, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Version: accountDataVersion,
+		Accounts: []DataAccount{{
+			Name: "openai-oauth", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token"}, ProxyKey: &proxyKey,
+			EgressMode: service.EgressModePool,
+			EgressPool: &DataAccountEgressPool{
+				RouteKeys: []string{proxyKey, dataDirectDefaultRouteKey}, PrimaryRouteKey: proxyKey, ConcurrencyPerEgress: 4,
+			},
+			Concurrency: 4,
+		}},
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.AccountCreated)
+	require.Zero(t, result.AccountFailed)
+	require.Empty(t, result.Warnings)
+	require.Len(t, adminSvc.createdAccounts, 1)
+	input := adminSvc.createdAccounts[0]
+	require.Nil(t, input.ProxyID)
+	require.NotNil(t, input.EgressPool)
+	require.Equal(t, []int64{101, 102}, input.EgressPool.RouteIDs)
+	require.Equal(t, int64(101), input.EgressPool.PrimaryRouteID)
+	require.Equal(t, 4, *input.EgressPool.ConcurrencyPerEgress)
+}
+
+func TestImportDataV2UnverifiedRouteFallsBackToLegacyWithWarning(t *testing.T) {
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(&accountDataSettingRepo{values: map[string]string{}})
+	proxyID := int64(41)
+	proxy := service.Proxy{
+		ID: proxyID, Name: "proxy", Protocol: "http", Host: "proxy.internal", Port: 8080,
+		Username: "user", Password: "pass", Status: service.StatusActive,
+	}
+	adminSvc.proxies = []service.Proxy{proxy}
+	handler.SetEgressService(service.NewEgressService(&accountDataEgressRepo{routes: []service.EgressRoute{{
+		ID: 101, Kind: service.EgressRouteKindProxy, ProxyID: &proxyID, Proxy: &proxy,
+		State:            service.EgressRouteStateActive,
+		ExpectedIdentity: &service.EgressIdentity{ID: 91, Status: service.EgressIdentityStatusActive},
+		// VerifiedAt deliberately nil: imported pools must be reverified locally.
+	}}}, nil))
+
+	proxyKey := buildProxyKey(proxy.Protocol, proxy.Host, proxy.Port, proxy.Username, proxy.Password)
+	result, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Version: accountDataVersion,
+		Accounts: []DataAccount{{
+			Name: "openai-oauth", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+			Credentials: map[string]any{"access_token": "token"}, ProxyKey: &proxyKey,
+			EgressMode: service.EgressModePool,
+			EgressPool: &DataAccountEgressPool{
+				RouteKeys: []string{proxyKey}, PrimaryRouteKey: proxyKey, ConcurrencyPerEgress: 4,
+			},
+			Concurrency: 4,
+		}},
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.AccountCreated)
+	require.Zero(t, result.AccountFailed)
+	require.Len(t, result.Warnings, 1)
+	require.Equal(t, "EGRESS_POOL_NOT_RESTORED", result.Warnings[0].Code)
+	require.NotContains(t, result.Warnings[0].Message, proxyKey)
+	require.Len(t, adminSvc.createdAccounts, 1)
+	input := adminSvc.createdAccounts[0]
+	require.Nil(t, input.EgressPool)
+	require.NotNil(t, input.ProxyID)
+	require.Equal(t, proxyID, *input.ProxyID)
+}
+
+func TestImportDataV2KeepsOpenAIAPIKeyAccountLegacy(t *testing.T) {
+	_, adminSvc, handler := setupAccountDataRouterWithSettings(&accountDataSettingRepo{values: map[string]string{}})
+	proxyID := int64(41)
+	proxy := service.Proxy{ID: proxyID, Protocol: "http", Host: "proxy.internal", Port: 8080, Status: service.StatusActive}
+	adminSvc.proxies = []service.Proxy{proxy}
+	proxyKey := buildProxyKey(proxy.Protocol, proxy.Host, proxy.Port, proxy.Username, proxy.Password)
+
+	result, err := handler.importData(context.Background(), DataImportRequest{Data: DataPayload{
+		Version: accountDataVersion,
+		Accounts: []DataAccount{{
+			Name: "openai-api-key", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+			Credentials: map[string]any{"api_key": "key"}, ProxyKey: &proxyKey,
+			EgressMode: service.EgressModePool,
+			EgressPool: &DataAccountEgressPool{
+				RouteKeys: []string{proxyKey}, PrimaryRouteKey: proxyKey, ConcurrencyPerEgress: 4,
+			},
+			Concurrency: 4,
+		}},
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.AccountCreated)
+	require.Empty(t, result.Warnings)
+	require.Len(t, adminSvc.createdAccounts, 1)
+	require.Nil(t, adminSvc.createdAccounts[0].EgressPool)
+	require.Equal(t, proxyID, *adminSvc.createdAccounts[0].ProxyID)
 }

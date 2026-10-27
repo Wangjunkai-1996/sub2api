@@ -12,6 +12,9 @@ type APIKey func(*sql.Selector)
 // Account is the predicate function for account builders.
 type Account func(*sql.Selector)
 
+// AccountEgressBinding is the predicate function for accountegressbinding builders.
+type AccountEgressBinding func(*sql.Selector)
+
 // AccountGroup is the predicate function for accountgroup builders.
 type AccountGroup func(*sql.Selector)
 
@@ -50,6 +53,12 @@ type ChannelMonitorRequestTemplate func(*sql.Selector)
 
 // CompositeModelRoute is the predicate function for compositemodelroute builders.
 type CompositeModelRoute func(*sql.Selector)
+
+// EgressIdentity is the predicate function for egressidentity builders.
+type EgressIdentity func(*sql.Selector)
+
+// EgressRoute is the predicate function for egressroute builders.
+type EgressRoute func(*sql.Selector)
 
 // ErrorPassthroughRule is the predicate function for errorpassthroughrule builders.
 type ErrorPassthroughRule func(*sql.Selector)

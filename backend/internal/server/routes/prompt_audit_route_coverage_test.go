@@ -54,6 +54,13 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 	}
 	excluded := map[string]string{
 		"/messages/count_tokens":     "tokenization only; it does not execute a model request",
+		"/embeddings":                "OpenAI proactive prompt auditing is disabled",
+		"/alpha/search":              "OpenAI proactive prompt auditing is disabled",
+		"/live":                      "OpenAI proactive prompt auditing is disabled",
+		"/realtime/calls":            "OpenAI proactive prompt auditing is disabled",
+		"/images/generations/async":  "OpenAI proactive prompt auditing is disabled",
+		"/images/edits/async":        "OpenAI proactive prompt auditing is disabled",
+		"/images/batches":            "OpenAI proactive prompt auditing is disabled",
 		"/images/batches/:id/cancel": "control-plane cancellation with no user prompt",
 		"/stt":                       "speech transcription is not a text-generation prompt",
 		"/custom-voices":             "voice profile management has no model prompt",
@@ -78,7 +85,10 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 		for _, filename := range files {
 			source, readErr := os.ReadFile(filepath.Join("..", "..", "handler", filename))
 			require.NoError(t, readErr)
-			require.Containsf(t, string(source), "checkSecurityAudit", "%s route handler %s bypasses Coordinator", route, filename)
+			sourceText := string(source)
+			hasDirectAudit := strings.Contains(sourceText, "checkSecurityAudit(")
+			hasSelectedAccountAudit := strings.Contains(sourceText, "checkSecurityAuditForSelectedOpenAIProAccount")
+			require.Truef(t, hasDirectAudit || hasSelectedAccountAudit, "%s route handler %s bypasses Coordinator", route, filename)
 		}
 	}
 
@@ -89,23 +99,15 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocketHasFirstAndSubsequentTurnPromptGates(t *testing.T) {
+func TestResponsesWebSocketDoesNotRunPromptAudit(t *testing.T) {
 	routeSource, err := os.ReadFile("gateway.go")
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, strings.Count(string(routeSource), `.GET("/responses"`), 2)
 	handlerSource, err := os.ReadFile(filepath.Join("..", "..", "handler", "openai_gateway_handler.go"))
 	require.NoError(t, err)
-	require.Contains(t, string(handlerSource), `checkSecurityAuditStage`)
-	require.Contains(t, string(handlerSource), `"first_turn"`)
-	require.Contains(t, string(handlerSource), `"subsequent_turn"`)
-	wsStart := strings.Index(string(handlerSource), `func (h *OpenAIGatewayHandler) ResponsesWebSocket`)
-	require.NotEqual(t, -1, wsStart)
-	wsSource := string(handlerSource)[wsStart:]
-	require.Less(t,
-		strings.Index(wsSource, `"first_turn"`),
-		strings.Index(wsSource, `TryAcquireUserSlotForAPIKey`),
-		"the first response.create gate must precede per-request user/account slots",
-	)
+	require.Contains(t, string(handlerSource), `func (h *OpenAIGatewayHandler) ResponsesWebSocket`)
+	require.NotContains(t, string(handlerSource), `newOpenAIAccountAuditState`)
+	require.NotContains(t, string(handlerSource), `ensureSecurityAuditForAccount`)
 }
 
 func TestPromptAuditAdminRoutesRejectUnauthenticatedAndNonAdminRequests(t *testing.T) {

@@ -34,7 +34,6 @@ export interface PlatformQuotaLimits {
 /** 全平台默认限额 map（key = PlatformType） */
 export type DefaultPlatformQuotasMap = Partial<Record<PlatformType, PlatformQuotaLimits>>
 
-
 export type SchedulingThresholdPlatformType =
   | "openai"
   | "anthropic"
@@ -664,6 +663,12 @@ export interface SystemSettings {
   cyber_policy_user_allowlist: string;
   cyber_session_block_enabled: boolean;
   cyber_session_block_ttl_seconds: number;
+  // OpenAI Cyber account cooldown
+  openai_cyber_account_cooldown_enabled: boolean;
+  openai_cyber_account_cooldown_window_seconds: number;
+  openai_cyber_account_cooldown_first_seconds: number;
+  openai_cyber_account_cooldown_escalated_seconds: number;
+  openai_cyber_account_cooldown_group_ids: number[];
 
   payment_min_amount: number;
   payment_max_amount: number;
@@ -988,6 +993,12 @@ export interface UpdateSettingsRequest {
   cyber_policy_user_allowlist?: string;
   cyber_session_block_enabled?: boolean;
   cyber_session_block_ttl_seconds?: number;
+  // OpenAI Cyber account cooldown
+  openai_cyber_account_cooldown_enabled?: boolean;
+  openai_cyber_account_cooldown_window_seconds?: number;
+  openai_cyber_account_cooldown_first_seconds?: number;
+  openai_cyber_account_cooldown_escalated_seconds?: number;
+  openai_cyber_account_cooldown_group_ids?: number[];
 
   payment_min_amount?: number;
   payment_max_amount?: number;

@@ -43,6 +43,7 @@ type RelayResult struct {
 	Usage                   Usage
 	RequestID               string
 	TerminalEventType       string
+	TerminalPayload         []byte
 	FirstTokenMs            *int
 	Duration                time.Duration
 	ClientToUpstreamFrames  int64
@@ -58,6 +59,7 @@ type RelayTurnResult struct {
 	Usage                 Usage
 	RequestID             string
 	TerminalEventType     string
+	TerminalPayload       []byte
 	StartedAt             time.Time
 	Duration              time.Duration
 	FirstTokenMs          *int
@@ -116,6 +118,7 @@ type relayState struct {
 	turnTimingByID          map[string]*relayTurnTiming
 	activeTurn              *relayTurnTiming
 	pendingBareError        *observedUpstreamEvent
+	terminalPayload         []byte
 }
 
 type relayExitSignal struct {
@@ -136,6 +139,7 @@ type observedUpstreamEvent struct {
 	responseServiceTier string
 	duration            time.Duration
 	firstToken          *int
+	terminalPayload     []byte
 }
 
 type relayTurnTiming struct {
@@ -804,6 +808,8 @@ func observeUpstreamMessage(
 	}
 	observeRelayTurnResponseServiceTier(turnTiming, firstRelayResponseServiceTier(message))
 	state.terminalEventType = eventType
+	observed.terminalPayload = append([]byte(nil), message...)
+	state.terminalPayload = append(state.terminalPayload[:0], message...)
 	if eventType == "error" {
 		// Some Responses servers emit error immediately before response.failed.
 		// Defer turn settlement so the authoritative failed usage can replace
@@ -904,6 +910,7 @@ func emitTurnComplete(
 		Usage:                 observed.usage,
 		RequestID:             responseID,
 		TerminalEventType:     observed.eventType,
+		TerminalPayload:       append([]byte(nil), observed.terminalPayload...),
 		StartedAt:             observed.startedAt,
 		Duration:              observed.duration,
 		FirstTokenMs:          openAIWSRelayCloneIntPtr(observed.firstToken),
@@ -1270,6 +1277,7 @@ func enrichResult(result *RelayResult, state *relayState, duration time.Duration
 	result.Usage = state.usage
 	result.RequestID = state.lastResponseID
 	result.TerminalEventType = state.terminalEventType
+	result.TerminalPayload = append(result.TerminalPayload[:0], state.terminalPayload...)
 	result.FirstTokenMs = state.firstTokenMs
 }
 

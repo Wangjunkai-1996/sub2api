@@ -986,6 +986,119 @@ export interface Proxy {
   updated_at: string
 }
 
+/** Credential-free proxy projection used by account assignment controls. */
+export interface ProxyOption {
+  id: number
+  name: string
+  display_endpoint: string
+  status: 'active' | 'inactive' | 'expired'
+  selectable: boolean
+  disabled_reason?: string | null
+  account_count?: number
+}
+
+export type EgressMode = 'legacy' | 'pool' | 'inherited'
+export type EgressKind = 'proxy' | 'direct'
+export type EgressRouteState =
+  | 'pending_verification'
+  | 'active'
+  | 'inactive'
+  | 'expired'
+  | 'identity_mismatch'
+  | 'retired'
+
+/** Redacted route projection used by account assignment UIs. */
+export interface AssignableEgressRoute {
+  id: number
+  ref?: string
+  kind: EgressKind
+  name?: string | null
+  display_name?: string | null
+  proxy_name?: string | null
+  protocol?: string | null
+  proxy_id?: number | null
+  revision?: number
+  state: EgressRouteState
+  eligible: boolean
+  reason_code?: string | null
+  observed_ip?: string | null
+  public_ip?: string | null
+  ip_address?: string | null
+  identity_status?: string | null
+  verified_at?: string | null
+  probe_success?: boolean | null
+  probe_reason_code?: string | null
+  probe_message?: string | null
+  probe_observed_ip?: string | null
+  probe_observed_at?: string | null
+  probe_latency_ms?: number | null
+  country?: string | null
+  country_code?: string | null
+  expires_at?: string | null
+}
+
+export interface AccountEgressCatalogCapabilities {
+  mutation_enabled: boolean
+  reason_code?: string | null
+}
+
+export interface AssignableEgressRouteCatalog {
+  items: AssignableEgressRoute[]
+  generation?: string | number | null
+  /** Server-authoritative route selected for OAuth handshakes. */
+  default_route_id?: number | null
+  /** Authoritative default capacity assigned to each selected static egress. */
+  default_concurrency?: number | null
+  capabilities: AccountEgressCatalogCapabilities
+}
+
+export interface AccountEgressPoolWrite {
+  route_ids: number[]
+  primary_route_id: number | null
+  concurrency_per_egress: number
+  revision?: number
+}
+
+export type AccountEgressPoolOperation = 'append' | 'remove' | 'replace'
+
+export interface BulkAccountEgressPoolWrite {
+  operation: AccountEgressPoolOperation
+  route_ids: number[]
+  primary_route_id?: number | null
+  concurrency_per_egress?: number
+  revision?: number
+}
+
+export interface AccountEgressPool extends AccountEgressPoolWrite {
+  routes?: AssignableEgressRoute[]
+  inherited?: boolean
+  inherited_from_account_id?: number | null
+}
+
+export interface AccountEgressSummary {
+  configured_route_count: number
+  eligible_route_count: number
+  degraded_route_count?: number
+  concurrency_per_egress: number
+  effective_capacity: number
+  current_concurrency?: number
+  primary_route_id?: number | null
+  routes?: AssignableEgressRoute[]
+  inherited?: boolean
+  inherited_from_account_id?: number | null
+  bindings?: AccountEgressCapacityBinding[]
+  route_usage?: AccountEgressCapacityBinding[]
+  breakdown?: AccountEgressCapacityBinding[]
+}
+
+export interface AccountEgressCapacityBinding {
+  route_id: number
+  name?: string
+  observed_ip?: string | null
+  eligible?: boolean
+  current_concurrency?: number
+}
+
 export interface ProxyAccountSummary {
   id: number
   name: string
@@ -1274,6 +1387,10 @@ export interface Account {
   concurrency: number
   load_factor?: number | null
   current_concurrency?: number // Real-time concurrency count from Redis
+  egress_mode?: EgressMode
+  egress_revision?: number
+  egress_summary?: AccountEgressSummary | null
+  egress_pool?: AccountEgressPool | null
   scheduler_score?: {
     base_score: number
     sticky_score?: number
@@ -1453,7 +1570,7 @@ export interface GrokBillingSummary {
 }
 
 export interface AccountUsageInfo {
-  source?: 'passive' | 'active'
+  source?: 'passive' | 'cached' | 'active'
   updated_at: string | null
   five_hour: UsageProgress | null
   seven_day: UsageProgress | null
@@ -1503,6 +1620,11 @@ export interface AccountUsageInfo {
   error_code?: string
 
   error?: string            // usage 获取失败时的错误信息
+}
+
+export interface AccountUsageRequestResult {
+  usage: AccountUsageInfo | null
+  error: string | null
 }
 
 // OpenAI Codex usage snapshot (from response headers)
@@ -1556,6 +1678,8 @@ export interface CreateAccountRequest {
   extra?: Record<string, unknown>
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   load_factor?: number | null
   priority?: number
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
@@ -1574,6 +1698,8 @@ export interface UpdateAccountRequest {
   extra?: Record<string, unknown>
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   load_factor?: number | null
   priority?: number
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
@@ -1703,6 +1829,8 @@ export interface CodexSessionImportRequest {
   group_ids?: number[]
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   priority?: number
   rate_multiplier?: number
   load_factor?: number | null
@@ -1722,6 +1850,8 @@ export interface OpenAICodexPATCreateRequest {
   group_ids?: number[]
   proxy_id?: number | null
   concurrency?: number
+  egress_mode?: 'pool'
+  egress_pool?: AccountEgressPoolWrite
   priority?: number
   rate_multiplier?: number
   load_factor?: number | null

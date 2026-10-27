@@ -96,7 +96,7 @@ func TestMain(m *testing.M) {
 		log.Printf("failed to open sql db: %v", err)
 		os.Exit(1)
 	}
-	if err := ApplyMigrations(ctx, integrationDB); err != nil {
+	if err := applyIntegrationMigrations(ctx, integrationDB); err != nil {
 		log.Printf("failed to apply db migrations: %v", err)
 		os.Exit(1)
 	}
@@ -132,6 +132,37 @@ func TestMain(m *testing.M) {
 	_ = integrationDB.Close()
 
 	os.Exit(code)
+}
+
+func applyIntegrationMigrations(ctx context.Context, db *sql.DB) error {
+	err := ApplyMigrations(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "248_account_egress_direct_default.sql: pq: sys1-ipv4 proxy route is required") {
+		return err
+	}
+
+	// Migration 248 requires an already verified deployment route. The test
+	// fixture uses a documentation-only address and never opens a connection.
+	_, err = db.ExecContext(ctx, `
+WITH proxy AS (
+    INSERT INTO proxies (name, protocol, host, port)
+    VALUES ('sys1-ipv4', 'http', '192.0.2.248', 80)
+    RETURNING id
+), identity AS (
+    INSERT INTO egress_identities (public_ip, status)
+    VALUES ('192.0.2.248', 'active')
+    RETURNING id
+)
+INSERT INTO egress_routes (
+    kind, proxy_id, state, expected_identity_id,
+    last_observed_ip, last_probed_at, verified_at
+)
+SELECT 'proxy', proxy.id, 'active', identity.id,
+       '192.0.2.248', now(), now()
+FROM proxy CROSS JOIN identity`)
+	if err != nil {
+		return fmt.Errorf("seed migration 248 integration route: %w", err)
+	}
+	return ApplyMigrations(ctx, db)
 }
 
 func dockerIsAvailable(ctx context.Context) bool {
@@ -342,7 +373,7 @@ func (h prefixHook) prefixCmd(cmd redisclient.Cmder) {
 
 	switch strings.ToLower(cmd.Name()) {
 	case "get", "set", "setnx", "setex", "psetex", "incr", "decr", "incrby", "expire", "pexpire", "ttl", "pttl",
-		"hgetall", "hget", "hset", "hdel", "hincrbyfloat", "exists",
+		"hgetall", "hget", "hmget", "hset", "hdel", "hincrbyfloat", "exists",
 		"zadd", "zcard", "zrange", "zrangebyscore", "zrem", "zremrangebyscore", "zrevrange", "zrevrangebyscore", "zscore":
 		prefixOne(1)
 	case "mget":

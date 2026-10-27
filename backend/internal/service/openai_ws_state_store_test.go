@@ -4,11 +4,179 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+type openAIWSDetachedWriteCache struct {
+	GatewayCache
+	mu            sync.Mutex
+	accountID     int64
+	ctxValue      any
+	hasDeadline   bool
+	deadlineDelta time.Duration
+}
+
+type openAIWSResponseRoutingPairFailureStore struct {
+	OpenAIWSStateStore
+	egressStore openAIWSEgressStateStore
+
+	bindAccountErr   error
+	bindEgressErr    error
+	deleteAccountErr error
+
+	bindAccountCalls    int
+	bindEgressCalls     int
+	deleteAccountCalls  int
+	deleteAccountCtxErr error
+}
+
+func newOpenAIWSResponseRoutingPairFailureStore() *openAIWSResponseRoutingPairFailureStore {
+	base := NewOpenAIWSStateStore(nil)
+	return &openAIWSResponseRoutingPairFailureStore{
+		OpenAIWSStateStore: base,
+		egressStore:        base.(openAIWSEgressStateStore),
+	}
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) BindResponseAccount(
+	ctx context.Context,
+	groupID int64,
+	responseID string,
+	accountID int64,
+	ttl time.Duration,
+) error {
+	s.bindAccountCalls++
+	if err := s.OpenAIWSStateStore.BindResponseAccount(ctx, groupID, responseID, accountID, ttl); err != nil {
+		return err
+	}
+	return s.bindAccountErr
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) DeleteResponseAccount(ctx context.Context, groupID int64, responseID string) error {
+	s.deleteAccountCalls++
+	s.deleteAccountCtxErr = ctx.Err()
+	if err := s.OpenAIWSStateStore.DeleteResponseAccount(ctx, groupID, responseID); err != nil {
+		return err
+	}
+	return s.deleteAccountErr
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) BindResponseEgress(
+	ctx context.Context,
+	groupID int64,
+	responseID string,
+	bindingID string,
+	ttl time.Duration,
+) error {
+	s.bindEgressCalls++
+	if s.bindEgressErr != nil {
+		return s.bindEgressErr
+	}
+	if err := s.egressStore.BindResponseEgress(ctx, groupID, responseID, bindingID, ttl); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) GetResponseEgress(ctx context.Context, groupID int64, responseID string) (string, bool) {
+	return s.egressStore.GetResponseEgress(ctx, groupID, responseID)
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) BindSessionEgress(ctx context.Context, groupID int64, sessionHash, bindingID string, ttl time.Duration) error {
+	return s.egressStore.BindSessionEgress(ctx, groupID, sessionHash, bindingID, ttl)
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) GetSessionEgress(ctx context.Context, groupID int64, sessionHash string) (string, bool) {
+	return s.egressStore.GetSessionEgress(ctx, groupID, sessionHash)
+}
+
+func (s *openAIWSResponseRoutingPairFailureStore) DeleteSessionEgress(ctx context.Context, groupID int64, sessionHash string) error {
+	return s.egressStore.DeleteSessionEgress(ctx, groupID, sessionHash)
+}
+
+type openAIHTTPInvalidMarkerCache struct {
+	*stubGatewayCache
+	mu     sync.Mutex
+	values map[string]openAIHTTPInvalidMarkerValue
+	setErr error
+}
+
+type openAIHTTPInvalidMarkerValue struct {
+	value     int64
+	expiresAt time.Time
+}
+
+func (c *openAIHTTPInvalidMarkerCache) markerKey(groupID int64, sessionHash string) string {
+	return fmt.Sprintf("%d:%s", groupID, sessionHash)
+}
+
+func (c *openAIHTTPInvalidMarkerCache) GetSessionAccountID(_ context.Context, groupID int64, sessionHash string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value, ok := c.values[c.markerKey(groupID, sessionHash)]
+	if !ok || !time.Now().Before(value.expiresAt) {
+		if ok {
+			delete(c.values, c.markerKey(groupID, sessionHash))
+		}
+		return 0, ErrStickySessionNotFound
+	}
+	return value.value, nil
+}
+
+func (c *openAIHTTPInvalidMarkerCache) SetSessionAccountID(ctx context.Context, groupID int64, sessionHash string, accountID int64, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.setErr != nil {
+		return c.setErr
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.values == nil {
+		c.values = make(map[string]openAIHTTPInvalidMarkerValue)
+	}
+	c.values[c.markerKey(groupID, sessionHash)] = openAIHTTPInvalidMarkerValue{
+		value: accountID, expiresAt: time.Now().Add(ttl),
+	}
+	return nil
+}
+
+func (c *openAIHTTPInvalidMarkerCache) DeleteSessionAccountID(_ context.Context, groupID int64, sessionHash string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.values, c.markerKey(groupID, sessionHash))
+	return nil
+}
+
+func (c *openAIWSDetachedWriteCache) SetSessionAccountID(ctx context.Context, _ int64, _ string, accountID int64, _ time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.accountID = accountID
+	c.ctxValue = ctx.Value(openAIWSDetachedWriteContextKey{})
+	if deadline, ok := ctx.Deadline(); ok {
+		c.hasDeadline = true
+		c.deadlineDelta = time.Until(deadline)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *openAIWSDetachedWriteCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accountID <= 0 {
+		return 0, ErrStickySessionNotFound
+	}
+	return c.accountID, nil
+}
+
+type openAIWSDetachedWriteContextKey struct{}
 
 func TestOpenAIWSStateStore_BindGetDeleteResponseAccount(t *testing.T) {
 	cache := &stubGatewayCache{}
@@ -26,6 +194,158 @@ func TestOpenAIWSStateStore_BindGetDeleteResponseAccount(t *testing.T) {
 	accountID, err = store.GetResponseAccount(ctx, groupID, "resp_abc")
 	require.NoError(t, err)
 	require.Zero(t, accountID)
+}
+
+func TestBindOpenAIWSResponseRoutingPairPreservesFailClosedMarkersOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	const (
+		groupID    = int64(17)
+		accountID  = int64(101)
+		responseID = "resp_pair_rollback"
+	)
+	bindingID := StableAccountEgressBindingID(accountID, 11)
+
+	assertPairMissing := func(t *testing.T, store *openAIWSResponseRoutingPairFailureStore) {
+		t.Helper()
+		gotAccountID, err := store.GetResponseAccount(ctx, groupID, responseID)
+		require.NoError(t, err)
+		require.Zero(t, gotAccountID)
+		_, found := store.GetResponseEgress(ctx, groupID, responseID)
+		require.False(t, found)
+	}
+
+	t.Run("empty route keeps legacy account marker", func(t *testing.T) {
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+
+		err := bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, accountID, "", time.Minute)
+
+		require.NoError(t, err)
+		require.Zero(t, store.bindEgressCalls)
+		require.Zero(t, store.deleteAccountCalls)
+		gotAccountID, getErr := store.GetResponseAccount(ctx, groupID, responseID)
+		require.NoError(t, getErr)
+		require.Equal(t, accountID, gotAccountID)
+		_, found := store.GetResponseEgress(ctx, groupID, responseID)
+		require.False(t, found)
+	})
+
+	t.Run("mismatched route account writes neither marker", func(t *testing.T) {
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+		mismatchedBindingID := StableAccountEgressBindingID(accountID+1, 11)
+
+		err := bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, accountID, mismatchedBindingID, time.Minute)
+
+		require.ErrorIs(t, err, ErrAccountEgressConfigStale)
+		require.Zero(t, store.bindAccountCalls)
+		require.Zero(t, store.bindEgressCalls)
+		require.Zero(t, store.deleteAccountCalls)
+		assertPairMissing(t, store)
+	})
+
+	t.Run("account write failure preserves partial account fence", func(t *testing.T) {
+		bindErr := errors.New("account write failed")
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+		store.bindAccountErr = bindErr
+
+		err := bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, accountID, bindingID, time.Minute)
+
+		require.ErrorIs(t, err, bindErr)
+		require.Zero(t, store.bindEgressCalls)
+		require.Zero(t, store.deleteAccountCalls)
+		gotAccountID, getErr := store.GetResponseAccount(ctx, groupID, responseID)
+		require.NoError(t, getErr)
+		require.Equal(t, accountID, gotAccountID)
+		_, found := store.GetResponseEgress(ctx, groupID, responseID)
+		require.False(t, found)
+	})
+
+	t.Run("route write failure preserves account-only fence", func(t *testing.T) {
+		bindErr := errors.New("route write failed")
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+		store.bindEgressErr = bindErr
+
+		err := bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, accountID, bindingID, time.Minute)
+
+		require.ErrorIs(t, err, bindErr)
+		require.Equal(t, 1, store.bindEgressCalls)
+		require.Zero(t, store.deleteAccountCalls)
+		gotAccountID, getErr := store.GetResponseAccount(ctx, groupID, responseID)
+		require.NoError(t, getErr)
+		require.Equal(t, accountID, gotAccountID)
+		_, found := store.GetResponseEgress(ctx, groupID, responseID)
+		require.False(t, found)
+	})
+
+	t.Run("route write failure preserves an existing hard fence", func(t *testing.T) {
+		bindErr := errors.New("route write failed")
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+		require.NoError(t, store.egressStore.BindResponseEgress(ctx, groupID, responseID, bindingID, time.Minute))
+		store.bindEgressErr = bindErr
+
+		err := bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, accountID, bindingID, time.Minute)
+
+		require.ErrorIs(t, err, bindErr)
+		require.Zero(t, store.deleteAccountCalls)
+		gotBindingID, found := store.GetResponseEgress(ctx, groupID, responseID)
+		require.True(t, found)
+		require.Equal(t, bindingID, gotBindingID)
+	})
+
+	t.Run("canceled request does not erase partial markers", func(t *testing.T) {
+		bindErr := errors.New("route write failed")
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+		store.bindEgressErr = bindErr
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		err := bindOpenAIWSResponseRoutingPair(store, canceledCtx, groupID, responseID, accountID, bindingID, time.Minute)
+
+		require.ErrorIs(t, err, bindErr)
+		require.Zero(t, store.deleteAccountCalls)
+		gotAccountID, getErr := store.GetResponseAccount(ctx, groupID, responseID)
+		require.NoError(t, getErr)
+		require.Equal(t, accountID, gotAccountID)
+	})
+
+	t.Run("write error is returned without invoking configured deletes", func(t *testing.T) {
+		bindErr := errors.New("account write failed")
+		store := newOpenAIWSResponseRoutingPairFailureStore()
+		store.bindAccountErr = bindErr
+		store.deleteAccountErr = errors.New("account delete must not run")
+
+		err := bindOpenAIWSResponseRoutingPair(store, ctx, groupID, responseID, accountID, bindingID, time.Minute)
+
+		require.ErrorIs(t, err, bindErr)
+		require.Zero(t, store.deleteAccountCalls)
+	})
+}
+
+func TestOpenAIWSStateStore_ResponseEgressIsolatedByGroup(t *testing.T) {
+	ctx := context.Background()
+	store := NewOpenAIWSStateStore(nil).(openAIWSEgressStateStore)
+	responseID := "resp_shared_across_groups"
+
+	require.NoError(t, store.BindResponseEgress(ctx, 101, responseID, StableAccountEgressBindingID(1001, 11), time.Minute))
+	require.NoError(t, store.BindResponseEgress(ctx, 202, responseID, StableAccountEgressBindingID(2002, 22), time.Minute))
+
+	binding, found := store.GetResponseEgress(ctx, 101, responseID)
+	require.True(t, found)
+	require.Equal(t, StableAccountEgressBindingID(1001, 11), binding)
+	binding, found = store.GetResponseEgress(ctx, 202, responseID)
+	require.True(t, found)
+	require.Equal(t, StableAccountEgressBindingID(2002, 22), binding)
+
+	// Deleting the response in one group must not remove another group's fence
+	// when response IDs happen to be identical.
+	defaultStore := store.(*defaultOpenAIWSStateStore)
+	require.NoError(t, defaultStore.BindResponseAccount(ctx, 101, responseID, 1001, time.Minute))
+	require.NoError(t, defaultStore.BindResponseAccount(ctx, 202, responseID, 2002, time.Minute))
+	require.NoError(t, defaultStore.DeleteResponseAccount(ctx, 101, responseID))
+	_, found = store.GetResponseEgress(ctx, 101, responseID)
+	require.False(t, found)
+	binding, found = store.GetResponseEgress(ctx, 202, responseID)
+	require.True(t, found)
+	require.Equal(t, StableAccountEgressBindingID(2002, 22), binding)
 }
 
 func TestOpenAIWSStateStore_HTTPResponseOwnerPersistsAcrossStoreInstances(t *testing.T) {
@@ -47,6 +367,25 @@ func TestOpenAIWSStateStore_HTTPResponseOwnerPersistsAcrossStoreInstances(t *tes
 	require.True(t, found)
 	require.Equal(t, int64(201), userID)
 	require.Equal(t, int64(301), apiKeyID)
+}
+
+func TestOpenAIWSStateStore_BindResponseAccountPersistsAfterParentCanceled(t *testing.T) {
+	cache := &openAIWSDetachedWriteCache{}
+	writer := NewOpenAIWSStateStore(cache)
+	parent := context.WithValue(context.Background(), openAIWSDetachedWriteContextKey{}, "request-value")
+	canceled, cancel := context.WithCancel(parent)
+	cancel()
+
+	require.NoError(t, writer.BindResponseAccount(canceled, 12, "resp_after_cancel", 10601, time.Hour))
+
+	reader := NewOpenAIWSStateStore(cache)
+	accountID, err := reader.GetResponseAccount(context.Background(), 12, "resp_after_cancel")
+	require.NoError(t, err)
+	require.Equal(t, int64(10601), accountID, "a fresh process must resolve the persisted response binding")
+	require.Equal(t, "request-value", cache.ctxValue, "detaching cancellation must preserve request context values")
+	require.True(t, cache.hasDeadline)
+	require.Greater(t, cache.deadlineDelta, 2*time.Second)
+	require.LessOrEqual(t, cache.deadlineDelta, openAIWSStateStoreRedisTimeout)
 }
 
 func TestOpenAIWSStateStore_ResponseConnTTL(t *testing.T) {
@@ -268,10 +607,63 @@ func TestOpenAIWSStateStore_RedisOpsUseShortTimeout(t *testing.T) {
 	require.LessOrEqual(t, probe2.getDeadlineDelta, 3*time.Second)
 }
 
+func TestOpenAIWSStateStore_HTTPResponseInvalidMarkerPersistsAcrossInstancesAndExpires(t *testing.T) {
+	cache := &openAIHTTPInvalidMarkerCache{stubGatewayCache: &stubGatewayCache{}}
+	ctx := context.Background()
+	groupID := int64(41)
+	responseID := "resp_invalid_marker"
+
+	writer := NewOpenAIWSStateStore(cache)
+	invalidWriter, ok := writer.(openAIHTTPResponseInvalidStateStore)
+	require.True(t, ok)
+	require.NoError(t, invalidWriter.MarkHTTPResponseInvalid(ctx, groupID, responseID, OpenAISessionBlockedReason, 30*time.Millisecond))
+
+	reader := NewOpenAIWSStateStore(cache)
+	reason, found, err := reader.(openAIHTTPResponseInvalidStateStore).GetHTTPResponseInvalidReason(ctx, groupID, responseID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, OpenAISessionBlockedReason, reason)
+
+	time.Sleep(50 * time.Millisecond)
+	readerAfterExpiry := NewOpenAIWSStateStore(cache)
+	reason, found, err = readerAfterExpiry.(openAIHTTPResponseInvalidStateStore).GetHTTPResponseInvalidReason(ctx, groupID, responseID)
+	require.NoError(t, err)
+	require.False(t, found)
+	require.Empty(t, reason)
+}
+
+func TestOpenAIWSStateStore_HTTPResponseInvalidMarkerWriteFailureIsReturned(t *testing.T) {
+	cache := &openAIHTTPInvalidMarkerCache{
+		stubGatewayCache: &stubGatewayCache{},
+		setErr:           errors.New("redis unavailable"),
+	}
+	store := NewOpenAIWSStateStore(cache).(openAIHTTPResponseInvalidStateStore)
+	err := store.MarkHTTPResponseInvalid(context.Background(), 42, "resp_write_failed", OpenAISessionBlockedReason, time.Minute)
+	require.Error(t, err)
+}
+
+func TestInvalidateOpenAIHTTPContinuationClearsLocalTurnStateWithoutCache(t *testing.T) {
+	store := NewOpenAIWSStateStore(nil)
+	store.BindSessionTurnState(43, "session_to_clear", "old-turn-state", time.Minute)
+	svc := &OpenAIGatewayService{openaiWSStateStore: store}
+
+	require.NoError(t, svc.InvalidateOpenAIHTTPContinuation(
+		context.Background(), nil, 43, "", "session_to_clear", 101,
+	))
+	_, found := store.GetSessionTurnState(43, "session_to_clear")
+	require.False(t, found)
+}
+
 func TestWithOpenAIWSStateStoreRedisTimeout_WithParentContext(t *testing.T) {
 	ctx, cancel := withOpenAIWSStateStoreRedisTimeout(context.Background())
 	defer cancel()
 	require.NotNil(t, ctx)
 	_, ok := ctx.Deadline()
 	require.True(t, ok, "应附加短超时")
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	canceledCtx, cancelCanceledCtx := withOpenAIWSStateStoreRedisTimeout(parent)
+	defer cancelCanceledCtx()
+	require.ErrorIs(t, canceledCtx.Err(), context.Canceled, "读取和删除使用的通用 helper 必须继续继承父取消")
 }

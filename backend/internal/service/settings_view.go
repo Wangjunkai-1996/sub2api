@@ -165,20 +165,25 @@ type SystemSettings struct {
 	CustomMenuItems             string // JSON array of custom menu items
 	CustomEndpoints             string // JSON array of custom endpoints
 
-	DefaultConcurrency           int
-	DefaultBalance               float64
-	RiskControlEnabled           bool
-	CyberSessionBlockEnabled     bool
-	CyberPolicyUserAllowlist     string
-	CyberSessionBlockTTLSeconds  int
-	AffiliateEnabled             bool
-	AffiliateRebateRate          float64
-	AffiliateRebateFreezeHours   int
-	AffiliateRebateDurationDays  int
-	AffiliateRebatePerInviteeCap float64
-	AdminRechargeRebateEnabled   bool
-	DefaultUserRPMLimit          int
-	DefaultSubscriptions         []DefaultSubscriptionSetting
+	DefaultConcurrency                         int
+	DefaultBalance                             float64
+	RiskControlEnabled                         bool
+	CyberSessionBlockEnabled                   bool
+	CyberPolicyUserAllowlist                   string
+	CyberSessionBlockTTLSeconds                int
+	OpenAICyberAccountCooldownEnabled          bool
+	OpenAICyberAccountCooldownWindowSeconds    int
+	OpenAICyberAccountCooldownFirstSeconds     int
+	OpenAICyberAccountCooldownEscalatedSeconds int
+	OpenAICyberAccountCooldownGroupIDs         []int64
+	AffiliateEnabled                           bool
+	AffiliateRebateRate                        float64
+	AffiliateRebateFreezeHours                 int
+	AffiliateRebateDurationDays                int
+	AffiliateRebatePerInviteeCap               float64
+	AdminRechargeRebateEnabled                 bool
+	DefaultUserRPMLimit                        int
+	DefaultSubscriptions                       []DefaultSubscriptionSetting
 
 	// Model fallback configuration
 	EnableModelFallback      bool   `json:"enable_model_fallback"`
@@ -261,7 +266,6 @@ type SystemSettings struct {
 	CodexCLIOnlyAllowAppServerClients      bool   // codex_cli_only App Server 开关：对未列名客户端开闸（默认 false）
 	CodexCLIOnlyEngineFingerprintSignals   string // codex_cli_only 引擎指纹门信号列表 JSON（[]EngineFingerprintSignal）
 
-	// Web Search Emulation
 	WebSearchEmulationEnabled bool // 是否启用 web search 模拟
 
 	// Payment visible method routing

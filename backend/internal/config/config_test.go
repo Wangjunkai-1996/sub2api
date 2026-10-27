@@ -46,6 +46,16 @@ func TestLoadMinOutputTokensFromEnv(t *testing.T) {
 	require.Equal(t, 16, cfg.Gateway.MinOutputTokens)
 }
 
+func TestLoadNewAPIAttributionFromEnv(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_NEWAPI_ATTRIBUTION_ORIGINS", "https://relay.example.com,https://relay-backup.example.com")
+	t.Setenv("GATEWAY_NEWAPI_ATTRIBUTION_SECRET", strings.Repeat("a", 32))
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, []string{"https://relay.example.com", "https://relay-backup.example.com"}, cfg.Gateway.NewAPIAttribution.Origins)
+	require.Equal(t, strings.Repeat("a", 32), cfg.Gateway.NewAPIAttribution.Secret)
+}
+
 func TestValidateMinOutputTokensMinimum(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	cfg, err := Load()
@@ -437,24 +447,59 @@ func TestLoadDefaultSchedulingConfig(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultOpenAIFirstOutputTimeoutsDisabled(t *testing.T) {
+func TestLoadDefaultOpenAIResponseTimeouts(t *testing.T) {
 	resetViperWithJWTSecret(t)
 
 	cfg, err := Load()
 	require.NoError(t, err)
-	require.Zero(t, cfg.Gateway.OpenAIFirstOutputTimeoutSeconds)
-	require.Zero(t, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
+	require.Equal(t, 120, cfg.Gateway.OpenAIFirstOutputTimeoutSeconds)
+	require.Equal(t, 600, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
+	require.Equal(t, 900, cfg.Gateway.OpenAIRequestBudgetSeconds)
+	require.Equal(t, 0, cfg.Gateway.OpenAIRetryBudgetSeconds)
 }
 
 func TestLoadOpenAIFirstOutputTimeoutsFromEnv(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("GATEWAY_OPENAI_FIRST_OUTPUT_TIMEOUT_SECONDS", "90")
 	t.Setenv("GATEWAY_OPENAI_HIGH_EFFORT_FIRST_OUTPUT_TIMEOUT_SECONDS", "240")
+	t.Setenv("GATEWAY_OPENAI_REQUEST_BUDGET_SECONDS", "180")
+	t.Setenv("GATEWAY_OPENAI_RETRY_BUDGET_SECONDS", "120")
 
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, 90, cfg.Gateway.OpenAIFirstOutputTimeoutSeconds)
 	require.Equal(t, 240, cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds)
+	require.Equal(t, 180, cfg.Gateway.OpenAIRequestBudgetSeconds)
+	require.Equal(t, 120, cfg.Gateway.OpenAIRetryBudgetSeconds)
+}
+
+func TestValidateOpenAIBudgetCompatibility(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	// Zero hard budget is a safe 900-second default, so the derived retry window is valid.
+	cfg.Gateway.OpenAIRequestBudgetSeconds = 0
+	cfg.Gateway.OpenAIRetryBudgetSeconds = 300
+	require.NoError(t, cfg.Validate())
+
+	cfg.Gateway.OpenAIRequestBudgetSeconds = 900
+	cfg.Gateway.OpenAIRetryBudgetSeconds = 600
+	require.NoError(t, cfg.Validate())
+
+	cfg.Gateway.OpenAIRequestBudgetSeconds = 180
+	cfg.Gateway.OpenAIRetryBudgetSeconds = 0
+	require.NoError(t, cfg.Validate())
+
+	cfg.Gateway.OpenAIRetryBudgetSeconds = 181
+	require.ErrorContains(t, cfg.Validate(), "gateway.openai_retry_budget_seconds")
+}
+
+func TestEffectiveOpenAIBudgets(t *testing.T) {
+	require.Equal(t, 900, (GatewayConfig{}).EffectiveOpenAIRequestBudgetSeconds())
+	require.Equal(t, 300, (GatewayConfig{}).EffectiveOpenAIRetryBudgetSeconds())
+	require.Equal(t, 180, (GatewayConfig{OpenAIRequestBudgetSeconds: 180}).EffectiveOpenAIRetryBudgetSeconds())
+	require.Equal(t, 120, (GatewayConfig{OpenAIRequestBudgetSeconds: 180, OpenAIRetryBudgetSeconds: 120}).EffectiveOpenAIRetryBudgetSeconds())
 }
 
 func TestValidateOpenAIFirstOutputTimeoutMinimum(t *testing.T) {
@@ -1620,12 +1665,11 @@ func TestValidateConfigErrors(t *testing.T) {
 		name    string
 		mutate  func(*Config)
 		wantErr string
-	}{
-		{
-			name:    "server read header timeout",
-			mutate:  func(c *Config) { c.Server.ReadHeaderTimeout = 0 },
-			wantErr: "server.read_header_timeout",
-		},
+	}{{
+		name:    "server read header timeout",
+		mutate:  func(c *Config) { c.Server.ReadHeaderTimeout = 0 },
+		wantErr: "server.read_header_timeout",
+	},
 		{
 			name:    "server max header bytes too small",
 			mutate:  func(c *Config) { c.Server.MaxHeaderBytes = 4096 },
@@ -1896,6 +1940,34 @@ func TestValidateConfigErrors(t *testing.T) {
 			name:    "gateway openai high effort first output timeout too large",
 			mutate:  func(c *Config) { c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds = 1801 },
 			wantErr: "gateway.openai_high_effort_first_output_timeout_seconds",
+		},
+		{
+			name:    "gateway openai request budget below minimum",
+			mutate:  func(c *Config) { c.Gateway.OpenAIRequestBudgetSeconds = 59 },
+			wantErr: "gateway.openai_request_budget_seconds",
+		},
+		{
+			name:    "gateway openai request budget too large",
+			mutate:  func(c *Config) { c.Gateway.OpenAIRequestBudgetSeconds = 901 },
+			wantErr: "gateway.openai_request_budget_seconds",
+		},
+		{
+			name:    "gateway openai retry budget too large",
+			mutate:  func(c *Config) { c.Gateway.OpenAIRetryBudgetSeconds = 601 },
+			wantErr: "gateway.openai_retry_budget_seconds",
+		},
+		{
+			name:    "gateway openai retry budget below minimum",
+			mutate:  func(c *Config) { c.Gateway.OpenAIRetryBudgetSeconds = 59 },
+			wantErr: "gateway.openai_retry_budget_seconds",
+		},
+		{
+			name: "gateway openai retry budget exceeds hard budget",
+			mutate: func(c *Config) {
+				c.Gateway.OpenAIRequestBudgetSeconds = 180
+				c.Gateway.OpenAIRetryBudgetSeconds = 181
+			},
+			wantErr: "gateway.openai_retry_budget_seconds",
 		},
 		{
 			name:    "gateway max idle conns",

@@ -180,7 +180,8 @@ func TestGPT55RetirementProjectionUsesPublicNames(t *testing.T) {
 func TestGPT55RetirementCompactFallbackKeepsSelectedModel(t *testing.T) {
 	for _, passthrough := range []bool{false, true} {
 		account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
-			Credentials: map[string]any{"access_token": "test-token"}, Extra: map[string]any{"openai_passthrough": passthrough}}
+			Credentials: map[string]any{"access_token": "test-token"}, Extra: map[string]any{"openai_passthrough": passthrough},
+			Status: StatusActive, Schedulable: true}
 		upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"id":"compact","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`))}}
 		svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{OpenAICompactModel: "gpt-5.5"}}, httpUpstream: upstream}
 		require.Empty(t, svc.resolveOpenAICompactFallbackModel(account, "gpt-6.1-sol"))

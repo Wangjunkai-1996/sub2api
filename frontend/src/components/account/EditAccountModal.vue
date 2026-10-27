@@ -1700,7 +1700,6 @@
         </div>
       </div>
 
-
       <div
         v-if="supportsAccountSchedulingThresholdOverride"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -1766,7 +1765,29 @@
         </div>
       </div>
 
-      <div v-if="!isSparkShadow">
+      <div v-if="usesEgressPool">
+        <div class="mb-1 flex items-center gap-2">
+          <label class="input-label mb-0">{{ t('admin.accounts.egressPool.title') }}</label>
+        </div>
+        <p v-if="!isSparkShadow" class="mb-2 text-xs text-gray-500 dark:text-gray-400">
+          {{ t('admin.accounts.egressPool.description') }}
+        </p>
+        <EgressPoolSelector
+          :routes="egressRoutes"
+          :selected-routes="accountEgressRoutes"
+          :selected-route-ids="egressRouteIds"
+          :primary-route-id="primaryEgressRouteId"
+          :require-primary="true"
+          :disabled="isSparkShadow || !egressMutationEnabled"
+          :inherited="isSparkShadow"
+          :verifying-route-id="egressVerifyingRouteId"
+          :verify-errors="egressVerifyErrors"
+          @update:selected-route-ids="updateEgressRouteIds"
+          @update:primary-route-id="updatePrimaryEgressRouteId"
+          @verify="emit('verify-egress-route', $event)"
+        />
+      </div>
+      <div v-else>
         <div class="mb-1 flex items-center gap-2">
           <label class="input-label mb-0">{{ t('admin.accounts.proxy') }}</label>
           <ProxyAdBanner />
@@ -1782,9 +1803,13 @@
 
       <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div>
-          <label class="input-label">{{ t('admin.accounts.concurrency') }}</label>
+          <label class="input-label">{{ usesEgressPool ? t('admin.accounts.egressPool.perEgressConcurrency') : t('admin.accounts.concurrency') }}</label>
           <input v-model.number="form.concurrency" type="number" min="1" class="input"
-            @input="form.concurrency = Math.max(1, form.concurrency || 1)" />
+            :data-testid="usesEgressPool ? 'egress-concurrency-per-route' : undefined"
+            :disabled="usesEgressPool && isSparkShadow"
+            :class="usesEgressPool && isSparkShadow && 'cursor-not-allowed opacity-60'"
+            @input="handleConcurrencyInput" />
+          <p v-if="usesEgressPool" class="input-hint">{{ t('admin.accounts.egressPool.perEgressConcurrencyHint') }}</p>
         </div>
         <div>
           <label class="input-label">{{ t('admin.accounts.loadFactor') }}</label>
@@ -2245,6 +2270,25 @@
             <option value="x_api_key">{{ t('admin.accounts.anthropic.apiKeyAuthSchemeXApiKey') }}</option>
             <option value="authorization_bearer">{{ t('admin.accounts.anthropic.apiKeyAuthSchemeBearer') }}</option>
           </select>
+        </div>
+      </div>
+
+      <div
+        v-if="account?.platform === 'anthropic' && account?.type === 'apikey'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.anthropic.metadataUserId') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.anthropic.metadataUserIdDesc') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="anthropicMetadataUserIDEnabled"
+            :aria-label="t('admin.accounts.anthropic.metadataUserId')"
+            data-testid="anthropic-metadata-user-id-toggle"
+          />
         </div>
       </div>
 
@@ -3235,7 +3279,8 @@ import { adminAPI } from '@/api/admin'
 import { useQuotaNotifyState } from '@/composables/useQuotaNotifyState'
 import type {
   Account,
-  Proxy,
+  ProxyOption,
+  AssignableEgressRoute,
   AdminGroup,
   Group,
   CheckMixedChannelResponse,
@@ -3256,6 +3301,7 @@ import HelpTooltip from '@/components/common/HelpTooltip.vue'
 import UpstreamRequestIdHeaderField from '@/components/account/UpstreamRequestIdHeaderField.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import Icon from '@/components/icons/Icon.vue'
+import EgressPoolSelector from '@/components/account/EgressPoolSelector.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
@@ -3321,6 +3367,11 @@ import { getAccountExpiryTimestamp } from '@/components/account/accountExpiry'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
+  AccountEgressPolicyError,
+  buildEditAccountEgressPatch,
+  initialAccountEgressDraft
+} from '@/components/account/accountEgressPolicy'
+import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
   OPENAI_WS_MODE_PASSTHROUGH,
@@ -3341,14 +3392,25 @@ import {
 interface Props {
   show: boolean
   account: Account | null
-  proxies: Proxy[]
+  proxies?: ProxyOption[]
+  egressRoutes?: AssignableEgressRoute[]
+  egressMutationEnabled?: boolean
+  egressVerifyingRouteId?: number | null
+  egressVerifyErrors?: Record<number, string>
   groups: AdminGroup[]
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  proxies: () => [],
+  egressRoutes: () => [],
+  egressMutationEnabled: true,
+  egressVerifyingRouteId: null,
+  egressVerifyErrors: () => ({})
+})
 const emit = defineEmits<{
   close: []
   updated: [account: Account]
+  'verify-egress-route': [route: AssignableEgressRoute]
 }>()
 
 const { t } = useI18n()
@@ -3366,9 +3428,11 @@ const selectableGroups = computed(() => {
   return Array.from(groups.values())
 })
 
-// Spark 影子账号(parent_account_id 非空):代理恒继承母账号,不可独立编辑(外审 B/P1),
-// 故隐藏代理选择器。
+// Spark shadows inherit the parent's entire egress policy and cannot override it.
 const isSparkShadow = computed(() => props.account?.parent_account_id != null)
+const accountEgressRoutes = computed(() =>
+  props.account?.egress_pool?.routes ?? props.account?.egress_summary?.routes ?? []
+)
 
 const hideAccountLongContextBilling = computed(() => {
   return allSelectedGroupsEnableLongContextPricing(form.group_ids, props.groups)
@@ -3866,6 +3930,7 @@ const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
 const anthropicPassthroughEnabled = ref(false)
 const anthropicAPIKeyAuthScheme = ref<AnthropicAPIKeyAuthScheme>('x_api_key')
+const anthropicMetadataUserIDEnabled = ref(false)
 const webSearchEmulationMode = ref('default')
 const webSearchGlobalEnabled = ref(false)
 const {
@@ -4198,6 +4263,28 @@ const form = reactive({
   expires_at: null as number | null
 })
 
+const egressRouteIds = ref<number[]>([])
+const primaryEgressRouteId = ref<number | null>(null)
+const egressTouched = ref(false)
+const updateEgressRouteIds = (ids: number[]) => {
+  egressRouteIds.value = ids
+  egressTouched.value = true
+}
+
+const updatePrimaryEgressRouteId = (id: number | null) => {
+  primaryEgressRouteId.value = id
+  egressTouched.value = true
+}
+
+const handleConcurrencyInput = () => {
+  form.concurrency = Math.max(1, form.concurrency || 1)
+  if (usesEgressPool.value && !isSparkShadow.value) egressTouched.value = true
+}
+
+const usesEgressPool = computed(
+  () => props.account?.platform === 'openai' && props.account?.type === 'oauth'
+)
+
 const handleUpstreamBillingRateSyncChange = (enabled: boolean) => {
   upstreamBillingRateSyncEnabled.value = enabled
   if (enabled) {
@@ -4296,8 +4383,18 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   mixedChannelWarningAction.value = null
   form.name = newAccount.name
   form.notes = newAccount.notes || ''
+  const accountUsesEgressPool = newAccount.platform === 'openai' && newAccount.type === 'oauth'
+  const draft = initialAccountEgressDraft(newAccount, [
+    ...(newAccount.egress_pool?.routes ?? newAccount.egress_summary?.routes ?? []),
+    ...props.egressRoutes
+  ])
+  egressRouteIds.value = draft.routeIds
+  primaryEgressRouteId.value = draft.primaryRouteId
+  egressTouched.value = false
   form.proxy_id = newAccount.proxy_id
-  form.concurrency = newAccount.concurrency
+  form.concurrency = accountUsesEgressPool
+    ? draft.concurrencyPerEgress
+    : newAccount.concurrency
   form.load_factor = newAccount.load_factor ?? null
   form.priority = newAccount.priority
   form.rate_multiplier = newAccount.rate_multiplier ?? 1
@@ -4360,6 +4457,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
+  anthropicMetadataUserIDEnabled.value = false
   webSearchEmulationMode.value = 'default'
   if (newAccount.platform === 'openai' && (newAccount.type === 'oauth' || newAccount.type === 'setup-token' || newAccount.type === 'apikey')) {
     openaiPassthroughEnabled.value = extra?.openai_passthrough === true || extra?.openai_oauth_passthrough === true
@@ -4423,6 +4521,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   }
   if (newAccount.platform === 'anthropic' && newAccount.type === 'apikey') {
     anthropicPassthroughEnabled.value = extra?.anthropic_passthrough === true
+    anthropicMetadataUserIDEnabled.value = extra?.anthropic_metadata_user_id_enabled === true
     anthropicAPIKeyAuthScheme.value = extra?.anthropic_apikey_auth_scheme === 'authorization_bearer'
       ? 'authorization_bearer'
       : 'x_api_key'
@@ -4970,7 +5069,6 @@ const applyTempUnschedConfig = (credentials: Record<string, unknown>) => {
   return true
 }
 
-
 function supportsAccountSchedulingThresholdOverridePlatform(platform: Account['platform'] | undefined) {
   return platform === 'openai' || platform === 'anthropic' || platform === 'grok'
 }
@@ -5328,6 +5426,16 @@ const handleSubmit = async () => {
   if (!props.account) return
   const accountID = props.account.id
 
+  if (usesEgressPool.value && egressTouched.value && !props.egressMutationEnabled) {
+    appStore.showError(t('admin.accounts.egressPool.catalogUnavailable'))
+    return
+  }
+
+  if (usesEgressPool.value && egressTouched.value && !isSparkShadow.value && egressRouteIds.value.length === 0) {
+    appStore.showError(t('admin.accounts.egressPool.noSelection'))
+    return
+  }
+
   if (form.status !== 'active' && form.status !== 'inactive' && form.status !== 'error') {
     appStore.showError(t('admin.accounts.pleaseSelectStatus'))
     return
@@ -5342,9 +5450,30 @@ const handleSubmit = async () => {
 
   const updatePayload: Record<string, unknown> = { ...form }
   try {
-    // 后端期望 proxy_id: 0 表示清除代理，而不是 null
-    if (updatePayload.proxy_id === null) {
-      updatePayload.proxy_id = 0
+    if (usesEgressPool.value) {
+      delete updatePayload.proxy_id
+      delete updatePayload.concurrency
+      Object.assign(updatePayload, buildEditAccountEgressPatch(props.account, egressTouched.value, {
+        routeIds: egressRouteIds.value,
+        primaryRouteId: primaryEgressRouteId.value,
+        concurrencyPerEgress: form.concurrency
+      }, [
+        ...(props.account.egress_pool?.routes ?? props.account.egress_summary?.routes ?? []),
+        ...props.egressRoutes
+      ]))
+    } else {
+      delete updatePayload.egress_mode
+      delete updatePayload.egress_pool
+      if (form.proxy_id === props.account.proxy_id) delete updatePayload.proxy_id
+      if (form.concurrency === props.account.concurrency) delete updatePayload.concurrency
+    }
+    const currentGroupIDs = [...(props.account.group_ids ?? [])].sort((left, right) => left - right)
+    const nextGroupIDs = [...form.group_ids].sort((left, right) => left - right)
+    if (
+      currentGroupIDs.length === nextGroupIDs.length
+      && currentGroupIDs.every((groupID, index) => groupID === nextGroupIDs[index])
+    ) {
+      delete updatePayload.group_ids
     }
     if (form.expires_at === null) {
       updatePayload.expires_at = 0
@@ -5867,7 +5996,7 @@ const handleSubmit = async () => {
       updatePayload.extra = newExtra
     }
 
-    // For Anthropic API Key accounts, handle passthrough mode + web search emulation in extra
+    // For Anthropic API Key accounts, handle upstream options in extra
     if (props.account.platform === 'anthropic' && props.account.type === 'apikey') {
       const currentExtra = (updatePayload.extra as Record<string, unknown>) || (props.account.extra as Record<string, unknown>) || {}
       const newExtra: Record<string, unknown> = { ...currentExtra }
@@ -5880,6 +6009,11 @@ const handleSubmit = async () => {
         newExtra.anthropic_apikey_auth_scheme = 'authorization_bearer'
       } else {
         delete newExtra.anthropic_apikey_auth_scheme
+      }
+      if (anthropicMetadataUserIDEnabled.value) {
+        newExtra.anthropic_metadata_user_id_enabled = true
+      } else {
+        delete newExtra.anthropic_metadata_user_id_enabled
       }
       if (webSearchEmulationMode.value === 'default') {
         delete newExtra.web_search_emulation
@@ -6012,6 +6146,7 @@ const handleSubmit = async () => {
         } else {
           delete newExtra.codex_fingerprint_mode
         }
+
       }
 
       updatePayload.extra = newExtra
@@ -6099,6 +6234,12 @@ const handleSubmit = async () => {
 
     await submitUpdateAccount(accountID, updatePayload)
   } catch (error: any) {
+    if (error instanceof AccountEgressPolicyError) {
+      appStore.showError(t(error.code === 'no_selection'
+        ? 'admin.accounts.egressPool.noSelection'
+        : 'admin.accounts.egressPool.catalogUnavailable'))
+      return
+    }
     appStore.showError(error.message || t('admin.accounts.failedToUpdate'))
   }
 }

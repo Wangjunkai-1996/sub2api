@@ -213,6 +213,8 @@ type CreateGroupRequest struct {
 	ProfitControlEnabled            bool                          `json:"profit_control_enabled"`
 	ProfitMinMargin                 *float64                      `json:"profit_min_margin"`
 	ProfitSafetyBuffer              *float64                      `json:"profit_safety_buffer"`
+	SchedulerType                   json.RawMessage               `json:"scheduler_type"`
+	AdvancedSchedulerOverrides      json.RawMessage               `json:"advanced_scheduler_overrides"`
 	ImagePrice1K                    *float64                      `json:"image_price_1k"`
 	ImagePrice2K                    *float64                      `json:"image_price_2k"`
 	ImagePrice4K                    *float64                      `json:"image_price_4k"`
@@ -289,6 +291,8 @@ type UpdateGroupRequest struct {
 	ProfitControlEnabled            *bool                         `json:"profit_control_enabled"`
 	ProfitMinMargin                 *float64                      `json:"profit_min_margin"`
 	ProfitSafetyBuffer              *float64                      `json:"profit_safety_buffer"`
+	SchedulerType                   json.RawMessage               `json:"scheduler_type"`
+	AdvancedSchedulerOverrides      json.RawMessage               `json:"advanced_scheduler_overrides"`
 	ImagePrice1K                    *float64                      `json:"image_price_1k"`
 	ImagePrice2K                    *float64                      `json:"image_price_2k"`
 	ImagePrice4K                    *float64                      `json:"image_price_4k"`
@@ -646,6 +650,10 @@ func (h *GroupHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	if len(req.SchedulerType) > 0 || len(req.AdvancedSchedulerOverrides) > 0 {
+		response.BadRequest(c, "Group scheduler overrides have been retired; refresh the admin page")
+		return
+	}
 	if h.isSimpleMode() && req.Platform == service.PlatformComposite {
 		response.BadRequest(c, "Platform is not supported in simple mode")
 		return
@@ -806,6 +814,10 @@ func (h *GroupHandler) Update(c *gin.Context) {
 	var req UpdateGroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if len(req.SchedulerType) > 0 || len(req.AdvancedSchedulerOverrides) > 0 {
+		response.BadRequest(c, "Group scheduler overrides have been retired; refresh the admin page")
 		return
 	}
 	if h.isSimpleMode() {

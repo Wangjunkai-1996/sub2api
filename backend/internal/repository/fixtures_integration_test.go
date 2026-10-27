@@ -250,7 +250,6 @@ func mustCreateAccount(t *testing.T, client *dbent.Client, a *service.Account) *
 
 	created, err := create.Save(ctx)
 	require.NoError(t, err, "create account")
-
 	a.ID = created.ID
 	a.CreatedAt = created.CreatedAt
 	a.UpdatedAt = created.UpdatedAt

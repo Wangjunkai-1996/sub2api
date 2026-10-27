@@ -368,9 +368,14 @@ type UpdateSettingsRequest struct {
 	RiskControlEnabled *bool `json:"risk_control_enabled"`
 
 	// cyber 会话屏蔽开关 + TTL
-	CyberSessionBlockEnabled    *bool   `json:"cyber_session_block_enabled"`
-	CyberPolicyUserAllowlist    *string `json:"cyber_policy_user_allowlist"`
-	CyberSessionBlockTTLSeconds *int    `json:"cyber_session_block_ttl_seconds"`
+	CyberSessionBlockEnabled                   *bool    `json:"cyber_session_block_enabled"`
+	CyberPolicyUserAllowlist                   *string  `json:"cyber_policy_user_allowlist"`
+	CyberSessionBlockTTLSeconds                *int     `json:"cyber_session_block_ttl_seconds"`
+	OpenAICyberAccountCooldownEnabled          *bool    `json:"openai_cyber_account_cooldown_enabled"`
+	OpenAICyberAccountCooldownWindowSeconds    *int     `json:"openai_cyber_account_cooldown_window_seconds"`
+	OpenAICyberAccountCooldownFirstSeconds     *int     `json:"openai_cyber_account_cooldown_first_seconds"`
+	OpenAICyberAccountCooldownEscalatedSeconds *int     `json:"openai_cyber_account_cooldown_escalated_seconds"`
+	OpenAICyberAccountCooldownGroupIDs         *[]int64 `json:"openai_cyber_account_cooldown_group_ids"`
 
 	// OpenAI fast/flex policy (optional, only updated when provided)
 	OpenAIFastPolicySettings *dto.OpenAIFastPolicySettings `json:"openai_fast_policy_settings,omitempty"`
@@ -496,11 +501,18 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	for key := range sentFields {
+		if strings.HasPrefix(key, "openai_codex_ticket_") || strings.HasPrefix(key, "openai_window_warmup_") {
+			response.BadRequest(c, "Codex ticket and window warmup settings have been retired; refresh the admin page")
+			return
+		}
+	}
 	var req UpdateSettingsRequest
 	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+
 	auditReq := settingsAuditRequest(req)
 	omitted := omittedSettingKeys(sentFields)
 
@@ -1791,6 +1803,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAICodexVersionAutoSyncEnabled
 		}(),
+
 		ClaudeCodeClientVersion: func() string {
 			if req.ClaudeCodeClientVersion != nil {
 				return *req.ClaudeCodeClientVersion
@@ -1816,6 +1829,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			return previousSettings.CodexCLIOnlyAllowAppServerClients
 		}(),
 		CodexCLIOnlyEngineFingerprintSignals: strings.TrimSpace(req.CodexCLIOnlyEngineFingerprintSignals),
+
 		PaymentVisibleMethodAlipaySource: func() string {
 			if req.PaymentVisibleMethodAlipaySource != nil {
 				return strings.TrimSpace(*req.PaymentVisibleMethodAlipaySource)
@@ -2032,11 +2046,33 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.CyberSessionBlockEnabled
 		}(),
-		CyberSessionBlockTTLSeconds: func() int {
-			if req.CyberSessionBlockTTLSeconds != nil {
-				return *req.CyberSessionBlockTTLSeconds
+		CyberSessionBlockTTLSeconds: intValueOrDefault(
+			req.CyberSessionBlockTTLSeconds,
+			previousSettings.CyberSessionBlockTTLSeconds,
+		),
+		OpenAICyberAccountCooldownEnabled: func() bool {
+			if req.OpenAICyberAccountCooldownEnabled != nil {
+				return *req.OpenAICyberAccountCooldownEnabled
 			}
-			return previousSettings.CyberSessionBlockTTLSeconds
+			return previousSettings.OpenAICyberAccountCooldownEnabled
+		}(),
+		OpenAICyberAccountCooldownWindowSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownWindowSeconds,
+			previousSettings.OpenAICyberAccountCooldownWindowSeconds,
+		),
+		OpenAICyberAccountCooldownFirstSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownFirstSeconds,
+			previousSettings.OpenAICyberAccountCooldownFirstSeconds,
+		),
+		OpenAICyberAccountCooldownEscalatedSeconds: intValueOrDefault(
+			req.OpenAICyberAccountCooldownEscalatedSeconds,
+			previousSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		),
+		OpenAICyberAccountCooldownGroupIDs: func() []int64 {
+			if req.OpenAICyberAccountCooldownGroupIDs != nil {
+				return append([]int64(nil), (*req.OpenAICyberAccountCooldownGroupIDs)...)
+			}
+			return append([]int64(nil), previousSettings.OpenAICyberAccountCooldownGroupIDs...)
 		}(),
 	}
 
@@ -2451,12 +2487,17 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 
 		AffiliateEnabled: updatedSettings.AffiliateEnabled,
 
-		RiskControlEnabled:          updatedSettings.RiskControlEnabled,
-		CyberSessionBlockEnabled:    updatedSettings.CyberSessionBlockEnabled,
-		CyberPolicyUserAllowlist:    updatedSettings.CyberPolicyUserAllowlist,
-		CyberSessionBlockTTLSeconds: updatedSettings.CyberSessionBlockTTLSeconds,
-		AccountSchedulingThresholds: updatedSettings.AccountSchedulingThresholds,
-		AllowUserViewErrorRequests:  updatedSettings.AllowUserViewErrorRequests,
+		RiskControlEnabled:                         updatedSettings.RiskControlEnabled,
+		CyberSessionBlockEnabled:                   updatedSettings.CyberSessionBlockEnabled,
+		CyberPolicyUserAllowlist:                   updatedSettings.CyberPolicyUserAllowlist,
+		CyberSessionBlockTTLSeconds:                updatedSettings.CyberSessionBlockTTLSeconds,
+		OpenAICyberAccountCooldownEnabled:          updatedSettings.OpenAICyberAccountCooldownEnabled,
+		OpenAICyberAccountCooldownWindowSeconds:    updatedSettings.OpenAICyberAccountCooldownWindowSeconds,
+		OpenAICyberAccountCooldownFirstSeconds:     updatedSettings.OpenAICyberAccountCooldownFirstSeconds,
+		OpenAICyberAccountCooldownEscalatedSeconds: updatedSettings.OpenAICyberAccountCooldownEscalatedSeconds,
+		OpenAICyberAccountCooldownGroupIDs:         updatedSettings.OpenAICyberAccountCooldownGroupIDs,
+		AccountSchedulingThresholds:                updatedSettings.AccountSchedulingThresholds,
+		AllowUserViewErrorRequests:                 updatedSettings.AllowUserViewErrorRequests,
 	}
 	if fastPolicy, err := h.settingService.GetOpenAIFastPolicySettings(c.Request.Context()); err != nil {
 		slog.Error("openai_fast_policy_settings_get_failed", "error", err)

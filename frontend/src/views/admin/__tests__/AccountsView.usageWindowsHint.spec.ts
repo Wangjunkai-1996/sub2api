@@ -8,13 +8,17 @@ const {
   listWithEtag,
   getBatchTodayStats,
   getAllProxies,
-  getAllGroups
+  getAllGroups,
+  getProxyOptions,
+  getAssignableEgressCatalog
 } = vi.hoisted(() => ({
   listAccounts: vi.fn(),
   listWithEtag: vi.fn(),
   getBatchTodayStats: vi.fn(),
   getAllProxies: vi.fn(),
-  getAllGroups: vi.fn()
+  getAllGroups: vi.fn(),
+  getProxyOptions: vi.fn(),
+  getAssignableEgressCatalog: vi.fn()
 }))
 
 vi.mock('@/api/admin', () => ({
@@ -30,7 +34,11 @@ vi.mock('@/api/admin', () => ({
       toggleSchedulable: vi.fn()
     },
     proxies: {
-      getAll: getAllProxies
+      getAll: getAllProxies,
+      getOptions: getProxyOptions
+    },
+    egressRoutes: {
+      getAssignableCatalog: getAssignableEgressCatalog
     },
     groups: {
       getAll: getAllGroups
@@ -75,8 +83,10 @@ const DataTableStub = {
           <slot :name="'header-' + column.key" :column="column" />
         </div>
       </template>
-      <div v-for="row in data" :key="row.id" data-test="account-rate">
-        <slot name="cell-rate_multiplier" :row="row" />
+      <div v-for="row in data" :key="row.id">
+        <div data-test="account-rate">
+          <slot name="cell-rate_multiplier" :row="row" />
+        </div>
       </div>
     </div>
   `
@@ -140,6 +150,8 @@ describe('admin AccountsView usage windows hint', () => {
     getBatchTodayStats.mockReset()
     getAllProxies.mockReset()
     getAllGroups.mockReset()
+    getProxyOptions.mockReset()
+    getAssignableEgressCatalog.mockReset()
 
     listAccounts.mockResolvedValue({
       items: [],
@@ -156,6 +168,11 @@ describe('admin AccountsView usage windows hint', () => {
     getBatchTodayStats.mockResolvedValue({ stats: {} })
     getAllProxies.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
+    getProxyOptions.mockResolvedValue([])
+    getAssignableEgressCatalog.mockResolvedValue({
+      items: [],
+      capabilities: { mutation_enabled: false, reason_code: 'catalog_unavailable' }
+    })
   })
 
   it('keeps groups available when loading proxies fails', async () => {

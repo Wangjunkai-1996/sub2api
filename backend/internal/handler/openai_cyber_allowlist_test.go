@@ -40,16 +40,18 @@ func TestCyberAllowlistedUserBypassesExistingBlocksAndContinuesWebSocket(t *test
 		_, _, _ = conn.Read(ctx)
 	}))
 	defer upstream.Close()
-	harness := newOpenAIWSPassthroughHandlerHarness(t, upstream.URL, map[string]string{
+	harness := newOpenAIWSPassthroughHandlerHarness(t, upstream.URL, "cyber-session-1", map[string]string{
 		service.SettingKeyCyberPolicyUserAllowlist: "1751",
 	})
 	payload := []byte(`{"type":"response.create","model":"gpt-5.1","prompt_cache_key":"trusted-session","input":"test"}`)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(string(payload)))
+	c.Request.Header.Set("X-Session-Id", "cyber-session-1")
+	c.Request = withNewAPIAttributionTestIdentity(c.Request)
 	explicitKey := service.CyberSessionExplicitBlockKey(harness.apiKey.ID, c, payload)
 	store, ok := harness.gatewayCache.(service.CyberSessionBlockStore)
 	require.True(t, ok)
-	require.NoError(t, store.SetCyberSessionBlocked(context.Background(), "", []string{explicitKey}, time.Minute))
+	require.NoError(t, store.SetCyberSessionBlocked(context.Background(), explicitKey, time.Minute))
 	for _, format := range []cyberSessionBlockFormat{cyberBlockFormatResponses, cyberBlockFormatChat, cyberBlockFormatAnthropic} {
 		require.False(t, harness.handler.rejectIfCyberSessionBlocked(c, harness.apiKey, payload, "gpt-5.1", format))
 	}
@@ -63,9 +65,9 @@ func TestCyberAllowlistedUserBypassesExistingBlocksAndContinuesWebSocket(t *test
 		logs := harness.moderationRepo.logSnapshot()
 		return len(logs) == 1 && logs[0].Mode == service.ContentModerationModeCyberLogOnly
 	}, 3*time.Second, 10*time.Millisecond)
-	matched, err := store.FindCyberSessionBlocked(ctx, service.CyberSessionTranscriptBlockKeys(harness.apiKey.ID, payload))
+	matched, err := store.FindCyberSessionBlocked(ctx, explicitKey)
 	require.NoError(t, err)
-	require.Empty(t, matched, "the cyber response must not write new transcript blocks")
+	require.True(t, matched, "the pre-existing block remains available to non-allowlisted users")
 	require.NoError(t, harness.clientConn.Write(ctx, coderws.MessageText, payload))
 	_, event, err = harness.clientConn.Read(ctx)
 	require.NoError(t, err)

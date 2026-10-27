@@ -111,10 +111,32 @@ func ProvideBatchImageCleanupService(repo BatchImageRepository, accountRepo Acco
 func ProvideOpenAIOAuthService(
 	proxyRepo ProxyRepository,
 	oauthClient OpenAIOAuthClient,
+	settingService *SettingService,
+	egressService *EgressService,
 	privacyClientFactory PrivacyClientFactory,
 ) *OpenAIOAuthService {
 	svc := NewOpenAIOAuthService(proxyRepo, oauthClient)
+	svc.SetSettingService(settingService)
+	svc.SetEgressService(egressService)
 	svc.SetPrivacyClientFactory(privacyClientFactory)
+	return svc
+}
+
+// ProvideCRSSyncService installs the same egress route writer used by the
+// admin account and OAuth services.  Keeping the constructor itself compatible
+// with focused tests avoids making the egress repository a required argument
+// for older callers.
+func ProvideCRSSyncService(
+	accountRepo AccountRepository,
+	proxyRepo ProxyRepository,
+	oauthService *OAuthService,
+	openaiOAuthService *OpenAIOAuthService,
+	geminiOAuthService *GeminiOAuthService,
+	cfg *config.Config,
+	egressService *EgressService,
+) *CRSSyncService {
+	svc := NewCRSSyncService(accountRepo, proxyRepo, oauthService, openaiOAuthService, geminiOAuthService, cfg)
+	svc.SetEgressService(egressService)
 	return svc
 }
 
@@ -192,8 +214,10 @@ func ProvideOpenAIQuotaService(
 	privacyClientFactory PrivacyClientFactory,
 	referralClient OpenAIReferralClient,
 	openAIGatewayService *OpenAIGatewayService,
+	openAIOAuthService *OpenAIOAuthService,
 ) *OpenAIQuotaService {
 	service := NewOpenAIQuotaService(accountRepo, proxyRepo, tokenProvider, privacyClientFactory, referralClient)
+	service.SetOAuthEgressResolver(openAIOAuthService)
 	service.agentIdentityWS = openAIGatewayService
 	return service
 }
@@ -462,17 +486,20 @@ func ProvideDeferredService(accountRepo AccountRepository, timingWheel *TimingWh
 	return svc
 }
 
-// ProvideConcurrencyService creates ConcurrencyService and starts slot cleanup worker.
-func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, cfg *config.Config) *ConcurrencyService {
-	svc := NewConcurrencyService(cache)
-	if err := svc.CleanupStaleProcessSlots(context.Background()); err != nil {
-		logger.LegacyPrintf("service.concurrency", "Warning: startup cleanup stale process slots failed: %v", err)
-	}
+// ProvideConcurrencyService creates ConcurrencyService and starts the expired-slot cleanup worker.
+func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, egressRepo EgressRepository, cfg *config.Config) *ConcurrencyService {
+	svc := NewConcurrencyService(cache, egressRepo)
 	if cfg != nil {
 		svc.SetAccountLoadBatchCacheTTL(time.Duration(cfg.Gateway.Scheduling.LoadBatchCacheTTLMS) * time.Millisecond)
 		svc.StartSlotCleanupWorker(accountRepo, cfg.Gateway.Scheduling.SlotCleanupInterval)
 	}
 	return svc
+}
+
+func ProvideEgressIdentityVerificationWorker(egressService *EgressService) *EgressIdentityVerificationWorker {
+	worker := NewEgressIdentityVerificationWorker(egressService)
+	worker.Start()
+	return worker
 }
 
 // ProvideUserMessageQueueService 创建用户消息串行队列服务并启动清理 worker
@@ -854,6 +881,41 @@ func ProvideAPIKeyService(
 	return svc
 }
 
+// ProvideConfiguredOpenAIGatewayService keeps the public constructor stable
+// for focused unit tests while wiring the production dependency graph.
+func ProvideConfiguredOpenAIGatewayService(
+	accountRepo AccountRepository,
+	usageLogRepo UsageLogRepository,
+	usageBillingRepo UsageBillingRepository,
+	userRepo UserRepository,
+	userSubRepo UserSubscriptionRepository,
+	userGroupRateRepo UserGroupRateRepository,
+	cache GatewayCache,
+	cfg *config.Config,
+	schedulerSnapshot *SchedulerSnapshotService,
+	concurrencyService *ConcurrencyService,
+	billingService *BillingService,
+	rateLimitService *RateLimitService,
+	billingCacheService *BillingCacheService,
+	httpUpstream HTTPUpstream,
+	deferredService *DeferredService,
+	openAITokenProvider *OpenAITokenProvider,
+	grokTokenProvider *GrokTokenProvider,
+	resolver *ModelPricingResolver,
+	channelService *ChannelService,
+	balanceNotifyService *BalanceNotifyService,
+	settingService *SettingService,
+	userPlatformQuotaRepo UserPlatformQuotaRepository,
+) *OpenAIGatewayService {
+	return NewOpenAIGatewayService(
+		accountRepo, usageLogRepo, usageBillingRepo, userRepo, userSubRepo,
+		userGroupRateRepo, cache, cfg, schedulerSnapshot, concurrencyService,
+		billingService, rateLimitService, billingCacheService, httpUpstream,
+		deferredService, openAITokenProvider, grokTokenProvider, resolver,
+		channelService, balanceNotifyService, settingService, userPlatformQuotaRepo,
+	)
+}
+
 // ProviderSet is the Wire provider set for all services
 var ProviderSet = wire.NewSet(
 	// Core services
@@ -877,7 +939,7 @@ var ProviderSet = wire.NewSet(
 	NewAnnouncementService,
 	NewAdminService,
 	NewGatewayService,
-	NewOpenAIGatewayService,
+	ProvideConfiguredOpenAIGatewayService,
 	ProvideImageStorageSettingService,
 	ProvideImageTaskService,
 	ProvideBatchImageModelPricingResolver,
@@ -938,11 +1000,13 @@ var ProviderSet = wire.NewSet(
 	NewSubscriptionService,
 	wire.Bind(new(DefaultSubscriptionAssigner), new(*SubscriptionService)),
 	ProvideConcurrencyService,
+	NewEgressService,
+	ProvideEgressIdentityVerificationWorker,
 	ProvideUserMessageQueueService,
 	NewUsageRecordWorkerPool,
 	ProvideSchedulerSnapshotService,
 	NewIdentityService,
-	NewCRSSyncService,
+	ProvideCRSSyncService,
 	ProvideUpdateService,
 	ProvideTokenRefreshService,
 	wire.Bind(new(GrokOAuthReconciler), new(*TokenRefreshService)),

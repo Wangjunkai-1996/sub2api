@@ -22,20 +22,19 @@ ALTER TABLE channel_account_stats_model_pricing
     ADD COLUMN IF NOT EXISTS reasoning_effort_multipliers JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- Group pricing stores the same entries as JSON. An existing generic map wins,
--- even when empty. Remove the consumed legacy key so replay cannot revive it.
+-- even when empty. Keep the legacy key during the rollback window so an older
+-- binary continues to see the same max multiplier. The new map is authoritative
+-- for the new binary; an explicitly empty map is an intentional clear.
 UPDATE groups AS g
 SET model_pricing = (
     SELECT jsonb_agg(
         CASE
-            WHEN jsonb_typeof(entry) = 'object' AND entry ? 'max_reasoning_effort_multiplier' THEN
-                (entry - 'max_reasoning_effort_multiplier') ||
-                CASE
-                    WHEN NOT (entry ? 'reasoning_effort_multipliers')
-                         AND jsonb_typeof(entry->'max_reasoning_effort_multiplier') = 'number' THEN
-                        jsonb_build_object('reasoning_effort_multipliers',
-                            jsonb_build_object('max', entry->'max_reasoning_effort_multiplier'))
-                    ELSE '{}'::jsonb
-                END
+            WHEN jsonb_typeof(entry) = 'object'
+                 AND entry ? 'max_reasoning_effort_multiplier'
+                 AND NOT (entry ? 'reasoning_effort_multipliers')
+                 AND jsonb_typeof(entry->'max_reasoning_effort_multiplier') = 'number' THEN
+                entry || jsonb_build_object('reasoning_effort_multipliers',
+                    jsonb_build_object('max', entry->'max_reasoning_effort_multiplier'))
             ELSE entry
         END ORDER BY ordinal
     )

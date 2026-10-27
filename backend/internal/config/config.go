@@ -977,8 +977,22 @@ const (
 	ImageConcurrencyOverflowModeWait   = "wait"
 )
 
+const (
+	DefaultOpenAIRequestBudgetSeconds                = 900
+	DefaultOpenAIHighEffortFirstOutputTimeoutSeconds = 600
+	DefaultOpenAIRetryBudgetSeconds                  = 300
+)
+
+// NewAPIAttributionConfig identifies trusted relay origins and their signing key.
+type NewAPIAttributionConfig struct {
+	Origins []string `mapstructure:"origins"`
+	Secret  string   `mapstructure:"secret"`
+}
+
 // GatewayConfig API网关相关配置
 type GatewayConfig struct {
+	// NewAPIAttribution verifies end-user identities supplied by a trusted NewAPI relay.
+	NewAPIAttribution NewAPIAttributionConfig `mapstructure:"newapi_attribution"`
 	// MinOutputTokens is the minimum max_output_tokens used when
 	// converting Chat Completions or Anthropic requests to Responses.
 	MinOutputTokens int `mapstructure:"min_output_tokens"`
@@ -996,6 +1010,12 @@ type GatewayConfig struct {
 	// OpenAIHighEffortFirstOutputTimeoutSeconds: high/xhigh/max 推理的首个语义输出超时（秒）。
 	// 0 表示回退到 OpenAIFirstOutputTimeoutSeconds。
 	OpenAIHighEffortFirstOutputTimeoutSeconds int `mapstructure:"openai_high_effort_first_output_timeout_seconds"`
+	// OpenAIRequestBudgetSeconds: native HTTP Responses 从入口、排队到全部重试共用的总预算（秒）。
+	// 0 使用安全默认值 900 秒；0 不能禁用硬预算。
+	OpenAIRequestBudgetSeconds int `mapstructure:"openai_request_budget_seconds"`
+	// OpenAIRetryBudgetSeconds: 请求入口后的错误重试/换号资格窗口（秒）。
+	// 0 自动使用 min(300, OpenAIRequestBudgetSeconds 的有效值)，不会禁用重试窗口。
+	OpenAIRetryBudgetSeconds int `mapstructure:"openai_retry_budget_seconds"`
 	// 请求体最大字节数，用于网关请求体大小限制
 	MaxBodySize int64 `mapstructure:"max_body_size"`
 	// TextMaxBodySize limits endpoints that cannot carry inline image/video payloads.
@@ -1137,6 +1157,28 @@ type GatewayConfig struct {
 	// CNProviders: 国产 OpenAI 兼容供应商（kimi/zhipu/deepseek）的余额检测配置。
 	// 仅作用于 payg（按量付费）账号：周期探测余额，低于阈值则临时停调。
 	CNProviders GatewayCNProvidersConfig `mapstructure:"cn_providers"`
+}
+
+// EffectiveOpenAIRequestBudgetSeconds returns the non-zero hard budget used by
+// the Responses gateway. Zero is retained as a compatibility-safe default.
+func (c GatewayConfig) EffectiveOpenAIRequestBudgetSeconds() int {
+	if c.OpenAIRequestBudgetSeconds == 0 {
+		return DefaultOpenAIRequestBudgetSeconds
+	}
+	return c.OpenAIRequestBudgetSeconds
+}
+
+// EffectiveOpenAIRetryBudgetSeconds returns the error retry/failover window.
+// Zero derives the smaller of the default retry window and hard budget.
+func (c GatewayConfig) EffectiveOpenAIRetryBudgetSeconds() int {
+	budget := c.EffectiveOpenAIRequestBudgetSeconds()
+	if c.OpenAIRetryBudgetSeconds == 0 {
+		if budget < DefaultOpenAIRetryBudgetSeconds {
+			return budget
+		}
+		return DefaultOpenAIRetryBudgetSeconds
+	}
+	return c.OpenAIRetryBudgetSeconds
 }
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
@@ -2323,6 +2365,8 @@ func setDefaults() {
 
 	// JWT
 	viper.SetDefault("jwt.secret", "")
+	viper.SetDefault("gateway.newapi_attribution.origins", []string{})
+	viper.SetDefault("gateway.newapi_attribution.secret", "")
 	viper.SetDefault("jwt.expire_hour", 24)
 	viper.SetDefault("jwt.access_token_expire_minutes", 0) // 0 表示回退到 expire_hour
 	viper.SetDefault("jwt.refresh_token_expire_days", 30)  // 30天Refresh Token有效期
@@ -2426,8 +2470,11 @@ func setDefaults() {
 	viper.SetDefault("gateway.response_header_timeout", 600) // 600秒(10分钟)等待上游响应头，LLM高负载时可能排队较久
 	viper.SetDefault("gateway.openai_response_header_timeout", 0)
 	viper.SetDefault("gateway.grok_response_header_timeout", 120)
-	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 0)
-	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 0)
+	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 120)
+	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", DefaultOpenAIHighEffortFirstOutputTimeoutSeconds)
+	viper.SetDefault("gateway.openai_request_budget_seconds", DefaultOpenAIRequestBudgetSeconds)
+	// Zero preserves compatibility with older configs and derives min(300, effective hard budget).
+	viper.SetDefault("gateway.openai_retry_budget_seconds", 0)
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
@@ -2647,6 +2694,9 @@ func setDefaults() {
 // environment. Any subsystem that wants a richer default still applies it after
 // unmarshal, exactly as before.
 func setEnvReachableDefaults() {
+	// This is an effective true default: existing single-container and text
+	// deployments must continue to run the worker unless they opt into the
+	// image-only role explicitly.
 	viper.SetDefault("gateway.forced_codex_instructions_template_file", "")
 	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
 	viper.SetDefault("gateway.user_message_queue.mode", "")
@@ -3378,6 +3428,21 @@ func (c *Config) Validate() error {
 	if c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds < 0 || c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds > 1800 ||
 		(c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds > 0 && c.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds < 30) {
 		return fmt.Errorf("gateway.openai_high_effort_first_output_timeout_seconds must be 0 or between 30-1800 seconds")
+	}
+	if c.Gateway.OpenAIRequestBudgetSeconds < 0 || c.Gateway.OpenAIRequestBudgetSeconds > DefaultOpenAIRequestBudgetSeconds ||
+		(c.Gateway.OpenAIRequestBudgetSeconds > 0 && c.Gateway.OpenAIRequestBudgetSeconds < 60) {
+		return fmt.Errorf("gateway.openai_request_budget_seconds must be 0 or between 60-900 seconds")
+	}
+	effectiveOpenAIRequestBudget := c.Gateway.OpenAIRequestBudgetSeconds
+	if effectiveOpenAIRequestBudget == 0 {
+		effectiveOpenAIRequestBudget = DefaultOpenAIRequestBudgetSeconds
+	}
+	if c.Gateway.OpenAIRetryBudgetSeconds < 0 || c.Gateway.OpenAIRetryBudgetSeconds > 600 ||
+		(c.Gateway.OpenAIRetryBudgetSeconds > 0 && c.Gateway.OpenAIRetryBudgetSeconds < 60) {
+		return fmt.Errorf("gateway.openai_retry_budget_seconds must be 0 or between 60-600 seconds")
+	}
+	if c.Gateway.OpenAIRetryBudgetSeconds > effectiveOpenAIRequestBudget {
+		return fmt.Errorf("gateway.openai_retry_budget_seconds must not exceed effective gateway.openai_request_budget_seconds (%d)", effectiveOpenAIRequestBudget)
 	}
 	if c.Gateway.Live.MaxSessionDurationSeconds <= 0 {
 		c.Gateway.Live.MaxSessionDurationSeconds = 3600

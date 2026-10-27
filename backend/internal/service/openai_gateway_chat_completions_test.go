@@ -723,6 +723,7 @@ func TestForwardAsChatCompletions_UnknownModelWithoutMessagesDispatchKeepsReques
 		httpUpstream: upstream,
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -895,6 +896,7 @@ func TestForwardAsChatCompletions_OAuthDoesNotInjectDefaultInstructions(t *testi
 		httpUpstream: upstream,
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          3,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -932,6 +934,7 @@ func forwardOAuthChatCompletionsForUpstreamBody(t *testing.T, body []byte) []byt
 	}}
 	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          4,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1017,6 +1020,7 @@ func TestForwardAsChatCompletions_ClientDisconnectDrainsUpstreamUsage(t *testing
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1058,6 +1062,7 @@ func TestForwardAsChatCompletions_BufferedContextWindowResponseFailedReturnsErro
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1103,6 +1108,7 @@ func TestForwardAsChatCompletions_StreamContextWindowResponseFailedReturnsErrorW
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1151,7 +1157,8 @@ func TestForwardAsChatCompletions_StreamBareErrorAfterOutputDoesNotFailOver(t *t
 	}}
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
-		ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+		Status: StatusActive,
+		ID:     1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
 		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
 	}
 
@@ -1190,6 +1197,7 @@ func TestForwardAsChatCompletions_StreamCyberPolicyNoFailover(t *testing.T) {
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1238,6 +1246,7 @@ func TestForwardAsChatCompletions_StreamsUsageWithoutClientStreamOptions(t *test
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1290,6 +1299,7 @@ func TestForwardAsChatCompletions_StreamsTopLevelTerminalUsage(t *testing.T) {
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1338,6 +1348,7 @@ func TestForwardAsChatCompletions_BufferedTopLevelTerminalUsage(t *testing.T) {
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1386,6 +1397,7 @@ func TestForwardAsChatCompletions_TerminalUsageWithoutUpstreamCloseReturns(t *te
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1452,6 +1464,7 @@ func TestForwardAsChatCompletions_EventNamedTerminalWithoutUpstreamCloseReturns(
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1515,6 +1528,7 @@ func TestForwardAsChatCompletions_EventTypeDoesNotLeakAcrossFrames(t *testing.T)
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1555,6 +1569,7 @@ func TestForwardAsChatCompletions_BufferedTerminalWithoutUpstreamCloseReturns(t 
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1607,6 +1622,7 @@ func TestForwardAsChatCompletions_DoneSentinelWithoutTerminalReturnsError(t *tes
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -1620,10 +1636,11 @@ func TestForwardAsChatCompletions_DoneSentinelWithoutTerminalReturnsError(t *tes
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.1")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "missing terminal event")
-	require.NotNil(t, result)
-	require.Zero(t, result.Usage.InputTokens)
-	require.Zero(t, result.Usage.OutputTokens)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, OpenAIUpstreamStreamTruncatedCode, gjson.GetBytes(failoverErr.ResponseBody, "error.code").String())
+	require.Nil(t, result)
+	require.Empty(t, rec.Body.String())
 }
 
 func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.T) {
@@ -1635,7 +1652,7 @@ func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.
 	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false}`)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)).WithContext(reqCtx)
 	c.Request.Header.Set("Content-Type", "application/json")
-	cancel()
+	defer cancel()
 
 	upstreamBody := strings.Join([]string{
 		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","model":"gpt-5.4","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`,
@@ -1643,7 +1660,7 @@ func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.
 		"data: [DONE]",
 		"",
 	}, "\n")
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_chat_ctx"}},
 		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
@@ -1651,6 +1668,7 @@ func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,

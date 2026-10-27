@@ -141,6 +141,7 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	if state := strings.TrimSpace(turnState); state != "" {
 		headers.Set(openAIWSTurnStateHeader, state)
 	}
+
 	if metadata := strings.TrimSpace(turnMetadata); metadata != "" {
 		headers.Set(openAIWSTurnMetadataHeader, metadata)
 	}
@@ -814,6 +815,12 @@ func buildOpenAIWSCurrentTurnRetryPayload(
 ) ([]byte, bool, error) {
 	if !fullInputExists {
 		return nil, false, nil
+	}
+	for _, item := range fullInput {
+		fields := gjson.GetManyBytes(item, "type", "encrypted_content")
+		if strings.TrimSpace(fields[0].String()) == "item_reference" || strings.TrimSpace(fields[1].String()) != "" {
+			return nil, false, nil
+		}
 	}
 	retryPayload, err := setOpenAIWSPayloadInputSequence(payload, fullInput, true)
 	if err != nil {

@@ -21,6 +21,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -37,6 +38,7 @@ type httpUpstreamRecorder struct {
 	resp      *http.Response
 	responses []*http.Response
 	err       error
+	onDo      func()
 }
 
 type passthroughErrReadCloser struct {
@@ -66,6 +68,9 @@ func (r passthroughErrReadCloser) Close() error {
 
 func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	u.lastReq = req
+	if u.onDo != nil {
+		u.onDo()
+	}
 	u.lastProxyURL = proxyURL
 	if req != nil && req.Body != nil {
 		b, _ := io.ReadAll(req.Body)
@@ -381,6 +386,201 @@ func captureStructuredLog(t *testing.T) (*inMemoryLogSink, func()) {
 	return sink, func() {
 		logger.SetSink(nil)
 		structuredLogCaptureMu.Unlock()
+	}
+}
+
+func TestOpenAIGatewayService_OAuthPassthrough_PreservesClientStreamMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name                string
+		streamField         string
+		upstreamContentType string
+		stream              bool
+	}{
+		{name: "explicit non-streaming", streamField: `,"stream":false`, upstreamContentType: "text/event-stream"},
+		{name: "omitted stream", upstreamContentType: "text/event-stream"},
+		{name: "streaming", streamField: `,"stream":true`, upstreamContentType: "text/event-stream", stream: true},
+		{name: "SSE with JSON content type", streamField: `,"stream":false`, upstreamContentType: "application/json"},
+		{name: "SSE without content type", streamField: `,"stream":false`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			body := []byte(`{"model":"gpt-6-astra","instructions":"Reply briefly","input":"hello"` + tc.streamField + `}`)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{},
+				Body: io.NopCloser(strings.NewReader(
+					"event: response.completed\n" +
+						`data: {"type":"response.completed","response":{"id":"resp_nonstream","object":"response","model":"gpt-6-astra","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}` + "\n\n",
+				)),
+			}}
+			if tc.upstreamContentType != "" {
+				upstream.resp.Header.Set("Content-Type", tc.upstreamContentType)
+			}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			account := &Account{
+				ID: 123, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
+				Extra:       map[string]any{"openai_passthrough": true},
+				Status:      StatusActive, Schedulable: true, Concurrency: 1,
+			}
+
+			result, err := svc.Forward(context.Background(), c, account, body)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+			assert.Equal(t, tc.stream, result.Stream)
+			assert.Equal(t, 7, result.Usage.InputTokens)
+			assert.Equal(t, 2, result.Usage.OutputTokens)
+			assert.Equal(t, http.StatusOK, rec.Code)
+			if tc.stream {
+				assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+				assert.Contains(t, rec.Body.String(), "event: response.completed")
+			} else {
+				assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+				require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+				assert.Equal(t, "resp_nonstream", gjson.GetBytes(rec.Body.Bytes(), "id").String())
+				assert.Equal(t, "hello", gjson.GetBytes(rec.Body.Bytes(), "output.0.content.0.text").String())
+			}
+		})
+	}
+}
+
+func TestHandleNonStreamingResponsePassthrough_JSONWithSSETextKeepsJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := `{"id":"resp_json","output":[{"type":"message","content":[{"type":"output_text","text":"event: response.completed\ndata: example"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+
+	result, err := svc.handleNonStreamingResponsePassthrough(context.Background(), resp, c, nil, "gpt-6-astra", "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.JSONEq(t, body, rec.Body.String())
+	assert.Equal(t, 7, result.usage.InputTokens)
+	assert.Equal(t, 2, result.usage.OutputTokens)
+}
+
+func TestOpenAIGatewayService_APIKeyPassthrough_RestoresClientToolsWithWrongContentType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := openAIClientToolsRequest(false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`data: {"type":"response.completed","response":{"id":"resp_tools","status":"completed","output":[{"type":"function_call","id":"i1","call_id":"c1","name":"exec","arguments":"{\"input\":\"pwd\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n")),
+	}}
+	svc := openAIClientToolsTestService(upstream)
+	account := &Account{
+		ID: 5659, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "test-key"},
+		Extra:       map[string]any{"openai_passthrough": true},
+		Status:      StatusActive, Schedulable: true, Concurrency: 1,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assertOpenAIClientToolsLowered(t, upstream.lastBody)
+	assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+	require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+	assert.Equal(t, "custom_tool_call", gjson.GetBytes(rec.Body.Bytes(), "output.0.type").String())
+	assert.Equal(t, "pwd", gjson.GetBytes(rec.Body.Bytes(), "output.0.input").String())
+	assert.Equal(t, "c1", gjson.GetBytes(rec.Body.Bytes(), "output.0.call_id").String())
+}
+
+func TestHandlePassthroughSSEToJSON_TerminalResponseContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name         string
+		sse          string
+		status       int
+		responseType string
+	}{
+		{name: "incomplete", sse: `data: {"type":"response.incomplete","response":{"id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, status: http.StatusOK, responseType: "incomplete"},
+		{name: "cancelled", sse: `data: {"type":"response.cancelled","response":{"id":"resp_partial","status":"cancelled","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, status: http.StatusOK, responseType: "cancelled"},
+		{name: "canceled", sse: `data: {"type":"response.canceled","response":{"id":"resp_partial","status":"canceled","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, status: http.StatusOK, responseType: "canceled"},
+		{name: "failed", sse: `data: {"type":"response.failed","response":{"error":{"message":"upstream rejected request"}}}`, status: http.StatusBadGateway},
+		{name: "bare error", sse: `event: error` + "\n" + `data: {"error":{"message":"upstream rejected request"}}`, status: http.StatusBadGateway},
+		{name: "missing terminal", sse: `data: {"type":"response.in_progress","response":{"id":"resp_partial"}}`, status: http.StatusBadGateway},
+		{name: "invalid final object", sse: `data: {"type":"response.completed","response":[]}`, status: http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			svc := &OpenAIGatewayService{cfg: &config.Config{}}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}}
+			body := []byte(tc.sse + "\n\ndata: [DONE]\n\n")
+
+			result, err := svc.handlePassthroughSSEToJSON(resp, c, nil, body, "gpt-6-astra", "")
+			assert.Equal(t, tc.status, rec.Code)
+			assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+			require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+			if tc.status != http.StatusOK {
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tc.responseType, gjson.GetBytes(rec.Body.Bytes(), "status").String())
+			assert.Equal(t, "partial", gjson.GetBytes(rec.Body.Bytes(), "output.0.content.0.text").String())
+			assert.Equal(t, 7, result.usage.InputTokens)
+			assert.Equal(t, 2, result.usage.OutputTokens)
+			if tc.responseType == "incomplete" {
+				assert.Equal(t, "max_output_tokens", gjson.GetBytes(rec.Body.Bytes(), "incomplete_details.reason").String())
+			}
+		})
+	}
+}
+
+func TestHandlePassthroughSSEToJSON_CompactIncompleteNeverCompletes(t *testing.T) {
+	for _, terminal := range []string{"incomplete", "cancelled", "canceled"} {
+		for _, committed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/committed=%v", terminal, committed), func(t *testing.T) {
+				c, rec := newCompactBridgeTestContext(t, true)
+				if committed {
+					keepalive := &openAICompactSSEKeepalive{writer: c.Writer, stop: make(chan struct{})}
+					c.Set(openAICompactSSEKeepaliveKey, keepalive)
+					t.Cleanup(keepalive.Stop)
+					require.True(t, keepalive.beat())
+				}
+				body := []byte(fmt.Sprintf(`data: {"type":"response.%s","response":{"id":"resp_partial","status":"%s","output":[{"type":"compaction","encrypted_content":"partial"}]}}`+"\n\n", terminal, terminal))
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}}
+
+				result, err := newCompactBridgeTestService().handlePassthroughSSEToJSON(resp, c, nil, body, "gpt-6-astra", "")
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.NotContains(t, rec.Body.String(), "response.completed")
+				if committed {
+					assert.Equal(t, http.StatusOK, rec.Code)
+					assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+					events := parseCompactBridgeSSE(t, stripKeepaliveComments(rec.Body.String()))
+					require.Len(t, events, 1)
+					assert.Equal(t, "response.failed", events[0][0])
+					assert.Equal(t, "failed", gjson.Get(events[0][1], "response.status").String())
+				} else {
+					assert.Equal(t, http.StatusBadGateway, rec.Code)
+					assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+					require.True(t, gjson.ValidBytes(rec.Body.Bytes()))
+					assert.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+				}
+			})
+		}
 	}
 }
 
@@ -849,10 +1049,10 @@ func TestOpenAIGatewayService_OAuthPassthrough_UpstreamRequestIgnoresClientCance
 	reqCtx, cancel := context.WithCancel(context.Background())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil)).WithContext(reqCtx)
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
-	cancel()
+	defer cancel()
 
 	originalBody := []byte(`{"model":"gpt-5.2","stream":true,"store":true,"instructions":"local-test-instructions","input":[{"type":"text","text":"hi"}]}`)
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_passthrough_ctx"}},
 		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
@@ -1094,10 +1294,10 @@ func TestOpenAIGatewayService_OAuthLegacy_UpstreamRequestIgnoresClientCancel(t *
 	reqCtx, cancel := context.WithCancel(context.Background())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil)).WithContext(reqCtx)
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
-	cancel()
+	defer cancel()
 
 	originalBody := []byte(`{"model":"gpt-5.2","stream":false,"store":true,"input":[{"type":"text","text":"hi"}]}`)
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
+	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_legacy_ctx"}},
 		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
@@ -1600,7 +1800,7 @@ func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover
 			accountType:    AccountTypeOAuth,
 			statusCode:     http.StatusBadGateway,
 			body:           `{"error":{"message":"bad gateway","type":"server_error"}}`,
-			expectFailover: false,
+			expectFailover: true,
 			assertRepo: func(t *testing.T, repo *openAIPassthroughFailoverRepo, _ time.Time) {
 				require.Empty(t, repo.rateLimitCalls)
 				require.Empty(t, repo.overloadCalls)
@@ -1611,7 +1811,7 @@ func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover
 			accountType:    AccountTypeOAuth,
 			statusCode:     http.StatusServiceUnavailable,
 			body:           `{"error":{"message":"service unavailable","type":"server_error"}}`,
-			expectFailover: false,
+			expectFailover: true,
 			assertRepo: func(t *testing.T, repo *openAIPassthroughFailoverRepo, _ time.Time) {
 				require.Empty(t, repo.rateLimitCalls)
 				require.Empty(t, repo.overloadCalls)
@@ -1622,7 +1822,7 @@ func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover
 			accountType:    AccountTypeOAuth,
 			statusCode:     http.StatusGatewayTimeout,
 			body:           `{"error":{"message":"gateway timeout","type":"server_error"}}`,
-			expectFailover: false,
+			expectFailover: true,
 			assertRepo: func(t *testing.T, repo *openAIPassthroughFailoverRepo, _ time.Time) {
 				require.Empty(t, repo.rateLimitCalls)
 				require.Empty(t, repo.overloadCalls)
@@ -2001,7 +2201,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_NonCodexUAFallbackToCodexUA(t *te
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}
 	upstream := &httpUpstreamRecorder{resp: resp}
 
@@ -2050,7 +2250,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_OfficialIdentityUnified(t *testin
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}
 	upstream := &httpUpstreamRecorder{resp: resp}
 
@@ -2095,7 +2295,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_CodexTuiIdentityUnified(t *testin
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}}
 
 	svc := &OpenAIGatewayService{
@@ -2200,7 +2400,7 @@ func TestOpenAIGatewayService_CodexFingerprintHTTPRawPassthroughHeaderBodyParity
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 	}}
 	svc := &OpenAIGatewayService{
 		cfg:          &config.Config{},
@@ -2397,7 +2597,7 @@ func TestOpenAIGatewayService_CodexCLIOnly_AllowOfficialClientFamilies(t *testin
 			resp := &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")),
 			}
 			upstream := &httpUpstreamRecorder{resp: resp}
 
