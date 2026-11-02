@@ -425,14 +425,14 @@ func (c *openAIWSPassthroughFirstOutputFrameConn) ReadFrame(ctx context.Context)
 	for {
 		select {
 		case result := <-readResultCh:
-			if result.err == nil {
-				state := c.deadlineState()
-				if state.armed && state.deadline.timeout > 0 && !time.Now().Before(state.deadline.startedAt.Add(state.deadline.timeout)) {
-					if state.deadline.phase == openAIWSPassthroughDeadlinePhaseActiveRead {
-						return coderws.MessageText, nil, &openAIWSPassthroughActiveTurnTimeoutError{}
-					}
-					return coderws.MessageText, nil, &openAIWSPassthroughFirstOutputTimeoutError{deadline: state.deadline}
+			state := c.deadlineState()
+			if ctx.Err() == nil && state.armed && state.deadline.timeout > 0 && !time.Now().Before(state.deadline.startedAt.Add(state.deadline.timeout)) {
+				if state.deadline.phase == openAIWSPassthroughDeadlinePhaseActiveRead {
+					return coderws.MessageText, nil, &openAIWSPassthroughActiveTurnTimeoutError{}
 				}
+				return coderws.MessageText, nil, &openAIWSPassthroughFirstOutputTimeoutError{deadline: state.deadline}
+			}
+			if result.err == nil {
 				c.observeUpstreamActivity(result.msgType, result.payload)
 			}
 			return result.msgType, result.payload, result.err

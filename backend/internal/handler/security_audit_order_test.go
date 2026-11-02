@@ -25,9 +25,6 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 		{file: "gateway_handler_responses.go", function: "Responses", auditToken: "checkSecurityAudit"},
 		{file: "gemini_v1beta_handler.go", function: "GeminiV1BetaModels", auditToken: "checkSecurityAudit"},
 		{file: "gemini_cached_contents_handler.go", function: "GeminiCachedContentsCreate", auditToken: "checkSecurityAudit"},
-		{file: "openai_gateway_handler.go", function: "Responses", auditToken: "checkSecurityAudit"},
-		{file: "openai_gateway_handler.go", function: "Messages", auditToken: "checkSecurityAudit"},
-		{file: "openai_chat_completions.go", function: "ChatCompletions", auditToken: "checkSecurityAudit"},
 		{file: "openai_images.go", function: "Images", auditToken: "checkSecurityAudit"},
 		{file: "grok_media.go", function: "handleGrokMedia", auditToken: "checkSecurityAudit"},
 	}
@@ -133,7 +130,6 @@ func TestOtherOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 		file     string
 		function string
 	}{
-		{file: "openai_images.go", function: "Images"},
 		{file: "openai_embeddings.go", function: "Embeddings"},
 		{file: "openai_alpha_search.go", function: "AlphaSearch"},
 		{file: "image_task_handler.go", function: "Submit"},

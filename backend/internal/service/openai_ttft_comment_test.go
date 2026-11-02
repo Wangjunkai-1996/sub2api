@@ -200,6 +200,7 @@ func TestOpenAITTFTCommentVisibleAfterStructuralOutput(t *testing.T) {
 			gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: OpenAITTFTModeSemantic})
 		}
 	})
+	createdAtField := regexp.MustCompile(`,"created_at":[0-9]+`)
 	const initial = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"search_1\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}\n\n"
 	const terminalData = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_late\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}"
 	for _, passthrough := range []bool{false, true} {
@@ -233,7 +234,7 @@ func TestOpenAITTFTCommentVisibleAfterStructuralOutput(t *testing.T) {
 					}
 					require.NotNil(t, ms)
 					marker := fmt.Sprintf(": sub2-ttft-ms=%d\n", *ms)
-					body := rec.Body.String()
+					body := createdAtField.ReplaceAllString(rec.Body.String(), "")
 					require.Equal(t, 1, strings.Count(body, marker))
 					require.Less(t, strings.Index(body, marker), strings.Index(body, terminalData))
 					require.Equal(t, strings.TrimRight(upstream, "\n"), strings.TrimRight(strings.Replace(body, marker, "", 1), "\n"), "the comment must preserve event framing and data")

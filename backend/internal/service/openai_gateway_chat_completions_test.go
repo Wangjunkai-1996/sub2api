@@ -422,6 +422,7 @@ func TestForwardAsChatCompletions_StructuredInputRejectionDoesNotRetryIneligible
 			}
 			if test.accountType != "" {
 				account.Type = test.accountType
+				account.Status = StatusActive
 				account.Credentials["access_token"] = "test-token"
 			}
 			status := test.status
@@ -1660,11 +1661,16 @@ func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.
 		"data: [DONE]",
 		"",
 	}, "\n")
-	upstream := &httpUpstreamRecorder{onDo: cancel, resp: &http.Response{
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_chat_ctx"}},
 		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
 	}}
+	var upstreamContextErrAfterClientCancel error
+	upstream.onDo = func() {
+		cancel()
+		upstreamContextErrAfterClientCancel = upstream.lastReq.Context().Err()
+	}
 
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := &Account{
@@ -1684,7 +1690,7 @@ func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.NotNil(t, upstream.lastReq)
-	require.NoError(t, upstream.lastReq.Context().Err())
+	require.NoError(t, upstreamContextErrAfterClientCancel)
 }
 
 // TestBuildChatStreamErrorSSE verifies F4: the error chunk payload follows the

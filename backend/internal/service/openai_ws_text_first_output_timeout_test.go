@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,20 +88,26 @@ func TestWSV2CommittedStructuralOutputTimeoutCannotFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	conn := &openAIWSCaptureConn{
 		events: [][]byte{
+			[]byte(`{"type":"response.created","response":{"id":"resp_partial","usage":{"input_tokens":13,"output_tokens":2}}}`),
 			[]byte(`{"type":"response.output_item.added","item":{"type":"computer_call","id":"call_1","action":{"type":"click"}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_late","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"too late"}]}]}}`),
 		},
-		readDelays: []time.Duration{0, 2 * time.Second},
+		readDelays: []time.Duration{0, 0, 2 * time.Second},
 	}
 	svc, account := newWSFirstOutputTestService(conn)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	_, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"stream":true,"input":"hello"}`))
+	result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"stream":true,"input":"hello"}`))
 	require.Error(t, err)
 	var failover *UpstreamFailoverError
 	require.False(t, errors.As(err, &failover), "committed output cannot be replayed on another account")
-	require.Contains(t, recorder.Body.String(), `"type":"first_output_timeout"`)
+	require.NotNil(t, result, "err=%v body=%s", err, recorder.Body.String())
+	require.Equal(t, 13, result.Usage.InputTokens)
+	require.Equal(t, 2, result.Usage.OutputTokens)
+	require.True(t, IsResponseCommitted(c))
+	require.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"response.failed"`))
+	require.Contains(t, recorder.Body.String(), `"code":"first_output_timeout"`)
 	require.NotContains(t, recorder.Body.String(), "response.completed")
 }
 
@@ -120,6 +127,25 @@ func TestWSV2PassthroughEmptyDeltaKeepsFirstOutputDeadline(t *testing.T) {
 		_, _, err := conn.ReadFrame(context.Background())
 		require.NoError(t, err)
 	}
+	_, _, err := conn.ReadFrame(context.Background())
+	var timeoutErr *openAIWSPassthroughFirstOutputTimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+}
+
+func TestWSV2PassthroughExpiredDeadlineWinsOverReadError(t *testing.T) {
+	upstream := newStagedPassthroughConn()
+	defer upstream.Close()
+	conn := &openAIWSPassthroughFirstOutputFrameConn{
+		inner: upstream,
+		resolveDeadline: func([]byte) openAIWSPassthroughFirstOutputDeadline {
+			return openAIWSPassthroughFirstOutputDeadline{
+				timeout: time.Second, startedAt: time.Now().Add(-2 * time.Second),
+			}
+		},
+	}
+	require.NoError(t, conn.WriteFrame(context.Background(), coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.5"}`)))
+	upstream.Fail(errors.New("upstream read failed at deadline"))
+
 	_, _, err := conn.ReadFrame(context.Background())
 	var timeoutErr *openAIWSPassthroughFirstOutputTimeoutError
 	require.ErrorAs(t, err, &timeoutErr)

@@ -566,7 +566,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			)
 		}
 	}
-	firstOutputExpired := func() error {
+	firstOutputExpired := func() (*OpenAIForwardResult, error) {
 		lease.MarkBroken()
 		proxyID, proxyName := opsUpstreamWSProxyAttribution(account)
 		failoverErr := s.newOpenAIFirstOutputTimeoutError(
@@ -575,12 +575,20 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			firstOutputTimeout, "websocket_first_usable_output", lease.HandshakeHeaders(),
 		)
 		if !wroteDownstream {
-			return failoverErr
+			return nil, failoverErr
 		}
 		if reqStream && !clientDisconnected {
-			emitStreamMessage([]byte(`{"type":"error","error":{"type":"first_output_timeout","code":"first_output_timeout","message":"Upstream produced no usable output before the deadline"}}`), true)
+			failure := buildOpenAIResponseFailedSSE(responseID, originalModel, 0,
+				[]byte(`{"error":{"code":"first_output_timeout"}}`),
+				"Upstream produced no usable output before the deadline")
+			if _, err := fmt.Fprint(c.Writer, failure); err != nil {
+				markClientDisconnected("downstream_write_error")
+			} else {
+				flusher.Flush()
+			}
 		}
-		return errors.New("openai ws first usable output timeout after downstream output")
+		MarkResponseCommitted(c)
+		return resultWithUsage(), errors.New("upstream response failed: openai ws first usable output timeout after downstream output")
 	}
 
 	// Bound each pre-output read by the fixed attempt deadline. Once the client
@@ -591,7 +599,7 @@ readLoop:
 	for {
 		markClientRequestCanceled()
 		if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved && !time.Now().Before(firstOutputDeadline) {
-			return nil, firstOutputExpired()
+			return firstOutputExpired()
 		}
 		var message []byte
 		var readErr error
@@ -633,7 +641,7 @@ readLoop:
 		}
 		markClientRequestCanceled()
 		if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved && !time.Now().Before(firstOutputDeadline) {
-			return nil, firstOutputExpired()
+			return firstOutputExpired()
 		}
 		if readErr == nil && !json.Valid(message) {
 			eventType, _, _ := parseOpenAIWSEventEnvelope(message)

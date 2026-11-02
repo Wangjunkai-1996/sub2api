@@ -396,6 +396,24 @@ func TestOpenAIEnsureForwardErrorResponse_PreservesCommittedStreamError(t *testi
 	require.Equal(t, body, w.Body.String(), "preserve the service error without a second terminal event")
 }
 
+func TestOpenAIEnsureForwardErrorResponse_PreservesCommittedFirstOutputTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, EndpointResponses, nil)
+	before := c.Writer.Size()
+	_, err := c.Writer.WriteString("event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\"}\n\n" +
+		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"first_output_timeout\"}}}\n\n")
+	require.NoError(t, err)
+	service.MarkResponseCommitted(c)
+
+	h := &OpenAIGatewayHandler{}
+	require.True(t, openAIForwardErrorAlreadyCommunicated(c, before, errors.New("upstream response failed: openai ws first usable output timeout after downstream output")))
+	require.False(t, h.ensureForwardErrorResponse(c, true))
+	require.Equal(t, 1, strings.Count(w.Body.String(), `"type":"response.failed"`))
+	require.Contains(t, w.Body.String(), `"code":"first_output_timeout"`)
+}
+
 func TestOpenAIEnsureForwardErrorResponse_CompactKeepaliveOnlyWritesResponseFailed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

@@ -99,7 +99,10 @@ func TestOpenAINativeTextFirstOutputTimeoutPreservesReplayBoundary(t *testing.T)
 			if tc.committed {
 				assert.Contains(t, recorder.Body.String(), tc.event)
 				assert.Contains(t, recorder.Body.String(), `"code":"first_output_timeout"`)
-				assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"error"`))
+				assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"response.failed"`))
+				assert.Contains(t, recorder.Body.String(), "event: response.failed\n")
+				assert.NotContains(t, recorder.Body.String(), "event: error\n")
+				assert.NotContains(t, recorder.Body.String(), "response.completed")
 				assert.True(t, IsResponseCommitted(c))
 			} else {
 				assert.Empty(t, recorder.Body.String())

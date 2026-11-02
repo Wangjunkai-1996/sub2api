@@ -253,6 +253,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	if s.cfg != nil && s.cfg.Gateway.StreamKeepaliveInterval > 0 {
 		keepaliveInterval = time.Duration(s.cfg.Gateway.StreamKeepaliveInterval) * time.Second
 	}
+	// The text deadline moves otherwise synchronous streams into the async scan
+	// loop. Preserve their original flush-at-each-complete-event behavior.
+	flushEveryCompleteEvent := streamInterval == 0 && keepaliveInterval == 0 && s.openAIFirstOutputTimeout(reasoningEffort) == 0
 
 	// 下游 keepalive 仅用于防止代理空闲断开
 	var keepaliveTicker *time.Ticker
@@ -325,7 +328,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		streamErrorRecorded = true
 	}
 	markPreOutputFailoverSafe := func(failoverErr *UpstreamFailoverError) *UpstreamFailoverError {
-		if failoverErr != nil && stageBeforeClientOutput && (firstOutputTimeout > 0 || c.Writer.Written()) {
+		configuredFirstOutputTimeout := s.cfg != nil && s.cfg.Gateway.OpenAIFirstOutputTimeoutSeconds > 0
+		if failoverErr != nil && stageBeforeClientOutput && (configuredFirstOutputTimeout || c.Writer.Written()) {
 			// A committed writer can only contain stable keepalive comments while the
 			// attempt-local stage is active, so replay remains safe. Preserve the
 			// configured timeout path's replay permission even before a keepalive.
@@ -376,7 +380,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
 		}
-		shouldFlush := firstProgressEvent || eventShouldFlush || (queueDrained && clientOutputStarted)
+		shouldFlush := firstProgressEvent || eventShouldFlush || (queueDrained && clientOutputStarted) || (flushEveryCompleteEvent && clientOutputStarted)
 
 		eventInProgress = false
 		if firstProgressEvent {
@@ -491,8 +495,18 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			_, _ = writePendingString("\n")
 			eventInProgress = false
 		}
-		sendErrorEvent("first_output_timeout", "Upstream produced no usable output before the deadline")
-		return resultWithError(errors.New("OpenAI first usable output timeout after response commitment"))
+		if !clientDisconnected {
+			failure := buildOpenAIResponseFailedSSE(responseID, originalModel, createdAtStamper.Value(),
+				[]byte(`{"error":{"code":"first_output_timeout"}}`),
+				"Upstream produced no usable output before the deadline")
+			if _, err := writePendingString(failure); err != nil {
+				clientDisconnected = true
+			} else if err := flushBuffered("first_output_timeout"); err != nil {
+				clientDisconnected = true
+			}
+		}
+		MarkResponseCommitted(c)
+		return resultWithError(errors.New("upstream response failed: OpenAI first usable output timeout after response commitment"))
 	}
 	flushPending := func(disconnectMessage string) {
 		if clientDisconnected || pendingBytes() == 0 {
@@ -1155,7 +1169,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// Long reasoning requests may legitimately remain silent before their
 			// first semantic event. Let the dedicated first-output deadline govern
 			// that phase; the stream idle timeout resumes once semantic output starts.
-			if firstOutputCh != nil && firstOutputTimeout > streamInterval && !sawBareError && !sawResponseFailed {
+			configuredFirstOutputTimeout := s.cfg != nil && s.cfg.Gateway.OpenAIFirstOutputTimeoutSeconds > 0
+			if firstOutputCh != nil && configuredFirstOutputTimeout && firstOutputTimeout > streamInterval && !sawBareError && !sawResponseFailed {
 				continue
 			}
 			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
