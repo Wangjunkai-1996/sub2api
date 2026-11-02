@@ -786,6 +786,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return nil, err
 	}
 	SetOpsUpstreamModel(c, upstreamModel)
+	explicitImageIntent := IsExplicitImageGenerationIntent(openAIResponsesEndpoint, requestedModel, canonicalImageIntentBody) || isOpenAIImageGenerationModel(upstreamModel)
 
 	// 命中 WS 时仅走 WebSocket Mode；不再自动回退 HTTP。
 	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
@@ -900,6 +901,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				wsDecision,
 				isCodexCLI,
 				reqStream,
+				explicitImageIntent,
 				originalModel,
 				upstreamModel,
 				startTime,
@@ -1035,6 +1037,13 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	firstOutputTimeout := time.Duration(0)
 	if reqStream && account.Platform == PlatformOpenAI {
 		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffortValue)
+		if !explicitImageIntent && !isCompactRequest {
+			firstOutputTimeout = s.openAITextFirstOutputTimeout()
+		}
+	}
+	nonStreamTextTimeout := time.Duration(0)
+	if !reqStream && account.Platform == PlatformOpenAI && !explicitImageIntent && !isCompactRequest {
+		nonStreamTextTimeout = s.openAITextFirstOutputTimeout()
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
@@ -1048,10 +1057,17 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		var headerGuard *openAIFirstOutputHeaderGuard
+		var textGuard *openAITextFirstOutputGuard
+		if nonStreamTextTimeout > 0 {
+			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(nonStreamTextTimeout))
+		}
 		upstreamCtxReleased := false
 		releaseAttemptContext := func() {
 			if !upstreamCtxReleased {
 				upstreamCtxReleased = true
+				if textGuard != nil {
+					textGuard.close()
+				}
 				releaseUpstreamCtx()
 			}
 		}
@@ -1089,6 +1105,19 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			return nil, err
 		}
+		if textGuard != nil {
+			if resp != nil {
+				textGuard.setBody(resp.Body)
+			}
+			if textGuard.timedOut() {
+				releaseAttemptContext()
+				return nil, s.newOpenAIFirstOutputTimeoutError(
+					ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+					startTime, originalModel, reasoningEffortValue,
+					nonStreamTextTimeout, "response_headers", nil,
+				)
+			}
+		}
 		if headerGuard != nil && headerGuard.stopHeaderWait() {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
@@ -1119,6 +1148,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// Handle error response
 		if resp.StatusCode >= 400 {
 			respBody := s.readUpstreamErrorBody(resp)
+			if textGuard != nil && textGuard.timedOut() {
+				_ = resp.Body.Close()
+				releaseAttemptContext()
+				return nil, s.newOpenAIFirstOutputTimeoutError(
+					ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+					startTime, originalModel, reasoningEffortValue,
+					nonStreamTextTimeout, "response_body", resp.Header,
+				)
+			}
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
@@ -1246,13 +1284,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 		// Handle normal response
 		var usage *OpenAIUsage
+		var forwardErr error
 		var firstTokenMs *int
 		responseID := ""
 		imageCount := 0
 		searchCount := 0
 		var imageOutputSizes []string
 		if reqStream {
-			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
+			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue, explicitImageIntent)
 			if err != nil {
 				if signal, ok := asOpenAICompactFallbackSignal(err); ok {
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
@@ -1292,7 +1331,13 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					}
 					return s.handleErrorResponse(ctx, compactResp, c, account, body, resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel))
 				}
-				return nil, err
+				var failoverErr *UpstreamFailoverError
+				if streamResult == nil || errors.As(err, &failoverErr) {
+					return nil, err
+				}
+				// Committed failures cannot retry. Preserve any usage already observed
+				// so the handler can settle the partial attempt instead of dropping it.
+				forwardErr = err
 			}
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
@@ -1301,8 +1346,19 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			imageOutputSizes = streamResult.imageOutputSizes
 			searchCount = streamResult.searchCount
 		} else {
-			nonStreamResult, err := s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
+			nonStreamResult, err := s.handleNonStreamingResponseWithGuard(ctx, resp, c, account, originalModel, upstreamModel, textGuard)
 			if err != nil {
+				if textGuard != nil && textGuard.timedOut() {
+					if c.Writer.Written() {
+						return nil, err
+					}
+					releaseAttemptContext()
+					return nil, s.newOpenAIFirstOutputTimeoutError(
+						ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+						startTime, originalModel, reasoningEffortValue,
+						nonStreamTextTimeout, "response_body", resp.Header,
+					)
+				}
 				if signal, ok := asOpenAICompactFallbackSignal(err); ok {
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 						c, account, requestedModel, body, http.StatusBadRequest, signal.message, signal.payload, compactModelFallbackRetried,
@@ -1373,7 +1429,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			forwardResult.SearchCount = searchCount
 		}
 		stampOpenAIResponsesUpstreamEndpoint(c, forwardResult)
-		return forwardResult, nil
+		return forwardResult, forwardErr
 	}
 }
 

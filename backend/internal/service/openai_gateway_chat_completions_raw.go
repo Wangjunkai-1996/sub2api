@@ -213,15 +213,36 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	// the outbound request (for example GLM xhigh is forwarded as max).
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(upstreamBody, upstreamModel, billingModel, originalModel)
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, upstreamBody, upstreamModel)
-	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity)
+	sendCtx := ctx
+	var firstOutputGuard *openAITextFirstOutputGuard
+	if account.Platform == PlatformOpenAI && !IsExplicitImageGenerationIntent("/v1/chat/completions", originalModel, body) && !isOpenAIImageGenerationModel(upstreamModel) {
+		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		defer releaseUpstreamCtx()
+		sendCtx, firstOutputGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()))
+		defer firstOutputGuard.close()
+	}
+	resp, err := s.sendCCUpstreamRequest(sendCtx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity, firstOutputGuard)
+	if firstOutputGuard.timedOut() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, s.newOpenAIChatOutputTimeoutError(c, account, startTime, originalModel, nil, false)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	firstOutputGuard.setBody(resp.Body)
+	defer func() {
+		firstOutputGuard.close()
+		_ = resp.Body.Close()
+	}()
 
 	// 7. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+		if firstOutputGuard.timedOut() {
+			return nil, s.newOpenAIChatOutputTimeoutError(c, account, startTime, originalModel, resp.Header, false)
+		}
 		if account.Platform == PlatformGrok {
 			kind := "http_error"
 			if s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody) {
@@ -268,9 +289,9 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	var result *OpenAIForwardResult
 	var forwardErr error
 	if clientStream {
-		result, forwardErr = s.streamRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, len(body))
+		result, forwardErr = s.streamRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, len(body), firstOutputGuard)
 	} else {
-		result, forwardErr = s.bufferRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		result, forwardErr = s.bufferRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, firstOutputGuard)
 	}
 	if result != nil {
 		addOpenAIUsage(&result.Usage, bridgeUsage)
@@ -308,7 +329,12 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	serviceTier *string,
 	startTime time.Time,
 	requestBodyLen int,
+	firstOutputGuards ...*openAITextFirstOutputGuard,
 ) (*OpenAIForwardResult, error) {
+	var firstOutputGuard *openAITextFirstOutputGuard
+	if len(firstOutputGuards) > 0 {
+		firstOutputGuard = firstOutputGuards[0]
+	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -321,6 +347,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	var firstTokenMs *int
 	clientDisconnected := false
 	clientOutputStarted := false
+	outputSeen := false
 	pendingLines := make([]string, 0, 8)
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var terminal openAIRawStreamTerminalState
@@ -329,7 +356,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		if clientDisconnected {
 			return
 		}
-		if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
+		if !clientOutputStarted && (!refusalDetector.ShouldReleaseClientOutput() || (firstOutputGuard != nil && !outputSeen)) {
 			pendingLines = append(pendingLines, line)
 			return
 		}
@@ -358,6 +385,9 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	}
 
 	for scanner.Scan() {
+		if firstOutputGuard.timedOut() {
+			break
+		}
 		line := scanner.Text()
 		refusalDetector.ObserveSSELine(line)
 		if payload, ok := extractOpenAISSEDataLine(line); ok {
@@ -370,6 +400,12 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 				if u := extractCCStreamUsage(payload); u != nil {
 					usage = *u
 				}
+				if openAIRawChatChunkStartsUsableOutput(payload) {
+					if !firstOutputGuard.observeOutput() {
+						break
+					}
+				}
+				outputSeen = outputSeen || openAIRawChatChunkStartsOutput(payload)
 				if firstTokenMs == nil && !usageOnlyChunk {
 					elapsed := int(time.Since(startTime).Milliseconds())
 					firstTokenMs = &elapsed
@@ -409,6 +445,13 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
 		}
+	}
+	if firstOutputGuard.timedOut() {
+		err := s.newOpenAIChatOutputTimeoutError(c, account, startTime, originalModel, resp.Header, clientOutputStarted)
+		if clientOutputStarted {
+			return resultWithUsage(), err
+		}
+		return nil, err
 	}
 
 	scanErr := scanner.Err()
@@ -502,6 +545,36 @@ func isOpenAIChatUsageOnlyStreamChunk(payload string) bool {
 	return choices.Exists() && choices.IsArray() && len(choices.Array()) == 0
 }
 
+func openAIRawChatChunkStartsUsableOutput(payload string) bool {
+	for _, choice := range gjson.Get(payload, "choices").Array() {
+		delta := choice.Get("delta")
+		if delta.Get("content").String() != "" || delta.Get("refusal").String() != "" ||
+			delta.Get("reasoning_content").String() != "" || delta.Get("reasoning").String() != "" ||
+			delta.Get("function_call.arguments").String() != "" {
+			return true
+		}
+		for _, call := range delta.Get("tool_calls").Array() {
+			if call.Get("function.arguments").String() != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAIRawChatChunkStartsOutput(payload string) bool {
+	if openAIRawChatChunkStartsUsableOutput(payload) {
+		return true
+	}
+	for _, choice := range gjson.Get(payload, "choices").Array() {
+		delta := choice.Get("delta")
+		if len(delta.Get("tool_calls").Array()) > 0 || delta.Get("function_call").Exists() {
+			return true
+		}
+	}
+	return false
+}
+
 // extractCCStreamUsage 从单个 CC 流式 chunk 的 payload 中提取 usage 字段。
 // CC 协议中 usage 仅出现在末尾 chunk（且仅当 include_usage 生效时），
 // 但上游可能在多个 chunk 中重复——总是用最新值。
@@ -528,10 +601,18 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	reasoningEffort *string,
 	serviceTier *string,
 	startTime time.Time,
+	firstOutputGuards ...*openAITextFirstOutputGuard,
 ) (*OpenAIForwardResult, error) {
+	var firstOutputGuard *openAITextFirstOutputGuard
+	if len(firstOutputGuards) > 0 {
+		firstOutputGuard = firstOutputGuards[0]
+	}
 	requestID := resp.Header.Get("x-request-id")
 
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	if firstOutputGuard.timedOut() {
+		return nil, s.newOpenAIChatOutputTimeoutError(c, account, startTime, originalModel, resp.Header, false)
+	}
 	if err != nil {
 		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
 			writeChatCompletionsError(c, http.StatusBadGateway, "api_error", "Failed to read upstream response")
@@ -557,6 +638,9 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	observeOpenAI429RecoveryOutput(c.Request.Context(), account, respBody, "")
 	respBody = s.replaceModelInResponseBody(respBody, upstreamModel, originalModel)
 
+	if !firstOutputGuard.observeOutput() {
+		return nil, s.newOpenAIChatOutputTimeoutError(c, account, startTime, originalModel, resp.Header, false)
+	}
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	}

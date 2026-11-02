@@ -28,6 +28,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	decision OpenAIWSProtocolDecision,
 	isCodexCLI bool,
 	reqStream bool,
+	imageIntent bool,
 	originalModel string,
 	mappedModel string,
 	startTime time.Time,
@@ -362,6 +363,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if err := takeOpenAIModelDispatch(ctx, account.ID); err != nil {
 		return nil, err
 	}
+	firstOutputStartedAt := time.Now()
 	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
@@ -416,6 +418,17 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	clientDisconnected := false
 	clientDisconnectDrainStartedAt := time.Time{}
 	readTimeout := s.openAIWSReadTimeout()
+	firstOutputTimeout := time.Duration(0)
+	firstOutputDeadline := time.Time{}
+	if !imageIntent {
+		firstOutputTimeout = s.openAITextFirstOutputTimeout()
+		firstOutputDeadline = firstOutputStartedAt.Add(firstOutputTimeout)
+	}
+	reasoningEffort := ""
+	if value := extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel); value != nil {
+		reasoningEffort = *value
+	}
+	firstUsableOutputObserved := false
 	upstreamReadCtx := ctx
 	upstreamReadDetached := false
 	var releaseDetachedProbe func()
@@ -553,14 +566,33 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			)
 		}
 	}
+	firstOutputExpired := func() error {
+		lease.MarkBroken()
+		proxyID, proxyName := opsUpstreamWSProxyAttribution(account)
+		failoverErr := s.newOpenAIFirstOutputTimeoutError(
+			ctx, c, account, proxyID, proxyName, firstOutputStartedAt,
+			originalModel, reasoningEffort,
+			firstOutputTimeout, "websocket_first_usable_output", lease.HandshakeHeaders(),
+		)
+		if !wroteDownstream {
+			return failoverErr
+		}
+		if reqStream && !clientDisconnected {
+			emitStreamMessage([]byte(`{"type":"error","error":{"type":"first_output_timeout","code":"first_output_timeout","message":"Upstream produced no usable output before the deadline"}}`), true)
+		}
+		return errors.New("openai ws first usable output timeout after downstream output")
+	}
 
-	// Keep per-read timeouts unchanged for connected clients. Once a client
-	// disconnects, use the same timeout as a bounded total drain budget.
+	// Bound each pre-output read by the fixed attempt deadline. Once the client
+	// disconnects, use the normal read timeout as a total drain budget.
 	var pendingJSONDocuments [][]byte
 
 readLoop:
 	for {
 		markClientRequestCanceled()
+		if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved && !time.Now().Before(firstOutputDeadline) {
+			return nil, firstOutputExpired()
+		}
 		var message []byte
 		var readErr error
 		readUsedDetachedContext := upstreamReadDetached
@@ -569,6 +601,11 @@ readLoop:
 			pendingJSONDocuments = pendingJSONDocuments[1:]
 		} else {
 			currentReadTimeout := readTimeout
+			if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved {
+				if remaining := time.Until(firstOutputDeadline); remaining < currentReadTimeout {
+					currentReadTimeout = remaining
+				}
+			}
 			if clientDisconnected && !clientDisconnectDrainStartedAt.IsZero() {
 				remaining := readTimeout - time.Since(clientDisconnectDrainStartedAt)
 				if remaining <= 0 {
@@ -595,6 +632,9 @@ readLoop:
 			}
 		}
 		markClientRequestCanceled()
+		if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved && !time.Now().Before(firstOutputDeadline) {
+			return nil, firstOutputExpired()
+		}
 		if readErr == nil && !json.Valid(message) {
 			eventType, _, _ := parseOpenAIWSEventEnvelope(message)
 			if eventType == "" {
@@ -660,12 +700,16 @@ readLoop:
 			firstEventType = eventType
 		}
 		lastEventType = eventType
+		isUsableOutput := openAIStreamDataStartsVisibleOutput(string(message), eventType)
+		if !firstUsableOutputObserved && isUsableOutput {
+			firstUsableOutputObserved = true
+		}
 
 		if responseID == "" && eventResponseID != "" {
 			responseID = eventResponseID
 		}
 
-		isTokenEvent := isOpenAIWSTokenEvent(eventType)
+		isTokenEvent := isOpenAIWSTokenEvent(eventType) && isUsableOutput
 		if isTokenEvent {
 			tokenEventCount++
 		}
@@ -781,9 +825,8 @@ readLoop:
 		}
 
 		if reqStream {
-			// 在首个 token 前先缓冲事件（如 response.created），
-			// 以便上游早期断连时仍可安全回退到 HTTP，不给下游发送半截流。
-			shouldBuffer := firstTokenMs == nil && !isTokenEvent && !isTerminalEvent
+			// Keep replayable preamble private until the first committed output.
+			shouldBuffer := !openAIStreamDataStartsClientOutput(string(message), eventType) && !isTerminalEvent
 			if shouldBuffer {
 				buffered := make([]byte, len(message))
 				copy(buffered, message)

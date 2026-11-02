@@ -287,6 +287,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		attemptImageIntentInvalidated,
 		IsImageGenerationIntent,
 	)
+	textTimeoutImageIntent := IsExplicitImageGenerationIntent(openAIResponsesEndpoint, policyModel, body)
 	if imageIntent && !GroupAllowsImageGeneration(apiKeyGroup(apiKey)) {
 		MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalFeatureGate)
 		c.JSON(http.StatusForbidden, gin.H{
@@ -366,6 +367,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	responseID := ""
 	imageCount := 0
 	var imageOutputSizes []string
+	var forwardErr error
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 && OpenAIRetryBudgetExpired(ctx) {
 			return nil, ErrOpenAIRetryBudgetExhausted
@@ -376,10 +378,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		SetOpsUpstreamModel(c, actualModel)
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		var textGuard *openAITextFirstOutputGuard
+		if account.Platform == PlatformOpenAI && !textTimeoutImageIntent && !isOpenAIResponsesCompactPath(c) {
+			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()))
+		}
 		upstreamCtxReleased := false
 		releaseAttemptContext := func() {
 			if !upstreamCtxReleased {
 				upstreamCtxReleased = true
+				textGuard.close()
 				releaseUpstreamCtx()
 			}
 		}
@@ -396,6 +403,13 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		upstreamStart := time.Now()
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		if resp != nil {
+			textGuard.setBody(resp.Body)
+		}
+		if textGuard.timedOut() {
+			return nil, s.newOpenAIFirstOutputTimeoutError(ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+				startTime, reqModel, "", s.openAITextFirstOutputTimeout(), "response_headers", nil)
+		}
 		if err != nil {
 			if IsOpenAIModelDispatchStop(err) {
 				return nil, err
@@ -408,6 +422,10 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			// Peek only to identify an invalid task. Restore the body so the existing
 			// passthrough error handling sees the same response after recovery fails.
 			probeBody := s.readUpstreamErrorBody(resp)
+			if textGuard.timedOut() {
+				return nil, s.newOpenAIFirstOutputTimeoutError(ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+					startTime, reqModel, "", s.openAITextFirstOutputTimeout(), "response_body", resp.Header)
+			}
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, probeBody); retryErr != nil {
@@ -464,7 +482,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 
 		if reqStream {
-			result, handleErr := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
+			result, handleErr := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel, textGuard)
 			if handleErr != nil {
 				if retryBody, fallbackModel, retry := s.applyOpenAIPassthroughCompactFallbackFromSignal(
 					c, account, requestedModel, body, handleErr, compactModelFallbackRetried, resp,
@@ -485,7 +503,11 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 					return nil, s.handleErrorResponsePassthrough(ctx, compactResp, c, account, body, compactBody)
 				}
 				_ = resp.Body.Close()
-				return nil, handleErr
+				var failoverErr *UpstreamFailoverError
+				if result == nil || errors.As(handleErr, &failoverErr) {
+					return nil, handleErr
+				}
+				forwardErr = handleErr
 			}
 			usage = result.usage
 			firstTokenMs = result.firstTokenMs
@@ -493,7 +515,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			imageCount = result.imageCount
 			imageOutputSizes = result.imageOutputSizes
 		} else {
-			result, handleErr := s.handleNonStreamingResponsePassthrough(ctx, resp, c, account, reqModel, upstreamPassthroughModel)
+			result, handleErr := s.handleNonStreamingResponsePassthrough(ctx, resp, c, account, reqModel, upstreamPassthroughModel, textGuard)
 			if handleErr != nil {
 				if retryBody, fallbackModel, retry := s.applyOpenAIPassthroughCompactFallbackFromSignal(
 					c, account, requestedModel, body, handleErr, compactModelFallbackRetried, resp,
@@ -562,7 +584,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		forwardResult.ImageOutputSizes = imageOutputSizes
 		forwardResult.BillingModel = imageBillingModel
 	}
-	return forwardResult, nil
+	return forwardResult, forwardErr
 }
 
 func logOpenAIPassthroughInstructionsRejected(
@@ -1378,7 +1400,7 @@ func openAIStreamItemHasVisibleOutput(item gjson.Result) bool {
 	}
 	for _, path := range []string{"content", "summary"} {
 		for _, part := range item.Get(path).Array() {
-			if part.Get("text").String() != "" || part.Get("transcript").String() != "" {
+			if part.Get("text").String() != "" || part.Get("transcript").String() != "" || part.Get("refusal").String() != "" {
 				return true
 			}
 		}
@@ -1407,6 +1429,8 @@ func openAIStreamDataStartsVisibleOutput(data, eventType string) bool {
 		"response.reasoning_text.done",
 		"response.audio_transcript.done":
 		return gjson.Get(trimmed, "text").String() != ""
+	case "response.refusal.done":
+		return gjson.Get(trimmed, "refusal").String() != ""
 	case "response.function_call_arguments.done":
 		return gjson.Get(trimmed, "arguments").String() != ""
 	case "response.custom_tool_call_input.done":
@@ -2045,7 +2069,16 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	startTime time.Time,
 	originalModel string,
 	mappedModel string,
+	textGuards ...*openAITextFirstOutputGuard,
 ) (*openaiStreamingResultPassthrough, error) {
+	var textGuard *openAITextFirstOutputGuard
+	if len(textGuards) > 0 {
+		textGuard = textGuards[0]
+	} else if imageIntent, _ := getOpenAIImageIntentHint(c); account != nil && account.Platform == PlatformOpenAI && !imageIntent && !IsImageGenerationIntent(openAIResponsesEndpoint, originalModel, nil) && !isOpenAIResponsesCompactPath(c) {
+		_, textGuard = newOpenAITextFirstOutputGuard(ctx, startTime.Add(s.openAITextFirstOutputTimeout()))
+		defer textGuard.close()
+	}
+	textGuard.setBody(resp.Body)
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -2148,15 +2181,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	// 都收不到】—— 连 HTTP 响应头都不会提交（gin 的 ResponseWriter 直到首次写入
 	// 才发送 header）。Forward 路径为此加了心跳，透传路径漏了。
 	//
-	// 推理模型在首个可见输出前思考数百秒是常态，于是中间层代理会按空闲超时把
-	// 连接判死。这不是假设：某生产部署实测 12 小时内 44 个 /v1/responses 请求在
-	// 600~900s 才产出首个可见输出（每个 3~5 万 output token，上游其实算完了），
-	// 全部被中间 nginx 的 proxy_read_timeout(600s) 判超时回 504，用户一个字没拿到。
+	// 首输出期限内仍需向下游发送心跳，避免代理把等待首输出的连接误判为空闲。
 	//
 	// 心跳写出的 SSE 注释同时做到三件事：
 	//   1. 提交 HTTP 响应头，让下游知道连接活着；
 	//   2. 刷新中间层的空闲超时（proxy_read_timeout 衡量的是两次读之间的间隔，
-	//      不是请求总时长），长推理因此不再被误杀；
+	//      不是请求总时长）；
 	//   3. 不写出任何 pendingStage，
 	//      且心跳字节已由 OpenAICompactKeepaliveAdjustedWrittenSize 排除，
 	//      所以 pre-output failover 的能力完全不受影响（#3887 的记账在此复用）。
@@ -2260,8 +2290,18 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 	}
 
+	usableEventPending := false
 	for documentScanner.Scan() {
+		if textGuard.timedOut() {
+			break
+		}
 		line := documentScanner.Text()
+		if line == "" && usableEventPending {
+			if !textGuard.observeOutput() {
+				break
+			}
+			usableEventPending = false
+		}
 		if eventType, ok := extractOpenAISSEEventLine(line); ok {
 			pendingSSEEventType = eventType
 			eventType = strings.TrimSpace(eventType)
@@ -2434,6 +2474,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				trimmedData = strings.TrimSpace(string(sanitizedData))
 				line = "data: " + string(sanitizedData)
 			}
+			if !suppressCurrentEvent && openAIStreamDataStartsVisibleOutput(trimmedData, eventType) {
+				usableEventPending = true
+			}
 			semanticOutput := openAIStreamDataStartsClientOutput(trimmedData, eventType)
 			lineStartsClientOutput = forceFlushFailedEvent || semanticOutput
 			if !clientOutputStarted && !forceFlushFailedEvent {
@@ -2515,6 +2558,23 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			break
 		}
 	}
+	if textGuard.timedOut() {
+		stopKeepalive()
+		failoverErr := s.newOpenAIFirstOutputTimeoutError(ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+			startTime, originalModel, "", s.openAITextFirstOutputTimeout(), "usable_output", resp.Header)
+		if !clientOutputStarted {
+			return resultWithUsage(), failoverErr
+		}
+		// An earlier structural event may already belong to this response. End
+		// this stream explicitly; it must never be replayed on another account.
+		failoverErr.SafeToFailoverAfterWrite = false
+		MarkResponseCommitted(c)
+		if !clientDisconnected {
+			_, _ = fmt.Fprint(w, "\n\n"+buildOpenAIResponseFailedSSE(responseID, originalModel, createdAtTracker.Value(), nil, "Upstream produced no usable output before the deadline"))
+			flusher.Flush()
+		}
+		return resultWithUsage(), fmt.Errorf("upstream first usable output timeout after response started")
+	}
 	ensureResponseFailedTerminal()
 	if err := documentScanner.Err(); err != nil {
 		if (sawDone || sawTerminalEvent) && !sawFailedEvent {
@@ -2593,9 +2653,18 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	account *Account,
 	originalModel string,
 	mappedModel string,
+	textGuards ...*openAITextFirstOutputGuard,
 ) (*openaiNonStreamingResultPassthrough, error) {
+	var textGuard *openAITextFirstOutputGuard
+	if len(textGuards) > 0 {
+		textGuard = textGuards[0]
+	}
 	reader := openAI429RecoveryResponseReader(ctx, resp, account, resolveUpstreamResponseReadLimit(s.cfg))
 	body, err := ReadUpstreamResponseBody(reader, s.cfg, c, openAITooLargeError)
+	if textGuard.timedOut() || (err == nil && !textGuard.observeOutput()) {
+		return nil, s.newOpenAIFirstOutputTimeoutError(ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+			textGuard.deadline.Add(-s.openAITextFirstOutputTimeout()), originalModel, "", s.openAITextFirstOutputTimeout(), "response_body", resp.Header)
+	}
 	if err != nil {
 		return nil, err
 	}

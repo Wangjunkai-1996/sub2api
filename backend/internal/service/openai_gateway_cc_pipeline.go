@@ -194,6 +194,7 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	bearerToken string,
 	userAgent string,
 	grokCacheIdentity string,
+	firstOutputGuards ...*openAITextFirstOutputGuard,
 ) (*http.Response, error) {
 	// DeepSeek thinking mode 要求历史 assistant 回传 reasoning_content。
 	// Responses→CC 回退在加密-only / 缺 reasoning item 且缓存未命中时会漏掉该
@@ -201,6 +202,11 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// passed back to the API"。在共用出站点补空格占位，真实明文不覆盖。
 	body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	if len(firstOutputGuards) > 0 && firstOutputGuards[0] != nil {
+		// The caller already detached and owns the first-output cancellation.
+		releaseUpstreamCtx()
+		upstreamCtx, releaseUpstreamCtx = ctx, func() {}
+	}
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		releaseUpstreamCtx()
@@ -257,6 +263,9 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 			_ = resp.Body.Close()
 		}
 		releaseUpstreamCtx()
+		if len(firstOutputGuards) > 0 && firstOutputGuards[0].timedOut() {
+			return nil, err
+		}
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
 	if resp == nil || resp.Body == nil {

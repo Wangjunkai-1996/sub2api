@@ -46,17 +46,23 @@ type openaiNonStreamingResult struct {
 }
 
 func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel string) (*openaiStreamingResult, error) {
-	return s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, mappedModel, "")
+	imageIntent, _ := getOpenAIImageIntentHint(c)
+	imageIntent = imageIntent || isOpenAIImageGenerationModel(mappedModel) || IsImageGenerationIntent(openAIResponsesEndpoint, originalModel, nil)
+	return s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, mappedModel, "", imageIntent)
 }
 
-func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string) (*openaiStreamingResult, error) {
+func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string, imageIntent bool) (*openaiStreamingResult, error) {
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
 	}
 	firstOutputTimeout := time.Duration(0)
+	textFirstOutput := account != nil && account.Platform == PlatformOpenAI && !imageIntent && !isOpenAIResponsesCompactPath(c)
 	if account != nil && account.Platform == PlatformOpenAI {
 		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffort)
+		if textFirstOutput {
+			firstOutputTimeout = s.openAITextFirstOutputTimeout()
+		}
 	}
 	// Native OpenAI Responses preamble belongs to one upstream attempt. Keep it
 	// private until the first non-replayable event even when the timeout is off;
@@ -144,6 +150,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		return nil
 	}
 	firstOutputProgressObserved := false
+	firstUsableOutputObserved := false
 	clientOutputStarted := false
 	var replayBoundary openAIStreamReplayBoundary
 	replayLogger := logger.FromContext(ctx).With(zap.String("path", "native_sse"),
@@ -342,6 +349,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	eventInProgress := false
 	eventStartsClientOutput := false
 	eventStartsTTFTOutput := false
+	eventStartsUsableOutput := false
 	eventShouldFlush := false
 	handlePendingWriteError := func(err error) {
 		if firstOutputStage != nil && !firstOutputStage.closed {
@@ -361,6 +369,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	completeGuardedEvent := func(queueDrained bool, releaseGuardedRead func()) {
 		completedProgressEvent := eventStartsClientOutput
 		completedTTFTEvent := eventStartsTTFTOutput
+		completedUsableEvent := eventStartsUsableOutput
 
 		firstProgressEvent := completedProgressEvent && !firstOutputProgressObserved
 		if ttftCommentRequested && completedTTFTEvent && firstTokenMs == nil {
@@ -395,6 +404,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		}
 		if firstProgressEvent {
 			firstOutputProgressObserved = true
+			if !textFirstOutput {
+				stopFirstOutputTimer()
+			}
+		}
+		if completedUsableEvent {
+			firstUsableOutputObserved = true
 			stopFirstOutputTimer()
 		}
 		if completedTTFTEvent && firstTokenMs == nil {
@@ -404,6 +419,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 
 		eventStartsClientOutput = false
 		eventStartsTTFTOutput = false
+		eventStartsUsableOutput = false
 		eventShouldFlush = false
 	}
 	sendErrorEvent := func(code, message string) {
@@ -455,6 +471,28 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 	resultWithError := func(err error) (*openaiStreamingResult, error) {
 		return resultWithUsage(), err
+	}
+	expireFirstOutput := func() (*openaiStreamingResult, error) {
+		_ = resp.Body.Close()
+		phase := "semantic_output"
+		if textFirstOutput {
+			phase = "visible_output"
+		}
+		failoverErr := s.newOpenAIFirstOutputTimeoutError(
+			ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+			startTime, originalModel, reasoningEffort, firstOutputTimeout, phase, resp.Header,
+		)
+		if !clientOutputHasStarted() {
+			return resultWithError(failoverErr)
+		}
+		// A structural or opaque event may already have committed this attempt
+		// without producing usable text. End it explicitly; never replay it.
+		if eventInProgress {
+			_, _ = writePendingString("\n")
+			eventInProgress = false
+		}
+		sendErrorEvent("first_output_timeout", "Upstream produced no usable output before the deadline")
+		return resultWithError(errors.New("OpenAI first usable output timeout after response commitment"))
 	}
 	flushPending := func(disconnectMessage string) {
 		if clientDisconnected || pendingBytes() == 0 {
@@ -827,6 +865,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			if stageBeforeClientOutput {
 				eventStartsClientOutput = eventStartsClientOutput || startsClientOutput
 				eventStartsTTFTOutput = eventStartsTTFTOutput || startsTTFTOutput
+				eventStartsUsableOutput = eventStartsUsableOutput || (startsVisibleOutput && !suppressCurrentEvent)
 				if startsClientOutput {
 					firstOutputScanGuard.Store(false)
 				}
@@ -858,7 +897,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				if releaseGuardedRead != nil {
 					releaseGuardedRead()
 				}
-				stopFirstOutputTimer()
+				if !textFirstOutput {
+					stopFirstOutputTimer()
+				}
 				applyAttemptResponseHeaders()
 				if err := flushBuffered("oversized_first_nonreplayable_event"); err != nil {
 					clientDisconnected = true
@@ -919,6 +960,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				eventInProgress = false
 				eventStartsClientOutput = false
 				eventStartsTTFTOutput = false
+				eventStartsUsableOutput = false
 				eventShouldFlush = false
 				return
 			}
@@ -927,6 +969,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				eventInProgress = false
 				eventStartsClientOutput = false
 				eventStartsTTFTOutput = false
+				eventStartsUsableOutput = false
 				eventShouldFlush = false
 				return
 			}
@@ -1063,6 +1106,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	for {
 		select {
 		case ev, ok := <-events:
+			if textFirstOutput && !firstUsableOutputObserved && time.Until(startTime.Add(firstOutputTimeout)) <= 0 {
+				if ok {
+					markEventProcessed(ev)
+				}
+				return expireFirstOutput()
+			}
 			if !ok {
 				if stageBeforeClientOutput && eventInProgress {
 					// EOF dispatches the final SSE event even without a trailing blank
@@ -1106,7 +1155,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// Long reasoning requests may legitimately remain silent before their
 			// first semantic event. Let the dedicated first-output deadline govern
 			// that phase; the stream idle timeout resumes once semantic output starts.
-			if !firstOutputProgressObserved && firstOutputTimeout > streamInterval && !sawBareError && !sawResponseFailed {
+			if firstOutputCh != nil && firstOutputTimeout > streamInterval && !sawBareError && !sawResponseFailed {
 				continue
 			}
 			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
@@ -1143,7 +1192,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			return resultWithUsage(), fmt.Errorf("stream data interval timeout")
 
 		case <-firstOutputCh:
-			if firstOutputProgressObserved {
+			if firstUsableOutputObserved || (!textFirstOutput && firstOutputProgressObserved) {
 				stopFirstOutputTimer()
 				continue
 			}
@@ -1151,16 +1200,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				_ = resp.Body.Close()
 				return finalizeStream()
 			}
-			_ = resp.Body.Close()
-			for ev := range events {
-				markEventProcessed(ev)
-			}
-			result, err := resultWithError(s.newOpenAIFirstOutputTimeoutError(
-				ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
-				startTime, originalModel, reasoningEffort,
-				firstOutputTimeout, "semantic_output", resp.Header,
-			))
-			return result, err
+			return expireFirstOutput()
 
 		case <-keepaliveCh:
 			if clientDisconnected || failureDelivered {
@@ -1837,10 +1877,17 @@ func openAICacheCreationTokensFromUsage(value gjson.Result) int {
 }
 
 func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
+	return s.handleNonStreamingResponseWithGuard(ctx, resp, c, account, originalModel, mappedModel, nil)
+}
+
+func (s *OpenAIGatewayService) handleNonStreamingResponseWithGuard(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string, guard *openAITextFirstOutputGuard) (*openaiNonStreamingResult, error) {
 	reader := openAI429RecoveryResponseReader(ctx, resp, account, resolveUpstreamResponseReadLimit(s.cfg))
 	body, err := ReadUpstreamResponseBody(reader, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
+	}
+	if !guard.observeOutput() {
+		return nil, context.DeadlineExceeded
 	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {

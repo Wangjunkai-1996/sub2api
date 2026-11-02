@@ -309,7 +309,7 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 		ProxyName: proxyName,
 		Platform:  account.Platform, AccountID: account.ID, AccountName: account.Name,
 		UpstreamStatusCode: http.StatusGatewayTimeout, UpstreamRequestID: requestID,
-		Kind: "first_output_timeout", Message: "OpenAI upstream produced no semantic output before the deadline",
+		Kind: "first_output_timeout", Message: "OpenAI upstream produced no usable output before the deadline",
 		Detail: fmt.Sprintf("phase=%s elapsed_ms=%d timeout_ms=%d", phase, elapsed.Milliseconds(), timeout.Milliseconds()),
 	})
 	if s.rateLimitService != nil {

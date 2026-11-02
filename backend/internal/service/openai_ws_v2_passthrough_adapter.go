@@ -426,6 +426,13 @@ func (c *openAIWSPassthroughFirstOutputFrameConn) ReadFrame(ctx context.Context)
 		select {
 		case result := <-readResultCh:
 			if result.err == nil {
+				state := c.deadlineState()
+				if state.armed && state.deadline.timeout > 0 && !time.Now().Before(state.deadline.startedAt.Add(state.deadline.timeout)) {
+					if state.deadline.phase == openAIWSPassthroughDeadlinePhaseActiveRead {
+						return coderws.MessageText, nil, &openAIWSPassthroughActiveTurnTimeoutError{}
+					}
+					return coderws.MessageText, nil, &openAIWSPassthroughFirstOutputTimeoutError{deadline: state.deadline}
+				}
 				c.observeUpstreamActivity(result.msgType, result.payload)
 			}
 			return result.msgType, result.payload, result.err
@@ -576,12 +583,8 @@ func openAIWSPassthroughStartsSemanticOutput(payload []byte) bool {
 	switch eventType {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		return true
-	case "", "response.created", "response.in_progress", "response.output_item.added", "response.output_item.done":
-		return false
 	}
-	return strings.Contains(eventType, ".delta") ||
-		strings.HasPrefix(eventType, "response.output_text") ||
-		strings.HasPrefix(eventType, "response.output")
+	return openAIStreamDataStartsVisibleOutput(string(payload), eventType)
 }
 
 func openAIWSPassthroughIsTerminalOutput(payload []byte) bool {
@@ -808,6 +811,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	// goroutine）之间同步当前 turn 的 usage metadata。
 	usageMeta.initFromFirstFrame(firstClientMessage, capturedSessionModel)
 	usageMeta.captureRequestedReasoningEffort(originalFirstClientMessage, capturedSessionModel)
+	var sessionImageTools atomic.Bool
+	var sessionImageChoice atomic.Bool
 	_, initialUpstreamModel := usageMeta.turnModels(initialRequestModel)
 	SetOpsUpstreamModel(c, initialUpstreamModel)
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -931,16 +936,19 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if current := usageMeta.reasoningEffort.Load(); current != nil {
 				reasoningEffort = *current
 			}
-			timeout := s.openAIFirstOutputTimeout(reasoningEffort)
-			if timeout <= 0 {
-				timeout = s.openAIWSPassthroughIdleTimeout()
-			}
 			model := openAIWSPassthroughRequestModelForFrame(payload)
 			if model == "" {
 				model = usageMeta.requestModelForFrame(payload)
 			}
 			if model == "" {
 				model = requestModel
+			}
+			timeout := s.openAITextFirstOutputTimeout()
+			if sessionImageTools.Load() || sessionImageChoice.Load() || IsExplicitImageGenerationIntent(openAIResponsesEndpoint, model, payload) {
+				timeout = s.openAIFirstOutputTimeout(reasoningEffort)
+				if timeout <= 0 {
+					timeout = s.openAIWSPassthroughIdleTimeout()
+				}
 			}
 			return openAIWSPassthroughFirstOutputDeadline{
 				timeout:         timeout,
@@ -1023,6 +1031,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 				if accountScoped {
 					payload = accountScopedPayload
+				}
+			}
+			if eventType == "session.update" {
+				if tools := gjson.GetBytes(payload, "session.tools"); tools.Exists() {
+					sessionImageTools.Store(openAIJSONToolsContainNativeImageGeneration(tools))
+				}
+				if choice := gjson.GetBytes(payload, "session.tool_choice"); choice.Exists() {
+					sessionImageChoice.Store(openAIJSONToolChoiceSelectsExplicitImageGeneration(choice))
 				}
 			}
 			if isResponseCreate {
@@ -1446,7 +1462,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			deadline.requestModel,
 			deadline.reasoningEffort,
 			deadline.timeout,
-			"websocket_first_semantic_output",
+			"websocket_first_usable_output",
 			handshakeHeaders,
 		)
 		if turnCount == 0 && !relayExit.WroteDownstream {
