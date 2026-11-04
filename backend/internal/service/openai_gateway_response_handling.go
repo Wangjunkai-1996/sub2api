@@ -270,8 +270,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 
 	var firstOutputTimer *time.Timer
 	var firstOutputCh <-chan time.Time
+	firstOutputDeadline := openAIFirstOutputDeadline(ctx, startTime, firstOutputTimeout)
 	if firstOutputTimeout > 0 {
-		remaining := time.Until(startTime.Add(firstOutputTimeout))
+		remaining := time.Until(firstOutputDeadline)
 		if remaining <= 0 {
 			remaining = time.Nanosecond
 		}
@@ -486,7 +487,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
 			startTime, originalModel, reasoningEffort, firstOutputTimeout, phase, resp.Header,
 		)
-		if !clientOutputHasStarted() {
+		if !clientOutputHasStarted() || IsOpenAIManagedRecovery(ctx) {
 			return resultWithError(failoverErr)
 		}
 		// A structural or opaque event may already have committed this attempt
@@ -560,6 +561,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				message := "OpenAI stream ended before a terminal event"
 				recordStreamError(nil, "stream_missing_terminal", message)
 				s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
+			}
+			if IsOpenAIManagedRecovery(ctx) && !clientDisconnected {
+				return resultWithUsage(), newPreOutputFailoverError(nil, "OpenAI stream ended before a terminal event")
 			}
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
 		}
@@ -637,6 +641,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		recordStreamError(nil, "stream_read_error", readMessage)
 		s.recordOpenAIProxyStreamDisconnect(account, scanErr, upstreamRequestID)
 		code, message := classifyOpenAIUpstreamStreamReadError(scanErr)
+		if IsOpenAIManagedRecovery(ctx) {
+			return resultWithUsage(), newPreOutputFailoverError(nil, message, resp.Header), true
+		}
 		sendErrorEvent(code, message)
 		return resultWithUsage(), fmt.Errorf("stream read error: %w", newOpenAIUpstreamStreamReadError(scanErr)), true
 	}
@@ -723,6 +730,17 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					})
 				}
 				outputStarted := clientOutputHasStarted()
+				if IsOpenAIManagedRecovery(ctx) && !cyberHit {
+					shouldFailover := openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
+					if eventType == "error" {
+						shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
+					}
+					if shouldFailover {
+						sawFailedEvent = true
+						streamEarlyErr = newPreOutputFailoverErrorWithModel(dataBytes, failedMessage, resp.Header)
+						return
+					}
+				}
 				if !outputStarted && sessionBlocked {
 					sawFailedEvent = true
 					streamEarlyErr = newOpenAISessionBlockedFailoverError(http.StatusOK, resp.Header, dataBytes)
@@ -1120,7 +1138,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	for {
 		select {
 		case ev, ok := <-events:
-			if textFirstOutput && !firstUsableOutputObserved && time.Until(startTime.Add(firstOutputTimeout)) <= 0 {
+			if textFirstOutput && !firstUsableOutputObserved && time.Until(firstOutputDeadline) <= 0 {
 				if ok {
 					markEventProcessed(ev)
 				}
@@ -1202,6 +1220,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					_ = resp.Body.Close()
 					return resultWithUsage(), grokStreamIdleFailoverError(account, streamInterval)
 				}
+			}
+			if IsOpenAIManagedRecovery(ctx) {
+				_ = resp.Body.Close()
+				return resultWithUsage(), newPreOutputFailoverError(nil, "Upstream response stream timed out", resp.Header)
 			}
 			sendErrorEvent("stream_timeout", "Upstream response stream timed out")
 			return resultWithUsage(), fmt.Errorf("stream data interval timeout")

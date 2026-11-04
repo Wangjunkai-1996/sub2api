@@ -1,0 +1,160 @@
+package service
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"strings"
+)
+
+var ErrOpenAIRecoveryHistoryUnavailable = errors.New("complete portable OpenAI recovery history unavailable")
+
+type openAIRecoveryHistory struct {
+	Version int               `json:"version"`
+	Turns   int               `json:"turns"`
+	Items   []json.RawMessage `json:"items"`
+}
+
+// BuildOpenAIRecoverySnapshot records only the successful attempt's portable
+// text context. A missing snapshot must disable cross-account reconstruction,
+// not same-account continuation. Output must be captured before public ID and
+// display-transcript rewriting.
+func BuildOpenAIRecoverySnapshot(request, winnerOutput, previousSnapshot []byte) ([]byte, error) {
+	var body map[string]json.RawMessage
+	if json.Unmarshal(request, &body) != nil || !openAIRecoveryPortableRequest(body) {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	current, err := openAIRecoveryTextItems(body["input"], false)
+	if err != nil {
+		return nil, err
+	}
+	history := openAIRecoveryHistory{Version: 1, Turns: 1}
+	previousID := bytes.TrimSpace(body["previous_response_id"])
+	hasPrevious := len(previousID) > 0 && !bytes.Equal(previousID, []byte("null")) && !bytes.Equal(previousID, []byte(`""`))
+	if hasPrevious {
+		if json.Unmarshal(previousSnapshot, &history) != nil || history.Version != 1 || history.Turns < 1 || history.Turns >= 16 || len(previousSnapshot) > openAIRecoveryAliasMaxSnapshot {
+			return nil, ErrOpenAIRecoveryHistoryUnavailable
+		}
+		history.Turns++
+	}
+	output, err := openAIRecoveryTextItems(winnerOutput, true)
+	if err != nil {
+		return nil, err
+	}
+	history.Items = append(history.Items, current...)
+	history.Items = append(history.Items, output...)
+	snapshot, err := json.Marshal(history)
+	if err != nil || len(snapshot) > openAIRecoveryAliasMaxSnapshot {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	return snapshot, nil
+}
+
+// RebuildOpenAIRecoveryContinuation uses a verified alias snapshot to form a
+// self-contained request. The caller still validates the target model, account,
+// and egress and removes the previous account's turn-state header.
+func RebuildOpenAIRecoveryContinuation(request, snapshot []byte) ([]byte, error) {
+	var history openAIRecoveryHistory
+	if len(snapshot) == 0 || len(snapshot) > openAIRecoveryAliasMaxSnapshot || json.Unmarshal(snapshot, &history) != nil || history.Version != 1 || history.Turns < 1 || history.Turns >= 16 {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	var body map[string]json.RawMessage
+	if json.Unmarshal(request, &body) != nil || !openAIRecoveryPortableRequest(body) {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	current, err := openAIRecoveryTextItems(body["input"], false)
+	if err != nil {
+		return nil, err
+	}
+	// Revalidate persisted content instead of trusting version alone.
+	stored, err := json.Marshal(history.Items)
+	if err != nil {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	items, err := openAIRecoveryTextItems(stored, false)
+	if err != nil {
+		return nil, err
+	}
+	items = append(items, current...)
+	body["input"], err = json.Marshal(items)
+	if err != nil || len(body["input"]) > 16<<20 {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	delete(body, "previous_response_id")
+	rebuilt, err := json.Marshal(body)
+	if err != nil {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	return rebuilt, nil
+}
+
+func openAIRecoveryPortableRequest(body map[string]json.RawMessage) bool {
+	if body == nil {
+		return false
+	}
+	for _, key := range []string{"tools", "conversation", "context_management"} {
+		value := bytes.TrimSpace(body[key])
+		if len(value) > 0 && !bytes.Equal(value, []byte("null")) && !bytes.Equal(value, []byte("[]")) {
+			return false
+		}
+	}
+	return true
+}
+
+// Text-only canonical items deliberately omit account-owned item IDs and status.
+// Unknown content (files, tool calls, opaque reasoning) is not silently dropped.
+func openAIRecoveryTextItems(raw []byte, output bool) ([]json.RawMessage, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	var text string
+	if !output && json.Unmarshal(raw, &text) == nil {
+		item, _ := json.Marshal(map[string]any{"type": "message", "role": "user", "content": text})
+		return []json.RawMessage{item}, nil
+	}
+	var items []map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &items) != nil || items == nil {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
+	}
+	result := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		var itemType, role string
+		_ = json.Unmarshal(item["type"], &itemType)
+		_ = json.Unmarshal(item["role"], &role)
+		if (itemType != "" && itemType != "message") || (role != "user" && role != "assistant" && role != "system" && role != "developer") || (output && role != "assistant") {
+			return nil, ErrOpenAIRecoveryHistoryUnavailable
+		}
+		for key := range item {
+			if key != "type" && key != "role" && key != "content" && key != "id" && key != "status" {
+				return nil, ErrOpenAIRecoveryHistoryUnavailable
+			}
+		}
+		var content string
+		if json.Unmarshal(item["content"], &content) != nil {
+			var parts []map[string]json.RawMessage
+			if json.Unmarshal(item["content"], &parts) != nil || parts == nil {
+				return nil, ErrOpenAIRecoveryHistoryUnavailable
+			}
+			var builder strings.Builder
+			for _, part := range parts {
+				for key := range part {
+					if key != "type" && key != "text" && key != "annotations" && key != "logprobs" {
+						return nil, ErrOpenAIRecoveryHistoryUnavailable
+					}
+				}
+				var partType, partText string
+				if json.Unmarshal(part["type"], &partType) != nil || json.Unmarshal(part["text"], &partText) != nil || (partType != "input_text" && partType != "output_text") {
+					return nil, ErrOpenAIRecoveryHistoryUnavailable
+				}
+				builder.WriteString(partText)
+			}
+			content = builder.String()
+		}
+		canonical, err := json.Marshal(map[string]any{"type": "message", "role": role, "content": content})
+		if err != nil {
+			return nil, ErrOpenAIRecoveryHistoryUnavailable
+		}
+		result = append(result, canonical)
+	}
+	return result, nil
+}

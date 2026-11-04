@@ -99,6 +99,9 @@ func sameAccountRetryAllowed(failoverErr *service.UpstreamFailoverError, retryCo
 // recoverable failures. Service-level compatibility repairs still run in place.
 // Other entry points retain their configured pool retry behavior.
 func openAIAccountRetryBeforeFailoverAllowed(ctx context.Context, failoverErr *service.UpstreamFailoverError) bool {
+	if service.IsOpenAIManagedRecovery(ctx) {
+		return failoverErr != nil && failoverErr.RetryableOnSameAccount
+	}
 	if service.HasOpenAIModelDispatchBudget(ctx) {
 		return false
 	}

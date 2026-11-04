@@ -242,10 +242,13 @@ gateway:
   # End-to-end hard budget shared by queueing, upstream attempts, and retries (seconds; default 900).
   # A value of 0 uses the safe 900-second default and cannot disable this limit.
   openai_request_budget_seconds: 900
-  # Error retry/account failover eligibility window from request entry (seconds).
-  # 0 derives min(300, effective request budget); set 300 for the normal five-minute retry window.
-  # An attempt that started before this window may continue until the 900-second hard budget.
-  openai_retry_budget_seconds: 300
+  # Deprecated legacy retry eligibility window (seconds; omitted/0 uses min(300, request budget)).
+  # Signed NewAPI managed recovery v1 ignores this window: it shares the logical deadline
+  # and 11 physical dispatches, reserves up to 300 seconds after the first attempt,
+  # and keeps 15 seconds for final delivery. Remove this key after managed-channel migration.
+  # Legacy/unmanaged entry points retain their historical retry-window behavior.
+  # 受管 v1 不再被旧 300 秒资格窗口截断；仅旧入口继续使用此配置。
+  # openai_retry_budget_seconds: 300
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456

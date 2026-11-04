@@ -218,7 +218,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	if account.Platform == PlatformOpenAI && !IsExplicitImageGenerationIntent("/v1/chat/completions", originalModel, body) && !isOpenAIImageGenerationModel(upstreamModel) {
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		defer releaseUpstreamCtx()
-		sendCtx, firstOutputGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()))
+		sendCtx, firstOutputGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()), s.openAITextFirstOutputTimeout())
 		defer firstOutputGuard.close()
 	}
 	resp, err := s.sendCCUpstreamRequest(sendCtx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity, firstOutputGuard)
@@ -488,8 +488,8 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 			zap.Bool("saw_sse_data", terminal.sawDataLine),
 			zap.Bool("client_output_started", clientOutputStarted),
 		)
-		if !clientOutputStarted {
-			// 响应头尚未提交：可以透明换号重试，客户端不会看到半截流。
+		if !clientOutputStarted || IsOpenAIManagedRecovery(c.Request.Context()) {
+			// Managed recovery keeps the logical stream open across attempts.
 			return nil, newOpenAIRawStreamTruncatedFailoverError(c, account, requestID, cause)
 		}
 		// 已写出语义字节：无法再 failover，改为带类型的上游错误。handler 会据此

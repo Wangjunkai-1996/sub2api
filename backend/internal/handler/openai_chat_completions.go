@@ -14,6 +14,7 @@ import (
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -25,6 +26,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	defer h.recoverResponsesPanic(c, &streamStarted)
 
 	requestStart := time.Now()
+	managedRecovery := openAIManagedRecoveryRequested(c)
 
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
 	if !ok {
@@ -82,7 +84,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	auditBody := body
-	if cappedBody, changed, err := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); err != nil {
+	if managedRecovery && openAICompatibleRequestPlatform(c.Request.Context(), apiKey) == service.PlatformOpenAI {
+		bindRequestedReasoningEffort(c, body, reqModel)
+	} else if cappedBody, changed, err := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); err != nil {
 		respondOpenAIReasoningEffortPolicyError(c, err, h.errorResponse)
 		return
 	} else if changed {
@@ -117,7 +121,28 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
+	managedRecovery = managedRecovery && requestPlatform == service.PlatformOpenAI
+	if managedRecovery {
+		releaseRequestBudget := h.beginOpenAIRequestBudget(c, requestStart, true)
+		defer releaseRequestBudget()
+	}
 
+	var managedWriter *service.OpenAIRecoveryStreamWriter
+	if managedRecovery {
+		wireFormat := service.OpenAIRecoveryChatJSON
+		if reqStream {
+			wireFormat = service.OpenAIRecoveryChatSSE
+		}
+		managedWriter = service.NewOpenAIRecoveryStreamWriter(c.Writer, wireFormat, "chatcmpl-"+uuid.NewString(), body, nil)
+		c.Writer = managedWriter
+		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchObserver(c.Request.Context(), managedWriter.BeginAttempt))
+		defer func() {
+			if !managedWriter.Finalized() && !managedWriter.ClientDisconnected() && c.Request.Context().Err() != context.Canceled {
+				service.MarkOpsStreamError(c, "upstream_error", "The upstream request could not complete", http.StatusBadGateway)
+				_ = managedWriter.FailAttempt("upstream_error", "recovery_exhausted", "The upstream request could not complete")
+			}
+		}()
+	}
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
 
@@ -160,6 +185,8 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	firstOutputTimeoutSwitchCount := 0
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
+	managedAccountRetryAt := make(map[int64]time.Time)
+	managedRetryAccountID := int64(0)
 	sameAccountRetryCount := make(map[int64]int)
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
@@ -168,13 +195,27 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
 	c.Request = c.Request.WithContext(ccPricingCtx)
 
+	attemptCount := 0
+
 	for {
+		if managedRecovery {
+			openAIManagedReleaseExpiredExclusions(failedAccountIDs, managedAccountRetryAt, time.Now())
+		}
+		if !openAIManagedCanDispatch(c.Request.Context()) {
+			h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+			return
+		}
 		if failoverClientGone(c) {
 			return
 		}
 		reqLog.Debug("openai_chat_completions.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
+		selectionCtx := c.Request.Context()
+		if managedRetryAccountID > 0 {
+			selectionCtx = service.WithOpenAIManagedRetryAccount(selectionCtx, managedRetryAccountID)
+			managedRetryAccountID = 0
+		}
 		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
+			selectionCtx,
 			apiKey.GroupID,
 			"",
 			sessionHash,
@@ -188,6 +229,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
+			if openAIManagedWaitForSelection(c.Request.Context(), err, managedAccountRetryAt) {
+				continue
+			}
 			if failoverClientGone(c) {
 				reqLog.Info("openai_chat_completions.account_select_aborted_client_disconnected", zap.Error(err))
 				return
@@ -279,6 +323,11 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 
+		if !openAIManagedCanDispatch(c.Request.Context()) {
+			releaseAccount()
+			h.handleOpenAIRequestBudgetExhausted(c, streamStarted)
+			return
+		}
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		forwardStart := time.Now()
 
@@ -286,11 +335,42 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		if channelMapping.Mapped {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
+		if managedRecovery {
+			maxEffort, mappings, overLimit, _ := openAIReasoningEffortPolicyForRequest(c, apiKey)
+			var policyErr error
+			forwardBody, policyErr = service.ApplyOpenAIManagedReasoningEffortPolicy(c.Request.Context(), account, forwardBody, maxEffort, mappings, overLimit)
+			if policyErr != nil {
+				releaseAccount()
+				if service.IsReasoningEffortPolicyDenied(policyErr) {
+					respondOpenAIReasoningEffortPolicyError(c, policyErr, h.errorResponse)
+				} else {
+					h.handleStreamingAwareErrorWithCode(c, http.StatusBadRequest, "invalid_request_error", "reasoning_effort_unsupported", policyErr.Error(), streamStarted, false)
+				}
+				return
+			}
+		}
 		writerSizeBeforeForward := service.OpenAICompactKeepaliveAdjustedWrittenSize(c)
+		attemptCount++
+		logicalCtx := c.Request.Context()
+		attemptCtx, cancelAttempt := openAIManagedAttemptContext(logicalCtx, attemptCount == 1)
+		c.Request = c.Request.WithContext(attemptCtx)
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
-			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
+			return h.gatewayService.ForwardAsChatCompletions(attemptCtx, c, account, forwardBody, promptCacheKey, "")
 		}()
+		attemptTimeout := openAIManagedAttemptFailure(attemptCtx, logicalCtx)
+		cancelAttempt()
+		c.Request = c.Request.WithContext(logicalCtx)
+		if err != nil && attemptTimeout != nil {
+			err = attemptTimeout
+		}
+		if err == nil && managedWriter != nil {
+			actualID := ""
+			if result != nil {
+				actualID = result.ResponseID
+			}
+			err = managedWriter.CommitAttempt(actualID)
+		}
 		var cyberBlockBodyChat []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyChat = body
@@ -351,6 +431,20 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			})
 		}
 		if err != nil {
+			if managedRecovery && openAIRequestBudgetExpired(c) {
+				submitChatUsage(result)
+				h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
+				return
+			}
+			if errors.Is(err, service.ErrOpenAIModelDispatchBudgetExhausted) {
+				submitChatUsage(result)
+				h.handleOpenAIModelDispatchBudgetExhausted(c, streamStarted || c.Writer.Written())
+				return
+			}
+			if managedWriter != nil && (managedWriter.ClientDisconnected() || (result != nil && result.ClientDisconnect)) {
+				submitChatUsage(result)
+				return
+			}
 			if result != nil && result.ImageCount > 0 {
 				reqLog.Warn("openai_chat_completions.forward_partial_error_with_image_result",
 					zap.Int64("account_id", account.ID),
@@ -360,6 +454,10 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			} else {
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
+					failoverErr = openAIManagedRetryableFailure(c.Request.Context(), failoverErr)
+					if managedWriter != nil {
+						submitChatUsage(result)
+					}
 					if failoverClientGone(c) {
 						reqLog.Info("openai_chat_completions.failover_aborted_client_disconnected",
 							zap.Int64("account_id", account.ID),
@@ -367,7 +465,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 						)
 						return
 					}
-					if !openAIForwardMayFailover(c, writerSizeBeforeForward, failoverErr) {
+					if managedWriter == nil && !openAIForwardMayFailover(c, writerSizeBeforeForward, failoverErr) {
 						h.gatewayService.ObserveOpenAIAccountHealthFailure(c.Request.Context(), account, err)
 						h.handleFailoverExhausted(c, failoverErr, true)
 						return
@@ -382,9 +480,15 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
-					// Retry account-scoped transients in pool mode; move on first for request-scoped overloads.
+					if managedWriter != nil {
+						if abandonErr := managedWriter.AbandonAttempt(); abandonErr != nil {
+							reqLog.Warn("openai_chat_completions.recovery_attempt_abandon_failed", zap.Error(abandonErr))
+							return
+						}
+					}
+					// Managed recovery also retries request-scoped transients on this account.
 					if openAIAccountRetryBeforeFailoverAllowed(c.Request.Context(), failoverErr) {
-						retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
+						retryLimit := openAIManagedSameAccountRetryLimit(c.Request.Context(), failoverErr, account)
 						if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
 							sameAccountRetryCount[account.ID]++
 							retryDelay := sameAccountRetryDelayFor(failoverErr, sameAccountRetryCount[account.ID])
@@ -401,23 +505,31 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 							case <-time.After(retryDelay):
 							}
 							if sameAccountRetryDeadlineAllows(failoverErr) {
+								if managedRecovery {
+									managedRetryAccountID = account.ID
+								}
 								continue
 							}
 						}
 					}
-					if openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
+					if !managedRecovery && openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}
+					if managedRecovery {
+						if retryAt := openAIManagedAccountRetryAt(account, failoverErr, time.Now()); !retryAt.IsZero() {
+							managedAccountRetryAt[account.ID] = retryAt
+						}
+					}
 					lastFailoverErr = failoverErr
-					if switchCount >= maxAccountSwitches {
+					if !managedRecovery && switchCount >= maxAccountSwitches {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
 					switchCount++
-					if h.gatewayService.ShouldStopOpenAIOAuth429Failover(account, failoverErr.StatusCode, switchCount, &oauth429FailoverState) {
+					if !managedRecovery && h.gatewayService.ShouldStopOpenAIOAuth429Failover(account, failoverErr.StatusCode, switchCount, &oauth429FailoverState) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}

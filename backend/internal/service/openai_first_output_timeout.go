@@ -315,6 +315,10 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 	if s.rateLimitService != nil {
 		s.rateLimitService.HandleStreamTimeout(ctx, account, originalModel)
 	}
+	return openAIFirstOutputTimeoutFailover(responseHeaders)
+}
+
+func openAIFirstOutputTimeoutFailover(responseHeaders http.Header) *UpstreamFailoverError {
 	return &UpstreamFailoverError{
 		StatusCode:      http.StatusGatewayTimeout,
 		ResponseBody:    []byte(`{"error":{"type":"first_output_timeout","message":"Upstream produced no output before the deadline"}}`),
@@ -324,33 +328,46 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 }
 
 type openAIFirstOutputHeaderGuard struct {
-	cancel  context.CancelFunc
-	release context.CancelFunc
-	timer   *time.Timer
-	fired   chan struct{}
-	once    sync.Once
+	cancel   context.CancelFunc
+	release  context.CancelFunc
+	timer    *time.Timer
+	deadline time.Time
+	fired    chan struct{}
+	once     sync.Once
 }
 
 func newOpenAIFirstOutputHeaderGuard(
 	ctx context.Context,
 	release context.CancelFunc,
 	deadline time.Time,
+	dispatchTimeout ...time.Duration,
 ) (context.Context, *openAIFirstOutputHeaderGuard) {
 	guardedCtx, cancel := context.WithCancel(ctx)
 	guard := &openAIFirstOutputHeaderGuard{cancel: cancel, release: release, fired: make(chan struct{})}
+	if IsOpenAIManagedRecovery(ctx) && len(dispatchTimeout) > 0 && dispatchTimeout[0] > 0 {
+		guardedCtx = context.WithValue(guardedCtx, openAIFirstOutputDispatchStartKey{}, func(startedAt time.Time) {
+			guard.start(openAIFirstOutputHardDeadline(ctx, startedAt.Add(dispatchTimeout[0])))
+		})
+	} else {
+		guard.start(deadline)
+	}
+	return guardedCtx, guard
+}
+
+func (g *openAIFirstOutputHeaderGuard) start(deadline time.Time) {
+	g.deadline = deadline
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		remaining = time.Nanosecond
 	}
-	guard.timer = time.AfterFunc(remaining, func() {
-		close(guard.fired)
-		cancel()
+	g.timer = time.AfterFunc(remaining, func() {
+		close(g.fired)
+		g.cancel()
 	})
-	return guardedCtx, guard
 }
 
 func (g *openAIFirstOutputHeaderGuard) stopHeaderWait() bool {
-	if g.timer.Stop() {
+	if g.timer == nil || g.timer.Stop() {
 		return false
 	}
 	<-g.fired
@@ -359,7 +376,9 @@ func (g *openAIFirstOutputHeaderGuard) stopHeaderWait() bool {
 
 func (g *openAIFirstOutputHeaderGuard) close() {
 	g.once.Do(func() {
-		g.timer.Stop()
+		if g.timer != nil {
+			g.timer.Stop()
+		}
 		g.cancel()
 		g.release()
 	})
@@ -367,9 +386,10 @@ func (g *openAIFirstOutputHeaderGuard) close() {
 
 type openAIRequestContextReadCloser struct {
 	io.ReadCloser
-	cleanup func()
-	once    sync.Once
-	err     error
+	cleanup          func()
+	firstOutputGuard *openAITextFirstOutputGuard
+	once             sync.Once
+	err              error
 }
 
 func (r *openAIRequestContextReadCloser) Close() error {

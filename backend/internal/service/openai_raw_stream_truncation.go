@@ -92,11 +92,16 @@ func newOpenAIRawStreamTruncatedFailoverError(
 	if id := strings.TrimSpace(upstreamRequestID); id != "" {
 		headers.Set("x-request-id", id)
 	}
-	return &UpstreamFailoverError{
+	failoverErr := &UpstreamFailoverError{
 		StatusCode:      http.StatusBadGateway,
 		ResponseBody:    openAIRawStreamTruncatedErrorBody(cause),
 		ResponseHeaders: headers,
 	}
+	if c != nil && c.Request != nil && IsOpenAIManagedRecovery(c.Request.Context()) {
+		failoverErr.RetryableOnSameAccount = true
+		failoverErr.RequestScopedTransient = true
+	}
+	return failoverErr
 }
 
 // recordOpenAIRawStreamTruncation 把上游截断记入 ops 上下文，使其在错误日志与

@@ -380,7 +380,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		var textGuard *openAITextFirstOutputGuard
 		if account.Platform == PlatformOpenAI && !textTimeoutImageIntent && !isOpenAIResponsesCompactPath(c) {
-			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()))
+			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()), s.openAITextFirstOutputTimeout())
 		}
 		upstreamCtxReleased := false
 		releaseAttemptContext := func() {
@@ -1440,7 +1440,9 @@ func openAIStreamDataStartsVisibleOutput(data, eventType string) bool {
 	case "response.content_part.added", "response.content_part.done",
 		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
 		part := gjson.Get(trimmed, "part")
-		return part.Get("text").String() != "" || part.Get("transcript").String() != ""
+		refusal := part.Get("refusal")
+		return part.Get("text").String() != "" || part.Get("transcript").String() != "" ||
+			(part.Get("type").String() == "refusal" && refusal.Type == gjson.String && refusal.Str != "")
 	case "response.output_item.added", "response.output_item.done":
 		return openAIStreamItemHasVisibleOutput(gjson.Get(trimmed, "item"))
 	case "response.completed", "response.done":
@@ -1992,6 +1994,10 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 		classificationHeaders = nil
 	}
 	failoverErr := s.newOpenAIAccountFailoverErrorWithClassificationHeaders(account, statusCode, headers, classificationHeaders, payload, message, shouldDisable, retryableOnSameAccount)
+	if c != nil && c.Request != nil && IsOpenAIManagedRecovery(c.Request.Context()) && !failoverErr.IsCredentialFailure() && (statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError) {
+		failoverErr.RetryableOnSameAccount = true
+		failoverErr.RequestScopedTransient = true
+	}
 	if failoverErr.IsCredentialFailure() || failoverErr.RequestScopedTransient {
 		return failoverErr
 	}
@@ -2075,7 +2081,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	if len(textGuards) > 0 {
 		textGuard = textGuards[0]
 	} else if imageIntent, _ := getOpenAIImageIntentHint(c); account != nil && account.Platform == PlatformOpenAI && !imageIntent && !IsImageGenerationIntent(openAIResponsesEndpoint, originalModel, nil) && !isOpenAIResponsesCompactPath(c) {
-		_, textGuard = newOpenAITextFirstOutputGuard(ctx, startTime.Add(s.openAITextFirstOutputTimeout()))
+		_, textGuard = newOpenAITextFirstOutputGuard(ctx, openAIFirstOutputDeadline(ctx, startTime, s.openAITextFirstOutputTimeout()))
 		defer textGuard.close()
 	}
 	textGuard.setBody(resp.Body)
@@ -2387,6 +2393,15 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					})
 				}
 				outputStarted := openAIStreamClientOutputStarted(c, clientOutputStarted)
+				if IsOpenAIManagedRecovery(ctx) && !cyberHit {
+					shouldFailover := openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
+					if eventType == "error" {
+						shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
+					}
+					if shouldFailover {
+						return resultWithUsage(), s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
+					}
+				}
 				if !outputStarted && sessionBlocked {
 					return resultWithUsage(), newOpenAISessionBlockedFailoverError(http.StatusOK, resp.Header, dataBytes)
 				}
@@ -2565,6 +2580,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		if !clientOutputStarted {
 			return resultWithUsage(), failoverErr
 		}
+		if IsOpenAIManagedRecovery(ctx) {
+			return resultWithUsage(), failoverErr
+		}
 		// An earlier structural event may already belong to this response. End
 		// this stream explicitly; it must never be replayed on another account.
 		failoverErr.SafeToFailoverAfterWrite = false
@@ -2619,6 +2637,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			upstreamRequestID,
 			err,
 		)
+		if IsOpenAIManagedRecovery(ctx) {
+			return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, readMessage, resp.Header)
+		}
 		return resultWithUsage(), newOpenAIUpstreamStreamReadError(err)
 	}
 	if sawFailedEvent {
@@ -2636,6 +2657,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 		recordStreamError(nil, "stream_missing_terminal", "OpenAI stream ended before a terminal event")
 		s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
+		if IsOpenAIManagedRecovery(ctx) {
+			return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event", resp.Header)
+		}
 		return resultWithUsage(), errors.New("stream usage incomplete: missing terminal event")
 	}
 	if (sawDone || sawTerminalEvent) && !sawFailedEvent {

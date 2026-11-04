@@ -23,6 +23,8 @@ const (
 	RunModeSimple   = "simple"
 )
 
+var openAIRetryBudgetDeprecationWarned atomic.Bool
+
 // 使用量记录队列溢出策略
 const (
 	UsageRecordOverflowPolicyDrop   = "drop"
@@ -1015,6 +1017,8 @@ type GatewayConfig struct {
 	OpenAIRequestBudgetSeconds int `mapstructure:"openai_request_budget_seconds"`
 	// OpenAIRetryBudgetSeconds: 请求入口后的错误重试/换号资格窗口（秒）。
 	// 0 自动使用 min(300, OpenAIRequestBudgetSeconds 的有效值)，不会禁用重试窗口。
+	// Deprecated for signed NewAPI managed recovery v1: those requests use the
+	// logical request deadline and physical dispatch budget instead.
 	OpenAIRetryBudgetSeconds int `mapstructure:"openai_retry_budget_seconds"`
 	// 请求体最大字节数，用于网关请求体大小限制
 	MaxBodySize int64 `mapstructure:"max_body_size"`
@@ -1909,6 +1913,10 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config error: %w", err)
+	}
+	_, legacyRetryBudgetEnvConfigured := os.LookupEnv("GATEWAY_OPENAI_RETRY_BUDGET_SECONDS")
+	if (viper.InConfig("gateway.openai_retry_budget_seconds") || legacyRetryBudgetEnvConfigured) && openAIRetryBudgetDeprecationWarned.CompareAndSwap(false, true) {
+		slog.Warn("gateway.openai_retry_budget_seconds is deprecated for managed OpenAI recovery; remove the legacy setting after migration. Signed recovery v1 uses the logical deadline and dispatch limit; legacy entry points retain the configured window.")
 	}
 	if trustedProxiesEnvConfigured {
 		cfg.Server.TrustedProxies = normalizeStringSlice(strings.Split(trustedProxiesEnv, ","))
