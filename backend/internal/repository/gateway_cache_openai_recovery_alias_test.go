@@ -53,6 +53,9 @@ func TestOpenAIRecoveryAliasCachePublishesAtomicallyAndExpires(t *testing.T) {
 	metadata, _, err = cache.GetOpenAIRecoveryAlias(ctx, scope, secondAlias)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"state":"published"}`, string(metadata))
+	globalCount, err := client.ZCard(ctx, openAIRecoveryAliasCachePrefix+"global:active").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, globalCount)
 
 	server.FastForward(time.Hour + time.Second)
 	metadata, _, err = cache.GetOpenAIRecoveryAlias(ctx, scope, alias)
@@ -89,6 +92,48 @@ func TestOpenAIRecoveryAliasCacheCapacityAndDelete(t *testing.T) {
 	assert.True(t, published)
 }
 
+func TestOpenAIRecoveryAliasCacheGlobalCountReclaimsZeroSnapshots(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	ctx := context.Background()
+	now := time.Now()
+	globalKey := openAIRecoveryAliasCachePrefix + "global:active"
+	publish := func(scope, alias string, ttl time.Duration, at time.Time) int64 {
+		aliasKey := openAIRecoveryAliasCacheKey(scope, alias)
+		keys := append([]string{aliasKey}, openAIRecoveryAliasIndexKeys(scope)...)
+		result, err := publishOpenAIRecoveryAliasScript.Run(ctx, client, keys,
+			[]byte(`{}`), "", ttl.Milliseconds(), at.Add(ttl).UnixMilli(), aliasKey, at.UnixMilli(),
+			openAIRecoveryAliasScopeLimit, openAIRecoveryAliasScopeBytesLimit, openAIRecoveryAliasGlobalBytesLimit, 2,
+		).Int64()
+		require.NoError(t, err)
+		return result
+	}
+	scopeA, scopeB, scopeC := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	aliasA, aliasB, aliasC, aliasD := "resp_lr_"+strings.Repeat("a", 36), "resp_lr_"+strings.Repeat("b", 36), "resp_lr_"+strings.Repeat("c", 36), "resp_lr_"+strings.Repeat("d", 36)
+	assert.EqualValues(t, 1, publish(scopeA, aliasA, time.Hour, now))
+	assert.EqualValues(t, 1, publish(scopeB, aliasB, time.Second, now))
+	assert.EqualValues(t, -1, publish(scopeC, aliasC, time.Hour, now))
+	exists, err := client.Exists(ctx, openAIRecoveryAliasCacheKey(scopeC, aliasC)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, exists)
+	count, err := client.ZCard(ctx, globalKey).Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, count)
+
+	cache := NewGatewayCache(client).(service.OpenAIRecoveryAliasCache)
+	require.NoError(t, cache.DeleteOpenAIRecoveryAlias(ctx, scopeA, aliasA))
+	assert.EqualValues(t, 1, publish(scopeC, aliasC, time.Hour, now))
+	server.FastForward(2 * time.Second)
+	assert.EqualValues(t, 1, publish(scopeA, aliasD, time.Hour, now.Add(2*time.Second)))
+	count, err = client.ZCard(ctx, globalKey).Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, count)
+	member, err := client.ZScore(ctx, globalKey, openAIRecoveryAliasCacheKey(scopeB, aliasB)).Result()
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Zero(t, member)
+}
+
 func TestOpenAIRecoveryAliasCacheSnapshotByteLimits(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -110,7 +155,7 @@ func TestOpenAIRecoveryAliasCacheSnapshotByteLimits(t *testing.T) {
 	} {
 		aliasKey := openAIRecoveryAliasCacheKey(scope, test.alias)
 		keys[0] = aliasKey
-		result, err := publishOpenAIRecoveryAliasScript.Run(ctx, client, keys, []byte(`{}`), strings.Repeat("x", test.size), time.Hour.Milliseconds(), time.Now().Add(time.Hour).UnixMilli(), aliasKey, time.Now().UnixMilli(), openAIRecoveryAliasScopeLimit, test.scope, test.global).Int64()
+		result, err := publishOpenAIRecoveryAliasScript.Run(ctx, client, keys, []byte(`{}`), strings.Repeat("x", test.size), time.Hour.Milliseconds(), time.Now().Add(time.Hour).UnixMilli(), aliasKey, time.Now().UnixMilli(), openAIRecoveryAliasScopeLimit, test.scope, test.global, openAIRecoveryAliasGlobalLimit).Int64()
 		require.NoError(t, err, "case %d", i)
 		assert.Equal(t, test.want, result, "case %d", i)
 	}
@@ -120,7 +165,7 @@ func TestOpenAIRecoveryAliasCacheSnapshotByteLimits(t *testing.T) {
 	require.NoError(t, deleteOpenAIRecoveryAliasScript.Run(ctx, client, keys, aliasKey).Err())
 	aliasKey = openAIRecoveryAliasCacheKey(scope, "resp_lr_"+strings.Repeat("d", 36))
 	keys[0] = aliasKey
-	result, err := publishOpenAIRecoveryAliasScript.Run(ctx, client, keys, []byte(`{}`), "xxx", time.Hour.Milliseconds(), time.Now().Add(time.Hour).UnixMilli(), aliasKey, time.Now().UnixMilli(), openAIRecoveryAliasScopeLimit, 8, 10).Int64()
+	result, err := publishOpenAIRecoveryAliasScript.Run(ctx, client, keys, []byte(`{}`), "xxx", time.Hour.Milliseconds(), time.Now().Add(time.Hour).UnixMilli(), aliasKey, time.Now().UnixMilli(), openAIRecoveryAliasScopeLimit, 8, 10, openAIRecoveryAliasGlobalLimit).Int64()
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, result)
 }

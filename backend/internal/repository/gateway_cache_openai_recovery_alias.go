@@ -14,6 +14,11 @@ const openAIRecoveryAliasCachePrefix = "kkai:recovery:v1:alias:"
 const openAIRecoveryAliasScopeLimit = 256
 const openAIRecoveryAliasScopeBytesLimit = 64 << 20
 const openAIRecoveryAliasGlobalBytesLimit = 256 << 20
+const openAIRecoveryAliasMaxMetadataBytes = 4 << 10
+
+// Bound all aliases, including those without snapshots, to leave room in the
+// shared 1 GiB Redis beyond the separate 256 MiB snapshot budget.
+const openAIRecoveryAliasGlobalLimit = 32768
 
 var acquireOpenAIRecoverySnapshotWriteScript = redis.NewScript(`
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
@@ -38,6 +43,7 @@ purge(KEYS[2], KEYS[3], KEYS[4])
 purge(KEYS[5], KEYS[6], KEYS[7])
 local size = string.len(ARGV[2])
 if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[7]) then return -1 end
+if redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[10]) then return -1 end
 if tonumber(redis.call('GET', KEYS[4]) or '0') + size > tonumber(ARGV[8]) then return -1 end
 if tonumber(redis.call('GET', KEYS[7]) or '0') + size > tonumber(ARGV[9]) then return -1 end
 redis.call('HSET', KEYS[1], 'state', 'published', 'metadata', ARGV[1], 'snapshot', ARGV[2])
@@ -45,9 +51,9 @@ redis.call('PEXPIRE', KEYS[1], ARGV[3])
 redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
 redis.call('HSET', KEYS[3], ARGV[5], size)
 redis.call('INCRBY', KEYS[4], size)
+redis.call('ZADD', KEYS[5], ARGV[4], ARGV[5])
+redis.call('HSET', KEYS[6], ARGV[5], size)
 if size > 0 then
-  redis.call('ZADD', KEYS[5], ARGV[4], ARGV[5])
-  redis.call('HSET', KEYS[6], ARGV[5], size)
   redis.call('INCRBY', KEYS[7], size)
 end
 for i = 2, 7 do
@@ -93,7 +99,7 @@ func (c *gatewayCache) PublishOpenAIRecoveryAlias(ctx context.Context, scope, al
 	if c == nil || c.rdb == nil {
 		return false, service.ErrOpenAIRecoveryAliasUnavailable
 	}
-	if ttl < time.Millisecond || len(metadata) > 4<<10 || len(snapshot) > 8<<20 {
+	if ttl < time.Millisecond || len(metadata) > openAIRecoveryAliasMaxMetadataBytes || len(snapshot) > 8<<20 {
 		return false, service.ErrOpenAIRecoveryAliasInvalid
 	}
 	aliasKey := openAIRecoveryAliasCacheKey(scope, alias)
@@ -123,7 +129,7 @@ func (c *gatewayCache) PublishOpenAIRecoveryAlias(ctx context.Context, scope, al
 	now := time.Now()
 	result, err := publishOpenAIRecoveryAliasScript.Run(cacheCtx, c.rdb,
 		keys,
-		metadata, snapshot, ttl.Milliseconds(), now.Add(ttl).UnixMilli(), aliasKey, now.UnixMilli(), openAIRecoveryAliasScopeLimit, openAIRecoveryAliasScopeBytesLimit, openAIRecoveryAliasGlobalBytesLimit,
+		metadata, snapshot, ttl.Milliseconds(), now.Add(ttl).UnixMilli(), aliasKey, now.UnixMilli(), openAIRecoveryAliasScopeLimit, openAIRecoveryAliasScopeBytesLimit, openAIRecoveryAliasGlobalBytesLimit, openAIRecoveryAliasGlobalLimit,
 	).Int64()
 	if err != nil {
 		return false, err
