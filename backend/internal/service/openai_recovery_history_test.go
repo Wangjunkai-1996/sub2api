@@ -11,8 +11,9 @@ import (
 func TestOpenAIRecoveryHistoryBuildAndReplay(t *testing.T) {
 	first, err := BuildOpenAIRecoverySnapshot(
 		[]byte(`{"model":"m","input":"first question","instructions":"old instructions"}`),
-		[]byte(`[{"id":"msg_actual","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"first answer","annotations":[]}]}]`), nil)
+		[]byte(`[{"id":"msg_actual","type":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"first answer","annotations":[]}]}]`), nil)
 	require.NoError(t, err)
+	assert.NotContains(t, string(first), `"phase"`)
 	request := []byte(`{"model":"m","previous_response_id":"resp_actual","input":[{"role":"user","content":[{"type":"input_text","text":"next question"}]}],"instructions":"new instructions","stream":true}`)
 	rebuilt, err := RebuildOpenAIRecoveryContinuation(request, first)
 	require.NoError(t, err)
@@ -40,6 +41,8 @@ func TestOpenAIRecoveryHistoryRejectsIncompleteOrNonportableContext(t *testing.T
 		{"opaque output", `{"input":"text"}`, `[{"type":"reasoning","id":"rs_a","encrypted_content":"opaque"}]`},
 		{"tool output", `{"input":"text"}`, `[{"type":"function_call","name":"charge","arguments":"{}","call_id":"call_a"}]`},
 		{"unknown message field", `{"input":[{"role":"user","content":"text","unknown_semantics":true}]}`, `[]`},
+		{"input message phase", `{"input":[{"role":"user","phase":"final_answer","content":"text"}]}`, `[]`},
+		{"unknown message phase", `{"input":"text"}`, `[{"type":"message","role":"assistant","phase":"commentary","content":"answer"}]`},
 		{"unknown part field", `{"input":[{"role":"user","content":[{"type":"input_text","text":"text","unknown_semantics":true}]}]}`, `[]`},
 		{"null input", `{"input":null}`, `[]`},
 	} {

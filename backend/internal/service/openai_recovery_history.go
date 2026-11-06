@@ -125,7 +125,13 @@ func openAIRecoveryTextItems(raw []byte, output bool) ([]json.RawMessage, error)
 			return nil, ErrOpenAIRecoveryHistoryUnavailable
 		}
 		for key := range item {
-			if key != "type" && key != "role" && key != "content" && key != "id" && key != "status" {
+			if key != "type" && key != "role" && key != "content" && key != "id" && key != "status" && key != "phase" {
+				return nil, ErrOpenAIRecoveryHistoryUnavailable
+			}
+		}
+		if phase, ok := item["phase"]; ok {
+			var value string
+			if !output || json.Unmarshal(phase, &value) != nil || value != "final_answer" {
 				return nil, ErrOpenAIRecoveryHistoryUnavailable
 			}
 		}

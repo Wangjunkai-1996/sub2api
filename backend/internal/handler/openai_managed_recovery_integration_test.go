@@ -123,10 +123,13 @@ func TestOpenAIManagedChatStopsAtSharedDispatchLimit(t *testing.T) {
 
 type openAIManagedResponsesUpstream struct {
 	service.HTTPUpstream
-	accounts       []int64
-	bodies         [][]byte
-	sessionBlocked bool
-	failure        string
+	accounts           []int64
+	bodies             [][]byte
+	sessionBlocked     bool
+	failure            string
+	phaseFinalAnswer   bool
+	physicalFailure    bool
+	succeedImmediately bool
 }
 
 func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
@@ -136,6 +139,9 @@ func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, account
 	}
 	u.accounts = append(u.accounts, accountID)
 	u.bodies = append(u.bodies, body)
+	if u.physicalFailure && gjson.GetBytes(body, "previous_response_id").Exists() {
+		return &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"api_error","code":"server_error","message":"temporarily unavailable"}}`))}, nil
+	}
 	if len(u.accounts) <= 3 && (u.failure == "before_429" || u.failure == "before_500") {
 		status, code := http.StatusTooManyRequests, "rate_limit_exceeded"
 		if u.failure == "before_500" {
@@ -166,13 +172,17 @@ func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, account
 			`data: {"type":"response.failed","response":{"id":"resp_actual","status":"failed","error":{"code":"` + code + `","message":"temporarily unavailable"}}}` + "\n\n"))
 		return response, nil
 	}
-	if len(u.accounts) <= 3 {
+	if len(u.accounts) <= 3 && !u.succeedImmediately {
 		response.Body = io.NopCloser(io.MultiReader(strings.NewReader(prefix+"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_actual\",\"delta\":\"partial-text\"}\n\n"), openAICompatFailoverReadError{}))
 		return response, nil
 	}
+	phase := ""
+	if u.phaseFinalAnswer {
+		phase = `,"phase":"final_answer"`
+	}
 	response.Body = io.NopCloser(strings.NewReader(prefix +
 		"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_actual\",\"delta\":\"winning-text\"}\n\n" +
-		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_actual\",\"model\":\"gpt-5.1\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_actual\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"winning-text\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_actual\",\"model\":\"gpt-5.1\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_actual\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"" + phase + ",\"content\":[{\"type\":\"output_text\",\"text\":\"winning-text\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	return response, nil
 }
 
@@ -343,4 +353,80 @@ func TestOpenAIManagedResponsesRecoversAndRebuildsContinuation(t *testing.T) {
 	assert.Contains(t, string(upstream.bodies[4]), "winning-text")
 	assert.Contains(t, string(upstream.bodies[4]), "followup")
 	assert.Empty(t, next.Request.Header.Get("X-Codex-Turn-State"))
+}
+
+func TestOpenAIManagedResponsesRebuildsFinalAnswerAfterPhysicalContinuationFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name            string
+		accounts        int
+		fallbackAccount int64
+	}{
+		{name: "alternate account", accounts: 2, fallbackAccount: 2},
+		{name: "same account", accounts: 1, fallbackAccount: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &openAIManagedResponsesUpstream{phaseFinalAnswer: true, succeedImmediately: true}
+			accounts := []service.Account{
+				{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 0, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}},
+				{ID: 2, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 1, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}},
+			}
+			accounts = accounts[:tc.accounts]
+			h := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts)
+			server := miniredis.RunT(t)
+			redisClient := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+			cache := repository.NewGatewayCache(redisClient)
+			h.gatewayService = service.NewOpenAIGatewayService(openAIImagesFailoverAccountRepo{accounts: accounts}, nil, nil, nil, nil, nil, cache, h.cfg, nil, nil, nil, nil, nil, upstream, nil, nil, nil, nil, nil, nil, nil, nil)
+			ctx := context.WithValue(context.Background(), ctxkey.NewAPIUserID, int64(1))
+			ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
+			ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
+
+			first, firstRec := newOpenAIResponsesFailoverTestContext(t, ctx)
+			first.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			first.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":"first"}`))
+			h.Responses(first)
+			require.Equal(t, http.StatusOK, firstRec.Code, firstRec.Body.String())
+			var alias string
+			for _, line := range strings.Split(firstRec.Body.String(), "\n") {
+				if gjson.Get(strings.TrimPrefix(line, "data: "), "type").String() == "response.completed" {
+					alias = gjson.Get(strings.TrimPrefix(line, "data: "), "response.id").String()
+				}
+			}
+			require.True(t, service.IsOpenAIRecoveryAliasID(alias), firstRec.Body.String())
+			scope, ok := service.OpenAIRecoveryScope(ctx, 99)
+			require.True(t, ok)
+			winner, err := h.gatewayService.ResolveOpenAIRecoveryAlias(ctx, scope, alias)
+			require.NoError(t, err)
+			require.NotEmpty(t, winner.Snapshot)
+
+			healthy, healthyRec := newOpenAIResponsesFailoverTestContext(t, ctx)
+			healthy.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			healthy.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"previous_response_id":"` + alias + `","input":"second"}`))
+			h.Responses(healthy)
+			require.Equal(t, http.StatusOK, healthyRec.Code, healthyRec.Body.String())
+			assert.Contains(t, healthyRec.Body.String(), `"type":"response.completed"`)
+			assert.Equal(t, "resp_actual", gjson.GetBytes(upstream.bodies[len(upstream.bodies)-1], "previous_response_id").String())
+			assert.Equal(t, int64(1), upstream.accounts[len(upstream.accounts)-1])
+
+			upstream.physicalFailure = true
+			attemptStart := len(upstream.bodies)
+			failed, recoveredRec := newOpenAIResponsesFailoverTestContext(t, ctx)
+			failed.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			failed.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"previous_response_id":"` + alias + `","input":"third"}`))
+			h.Responses(failed)
+			require.Equal(t, http.StatusOK, recoveredRec.Code, recoveredRec.Body.String())
+			assert.Equal(t, 1, strings.Count(recoveredRec.Body.String(), `"type":"response.completed"`))
+			assert.Equal(t, 1, strings.Count(recoveredRec.Body.String(), `"kind":"terminal"`))
+			require.Len(t, upstream.bodies[attemptStart:], 4, recoveredRec.Body.String())
+			for _, body := range upstream.bodies[attemptStart : attemptStart+3] {
+				assert.Equal(t, "resp_actual", gjson.GetBytes(body, "previous_response_id").String())
+			}
+			portable := upstream.bodies[len(upstream.bodies)-1]
+			assert.False(t, gjson.GetBytes(portable, "previous_response_id").Exists())
+			assert.Contains(t, string(portable), "winning-text")
+			assert.Contains(t, string(portable), "third")
+			assert.Equal(t, tc.fallbackAccount, upstream.accounts[len(upstream.accounts)-1])
+		})
+	}
 }
