@@ -45,3 +45,19 @@ func TestOpenAIRequestRetryBudgetUsesCompatibilityDefaultAndStopsOnlyRetry(t *te
 	require.True(t, service.OpenAIRetryBudgetExpired(c.Request.Context()))
 	require.False(t, openAIRequestBudgetExpired(c))
 }
+
+func TestManagedChatBudgetLimitsNextDispatchWithoutCancellingHealthyStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	h := &OpenAIGatewayHandler{cfg: &config.Config{Gateway: config.GatewayConfig{OpenAIRequestBudgetSeconds: 900}}}
+	cleanup := h.beginOpenAIRequestBudget(c, time.Now().Add(-901*time.Second), true)
+	defer cleanup()
+
+	_, hasDeadline := c.Request.Context().Deadline()
+	require.False(t, hasDeadline)
+	require.NoError(t, c.Request.Context().Err())
+	require.False(t, openAIManagedCanDispatch(c.Request.Context()))
+	require.True(t, openAIRequestBudgetExpired(c))
+	require.True(t, service.HasOpenAIModelDispatchBudget(c.Request.Context()))
+}

@@ -45,6 +45,56 @@ func TestOpenAIManagedChatRecoversAfterVisibleText(t *testing.T) {
 	assert.NotContains(t, rec.Body.String(), `"outcome":"failed"`)
 }
 
+func TestOpenAIManagedChatStopsAfterPublicToolOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &openAICompatFailoverUpstream{failure: "after_tool"}
+	h := newOpenAIResponsesFailoverTestHandler(t, upstream)
+	ctx := context.WithValue(context.Background(), ctxkey.NewAPIUserID, int64(1))
+	ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
+	ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
+	c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
+	c.Request.URL.Path = "/v1/chat/completions"
+	c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+	c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"test_tool","parameters":{"type":"object"}}}]}`))
+	h.ChatCompletions(c)
+
+	assert.Equal(t, []int64{1}, upstream.accountIDs, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "tool_calls")
+	assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`))
+	assert.Contains(t, rec.Body.String(), `"outcome":"failed"`)
+	assert.NotContains(t, rec.Body.String(), "Regenerating")
+}
+
+func TestOpenAIManagedExplicitJSONRejectsBeforeDispatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name, path, body string
+	}{
+		{"chat", "/v1/chat/completions", `{"model":"gpt-5.1","stream":true,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`},
+		{"responses", "/v1/responses", `{"model":"gpt-5.1","stream":true,"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}},"input":"hello"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &openAICompatFailoverUpstream{}
+			h := newOpenAIResponsesFailoverTestHandler(t, upstream)
+			ctx := context.WithValue(context.Background(), ctxkey.NewAPIUserID, int64(1))
+			ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
+			ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
+			c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
+			c.Request.URL.Path = tc.path
+			c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			c.Request.Body = io.NopCloser(strings.NewReader(tc.body))
+			if tc.path == "/v1/responses" {
+				h.Responses(c)
+			} else {
+				h.ChatCompletions(c)
+			}
+			assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+			assert.Contains(t, rec.Body.String(), "recovery_capability_unavailable")
+			assert.Empty(t, upstream.accountIDs)
+		})
+	}
+}
+
 func TestOpenAIManagedChatStopsAtSharedDispatchLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstream := &openAIResponsesDispatchBudgetUpstream{}
@@ -101,6 +151,11 @@ func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, account
 	const prefix = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_actual\",\"model\":\"gpt-5.1\",\"status\":\"in_progress\"}}\n\n" +
 		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_actual\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n" +
 		"data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_actual\",\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n"
+	if u.failure == "after_tool" {
+		response.Body = io.NopCloser(io.MultiReader(strings.NewReader(prefix+
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"test_tool\",\"arguments\":\"{}\"}}\n\n"), openAICompatFailoverReadError{}))
+		return response, nil
+	}
 	if len(u.accounts) <= 3 && (u.failure == "after_429" || u.failure == "after_500") {
 		code := "rate_limit_exceeded"
 		if u.failure == "after_500" {
@@ -172,6 +227,33 @@ func TestOpenAIManagedResponsesRecoversFromTransientFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenAIManagedResponsesStopsAfterPublicToolOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &openAIManagedResponsesUpstream{failure: "after_tool"}
+	accounts := []service.Account{
+		{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}},
+		{ID: 2, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}},
+	}
+	h := newOpenAIFailoverTestHandlerWithAccounts(t, upstream, accounts)
+	server := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+	h.gatewayService = service.NewOpenAIGatewayService(openAIImagesFailoverAccountRepo{accounts: accounts}, nil, nil, nil, nil, nil, repository.NewGatewayCache(redisClient), h.cfg, nil, nil, nil, nil, nil, upstream, nil, nil, nil, nil, nil, nil, nil, nil)
+	ctx := context.WithValue(context.Background(), ctxkey.NewAPIUserID, int64(1))
+	ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
+	ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
+	c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
+	c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+	c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":"hello","tools":[{"type":"function","name":"test_tool","parameters":{"type":"object"}}]}`))
+	h.Responses(c)
+
+	assert.Equal(t, []int64{1}, upstream.accounts, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), `"type":"function_call"`)
+	assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`))
+	assert.Contains(t, rec.Body.String(), `"outcome":"failed"`)
+	assert.NotContains(t, rec.Body.String(), "Regenerating")
 }
 
 func TestOpenAIManagedLegacyContinuationDoesNotDropMissingHistory(t *testing.T) {

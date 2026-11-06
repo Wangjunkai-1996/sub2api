@@ -1042,19 +1042,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 		}
 		attemptCount++
-		logicalCtx := c.Request.Context()
-		attemptCtx, cancelAttempt := openAIManagedAttemptContext(logicalCtx, attemptCount == 1)
-		c.Request = c.Request.WithContext(attemptCtx)
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer releaseAccount()
-			return h.gatewayService.Forward(attemptCtx, c, account, attemptBody)
+			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
-		attemptTimeout := openAIManagedAttemptFailure(attemptCtx, logicalCtx)
-		cancelAttempt()
-		c.Request = c.Request.WithContext(logicalCtx)
-		if err != nil && attemptTimeout != nil {
-			err = attemptTimeout
-		}
 		if err == nil && managedWriter != nil {
 			actualID := ""
 			if result != nil {
@@ -1124,6 +1115,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			})
 		}
 		if err != nil {
+			if managedWriter != nil && managedWriter.Finalized() {
+				submitResponsesUsage(result)
+				return
+			}
 			if openAIRequestBudgetExpired(c) {
 				submitResponsesUsage(result)
 				h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
@@ -1198,6 +1193,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					}
 					if failoverErr.ShouldReportAccountScheduleFailure() {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, forwardModel, requireCompact, nil), false, nil, err)
+					}
+					if managedWriter != nil && managedWriter.PublicToolOutputStarted() {
+						h.handleFailoverExhausted(c, failoverErr, streamStarted)
+						return
 					}
 					if !failoverErr.ShouldRetryNextAccount() {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
@@ -4524,12 +4523,16 @@ func (h *OpenAIGatewayHandler) beginOpenAIRequestBudget(c *gin.Context, startedA
 	retryBudget := time.Duration(gatewayCfg.EffectiveOpenAIRetryBudgetSeconds()) * time.Second
 	hardDeadline := startedAt.Add(hardBudget)
 	retryDeadline := startedAt.Add(retryBudget)
-	requestCtx, cancel := context.WithDeadline(c.Request.Context(), hardDeadline)
+	var requestCtx context.Context
+	var cancel context.CancelFunc
 	if managed {
+		requestCtx, cancel = context.WithCancel(c.Request.Context())
+		requestCtx = context.WithValue(requestCtx, openAIManagedDispatchDeadlineKey{}, hardDeadline)
 		requestCtx = service.WithOpenAIManagedRecovery(requestCtx)
 		requestCtx = service.WithOpenAIModelDispatchBudget(requestCtx)
 		c.Header(openAIRecoveryProtocolHeader, "1")
 	} else {
+		requestCtx, cancel = context.WithDeadline(c.Request.Context(), hardDeadline)
 		requestCtx = service.WithOpenAIRetryBudgetDeadline(requestCtx, retryDeadline)
 	}
 	c.Request = c.Request.WithContext(requestCtx)

@@ -12,7 +12,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestOpenAIManagedRecoveryRequiresVerifiedAttribution(t *testing.T) {
@@ -39,40 +38,14 @@ func TestOpenAIManagedRecoveryRequiresVerifiedAttribution(t *testing.T) {
 	}
 }
 
-func TestOpenAIManagedAttemptPreservesRecoveryBudget(t *testing.T) {
-	for _, tc := range []struct {
-		remaining, wantCap time.Duration
-	}{
-		{900 * time.Second, 600 * time.Second},
-		{180 * time.Second, 120 * time.Second},
-		{100 * time.Second, 85 * time.Second},
-	} {
-		logical, release := context.WithDeadline(context.Background(), time.Now().Add(tc.remaining))
-		logical = service.WithOpenAIManagedRecovery(logical)
-		attempt, cancel := openAIManagedAttemptContext(logical, true)
-		deadline, ok := attempt.Deadline()
-		require.True(t, ok)
-		assert.InDelta(t, tc.wantCap.Seconds(), time.Until(deadline).Seconds(), 0.05)
-		cancel()
-		assert.NoError(t, logical.Err())
-		retry, finish := openAIManagedAttemptContext(logical, false)
-		assert.Same(t, logical, retry)
-		finish()
-		release()
-	}
-}
-
-func TestOpenAIManagedAttemptTimeoutIsRecoverableButClientCancelIsNot(t *testing.T) {
-	logical, release := context.WithCancel(service.WithOpenAIManagedRecovery(context.Background()))
-	attempt, cancel := context.WithCancelCause(logical)
-	cancel(errOpenAIManagedAttemptTimeout)
-	failure := openAIManagedAttemptFailure(attempt, logical)
-	require.NotNil(t, failure)
-	assert.True(t, failure.RetryableOnSameAccount)
-	assert.True(t, failure.RequestScopedTransient)
-	assert.Equal(t, http.StatusGatewayTimeout, failure.StatusCode)
-	release()
-	assert.Nil(t, openAIManagedAttemptFailure(attempt, logical))
+func TestOpenAIManagedDispatchDeadlineDoesNotCancelHealthyAttempt(t *testing.T) {
+	deadline := time.Now().Add(-time.Second)
+	ctx := context.WithValue(context.Background(), openAIManagedDispatchDeadlineKey{}, deadline)
+	ctx = service.WithOpenAIManagedRecovery(ctx)
+	assert.False(t, openAIManagedCanDispatch(ctx))
+	assert.NoError(t, ctx.Err())
+	_, hasDeadline := ctx.Deadline()
+	assert.False(t, hasDeadline)
 }
 
 func TestOpenAIManagedExclusionsExpireWithoutRemovingHardFailures(t *testing.T) {
@@ -109,7 +82,8 @@ func TestOpenAIManagedTextCapabilityGates(t *testing.T) {
 	assert.True(t, openAIManagedResponsesTextSupported([]byte(`{"input":"hello"}`)))
 	assert.True(t, openAIManagedResponsesTextSupported([]byte(`{"tools":[{"type":"function"}]}`)))
 	assert.True(t, openAIManagedResponsesTextSupported([]byte(`{"include":["reasoning.encrypted_content"]}`)))
-	assert.True(t, openAIManagedResponsesTextSupported([]byte(`{"text":{"format":{"type":"json_schema"}}}`)))
+	assert.False(t, openAIManagedResponsesTextSupported([]byte(`{"text":{"format":{"type":"json_schema"}}}`)))
+	assert.False(t, openAIManagedResponsesTextSupported([]byte(`{"response_format":{"type":"json_object"}}`)))
 	assert.False(t, openAIManagedResponsesTextSupported([]byte(`{"input":[{"type":"reasoning","encrypted_content":"opaque"}]}`)))
 }
 

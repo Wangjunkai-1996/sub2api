@@ -17,12 +17,10 @@ import (
 const openAIRecoveryProtocolHeader = "X-KKAI-Recovery-Protocol"
 
 const (
-	openAIManagedFirstAttemptMax = 600 * time.Second
-	openAIManagedRecoveryReserve = 300 * time.Second
 	openAIManagedDeliveryReserve = 15 * time.Second
 )
 
-var errOpenAIManagedAttemptTimeout = errors.New("managed OpenAI attempt timed out")
+type openAIManagedDispatchDeadlineKey struct{}
 
 // Only signed NewAPI attribution can activate the internal recovery protocol.
 func openAIManagedRecoveryRequested(c *gin.Context) bool {
@@ -42,6 +40,9 @@ func openAIManagedRecoveryRequested(c *gin.Context) bool {
 }
 
 func openAIManagedResponsesTextSupported(body []byte) bool {
+	if service.OpenAIRecoveryStructuredFormat(body, service.OpenAIRecoveryResponsesSSE) != "" {
+		return false
+	}
 	for _, item := range gjson.GetBytes(body, "input").Array() {
 		if item.Get("encrypted_content").Exists() {
 			return false
@@ -91,8 +92,19 @@ func openAIManagedCanDispatch(ctx context.Context) bool {
 	if !service.IsOpenAIManagedRecovery(ctx) || ctx == nil {
 		return true
 	}
-	deadline, ok := ctx.Deadline()
-	return ok && time.Until(deadline) > openAIManagedDeliveryReserve
+	deadline, ok := openAIManagedDispatchDeadline(ctx)
+	return !ok || time.Until(deadline) > openAIManagedDeliveryReserve
+}
+
+func openAIManagedDispatchDeadline(ctx context.Context) (time.Time, bool) {
+	if ctx == nil {
+		return time.Time{}, false
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline, true
+	}
+	deadline, ok := ctx.Value(openAIManagedDispatchDeadlineKey{}).(time.Time)
+	return deadline, ok
 }
 
 func openAIManagedAccountRetryAt(account *service.Account, failure *service.UpstreamFailoverError, now time.Time) time.Time {
@@ -147,43 +159,9 @@ func openAIManagedWaitForSelection(ctx context.Context, err error, retryAt map[i
 			earliest = deadline
 		}
 	}
-	deadline, bounded := ctx.Deadline()
+	deadline, bounded := openAIManagedDispatchDeadline(ctx)
 	if earliest.IsZero() || !bounded || !earliest.Before(deadline.Add(-openAIManagedDeliveryReserve)) {
 		return false
 	}
 	return sleepWithContext(ctx, max(time.Until(earliest), time.Millisecond))
-}
-
-func openAIManagedAttemptContext(ctx context.Context, first bool) (context.Context, context.CancelFunc) {
-	if !service.IsOpenAIManagedRecovery(ctx) || !first {
-		return ctx, func() {}
-	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return ctx, func() {}
-	}
-	remaining := time.Until(deadline)
-	reserve := min(openAIManagedRecoveryReserve, max(openAIManagedDeliveryReserve, remaining-120*time.Second))
-	cap := min(openAIManagedFirstAttemptMax, remaining-reserve)
-	if cap <= 0 {
-		return ctx, func() {}
-	}
-	return context.WithTimeoutCause(ctx, cap, errOpenAIManagedAttemptTimeout)
-}
-
-func openAIManagedAttemptFailure(ctx, logicalCtx context.Context) *service.UpstreamFailoverError {
-	if ctx == nil || logicalCtx == nil || logicalCtx.Err() != nil || !errors.Is(context.Cause(ctx), errOpenAIManagedAttemptTimeout) {
-		return nil
-	}
-	return &service.UpstreamFailoverError{
-		StatusCode:             http.StatusGatewayTimeout,
-		RetryableOnSameAccount: true,
-		RequestScopedTransient: true,
-		Stage:                  service.GatewayFailureStageInference,
-		Scope:                  service.GatewayFailureScopeRequest,
-		Reason:                 service.GatewayFailureReason("managed_attempt_timeout"),
-		NextAccountAction:      service.NextAccountRetry,
-		ClientStatusCode:       http.StatusGatewayTimeout,
-		ClientMessage:          "The upstream attempt timed out",
-	}
 }

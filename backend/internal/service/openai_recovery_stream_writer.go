@@ -53,6 +53,7 @@ type OpenAIRecoveryStreamWriter struct {
 	status                int
 	started               bool
 	visible               bool
+	publicTool            bool
 	disconnect            bool
 	ended                 bool
 	protocolErr           error
@@ -86,7 +87,10 @@ type OpenAIRecoveryStreamWriter struct {
 	finishedChoices       map[int]bool
 	heldItems             map[int]map[string]any
 	heldItemIDs           map[string]int
-	heldChatFrames        [][]byte
+	publicToolItems       map[int]bool
+	publicToolInput       map[int]string
+	publicToolInputDone   map[int]bool
+	publicToolItemDone    map[int]bool
 	heldChatTools         map[string]*openAIRecoveryChatTool
 	heldBytes             int
 	releaseItems          []map[string]any
@@ -174,6 +178,9 @@ func (w *OpenAIRecoveryStreamWriter) BeginAttempt(n int) error {
 	if w.ended || w.disconnect {
 		return errors.New("OpenAI recovery response cannot begin another attempt")
 	}
+	if w.publicTool {
+		return errors.New("OpenAI recovery cannot retry after a public tool call")
+	}
 	if n <= w.attempt || n < 1 {
 		return errors.New("OpenAI recovery attempt must increase monotonically")
 	}
@@ -203,7 +210,10 @@ func (w *OpenAIRecoveryStreamWriter) BeginAttempt(n int) error {
 	w.finishedChoices = make(map[int]bool)
 	w.heldItems = make(map[int]map[string]any)
 	w.heldItemIDs = make(map[string]int)
-	w.heldChatFrames = nil
+	w.publicToolItems = make(map[int]bool)
+	w.publicToolInput = make(map[int]string)
+	w.publicToolInputDone = make(map[int]bool)
+	w.publicToolItemDone = make(map[int]bool)
 	w.heldChatTools = make(map[string]*openAIRecoveryChatTool)
 	w.heldBytes = 0
 	w.releaseItems = nil
@@ -234,6 +244,9 @@ func (w *OpenAIRecoveryStreamWriter) BeginAttempt(n int) error {
 func (w *OpenAIRecoveryStreamWriter) AbandonAttempt() error {
 	if w.attempt == 0 || w.abandoned {
 		return nil
+	}
+	if w.publicTool {
+		return errors.New("OpenAI recovery cannot abandon a public tool call")
 	}
 	w.abandoned = true
 	if w.mode == OpenAIRecoveryResponsesSSE || w.mode == OpenAIRecoveryChatSSE {
@@ -355,7 +368,11 @@ func (w *OpenAIRecoveryStreamWriter) CommitAttempt(actualResponseID string) erro
 			}
 			w.structuredAlternative[tool.choice] = true
 		}
-		for _, item := range w.releaseItems {
+		validationItems := append([]map[string]any(nil), w.releaseItems...)
+		for index := range w.publicToolItems {
+			validationItems = append(validationItems, w.heldItems[index])
+		}
+		for _, item := range validationItems {
 			if err := validateRecoveryItem(item); err != nil {
 				return openAIRecoveryInvalidAttempt(err.Error())
 			}
@@ -449,14 +466,6 @@ func (w *OpenAIRecoveryStreamWriter) CommitAttempt(actualResponseID string) erro
 			return err
 		}
 		w.created = true
-	}
-	for _, frame := range w.heldChatFrames {
-		if err := w.flushControls(); err != nil {
-			return err
-		}
-		if _, err := w.writePublic(frame); err != nil {
-			return err
-		}
 	}
 	for _, item := range w.releaseItems {
 		if err := w.releaseResponseItem(item); err != nil {
@@ -555,10 +564,11 @@ func (w *OpenAIRecoveryStreamWriter) FailAttempt(errType, code, message string) 
 	return err
 }
 
-func (w *OpenAIRecoveryStreamWriter) PublicOutputStarted() bool { return w.started }
-func (w *OpenAIRecoveryStreamWriter) ClientDisconnected() bool  { return w.disconnect }
-func (w *OpenAIRecoveryStreamWriter) Finalized() bool           { return w.ended }
-func (w *OpenAIRecoveryStreamWriter) Written() bool             { return w.started }
+func (w *OpenAIRecoveryStreamWriter) PublicOutputStarted() bool     { return w.started }
+func (w *OpenAIRecoveryStreamWriter) PublicToolOutputStarted() bool { return w.publicTool }
+func (w *OpenAIRecoveryStreamWriter) ClientDisconnected() bool      { return w.disconnect }
+func (w *OpenAIRecoveryStreamWriter) Finalized() bool               { return w.ended }
+func (w *OpenAIRecoveryStreamWriter) Written() bool                 { return w.started }
 
 // WinnerOutput contains only the successful physical response output, never the
 // public display transcript assembled from abandoned attempts and markers.
@@ -726,6 +736,11 @@ func (w *OpenAIRecoveryStreamWriter) handleChatFrame(data []byte, eventType stri
 				}
 			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
+				role, hasRole := delta["role"]
+				if hasRole && w.roles[index] {
+					delete(delta, "role")
+					hasRole = false
+				}
 				if rawTools, hasTool := delta["tool_calls"]; hasTool {
 					tools, ok := rawTools.([]any)
 					if !ok {
@@ -758,7 +773,14 @@ func (w *OpenAIRecoveryStreamWriter) handleChatFrame(data []byte, eventType stri
 							}
 						}
 					}
-					toolEvent := map[string]any{"id": w.logicalID, "object": event["object"], "model": event["model"], "created": event["created"], "choices": []any{map[string]any{"index": index, "delta": map[string]any{"tool_calls": rawTools}, "finish_reason": nil}}}
+					toolDelta := map[string]any{"tool_calls": rawTools}
+					if hasRole {
+						toolDelta["role"] = role
+						delete(delta, "role")
+						w.roles[index] = true
+						hasRole = false
+					}
+					toolEvent := map[string]any{"id": w.logicalID, "object": event["object"], "model": event["model"], "created": event["created"], "choices": []any{map[string]any{"index": index, "delta": toolDelta, "finish_reason": nil}}}
 					encodedTool, err := json.Marshal(toolEvent)
 					if err != nil {
 						return err
@@ -767,11 +789,55 @@ func (w *OpenAIRecoveryStreamWriter) handleChatFrame(data []byte, eventType stri
 					if w.heldBytes > openAIRecoveryMaxPendingBytes {
 						return errors.New("OpenAI recovery tool capacity exceeded")
 					}
-					w.heldChatFrames = append(w.heldChatFrames, []byte("data: "+string(encodedTool)+"\n\n"))
+					w.publicTool = !w.structured
+					if err := w.flushControls(); err != nil {
+						return err
+					}
+					if _, err := w.writePublic([]byte("data: " + string(encodedTool) + "\n\n")); err != nil {
+						return err
+					}
 					delete(delta, "tool_calls")
 				}
-				if _, hasTool := delta["function_call"]; hasTool {
-					return errors.New("managed legacy function_call requires explicit tool_calls conversion")
+				if rawCall, hasTool := delta["function_call"]; hasTool {
+					call, ok := rawCall.(map[string]any)
+					if !ok {
+						return errors.New("invalid OpenAI recovery Chat function call")
+					}
+					key := "legacy:" + strconv.Itoa(index)
+					state := w.heldChatTools[key]
+					if state == nil {
+						state = &openAIRecoveryChatTool{choice: index, id: key}
+						w.heldChatTools[key] = state
+					}
+					if name, _ := call["name"].(string); name != "" {
+						state.name += name
+					}
+					if arguments, _ := call["arguments"].(string); arguments != "" {
+						state.arguments.WriteString(arguments)
+					}
+					w.heldBytes += len(data)
+					if w.heldBytes > openAIRecoveryMaxPendingBytes {
+						return errors.New("OpenAI recovery tool capacity exceeded")
+					}
+					toolDelta := map[string]any{"function_call": call}
+					if hasRole {
+						toolDelta["role"] = role
+						delete(delta, "role")
+						w.roles[index] = true
+					}
+					toolEvent := map[string]any{"id": w.logicalID, "object": event["object"], "model": event["model"], "created": event["created"], "choices": []any{map[string]any{"index": index, "delta": toolDelta, "finish_reason": nil}}}
+					encodedTool, err := json.Marshal(toolEvent)
+					if err != nil {
+						return err
+					}
+					w.publicTool = !w.structured
+					if err := w.flushControls(); err != nil {
+						return err
+					}
+					if _, err := w.writePublic([]byte("data: " + string(encodedTool) + "\n\n")); err != nil {
+						return err
+					}
+					delete(delta, "function_call")
 				}
 				if _, hasRole := delta["role"]; hasRole {
 					if w.roles[index] {
@@ -945,7 +1011,14 @@ func (w *OpenAIRecoveryStreamWriter) handleResponsesFrame(data []byte, eventType
 							if err := validateRecoveryItem(item); err != nil {
 								return err
 							}
-							w.releaseItems = append(w.releaseItems, item)
+							if w.publicToolItems[index] {
+								if err := w.completePublicToolItem(index, item); err != nil {
+									return err
+								}
+								w.heldItems[index] = item
+							} else {
+								w.releaseItems = append(w.releaseItems, item)
+							}
 						} else if err := w.normalizeResponseMessage(item, index, true); err != nil {
 							return err
 						}
@@ -967,6 +1040,43 @@ func (w *OpenAIRecoveryStreamWriter) handleResponsesFrame(data []byte, eventType
 			originalIndex, ok := recoveryInteger(event["output_index"])
 			if !ok {
 				return errors.New("managed Responses item has no output index")
+			}
+			if isRecoveryExecutableToolItem(itemType) {
+				if eventType == "response.output_item.added" {
+					if w.publicToolItems[originalIndex] {
+						return errors.New("managed Responses tool item added twice")
+					}
+					w.publicToolItems[originalIndex] = true
+					w.heldItems[originalIndex] = item
+					if id, _ := item["id"].(string); id != "" {
+						w.heldItemIDs[id] = originalIndex
+					}
+					index := w.publicOutputIndex(originalIndex)
+					w.publicToolInput[originalIndex] = recoveryToolInput(item)
+					publicItem := recoveryItemCopy(item)
+					w.rewriteResponseItem(publicItem, -1)
+					id, _ := publicItem["id"].(string)
+					w.displayIndexes[id] = index
+					if err := w.rememberDisplayItem(publicItem); err != nil {
+						return err
+					}
+					event["output_index"] = index
+					event["item"] = publicItem
+					w.publicTool = !w.structured
+					return w.writeResponsesEvent(event)
+				}
+				if eventType == "response.output_item.done" {
+					if !w.publicToolItems[originalIndex] {
+						if err := w.beginPublicToolItem(originalIndex, item); err != nil {
+							return err
+						}
+					}
+					if err := validateRecoveryItem(item); err != nil {
+						return err
+					}
+					w.heldItems[originalIndex] = item
+					return w.completePublicToolItem(originalIndex, item)
+				}
 			}
 			w.heldItems[originalIndex] = item
 			if id, _ := item["id"].(string); id != "" {
@@ -994,7 +1104,7 @@ func (w *OpenAIRecoveryStreamWriter) handleResponsesFrame(data []byte, eventType
 			return w.normalizeResponseMessage(item, originalIndex, eventType == "response.output_item.done")
 		}
 	}
-	if originalIndex, ok := recoveryInteger(event["output_index"]); ok && w.heldItems[originalIndex] != nil {
+	if originalIndex, ok := recoveryInteger(event["output_index"]); ok && w.heldItems[originalIndex] != nil && !w.publicToolItems[originalIndex] {
 		if w.heldItems[originalIndex]["type"] == "reasoning" && strings.HasPrefix(eventType, "response.reasoning_summary_") {
 			return w.handleRecoveryReasoning(event, originalIndex)
 		}
@@ -1005,11 +1115,46 @@ func (w *OpenAIRecoveryStreamWriter) handleResponsesFrame(data []byte, eventType
 		return nil
 	}
 	if id, _ := event["item_id"].(string); id != "" {
-		if originalIndex, held := w.heldItemIDs[id]; held {
+		if originalIndex, held := w.heldItemIDs[id]; held && !w.publicToolItems[originalIndex] {
 			if w.heldItems[originalIndex]["type"] == "reasoning" && strings.HasPrefix(eventType, "response.reasoning_summary_") {
 				return w.handleRecoveryReasoning(event, originalIndex)
 			}
 			return nil
+		}
+	}
+	if strings.HasPrefix(eventType, "response.function_call_arguments.") || strings.HasPrefix(eventType, "response.custom_tool_call_input.") {
+		originalIndex, ok := recoveryInteger(event["output_index"])
+		if !ok {
+			id, _ := event["item_id"].(string)
+			originalIndex, ok = w.heldItemIDs[id]
+		}
+		if !ok || !w.publicToolItems[originalIndex] {
+			return errors.New("managed Responses tool input has no public item")
+		}
+		if strings.HasSuffix(eventType, ".delta") {
+			delta, _ := event["delta"].(string)
+			if len(w.publicToolInput[originalIndex])+len(delta) > openAIRecoveryMaxPendingBytes {
+				return errors.New("OpenAI recovery tool capacity exceeded")
+			}
+			w.publicToolInput[originalIndex] += delta
+		} else if strings.HasSuffix(eventType, ".done") {
+			field := "arguments"
+			if strings.HasPrefix(eventType, "response.custom_tool_call_input.") {
+				field = "input"
+			}
+			full, _ := event[field].(string)
+			if !strings.HasPrefix(full, w.publicToolInput[originalIndex]) {
+				return errors.New("OpenAI recovery tool input differs from streamed prefix")
+			}
+			if suffix := strings.TrimPrefix(full, w.publicToolInput[originalIndex]); suffix != "" {
+				index := w.publicOutputIndex(originalIndex)
+				id, _ := event["item_id"].(string)
+				if err := w.writeResponsesEvent(map[string]any{"type": strings.TrimSuffix(eventType, ".done") + ".delta", "output_index": index, "item_id": w.publicItemID(id), "delta": suffix}); err != nil {
+					return err
+				}
+			}
+			w.publicToolInput[originalIndex] = full
+			w.publicToolInputDone[originalIndex] = true
 		}
 	}
 	if eventType == "response.output_text.delta" || eventType == "response.output_text.done" || eventType == "response.refusal.delta" || eventType == "response.refusal.done" {
@@ -1279,9 +1424,107 @@ func validateRecoveryItem(item map[string]any) error {
 			}
 		}
 	default:
-		return errors.New("OpenAI recovery item type is not supported")
+		if !isRecoveryExecutableToolItem(typeName) {
+			return errors.New("OpenAI recovery item type is not supported")
+		}
 	}
 	return nil
+}
+
+func isRecoveryExecutableToolItem(typeName string) bool {
+	return strings.HasSuffix(typeName, "_call") && typeName != ""
+}
+
+func recoveryItemCopy(item map[string]any) map[string]any {
+	copy := make(map[string]any, len(item))
+	for key, value := range item {
+		copy[key] = value
+	}
+	return copy
+}
+
+func recoveryToolInput(item map[string]any) string {
+	field := "arguments"
+	if item["type"] == "custom_tool_call" {
+		field = "input"
+	}
+	value, _ := item[field].(string)
+	return value
+}
+
+func (w *OpenAIRecoveryStreamWriter) beginPublicToolItem(originalIndex int, item map[string]any) error {
+	if w.publicToolItems[originalIndex] {
+		return nil
+	}
+	if id, _ := item["id"].(string); id == "" {
+		return errors.New("OpenAI recovery tool item has no ID")
+	}
+	w.publicToolItems[originalIndex] = true
+	w.heldItems[originalIndex] = item
+	id, _ := item["id"].(string)
+	w.heldItemIDs[id] = originalIndex
+	index := w.publicOutputIndex(originalIndex)
+	w.publicToolInput[originalIndex] = ""
+	publicItem := recoveryItemCopy(item)
+	w.rewriteResponseItem(publicItem, -1)
+	publicItem["status"] = "in_progress"
+	if typeName, _ := item["type"].(string); typeName == "function_call" || typeName == "custom_tool_call" {
+		field := "arguments"
+		if typeName == "custom_tool_call" {
+			field = "input"
+		}
+		publicItem[field] = ""
+	}
+	w.displayIndexes[publicItem["id"].(string)] = index
+	if err := w.rememberDisplayItem(publicItem); err != nil {
+		return err
+	}
+	w.publicTool = !w.structured
+	return w.writeResponsesEvent(map[string]any{"type": "response.output_item.added", "output_index": index, "item": publicItem})
+}
+
+func (w *OpenAIRecoveryStreamWriter) completePublicToolItem(originalIndex int, item map[string]any) error {
+	if !w.publicToolItems[originalIndex] {
+		if err := w.beginPublicToolItem(originalIndex, item); err != nil {
+			return err
+		}
+	}
+	index := w.publicOutputIndex(originalIndex)
+	publicItem := recoveryItemCopy(item)
+	w.rewriteResponseItem(publicItem, -1)
+	id, _ := publicItem["id"].(string)
+	if id == "" {
+		return errors.New("OpenAI recovery tool item has no ID")
+	}
+	if typeName, _ := item["type"].(string); typeName == "function_call" || typeName == "custom_tool_call" {
+		field, eventName := "arguments", "response.function_call_arguments"
+		if typeName == "custom_tool_call" {
+			field, eventName = "input", "response.custom_tool_call_input"
+		}
+		full, _ := item[field].(string)
+		if !strings.HasPrefix(full, w.publicToolInput[originalIndex]) {
+			return errors.New("OpenAI recovery tool input differs from streamed prefix")
+		}
+		if suffix := strings.TrimPrefix(full, w.publicToolInput[originalIndex]); suffix != "" {
+			if err := w.writeResponsesEvent(map[string]any{"type": eventName + ".delta", "output_index": index, "item_id": id, "delta": suffix}); err != nil {
+				return err
+			}
+			w.publicToolInput[originalIndex] = full
+		}
+		if !w.publicToolInputDone[originalIndex] {
+			if err := w.writeResponsesEvent(map[string]any{"type": eventName + ".done", "output_index": index, "item_id": id, "call_id": item["call_id"], "name": item["name"], field: full}); err != nil {
+				return err
+			}
+			w.publicToolInputDone[originalIndex] = true
+		}
+	}
+	if !w.publicToolItemDone[originalIndex] {
+		if err := w.writeResponsesEvent(map[string]any{"type": "response.output_item.done", "output_index": index, "item": publicItem}); err != nil {
+			return err
+		}
+		w.publicToolItemDone[originalIndex] = true
+	}
+	return w.rememberDisplayItem(publicItem)
 }
 
 func (w *OpenAIRecoveryStreamWriter) handleRecoveryReasoning(event map[string]any, originalIndex int) error {

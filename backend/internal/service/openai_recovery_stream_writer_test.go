@@ -190,19 +190,134 @@ func TestOpenAIRecoveryStreamWriterRejectsReservedControl(t *testing.T) {
 	assert.Empty(t, recorder.Body.String())
 }
 
-func TestOpenAIRecoveryStreamWriterToolSearchWaitsForSuccessfulAttempt(t *testing.T) {
+func TestOpenAIRecoveryStreamWriterToolSearchStreamsAndStopsRecovery(t *testing.T) {
 	w, recorder := recoveryTestWriter(t, OpenAIRecoveryResponsesSSE, nil)
-	w.BeginAttempt(1)
-	writeRecoveryFrame(t, w, `{"type":"response.output_item.added","output_index":0,"item":{"id":"tool_bad","type":"tool_search_call","arguments":{},"call_id":"call_bad"}}`)
-	assert.NotContains(t, recorder.Body.String(), "call_bad")
-	require.NoError(t, w.AbandonAttempt())
-	w.BeginAttempt(2)
-	writeRecoveryFrame(t, w, `{"type":"response.completed","response":{"id":"resp_tools","status":"completed","output":[{"type":"tool_search_call","id":"tool_good","call_id":"call_good","status":"completed","arguments":{"query":"project"}}]}}`)
-	assert.NotContains(t, recorder.Body.String(), "call_good")
+	require.NoError(t, w.BeginAttempt(1))
+	writeRecoveryFrame(t, w, `{"type":"response.output_item.added","output_index":0,"item":{"id":"tool_live","type":"tool_search_call","arguments":{},"call_id":"call_live"}}`)
+	require.True(t, w.PublicToolOutputStarted())
+	assert.Contains(t, recorder.Body.String(), "call_live", "tool item must arrive before upstream terminal")
+	require.Error(t, w.AbandonAttempt())
+	require.Error(t, w.BeginAttempt(2))
+	require.NoError(t, w.FailAttempt("upstream_error", "rate_limit_exceeded", "rate limited"))
+	assert.Contains(t, recorder.Body.String(), "response.failed")
+	assert.NotContains(t, recorder.Body.String(), "Regenerating")
+	assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"kind":"terminal"`))
+}
+
+func TestOpenAIRecoveryStreamWriterChatToolDeltasStreamBeforeTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name, request, frame, want string
+	}{
+		{"tool_calls", `{"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, `{"id":"chat_a","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_one","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]}`, `"tool_calls"`},
+		{"legacy function_call", `{"functions":[{"name":"lookup","parameters":{"type":"object"}}]}`, `{"id":"chat_a","choices":[{"index":0,"delta":{"role":"assistant","function_call":{"name":"lookup","arguments":"{\"q\":"}},"finish_reason":null}]}`, `"function_call"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, recorder := recoveryTestWriter(t, OpenAIRecoveryChatSSE, nil)
+			w.request = []byte(tc.request)
+			require.NoError(t, w.BeginAttempt(1))
+			writeRecoveryFrame(t, w, tc.frame)
+			assert.True(t, w.PublicToolOutputStarted())
+			assert.Contains(t, recorder.Body.String(), tc.want)
+			var firstChoice string
+			for _, frame := range strings.Split(recorder.Body.String(), "\n\n") {
+				data := strings.TrimPrefix(frame, "data: ")
+				if gjson.Get(data, "choices").Exists() {
+					firstChoice = data
+					break
+				}
+			}
+			require.NotEmpty(t, firstChoice)
+			assert.Equal(t, "assistant", gjson.Get(firstChoice, "choices.0.delta.role").String())
+			assert.True(t, gjson.Get(firstChoice, "choices.0.delta."+strings.Trim(tc.want, `"`)).Exists())
+			assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"role":"assistant"`))
+			require.Error(t, w.AbandonAttempt())
+			require.NoError(t, w.FailAttempt("upstream_error", "rate_limit_exceeded", "rate limited"))
+			assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"kind":"terminal"`))
+			assert.NotContains(t, recorder.Body.String(), "Regenerating")
+		})
+	}
+}
+
+func TestOpenAIRecoveryStreamWriterResponsesToolFramesMatchTerminal(t *testing.T) {
+	w, recorder := recoveryTestWriter(t, OpenAIRecoveryResponsesSSE, nil)
+	w.request = []byte(`{"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`)
+	require.NoError(t, w.BeginAttempt(1))
+	writeRecoveryFrame(t, w, `{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_upstream","type":"function_call","call_id":"call_one","name":"lookup","arguments":"","status":"in_progress"}}`)
+	writeRecoveryFrame(t, w, `{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_upstream","delta":"{\"q\":"}`)
+	assert.Contains(t, recorder.Body.String(), `"delta":"{\"q\":"`, "argument delta must arrive before terminal")
+	writeRecoveryFrame(t, w, `{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_upstream","arguments":"{\"q\":1}"}`)
+	writeRecoveryFrame(t, w, `{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_upstream","type":"function_call","call_id":"call_one","name":"lookup","arguments":"{\"q\":1}","status":"completed"}}`)
+	writeRecoveryFrame(t, w, `{"type":"response.completed","response":{"id":"resp_upstream","status":"completed","output":[{"id":"fc_upstream","type":"function_call","call_id":"call_one","name":"lookup","arguments":"{\"q\":1}","status":"completed"}]}}`)
 	require.NoError(t, w.CommitAttempt(""))
-	assert.Contains(t, recorder.Body.String(), "call_good")
-	assert.NotContains(t, recorder.Body.String(), "call_bad")
-	assert.Less(t, strings.Index(recorder.Body.String(), "call_good"), strings.Index(recorder.Body.String(), `"kind":"terminal"`))
+	var added, done, completed string
+	for _, frame := range strings.Split(recorder.Body.String(), "\n\n") {
+		start := strings.Index(frame, "data: ")
+		if start < 0 {
+			continue
+		}
+		data := strings.TrimSpace(frame[start+len("data: "):])
+		switch gjson.Get(data, "type").String() {
+		case "response.output_item.added":
+			added = data
+		case "response.output_item.done":
+			done = data
+		case "response.completed":
+			completed = data
+		}
+	}
+	require.NotEmpty(t, added)
+	require.NotEmpty(t, done)
+	require.NotEmpty(t, completed)
+	assert.Equal(t, gjson.Get(added, "item.id").String(), gjson.Get(done, "item.id").String())
+	assert.Equal(t, gjson.Get(done, "item.id").String(), gjson.Get(completed, "response.output.0.id").String())
+	assert.Equal(t, gjson.Get(added, "output_index").Int(), gjson.Get(done, "output_index").Int())
+	assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"response.output_item.done"`))
+}
+
+func TestOpenAIRecoveryStreamWriterResponsesDoneOnlyToolStreamsOrderedInput(t *testing.T) {
+	w, recorder := recoveryTestWriter(t, OpenAIRecoveryResponsesSSE, nil)
+	require.NoError(t, w.BeginAttempt(1))
+	writeRecoveryFrame(t, w, `{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_upstream","type":"function_call","call_id":"call_one","name":"lookup","arguments":"{\"q\":1}","status":"completed"}}`)
+
+	var events []string
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		if data := strings.TrimPrefix(line, "data: "); data != line && gjson.Get(data, "type").Exists() && gjson.Get(data, "type").String() != "kkai.recovery.v1" {
+			events = append(events, data)
+		}
+	}
+	require.Len(t, events, 5) // created, added, arguments delta/done, item done
+	assert.Equal(t, "response.output_item.added", gjson.Get(events[1], "type").String())
+	assert.Equal(t, "in_progress", gjson.Get(events[1], "item.status").String())
+	assert.Empty(t, gjson.Get(events[1], "item.arguments").String())
+	assert.Equal(t, "response.function_call_arguments.delta", gjson.Get(events[2], "type").String())
+	assert.Equal(t, `{"q":1}`, gjson.Get(events[2], "delta").String())
+	assert.Equal(t, "response.function_call_arguments.done", gjson.Get(events[3], "type").String())
+	assert.Equal(t, "response.output_item.done", gjson.Get(events[4], "type").String())
+}
+
+func TestOpenAIRecoveryStreamWriterRejectsInvalidPublicFunctionCall(t *testing.T) {
+	for _, tc := range []struct {
+		name, toolName, arguments string
+	}{
+		{"invalid arguments", "lookup", `{"id":"wrong"}`},
+		{"undeclared name", "other", `{"id":1}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, recorder := recoveryTestWriter(t, OpenAIRecoveryResponsesSSE, nil)
+			w.request = []byte(`{"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}]}`)
+			require.NoError(t, w.BeginAttempt(1))
+			added := `{"id":"fc_upstream","type":"function_call","call_id":"call_one","name":"` + tc.toolName + `","arguments":"","status":"in_progress"}`
+			completed := `{"id":"fc_upstream","type":"function_call","call_id":"call_one","name":"` + tc.toolName + `","arguments":` + strconv.Quote(tc.arguments) + `,"status":"completed"}`
+			writeRecoveryFrame(t, w, `{"type":"response.output_item.added","output_index":0,"item":`+added+`}`)
+			writeRecoveryFrame(t, w, `{"type":"response.output_item.done","output_index":0,"item":`+completed+`}`)
+			writeRecoveryFrame(t, w, `{"type":"response.completed","response":{"id":"resp_upstream","status":"completed","output":[`+completed+`]}}`)
+			require.True(t, w.PublicToolOutputStarted())
+			var failover *UpstreamFailoverError
+			require.ErrorAs(t, w.CommitAttempt(""), &failover)
+			assert.Equal(t, "OpenAI recovery tool arguments failed validation", gjson.GetBytes(failover.ResponseBody, "error.message").String())
+			assert.NotContains(t, recorder.Body.String(), `"type":"response.completed"`)
+		})
+	}
 }
 
 func TestOpenAIRecoveryStreamWriterChatRequiresEveryChoice(t *testing.T) {
