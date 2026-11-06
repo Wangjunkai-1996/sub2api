@@ -708,7 +708,21 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		})
 		c.Writer = managedWriter
 		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchObserver(c.Request.Context(), managedWriter.BeginAttempt))
+		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchStartedObserver(c.Request.Context(), managedWriter.RecordDispatch))
 		defer func() {
+			if !managedWriter.Finalized() && (managedWriter.ClientDisconnected() || c.Request.Context().Err() == context.Canceled) {
+				stopReason := managedWriter.StopReason()
+				if stopReason == "" {
+					managedWriter.SetStopReason("client_disconnected")
+					stopReason = "client_disconnected"
+				}
+				reqLog.Warn("openai.recovery_incomplete",
+					zap.Int("same_account_retries", managedWriter.SameAccountRetryCount()),
+					zap.Int("account_switches", managedWriter.AccountSwitchCount()),
+					zap.String("stop_reason", stopReason),
+					zap.Bool("public_tool_output_started", managedWriter.PublicToolOutputStarted()),
+				)
+			}
 			if !managedWriter.Finalized() && !managedWriter.ClientDisconnected() && c.Request.Context().Err() != context.Canceled {
 				service.MarkOpsStreamError(c, "upstream_error", "The upstream request could not complete", http.StatusBadGateway)
 				_ = managedWriter.FailAttempt("upstream_error", "recovery_exhausted", "The upstream request could not complete")
@@ -876,6 +890,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 				h.handleSelectionFailure(c, cls, streamStarted)
 				return
+			}
+			if managedWriter != nil {
+				managedWriter.SetStopReason("no_viable_account")
 			}
 			if lastFailoverErr != nil {
 				h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
@@ -1195,10 +1212,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, forwardModel, requireCompact, nil), false, nil, err)
 					}
 					if managedWriter != nil && managedWriter.PublicToolOutputStarted() {
+						managedWriter.SetStopReason("tool_output_started")
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
 					if !failoverErr.ShouldRetryNextAccount() {
+						if managedWriter != nil {
+							managedWriter.SetStopReason("retry_not_allowed")
+						}
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
@@ -4573,6 +4594,9 @@ func (h *OpenAIGatewayHandler) handleOpenAIRequestBudgetExhausted(c *gin.Context
 		}
 	}
 	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusGatewayTimeout, stopReason)
+	if writer, ok := c.Writer.(*service.OpenAIRecoveryStreamWriter); ok {
+		writer.SetStopReason(stopReason)
+	}
 	h.handleStreamingAwareError(c, http.StatusGatewayTimeout, "request_timeout", message, streamStarted)
 }
 
@@ -4581,6 +4605,9 @@ func (h *OpenAIGatewayHandler) handleOpenAIRetryBudgetExhausted(c *gin.Context, 
 	const message = "The upstream retry window has expired"
 	service.SetOpsUpstreamError(c, http.StatusBadGateway, message, "")
 	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusBadGateway, "retry_budget_exhausted")
+	if writer, ok := c.Writer.(*service.OpenAIRecoveryStreamWriter); ok {
+		writer.SetStopReason("retry_budget_exhausted")
+	}
 	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", message, streamStarted)
 }
 
@@ -4593,6 +4620,9 @@ func (h *OpenAIGatewayHandler) handleOpenAIModelDispatchBudgetExhausted(c *gin.C
 		stopReason = "dispatch_limit"
 	}
 	service.MarkOpsUpstreamFinalOutcome(c, nil, http.StatusBadGateway, stopReason)
+	if writer, ok := c.Writer.(*service.OpenAIRecoveryStreamWriter); ok {
+		writer.SetStopReason(stopReason)
+	}
 	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", message, streamStarted)
 }
 

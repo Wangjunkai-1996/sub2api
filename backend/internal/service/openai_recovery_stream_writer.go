@@ -25,16 +25,21 @@ const (
 
 const openAIRecoveryMaxPendingBytes = 8 << 20
 
+const OpenAIRecoveryDiagnosticsHeader = "X-KKAI-Recovery-Diagnostics"
+
 type openAIRecoveryControl struct {
-	Type          string          `json:"type"`
-	Kind          string          `json:"kind"`
-	LogicalID     string          `json:"logical_id"`
-	Seq           int             `json:"seq"`
-	Attempt       int             `json:"attempt"`
-	Outcome       string          `json:"outcome,omitempty"`
-	UsageFormat   string          `json:"usage_format,omitempty"`
-	UsageReported *bool           `json:"usage_reported,omitempty"`
-	Usage         json.RawMessage `json:"usage,omitempty"`
+	Type               string          `json:"type"`
+	Kind               string          `json:"kind"`
+	LogicalID          string          `json:"logical_id"`
+	Seq                int             `json:"seq"`
+	Attempt            int             `json:"attempt"`
+	Outcome            string          `json:"outcome,omitempty"`
+	UsageFormat        string          `json:"usage_format,omitempty"`
+	UsageReported      *bool           `json:"usage_reported,omitempty"`
+	Usage              json.RawMessage `json:"usage,omitempty"`
+	SameAccountRetries *int            `json:"same_account_retries,omitempty"`
+	AccountSwitches    *int            `json:"account_switches,omitempty"`
+	StopReason         string          `json:"stop_reason,omitempty"`
 }
 
 // OpenAIRecoveryStreamWriter owns the public response for all physical attempts
@@ -54,6 +59,12 @@ type OpenAIRecoveryStreamWriter struct {
 	started               bool
 	visible               bool
 	publicTool            bool
+	lastDispatchAccountID int64
+	dispatchCount         int
+	sameAccountRetries    int
+	accountSwitches       int
+	stopReason            string
+	diagnosticsHeaderSent bool
 	disconnect            bool
 	ended                 bool
 	protocolErr           error
@@ -526,6 +537,7 @@ func (w *OpenAIRecoveryStreamWriter) FailAttempt(errType, code, message string) 
 	w.pendingScan = 0
 	w.terminal = nil
 	if w.mode == OpenAIRecoveryResponsesJSON || w.mode == OpenAIRecoveryChatJSON || !w.started {
+		w.writeDiagnosticsHeader("failed")
 		body, err := json.Marshal(gin.H{"error": gin.H{"type": errType, "code": code, "message": message}})
 		if err != nil {
 			return err
@@ -569,6 +581,51 @@ func (w *OpenAIRecoveryStreamWriter) PublicToolOutputStarted() bool { return w.p
 func (w *OpenAIRecoveryStreamWriter) ClientDisconnected() bool      { return w.disconnect }
 func (w *OpenAIRecoveryStreamWriter) Finalized() bool               { return w.ended }
 func (w *OpenAIRecoveryStreamWriter) Written() bool                 { return w.started }
+
+func (w *OpenAIRecoveryStreamWriter) RecordDispatch(accountID int64) {
+	if w.dispatchCount > 0 {
+		if accountID == w.lastDispatchAccountID {
+			w.sameAccountRetries++
+		} else {
+			w.accountSwitches++
+		}
+	}
+	w.lastDispatchAccountID = accountID
+	w.dispatchCount++
+}
+
+func (w *OpenAIRecoveryStreamWriter) SetStopReason(reason string) {
+	if w.stopReason == "" {
+		w.stopReason = reason
+	}
+}
+
+func (w *OpenAIRecoveryStreamWriter) SameAccountRetryCount() int { return w.sameAccountRetries }
+func (w *OpenAIRecoveryStreamWriter) AccountSwitchCount() int    { return w.accountSwitches }
+func (w *OpenAIRecoveryStreamWriter) StopReason() string         { return w.stopReason }
+
+func (w *OpenAIRecoveryStreamWriter) writeDiagnosticsHeader(outcome string) {
+	if w.diagnosticsHeaderSent || w.ResponseWriter == nil {
+		return
+	}
+	payload := map[string]any{
+		"same_account_retries": w.sameAccountRetries,
+		"account_switches":     w.accountSwitches,
+		"outcome":              outcome,
+	}
+	if outcome == "failed" {
+		stopReason := w.stopReason
+		if stopReason == "" {
+			stopReason = "upstream_error"
+		}
+		payload["stop_reason"] = stopReason
+	}
+	encoded, err := json.Marshal(payload)
+	if err == nil {
+		w.ResponseWriter.Header().Set(OpenAIRecoveryDiagnosticsHeader, string(encoded))
+		w.diagnosticsHeaderSent = true
+	}
+}
 
 // WinnerOutput contains only the successful physical response output, never the
 // public display transcript assembled from abandoned attempts and markers.
@@ -2007,7 +2064,14 @@ func (w *OpenAIRecoveryStreamWriter) queueTerminal(outcome string) {
 	if !reported {
 		usage = json.RawMessage("null")
 	}
-	control := openAIRecoveryControl{Type: "kkai.recovery.v1", Kind: "terminal", LogicalID: w.logicalID, Seq: w.seq, Attempt: w.attempt, Outcome: outcome, UsageFormat: format, UsageReported: &reported, Usage: usage}
+	stopReason := ""
+	if outcome == "failed" {
+		stopReason = w.stopReason
+		if stopReason == "" {
+			stopReason = "upstream_error"
+		}
+	}
+	control := openAIRecoveryControl{Type: "kkai.recovery.v1", Kind: "terminal", LogicalID: w.logicalID, Seq: w.seq, Attempt: w.attempt, Outcome: outcome, UsageFormat: format, UsageReported: &reported, Usage: usage, SameAccountRetries: &w.sameAccountRetries, AccountSwitches: &w.accountSwitches, StopReason: stopReason}
 	data, _ := json.Marshal(control)
 	w.controls = append(w.controls, []byte("data: "+string(data)+"\n\n"))
 }
@@ -2044,6 +2108,7 @@ func (w *OpenAIRecoveryStreamWriter) flushJSON() error {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
+	w.writeDiagnosticsHeader(w.outcome)
 	_, err = w.writePublic(encoded)
 	w.pending.Reset()
 	w.ended = err == nil
@@ -2061,10 +2126,13 @@ func (w *OpenAIRecoveryStreamWriter) prepareRecoveryJSON() error {
 	if body["error"] != nil {
 		return openAIRecoveryInvalidAttempt("OpenAI recovery JSON body contains an error")
 	}
+	w.outcome = "completed"
 	if w.mode == OpenAIRecoveryResponsesJSON {
-		if status, _ := body["status"].(string); status != "completed" && status != "incomplete" {
+		status, _ := body["status"].(string)
+		if status != "completed" && status != "incomplete" {
 			return openAIRecoveryInvalidAttempt("OpenAI recovery JSON response is not complete")
 		}
+		w.outcome = status
 		output, _ := body["output"].([]any)
 		var text strings.Builder
 		alternative := false
@@ -2121,6 +2189,9 @@ func (w *OpenAIRecoveryStreamWriter) prepareRecoveryJSON() error {
 			choice, _ := raw.(map[string]any)
 			if choice["finish_reason"] == nil {
 				return openAIRecoveryInvalidAttempt("OpenAI recovery JSON choice has no finish reason")
+			}
+			if choice["finish_reason"] == "length" {
+				w.outcome = "incomplete"
 			}
 			message, _ := choice["message"].(map[string]any)
 			if message == nil {

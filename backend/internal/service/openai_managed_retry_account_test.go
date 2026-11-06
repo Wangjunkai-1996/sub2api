@@ -72,12 +72,16 @@ func TestOpenAIManagedDispatchObserverCountsActualAttemptsAcrossOldRetryDeadline
 func TestOpenAIManagedDispatchStopsIfResponseWriterRejectsAttempt(t *testing.T) {
 	ctx := WithOpenAIModelDispatchBudget(WithOpenAIManagedRecovery(context.Background()))
 	writerErr := errors.New("client output unavailable")
+	var started []int64
+	ctx = WithOpenAIModelDispatchStartedObserver(ctx, func(accountID int64) { started = append(started, accountID) })
 	ctx = WithOpenAIModelDispatchObserver(ctx, func(int) error { return writerErr })
 	err := takeOpenAIModelDispatch(ctx, 1)
 	require.ErrorIs(t, err, writerErr)
 	assert.True(t, IsOpenAIModelDispatchStop(err))
+	assert.Empty(t, started)
 	var firstAttempt int
 	ctx = WithOpenAIModelDispatchObserver(ctx, func(attempt int) error { firstAttempt = attempt; return nil })
 	require.NoError(t, takeOpenAIModelDispatch(ctx, 1))
 	assert.Equal(t, 1, firstAttempt)
+	assert.Equal(t, []int64{1}, started)
 }

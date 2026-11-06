@@ -140,7 +140,21 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		managedWriter = service.NewOpenAIRecoveryStreamWriter(c.Writer, wireFormat, "chatcmpl-"+uuid.NewString(), body, nil)
 		c.Writer = managedWriter
 		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchObserver(c.Request.Context(), managedWriter.BeginAttempt))
+		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchStartedObserver(c.Request.Context(), managedWriter.RecordDispatch))
 		defer func() {
+			if !managedWriter.Finalized() && (managedWriter.ClientDisconnected() || c.Request.Context().Err() == context.Canceled) {
+				stopReason := managedWriter.StopReason()
+				if stopReason == "" {
+					managedWriter.SetStopReason("client_disconnected")
+					stopReason = "client_disconnected"
+				}
+				reqLog.Warn("openai.recovery_incomplete",
+					zap.Int("same_account_retries", managedWriter.SameAccountRetryCount()),
+					zap.Int("account_switches", managedWriter.AccountSwitchCount()),
+					zap.String("stop_reason", stopReason),
+					zap.Bool("public_tool_output_started", managedWriter.PublicToolOutputStarted()),
+				)
+			}
 			if !managedWriter.Finalized() && !managedWriter.ClientDisconnected() && c.Request.Context().Err() != context.Canceled {
 				service.MarkOpsStreamError(c, "upstream_error", "The upstream request could not complete", http.StatusBadGateway)
 				_ = managedWriter.FailAttempt("upstream_error", "recovery_exhausted", "The upstream request could not complete")
@@ -259,6 +273,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				h.handleSelectionFailure(c, cls, streamStarted)
 				return
 			} else {
+				if managedWriter != nil {
+					managedWriter.SetStopReason("no_viable_account")
+				}
 				if lastFailoverErr != nil {
 					h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
 				} else {
@@ -476,10 +493,14 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, reqModel, false, nil), false, nil, err)
 					}
 					if managedWriter != nil && managedWriter.PublicToolOutputStarted() {
+						managedWriter.SetStopReason("tool_output_started")
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
 					if !failoverErr.ShouldRetryNextAccount() {
+						if managedWriter != nil {
+							managedWriter.SetStopReason("retry_not_allowed")
+						}
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}

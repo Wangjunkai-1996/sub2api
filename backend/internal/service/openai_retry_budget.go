@@ -14,6 +14,7 @@ import (
 type openAIRetryBudgetDeadlineKey struct{}
 type openAIManagedRecoveryKey struct{}
 type openAIModelDispatchObserverKey struct{}
+type openAIModelDispatchStartedObserverKey struct{}
 type openAIManagedRetryAccountKey struct{}
 
 // WithOpenAIManagedRetryAccount prefers a fresh admission of the same account.
@@ -41,6 +42,14 @@ func WithOpenAIModelDispatchObserver(ctx context.Context, observe func(int) erro
 		return ctx
 	}
 	return context.WithValue(ctx, openAIModelDispatchObserverKey{}, observe)
+}
+
+// WithOpenAIModelDispatchStartedObserver observes only debited physical calls.
+func WithOpenAIModelDispatchStartedObserver(ctx context.Context, observe func(int64)) context.Context {
+	if observe == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, openAIModelDispatchStartedObserverKey{}, observe)
 }
 
 // WithOpenAIRetryBudgetDeadline carries the request-scoped deadline that limits
@@ -147,6 +156,9 @@ func takeOpenAIModelDispatch(ctx context.Context, accountID int64) error {
 	}
 	budget.attempts++
 	budget.dispatchStartedAt = time.Now()
+	if observe, ok := ctx.Value(openAIModelDispatchStartedObserverKey{}).(func(int64)); ok {
+		observe(accountID)
+	}
 	startOpenAIFirstOutputDispatch(ctx, budget.dispatchStartedAt)
 	fields := []zap.Field{
 		zap.Int64("account_id", accountID),

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/alicebob/miniredis/v2"
@@ -20,7 +21,43 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestOpenAIManagedClientCancellationKeepsIncompleteDiagnostics(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, route := range []string{"responses", "chat/completions"} {
+		t.Run(route, func(t *testing.T) {
+			core, observed := observer.New(zap.WarnLevel)
+			ctx, cancel := context.WithCancel(logger.IntoContext(context.Background(), zap.New(core)))
+			defer cancel()
+			ctx = context.WithValue(ctx, ctxkey.NewAPIUserID, int64(1))
+			ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
+			ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
+			upstream := &openAIResponsesFailoverCancelUpstream{onFirstDo: cancel}
+			h := newOpenAIResponsesFailoverTestHandler(t, upstream)
+			c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
+			c.Request.URL.Path = "/v1/" + route
+			c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":"hello","messages":[{"role":"user","content":"hello"}]}`))
+			if route == "responses" {
+				h.Responses(c)
+			} else {
+				h.ChatCompletions(c)
+			}
+			assert.Equal(t, []int64{1}, upstream.calls(), "client cancellation must not dispatch another account")
+			assert.Empty(t, rec.Body.String(), "a canceled response must not manufacture a failed terminal")
+			logs := observed.FilterMessage("openai.recovery_incomplete").All()
+			require.Len(t, logs, 1)
+			fields := logs[0].ContextMap()
+			assert.Equal(t, "client_disconnected", fields["stop_reason"])
+			assert.Equal(t, int64(0), fields["same_account_retries"])
+			assert.Equal(t, int64(0), fields["account_switches"])
+			assert.Equal(t, false, fields["public_tool_output_started"])
+		})
+	}
+}
 
 func TestOpenAIManagedChatRecoversAfterVisibleText(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -43,6 +80,8 @@ func TestOpenAIManagedChatRecoversAfterVisibleText(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(rec.Body.String(), "data: [DONE]"))
 	assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`))
 	assert.NotContains(t, rec.Body.String(), `"outcome":"failed"`)
+	assert.Contains(t, rec.Body.String(), `"same_account_retries":2`)
+	assert.Contains(t, rec.Body.String(), `"account_switches":1`)
 }
 
 func TestOpenAIManagedChatStopsAfterPublicToolOutput(t *testing.T) {
@@ -62,6 +101,9 @@ func TestOpenAIManagedChatStopsAfterPublicToolOutput(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "tool_calls")
 	assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`))
 	assert.Contains(t, rec.Body.String(), `"outcome":"failed"`)
+	assert.Contains(t, rec.Body.String(), `"stop_reason":"tool_output_started"`)
+	assert.Contains(t, rec.Body.String(), `"same_account_retries":0`)
+	assert.Contains(t, rec.Body.String(), `"account_switches":0`)
 	assert.NotContains(t, rec.Body.String(), "Regenerating")
 }
 
@@ -220,6 +262,8 @@ func TestOpenAIManagedResponsesRecoversFromTransientFailures(t *testing.T) {
 			assert.NotContains(t, rec.Body.String(), `"type":"response.failed"`)
 			assert.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.completed"`))
 			assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`))
+			assert.Contains(t, rec.Body.String(), `"same_account_retries":2`)
+			assert.Contains(t, rec.Body.String(), `"account_switches":1`)
 			var alias string
 			for _, line := range strings.Split(rec.Body.String(), "\n") {
 				data := strings.TrimPrefix(line, "data: ")
@@ -268,6 +312,9 @@ func TestOpenAIManagedResponsesStopsAfterPublicToolOutput(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"type":"function_call"`)
 	assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`))
 	assert.Contains(t, rec.Body.String(), `"outcome":"failed"`)
+	assert.Contains(t, rec.Body.String(), `"stop_reason":"tool_output_started"`)
+	assert.Contains(t, rec.Body.String(), `"same_account_retries":0`)
+	assert.Contains(t, rec.Body.String(), `"account_switches":0`)
 	assert.NotContains(t, rec.Body.String(), "Regenerating")
 }
 

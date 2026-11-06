@@ -36,6 +36,7 @@ func TestOpenAIRecoveryStreamWriterResponsesRegeneratesWithOneLogicalTerminal(t 
 		return nil
 	})
 	w.BeginAttempt(1)
+	w.RecordDispatch(101)
 	writeRecoveryFrame(t, w, `{"type":"response.created","response":{"id":"resp_a","status":"in_progress","output":[]},"sequence_number":0}`)
 	writeRecoveryFrame(t, w, `{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_a","type":"message","role":"assistant","status":"in_progress","content":[]}}`)
 	writeRecoveryFrame(t, w, `{"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"msg_a","part":{"type":"output_text","text":""}}`)
@@ -44,6 +45,7 @@ func TestOpenAIRecoveryStreamWriterResponsesRegeneratesWithOneLogicalTerminal(t 
 	writeRecoveryFrame(t, w, `{"type":"response.failed","response":{"id":"resp_a","status":"failed"}}`)
 	require.NoError(t, w.AbandonAttempt())
 	w.BeginAttempt(2)
+	w.RecordDispatch(101)
 	writeRecoveryFrame(t, w, `{"type":"response.created","response":{"id":"resp_b","status":"in_progress","output":[]}}`)
 	writeRecoveryFrame(t, w, `{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_b","type":"message","role":"assistant","status":"in_progress","content":[]}}`)
 	writeRecoveryFrame(t, w, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg_b","delta":"new"}`)
@@ -58,9 +60,28 @@ func TestOpenAIRecoveryStreamWriterResponsesRegeneratesWithOneLogicalTerminal(t 
 	assert.Contains(t, body, `"kind":"attempt_abandoned"`)
 	assert.Contains(t, body, `"usage_format":"responses"`)
 	assert.Contains(t, body, `"usage_reported":true`)
+	assert.Contains(t, body, `"same_account_retries":1`)
+	assert.Contains(t, body, `"account_switches":0`)
+	assert.NotContains(t, body, `"stop_reason"`)
 	assert.Contains(t, body, `"id":"resp_lr_test"`)
 	assert.NotContains(t, body, `"id":"resp_b"`)
 	assert.JSONEq(t, `[{"id":"msg_b","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"new"}]}]`, string(w.WinnerOutput()))
+}
+
+func TestOpenAIRecoveryStreamWriterTerminalReportsSwitchAndToolStop(t *testing.T) {
+	w, recorder := recoveryTestWriter(t, OpenAIRecoveryChatSSE, nil)
+	require.NoError(t, w.BeginAttempt(1))
+	w.RecordDispatch(101)
+	require.NoError(t, w.AbandonAttempt())
+	require.NoError(t, w.BeginAttempt(2))
+	w.RecordDispatch(202)
+	writeRecoveryFrame(t, w, `{"id":"chat_b","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`)
+	w.SetStopReason("tool_output_started")
+	require.NoError(t, w.FailAttempt("upstream_error", "", "failed"))
+	body := recorder.Body.String()
+	assert.Equal(t, 1, strings.Count(body, `"same_account_retries":0`))
+	assert.Equal(t, 1, strings.Count(body, `"account_switches":1`))
+	assert.Equal(t, 1, strings.Count(body, `"stop_reason":"tool_output_started"`))
 }
 
 func TestOpenAIRecoveryStreamWriterChatKeepsOnlyWinnerFinishAndUsage(t *testing.T) {
@@ -362,9 +383,12 @@ func TestOpenAIRecoveryStreamWriterStrictJSONCommitsOrFailsWithBody(t *testing.T
 		mode    OpenAIRecoveryWireFormat
 		request string
 		body    string
+		outcome string
 	}{
-		{"responses", OpenAIRecoveryResponsesJSON, `{"text":{"format":{"type":"json_object"}}}`, `{"id":"resp_json","status":"completed","output":[{"id":"msg_json","type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]}`},
-		{"chat", OpenAIRecoveryChatJSON, `{"response_format":{"type":"json_object"}}`, `{"id":"chat_json","choices":[{"index":0,"message":{"role":"assistant","content":"{\"ok\":true}"},"finish_reason":"stop"}]}`},
+		{"responses", OpenAIRecoveryResponsesJSON, `{"text":{"format":{"type":"json_object"}}}`, `{"id":"resp_json","status":"completed","output":[{"id":"msg_json","type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]}`, "completed"},
+		{"chat", OpenAIRecoveryChatJSON, `{"response_format":{"type":"json_object"}}`, `{"id":"chat_json","choices":[{"index":0,"message":{"role":"assistant","content":"{\"ok\":true}"},"finish_reason":"stop"}]}`, "completed"},
+		{"responses incomplete", OpenAIRecoveryResponsesJSON, `{"text":{"format":{"type":"json_object"}}}`, `{"id":"resp_json","status":"incomplete","output":[{"id":"msg_json","type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]}`, "incomplete"},
+		{"chat incomplete", OpenAIRecoveryChatJSON, `{"response_format":{"type":"json_object"}}`, `{"id":"chat_json","choices":[{"index":0,"message":{"role":"assistant","content":"{\"ok\":true}"},"finish_reason":"length"}]}`, "incomplete"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -378,6 +402,8 @@ func TestOpenAIRecoveryStreamWriterStrictJSONCommitsOrFailsWithBody(t *testing.T
 			require.NoError(t, w.CommitAttempt(""))
 			assert.Contains(t, recorder.Body.String(), `"id":"resp_lr_test"`)
 			assert.Contains(t, recorder.Body.String(), `\"ok\":true`)
+			assert.Equal(t, tc.outcome, gjson.Get(recorder.Header().Get(OpenAIRecoveryDiagnosticsHeader), "outcome").String())
+			assert.Equal(t, 0, int(gjson.Get(recorder.Header().Get(OpenAIRecoveryDiagnosticsHeader), "same_account_retries").Int()))
 		})
 	}
 	w, recorder := recoveryTestWriter(t, OpenAIRecoveryChatSSE, nil)
@@ -389,6 +415,8 @@ func TestOpenAIRecoveryStreamWriterStrictJSONCommitsOrFailsWithBody(t *testing.T
 	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), `"message":"Try later"`)
 	assert.NotContains(t, recorder.Body.String(), "kkai.recovery.v1")
+	assert.Equal(t, "failed", gjson.Get(recorder.Header().Get(OpenAIRecoveryDiagnosticsHeader), "outcome").String())
+	assert.Equal(t, "upstream_error", gjson.Get(recorder.Header().Get(OpenAIRecoveryDiagnosticsHeader), "stop_reason").String())
 }
 
 func TestOpenAIRecoveryStreamWriterStructuredDoneCompletesMissingDelta(t *testing.T) {
