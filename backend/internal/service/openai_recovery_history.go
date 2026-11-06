@@ -15,10 +15,10 @@ type openAIRecoveryHistory struct {
 	Items   []json.RawMessage `json:"items"`
 }
 
-// BuildOpenAIRecoverySnapshot records only the successful attempt's portable
-// text context. A missing snapshot must disable cross-account reconstruction,
-// not same-account continuation. Output must be captured before public ID and
-// display-transcript rewriting.
+// BuildOpenAIRecoverySnapshot records only the successful attempt's visible
+// text context. A reconstructed continuation cannot preserve hidden reasoning.
+// A missing snapshot must disable cross-account reconstruction, not same-account
+// continuation. Output must be captured before public ID and display rewriting.
 func BuildOpenAIRecoverySnapshot(request, winnerOutput, previousSnapshot []byte) ([]byte, error) {
 	var body map[string]json.RawMessage
 	if json.Unmarshal(request, &body) != nil || !openAIRecoveryPortableRequest(body) {
@@ -102,7 +102,8 @@ func openAIRecoveryPortableRequest(body map[string]json.RawMessage) bool {
 }
 
 // Text-only canonical items deliberately omit account-owned item IDs and status.
-// Unknown content (files, tool calls, opaque reasoning) is not silently dropped.
+// Known output reasoning is omitted only alongside visible assistant text;
+// unknown content, tools, and input reasoning are never silently dropped.
 func openAIRecoveryTextItems(raw []byte, output bool) ([]json.RawMessage, error) {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, ErrOpenAIRecoveryHistoryUnavailable
@@ -117,10 +118,63 @@ func openAIRecoveryTextItems(raw []byte, output bool) ([]json.RawMessage, error)
 		return nil, ErrOpenAIRecoveryHistoryUnavailable
 	}
 	result := make([]json.RawMessage, 0, len(items))
+	sawReasoning, sawText := false, false
 	for _, item := range items {
 		var itemType, role string
 		_ = json.Unmarshal(item["type"], &itemType)
 		_ = json.Unmarshal(item["role"], &role)
+		if output && itemType == "reasoning" {
+			if role != "" {
+				return nil, ErrOpenAIRecoveryHistoryUnavailable
+			}
+			var reasoningID string
+			for key, raw := range item {
+				switch key {
+				case "type":
+				case "id":
+					if json.Unmarshal(raw, &reasoningID) != nil || reasoningID == "" {
+						return nil, ErrOpenAIRecoveryHistoryUnavailable
+					}
+				case "encrypted_content":
+					if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+						var value string
+						if json.Unmarshal(raw, &value) != nil {
+							return nil, ErrOpenAIRecoveryHistoryUnavailable
+						}
+					}
+				case "status":
+					var status string
+					if json.Unmarshal(raw, &status) != nil || status != "completed" {
+						return nil, ErrOpenAIRecoveryHistoryUnavailable
+					}
+				case "content", "summary":
+					if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+						continue
+					}
+					var parts []map[string]json.RawMessage
+					if json.Unmarshal(raw, &parts) != nil || parts == nil {
+						return nil, ErrOpenAIRecoveryHistoryUnavailable
+					}
+					for _, part := range parts {
+						if len(part) != 2 {
+							return nil, ErrOpenAIRecoveryHistoryUnavailable
+						}
+						var partType, partText string
+						if json.Unmarshal(part["type"], &partType) != nil || json.Unmarshal(part["text"], &partText) != nil ||
+							(key == "content" && partType != "reasoning_text") || (key == "summary" && partType != "summary_text") {
+							return nil, ErrOpenAIRecoveryHistoryUnavailable
+						}
+					}
+				default:
+					return nil, ErrOpenAIRecoveryHistoryUnavailable
+				}
+			}
+			if reasoningID == "" {
+				return nil, ErrOpenAIRecoveryHistoryUnavailable
+			}
+			sawReasoning = true
+			continue
+		}
 		if (itemType != "" && itemType != "message") || (role != "user" && role != "assistant" && role != "system" && role != "developer") || (output && role != "assistant") {
 			return nil, ErrOpenAIRecoveryHistoryUnavailable
 		}
@@ -156,11 +210,17 @@ func openAIRecoveryTextItems(raw []byte, output bool) ([]json.RawMessage, error)
 			}
 			content = builder.String()
 		}
+		if output && content != "" {
+			sawText = true
+		}
 		canonical, err := json.Marshal(map[string]any{"type": "message", "role": role, "content": content})
 		if err != nil {
 			return nil, ErrOpenAIRecoveryHistoryUnavailable
 		}
 		result = append(result, canonical)
+	}
+	if sawReasoning && !sawText {
+		return nil, ErrOpenAIRecoveryHistoryUnavailable
 	}
 	return result, nil
 }

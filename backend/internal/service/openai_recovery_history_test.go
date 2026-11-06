@@ -29,6 +29,27 @@ func TestOpenAIRecoveryHistoryBuildAndReplay(t *testing.T) {
 	assert.NotContains(t, string(second), "old instructions")
 }
 
+func TestOpenAIRecoveryHistoryOmitsKnownReasoningAlongsideVisibleText(t *testing.T) {
+	snapshot, err := BuildOpenAIRecoverySnapshot(
+		[]byte(`{"model":"m","input":"question"}`),
+		[]byte(`[
+			{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"private summary"}],"content":[{"type":"reasoning_text","text":"private reasoning"}],"encrypted_content":"opaque"},
+			{"id":"msg_1","type":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"visible answer"}]}
+		]`), nil)
+	require.NoError(t, err)
+	assert.Contains(t, string(snapshot), "visible answer")
+	assert.NotContains(t, string(snapshot), "private summary")
+	assert.NotContains(t, string(snapshot), "private reasoning")
+	assert.NotContains(t, string(snapshot), "opaque")
+}
+
+func TestOpenAIRecoveryHistoryRejectsReasoningOnlyOutput(t *testing.T) {
+	_, err := BuildOpenAIRecoverySnapshot(
+		[]byte(`{"model":"m","input":"question"}`),
+		[]byte(`[{"id":"rs_1","type":"reasoning","status":"completed","summary":[],"content":[],"encrypted_content":"opaque"}]`), nil)
+	require.ErrorIs(t, err, ErrOpenAIRecoveryHistoryUnavailable)
+}
+
 func TestOpenAIRecoveryHistoryRejectsIncompleteOrNonportableContext(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -39,6 +60,7 @@ func TestOpenAIRecoveryHistoryRejectsIncompleteOrNonportableContext(t *testing.T
 		{"tool input", `{"input":[{"type":"function_call_output","call_id":"call_a","output":"ok"}]}`, `[]`},
 		{"attachment", `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.test/x"}]}]}`, `[]`},
 		{"opaque output", `{"input":"text"}`, `[{"type":"reasoning","id":"rs_a","encrypted_content":"opaque"}]`},
+		{"unknown reasoning field", `{"input":"text"}`, `[{"type":"reasoning","id":"rs_a","status":"completed","summary":[],"unexpected":true},{"type":"message","role":"assistant","content":"answer"}]`},
 		{"tool output", `{"input":"text"}`, `[{"type":"function_call","name":"charge","arguments":"{}","call_id":"call_a"}]`},
 		{"unknown message field", `{"input":[{"role":"user","content":"text","unknown_semantics":true}]}`, `[]`},
 		{"input message phase", `{"input":[{"role":"user","phase":"final_answer","content":"text"}]}`, `[]`},

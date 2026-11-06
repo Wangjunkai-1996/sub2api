@@ -128,6 +128,7 @@ type openAIManagedResponsesUpstream struct {
 	sessionBlocked     bool
 	failure            string
 	phaseFinalAnswer   bool
+	reasoningOutput    bool
 	physicalFailure    bool
 	succeedImmediately bool
 }
@@ -180,9 +181,13 @@ func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, account
 	if u.phaseFinalAnswer {
 		phase = `,"phase":"final_answer"`
 	}
+	reasoning := ""
+	if u.reasoningOutput {
+		reasoning = `,{"id":"rs_actual","type":"reasoning","content":null,"summary":[],"encrypted_content":"private-reasoning"}`
+	}
 	response.Body = io.NopCloser(strings.NewReader(prefix +
 		"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_actual\",\"delta\":\"winning-text\"}\n\n" +
-		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_actual\",\"model\":\"gpt-5.1\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_actual\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"" + phase + ",\"content\":[{\"type\":\"output_text\",\"text\":\"winning-text\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_actual\",\"model\":\"gpt-5.1\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_actual\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"" + phase + ",\"content\":[{\"type\":\"output_text\",\"text\":\"winning-text\",\"annotations\":[]}]}" + reasoning + "],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	return response, nil
 }
 
@@ -366,7 +371,7 @@ func TestOpenAIManagedResponsesRebuildsFinalAnswerAfterPhysicalContinuationFails
 		{name: "same account", accounts: 1, fallbackAccount: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			upstream := &openAIManagedResponsesUpstream{phaseFinalAnswer: true, succeedImmediately: true}
+			upstream := &openAIManagedResponsesUpstream{phaseFinalAnswer: true, reasoningOutput: true, succeedImmediately: true}
 			accounts := []service.Account{
 				{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 0, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}},
 				{ID: 2, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 1, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}},
@@ -399,6 +404,9 @@ func TestOpenAIManagedResponsesRebuildsFinalAnswerAfterPhysicalContinuationFails
 			winner, err := h.gatewayService.ResolveOpenAIRecoveryAlias(ctx, scope, alias)
 			require.NoError(t, err)
 			require.NotEmpty(t, winner.Snapshot)
+			assert.Contains(t, string(winner.Snapshot), "winning-text")
+			assert.NotContains(t, string(winner.Snapshot), "private-reasoning")
+			assert.NotContains(t, string(winner.Snapshot), "rs_actual")
 
 			healthy, healthyRec := newOpenAIResponsesFailoverTestContext(t, ctx)
 			healthy.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
