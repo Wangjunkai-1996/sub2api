@@ -66,12 +66,13 @@ func TestOpenAIRecoveryAliasPublishesOneWinnerBeforeContinuation(t *testing.T) {
 	_, err = svc.ResolveOpenAIRecoveryAlias(ctx, scope, alias)
 	require.ErrorIs(t, err, ErrOpenAIRecoveryAliasNotFound)
 
-	winner := OpenAIRecoveryAliasWinner{ResponseID: "resp_actual", AccountID: 17016, Snapshot: []byte(`{"input":"complete"}`)}
+	winner := OpenAIRecoveryAliasWinner{ResponseID: "resp_actual", AccountID: 17016, RouteFingerprint: strings.Repeat("f", 64), Snapshot: []byte(`{"input":"complete"}`)}
 	require.NoError(t, svc.PublishOpenAIRecoveryAlias(ctx, scope, alias, winner, time.Hour))
 	resolved, err := svc.ResolveOpenAIRecoveryAlias(ctx, scope, alias)
 	require.NoError(t, err)
 	assert.Equal(t, winner.ResponseID, resolved.ResponseID)
 	assert.Equal(t, winner.AccountID, resolved.AccountID)
+	assert.Equal(t, winner.RouteFingerprint, resolved.RouteFingerprint)
 	assert.Equal(t, winner.Snapshot, resolved.Snapshot)
 	assert.Equal(t, "strip_old_echo", resolved.TurnStatePolicy)
 	require.ErrorIs(t, svc.PublishOpenAIRecoveryAlias(ctx, scope, alias, winner, time.Hour), ErrOpenAIRecoveryAliasConflict)

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -35,6 +36,15 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 // doOpenAIUpstream 只在 OpenAI OAuth 能力绑定已启用时把真实请求交给插件。
 // 插件返回标准 http.Response，响应解析、错误映射、SSE 和计费仍由现有核心链处理。
 func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (response *http.Response, err error) {
+	opaqueState := openAIOpaqueRecoveryFromContext(request.Context())
+	if opaqueState != nil {
+		// A request-local reservation must settle before a second transport can
+		// reuse it or clear its route after an explicitly unsent setup failure.
+		opaqueState.dispatchMu.Lock()
+		defer opaqueState.dispatchMu.Unlock()
+	}
+	wasOpaquePinned := OpenAIOpaqueRecoveryRoutePinned(request.Context())
+	dispatchReserved := false
 	var releaseProbeContext func()
 	if request != nil {
 		request = request.WithContext(ContextWithSelectedAccountEgress(request.Context(), account))
@@ -68,6 +78,30 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 		}
 	}
 	finish := func(response *http.Response, err error) (*http.Response, error) {
+		if opaqueState != nil && dispatchReserved {
+			var pluginErr *PluginTransportError
+			notSent := response == nil && (IsHTTPUpstreamRequestNotSent(err) ||
+				(errors.As(err, &pluginErr) && pluginErr != nil && !pluginErr.RequestSent))
+			budget := request.Context().Value(openAIModelDispatchBudgetKey{}).(*openAIModelDispatchBudget)
+			budget.mu.Lock()
+			if notSent {
+				budget.attempts--
+			} else {
+				budget.routeFingerprint = openAIRecoveryRouteFingerprint(request, proxyURL, account)
+				recordOpenAIModelDispatch(request.Context(), account.ID, budget, 3)
+			}
+			budget.mu.Unlock()
+			if notSent && !wasOpaquePinned {
+				opaqueState.mu.Lock()
+				opaqueState.dispatched = false
+				opaqueState.route = nil
+				opaqueState.wireBody = nil
+				opaqueState.wireURL = ""
+				opaqueState.fingerprint = nil
+				opaqueState.fingerprintReady = false
+				opaqueState.mu.Unlock()
+			}
+		}
 		if releaseEgressUse == nil && releaseProbeContext == nil {
 			return response, err
 		}
@@ -78,8 +112,25 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 		response.Body = &accountEgressUseBody{body: response.Body, release: releaseUse}
 		return response, nil
 	}
+	if err := prepareOpenAIOpaqueDispatch(request, proxyURL, account); err != nil {
+		return finish(nil, err)
+	}
 	if err := takeOpenAIModelDispatch(request.Context(), account.ID); err != nil {
 		return finish(nil, err)
+	}
+	dispatchReserved = true
+	if IsOpenAIManagedRecovery(request.Context()) && opaqueState == nil {
+		if budget, _ := request.Context().Value(openAIModelDispatchBudgetKey{}).(*openAIModelDispatchBudget); budget != nil {
+			fingerprint := openAIRecoveryRouteFingerprint(request, proxyURL, account)
+			budget.mu.Lock()
+			budget.routeFingerprint = fingerprint
+			budget.mu.Unlock()
+		}
+	}
+	if state := openAIOpaqueRecoveryFromContext(request.Context()); state != nil {
+		state.mu.Lock()
+		state.dispatched = true
+		state.mu.Unlock()
 	}
 	if s.pluginManager != nil {
 		var handled bool

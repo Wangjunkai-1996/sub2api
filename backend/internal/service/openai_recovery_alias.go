@@ -32,11 +32,12 @@ var (
 // logical response ID. Snapshot is only used for a separately validated
 // cross-account replay; same-account continuation does not require it.
 type OpenAIRecoveryAliasWinner struct {
-	ResponseID      string `json:"response_id"`
-	AccountID       int64  `json:"account_id"`
-	EgressID        string `json:"egress_id,omitempty"`
-	TurnStatePolicy string `json:"turn_state_policy"`
-	Snapshot        []byte `json:"-"`
+	ResponseID       string `json:"response_id"`
+	AccountID        int64  `json:"account_id"`
+	EgressID         string `json:"egress_id,omitempty"`
+	RouteFingerprint string `json:"route_fingerprint,omitempty"`
+	TurnStatePolicy  string `json:"turn_state_policy"`
+	Snapshot         []byte `json:"-"`
 }
 
 type openAIRecoveryAliasRecord struct {

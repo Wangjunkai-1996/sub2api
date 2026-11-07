@@ -731,6 +731,11 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				}
 				outputStarted := clientOutputHasStarted()
 				if IsOpenAIManagedRecovery(ctx) && !cyberHit {
+					if failure := newOpenAIOpaqueContextRejection(ctx, resp.StatusCode, resp.Header, dataBytes); failure != nil {
+						sawFailedEvent = true
+						streamEarlyErr = failure
+						return
+					}
 					shouldFailover := openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
 					if eventType == "error" {
 						shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)

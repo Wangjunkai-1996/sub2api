@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/repository"
+	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -107,13 +109,19 @@ func TestOpenAIManagedChatStopsAfterPublicToolOutput(t *testing.T) {
 	assert.NotContains(t, rec.Body.String(), "Regenerating")
 }
 
-func TestOpenAIManagedExplicitJSONRejectsBeforeDispatch(t *testing.T) {
+func TestOpenAIManagedCapabilityHandshakePreservesNoDispatchFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, tc := range []struct {
 		name, path, body string
+		requested        bool
 	}{
-		{"chat", "/v1/chat/completions", `{"model":"gpt-5.1","stream":true,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`},
-		{"responses", "/v1/responses", `{"model":"gpt-5.1","stream":true,"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}},"input":"hello"}`},
+		{"chat JSON handshake", "/v1/chat/completions", `{"model":"gpt-5.1","stream":true,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`, true},
+		{"responses JSON handshake", "/v1/responses", `{"model":"gpt-5.1","stream":true,"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}},"input":"hello"}`, true},
+		{"image handshake", "/v1/responses", `{"model":"gpt-5.1","stream":true,"tools":[{"type":"image_generation"}],"input":"draw a cat"}`, true},
+		{"legacy compact handshake", "/v1/responses/compact", `{"model":"gpt-5.1","input":"hello"}`, true},
+		{"native compact handshake", "/v1/responses", `{"model":"gpt-5.1","stream":true,"input":[{"type":"message","role":"user","content":"hello"},{"type":"compaction_trigger"}]}`, true},
+		{"ordinary chat JSON", "/v1/chat/completions", `{"model":"gpt-5.1","stream":true,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`, false},
+		{"ordinary responses JSON", "/v1/responses", `{"model":"gpt-5.1","stream":true,"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}},"input":"hello"}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := &openAICompatFailoverUpstream{}
@@ -122,17 +130,30 @@ func TestOpenAIManagedExplicitJSONRejectsBeforeDispatch(t *testing.T) {
 			ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
 			ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
 			c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
+			apiKey, ok := middleware2.GetAPIKeyFromContext(c)
+			require.True(t, ok)
+			apiKey.Group.AllowImageGeneration = true
 			c.Request.URL.Path = tc.path
-			c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			if tc.requested {
+				c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			}
 			c.Request.Body = io.NopCloser(strings.NewReader(tc.body))
-			if tc.path == "/v1/responses" {
+			if strings.HasPrefix(tc.path, "/v1/responses") {
 				h.Responses(c)
 			} else {
 				h.ChatCompletions(c)
 			}
-			assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
-			assert.Contains(t, rec.Body.String(), "recovery_capability_unavailable")
-			assert.Empty(t, upstream.accountIDs)
+			if tc.requested {
+				assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+				assert.Contains(t, rec.Body.String(), "recovery_capability_unavailable")
+				assert.Empty(t, upstream.accountIDs, "capability fallback must not follow a real generation")
+			} else {
+				assert.NotEqual(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+				assert.NotContains(t, rec.Body.String(), "recovery_capability_unavailable")
+				assert.NotEmpty(t, upstream.accountIDs)
+			}
+			assert.Empty(t, rec.Header().Get(openAIRecoveryProtocolHeader))
+			assert.NotContains(t, rec.Body.String(), `"kind":"terminal"`)
 		})
 	}
 }
@@ -173,6 +194,8 @@ type openAIManagedResponsesUpstream struct {
 	reasoningOutput    bool
 	physicalFailure    bool
 	succeedImmediately bool
+	failureAttempts    int
+	afterDispatch      func()
 }
 
 func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
@@ -182,13 +205,29 @@ func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, account
 	}
 	u.accounts = append(u.accounts, accountID)
 	u.bodies = append(u.bodies, body)
+	if u.failure == "not_sent_first_account" && accountID == 1 {
+		return nil, service.MarkHTTPUpstreamRequestNotSent(errors.New("proxy connection setup failed"))
+	}
+	if u.afterDispatch != nil {
+		u.afterDispatch()
+	}
+	failureAttempts := u.failureAttempts
+	if failureAttempts == 0 {
+		failureAttempts = 3
+	}
+	if u.failure == "invalid_encrypted_content" {
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"Encrypted content could not be verified"}}`))}, nil
+	}
 	if u.physicalFailure && gjson.GetBytes(body, "previous_response_id").Exists() {
 		return &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"api_error","code":"server_error","message":"temporarily unavailable"}}`))}, nil
 	}
-	if len(u.accounts) <= 3 && (u.failure == "before_429" || u.failure == "before_500") {
+	if len(u.accounts) <= failureAttempts && (u.failure == "before_429" || u.failure == "before_500" || u.failure == "before_502") {
 		status, code := http.StatusTooManyRequests, "rate_limit_exceeded"
 		if u.failure == "before_500" {
 			status, code = http.StatusInternalServerError, "server_error"
+		}
+		if u.failure == "before_502" {
+			status, code = http.StatusBadGateway, "server_error"
 		}
 		payload := fmt.Sprintf(`{"error":{"type":"api_error","code":%q,"message":"temporarily unavailable"}}`, code)
 		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(payload))}, nil
@@ -205,17 +244,20 @@ func (u *openAIManagedResponsesUpstream) Do(req *http.Request, _ string, account
 			"data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"test_tool\",\"arguments\":\"{}\"}}\n\n"), openAICompatFailoverReadError{}))
 		return response, nil
 	}
-	if len(u.accounts) <= 3 && (u.failure == "after_429" || u.failure == "after_500") {
+	if len(u.accounts) <= failureAttempts && (u.failure == "after_429" || u.failure == "after_500" || u.failure == "after_invalid_encrypted_content") {
 		code := "rate_limit_exceeded"
 		if u.failure == "after_500" {
 			code = "server_error"
+		}
+		if u.failure == "after_invalid_encrypted_content" {
+			code = "invalid_encrypted_content"
 		}
 		response.Body = io.NopCloser(strings.NewReader(prefix +
 			"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_actual\",\"delta\":\"partial-text\"}\n\n" +
 			`data: {"type":"response.failed","response":{"id":"resp_actual","status":"failed","error":{"code":"` + code + `","message":"temporarily unavailable"}}}` + "\n\n"))
 		return response, nil
 	}
-	if len(u.accounts) <= 3 && !u.succeedImmediately {
+	if len(u.accounts) <= failureAttempts && !u.succeedImmediately {
 		response.Body = io.NopCloser(io.MultiReader(strings.NewReader(prefix+"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_actual\",\"delta\":\"partial-text\"}\n\n"), openAICompatFailoverReadError{}))
 		return response, nil
 	}

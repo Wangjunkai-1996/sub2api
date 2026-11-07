@@ -40,15 +40,51 @@ func openAIManagedRecoveryRequested(c *gin.Context) bool {
 }
 
 func openAIManagedResponsesTextSupported(body []byte) bool {
-	if service.OpenAIRecoveryStructuredFormat(body, service.OpenAIRecoveryResponsesSSE) != "" {
-		return false
-	}
+	return service.OpenAIRecoveryStructuredFormat(body, service.OpenAIRecoveryResponsesSSE) == ""
+}
+
+func openAIManagedResponsesOpaqueInput(body []byte) bool {
 	for _, item := range gjson.GetBytes(body, "input").Array() {
 		if item.Get("encrypted_content").Exists() {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+func (h *OpenAIGatewayHandler) handleOpenAIOpaqueRecoveryFailure(c *gin.Context, failure *service.UpstreamFailoverError, reason string, streamStarted bool) {
+	if writer, ok := c.Writer.(*service.OpenAIRecoveryStreamWriter); ok {
+		writer.SetStopReason(reason)
+	}
+	if failure == nil {
+		h.handleStreamingAwareErrorWithCode(c, http.StatusServiceUnavailable, "upstream_error", "route_unavailable", "The original upstream route is unavailable", streamStarted, false)
+		return
+	}
+	if failure.Reason == "invalid_encrypted_content" {
+		upstreamError := gjson.GetBytes(failure.ResponseBody, "response.error")
+		if !upstreamError.Exists() {
+			upstreamError = gjson.GetBytes(failure.ResponseBody, "error")
+		}
+		if !upstreamError.Exists() {
+			upstreamError = gjson.ParseBytes(failure.ResponseBody)
+		}
+		errType := upstreamError.Get("type").String()
+		if errType == "" {
+			errType = "invalid_request_error"
+		}
+		code := upstreamError.Get("code").String()
+		if code == "" {
+			code = "invalid_encrypted_content"
+		}
+		message := service.SanitizeUpstreamErrorMessage(upstreamError.Get("message").String())
+		if message == "" {
+			message = "The upstream rejected encrypted conversation context"
+		}
+		service.MarkOpsUpstreamFinalOutcome(c, failure, failure.StatusCode, reason)
+		h.handleStreamingAwareErrorWithCode(c, failure.StatusCode, errType, code, message, streamStarted, false)
+		return
+	}
+	h.handleFailoverExhausted(c, failure, streamStarted)
 }
 
 func openAIManagedContinuationRouteMatches(account *service.Account, winner *service.OpenAIRecoveryAliasWinner) bool {

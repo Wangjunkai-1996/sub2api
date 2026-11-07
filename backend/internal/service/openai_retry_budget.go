@@ -44,7 +44,8 @@ func WithOpenAIModelDispatchObserver(ctx context.Context, observe func(int) erro
 	return context.WithValue(ctx, openAIModelDispatchObserverKey{}, observe)
 }
 
-// WithOpenAIModelDispatchStartedObserver observes only debited physical calls.
+// WithOpenAIModelDispatchStartedObserver excludes proven-unsent opaque setup
+// failures; opaque calls are confirmed before response parsing starts.
 func WithOpenAIModelDispatchStartedObserver(ctx context.Context, observe func(int64)) context.Context {
 	if observe == nil {
 		return ctx
@@ -87,7 +88,9 @@ type openAIModelDispatchBudget struct {
 	mu                sync.Mutex
 	entryCtx          context.Context
 	attempts          int
+	attemptSequence   int
 	dispatchStartedAt time.Time
+	routeFingerprint  string
 }
 
 // WithOpenAIModelDispatchBudget bounds model dispatches across account changes
@@ -116,6 +119,7 @@ func HasOpenAIModelDispatchBudget(ctx context.Context) bool {
 func IsOpenAIModelDispatchStop(err error) bool {
 	return errors.Is(err, ErrOpenAIModelDispatchBudgetExhausted) ||
 		errors.Is(err, ErrOpenAIRetryBudgetExhausted) ||
+		errors.Is(err, ErrOpenAIOpaqueRouteUnavailable) ||
 		errors.Is(err, errOpenAIModelDispatchCanceled)
 }
 
@@ -136,11 +140,17 @@ func takeOpenAIModelDispatch(ctx context.Context, accountID int64) error {
 	if budget.attempts > 0 && OpenAIRetryBudgetExpired(budget.entryCtx) {
 		return ErrOpenAIRetryBudgetExhausted
 	}
-	if budget.attempts >= maxOpenAIModelDispatches {
+	limit := maxOpenAIModelDispatches
+	if IsOpenAIOpaqueRecovery(ctx) {
+		limit = 3 // Initial dispatch plus at most two same-route retries.
+	}
+	// Protocol v1 also bounds monotonic attempt IDs, even when local setup
+	// failures refund the physical-call budget.
+	if budget.attempts >= limit || budget.attemptSequence >= maxOpenAIModelDispatches {
 		return ErrOpenAIModelDispatchBudgetExhausted
 	}
 	if observe, ok := ctx.Value(openAIModelDispatchObserverKey{}).(func(int) error); ok {
-		if err := observe(budget.attempts + 1); err != nil {
+		if err := observe(budget.attemptSequence + 1); err != nil {
 			return fmt.Errorf("%w: %w", errOpenAIModelDispatchCanceled, err)
 		}
 	}
@@ -155,15 +165,26 @@ func takeOpenAIModelDispatch(ctx context.Context, accountID int64) error {
 		}
 	}
 	budget.attempts++
+	budget.attemptSequence++
 	budget.dispatchStartedAt = time.Now()
+	startOpenAIFirstOutputDispatch(ctx, budget.dispatchStartedAt)
+	// Opaque setup failures can prove that no request was sent. Confirm their
+	// diagnostic count after transport setup; the budget is reserved meanwhile.
+	if !IsOpenAIOpaqueRecovery(ctx) {
+		recordOpenAIModelDispatch(ctx, accountID, budget, limit)
+	}
+	return nil
+}
+
+// The caller holds budget.mu; callbacks run before response parsing begins.
+func recordOpenAIModelDispatch(ctx context.Context, accountID int64, budget *openAIModelDispatchBudget, limit int) {
 	if observe, ok := ctx.Value(openAIModelDispatchStartedObserverKey{}).(func(int64)); ok {
 		observe(accountID)
 	}
-	startOpenAIFirstOutputDispatch(ctx, budget.dispatchStartedAt)
 	fields := []zap.Field{
 		zap.Int64("account_id", accountID),
 		zap.Int("attempt", budget.attempts),
-		zap.Int("remaining_dispatches", maxOpenAIModelDispatches-budget.attempts),
+		zap.Int("remaining_dispatches", limit-budget.attempts),
 		zap.Bool("managed_recovery", IsOpenAIManagedRecovery(ctx)),
 	}
 	if deadline, ok := budget.entryCtx.Deadline(); ok {
@@ -173,7 +194,6 @@ func takeOpenAIModelDispatch(ctx context.Context, accountID int64) error {
 		fields = append(fields, zap.Int64("retry_budget_remaining_ms", time.Until(deadline).Milliseconds()))
 	}
 	logger.FromContext(ctx).Info("openai.model_dispatch", fields...)
-	return nil
 }
 
 // Internal compatibility retries share a Forward call, but each physical

@@ -493,17 +493,20 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	} else if changed {
 		body = cappedBody
 	}
-	if normalizedBody, changed := normalizeCodexAutomationBootstrap(body); changed {
-		body = normalizedBody
-		reqLog.Info("openai.codex_automation_bootstrap_normalized",
-			zap.String("normalization", "call_output_to_user_message"),
-		)
-	}
-	if normalizedBody, changed := normalizeCodexDelegationBootstrap(body); changed {
-		body = normalizedBody
-		reqLog.Info("openai.codex_delegation_bootstrap_normalized",
-			zap.String("normalization", "call_output_to_user_message"),
-		)
+	opaqueInput := managedRecovery && openAIManagedResponsesOpaqueInput(body)
+	if !opaqueInput {
+		if normalizedBody, changed := normalizeCodexAutomationBootstrap(body); changed {
+			body = normalizedBody
+			reqLog.Info("openai.codex_automation_bootstrap_normalized",
+				zap.String("normalization", "call_output_to_user_message"),
+			)
+		}
+		if normalizedBody, changed := normalizeCodexDelegationBootstrap(body); changed {
+			body = normalizedBody
+			reqLog.Info("openai.codex_delegation_bootstrap_normalized",
+				zap.String("normalization", "call_output_to_user_message"),
+			)
+		}
 	}
 
 	reqStream, ok := parseOpenAICompatibleStream(body)
@@ -644,19 +647,30 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 	managedRecovery = managedRecovery && requestPlatform == service.PlatformOpenAI
 	if managedRecovery {
-		if imageIntent || legacyCompact || nativeV2 || !openAIManagedResponsesTextSupported(body) {
+		if imageIntent || legacyCompact || nativeV2 || !openAIManagedResponsesTextSupported(forwardBody) {
 			h.errorResponse(c, http.StatusUnprocessableEntity, "recovery_capability_unavailable", "Managed recovery is unavailable for this response format")
 			return
 		}
-		c.Request = c.Request.WithContext(service.WithOpenAIManagedRecovery(c.Request.Context()))
+		managedCtx := service.WithOpenAIManagedRecovery(c.Request.Context())
+		if openAIManagedResponsesOpaqueInput(forwardBody) {
+			managedCtx = service.WithOpenAIOpaqueRecovery(managedCtx)
+			if previousAliasWinner != nil {
+				managedCtx = service.WithOpenAIOpaqueRecoveryRouteFingerprint(managedCtx, previousAliasWinner.RouteFingerprint)
+			}
+		}
+		c.Request = c.Request.WithContext(managedCtx)
 		c.Header(openAIRecoveryProtocolHeader, "1")
 	}
+	opaqueRecovery := service.IsOpenAIOpaqueRecovery(c.Request.Context())
 	if requestPlatform == service.PlatformOpenAI {
 		c.Request = c.Request.WithContext(service.WithOpenAIModelDispatchBudget(c.Request.Context()))
 	}
 
 	historyRequestBody := forwardBody
 	rebuildManagedContinuation := func() error {
+		if opaqueRecovery {
+			return service.ErrOpenAIRecoveryHistoryUnavailable
+		}
 		if previousAliasWinner == nil || len(previousAliasWinner.Snapshot) == 0 {
 			return service.ErrOpenAIRecoveryAliasUnavailable
 		}
@@ -704,6 +718,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 			return h.gatewayService.PublishOpenAIRecoveryAlias(c.Request.Context(), scope, logicalID, service.OpenAIRecoveryAliasWinner{
 				ResponseID: actualID, AccountID: managedAccount.ID, EgressID: egressID, Snapshot: snapshot,
+				RouteFingerprint: service.OpenAIRecoveryRouteFingerprint(c.Request.Context()),
 			}, h.gatewayService.OpenAIRecoveryAliasTTL())
 		})
 		c.Writer = managedWriter
@@ -795,7 +810,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 仅对 OpenAI 平台生效：Grok 生图走独立的 forwardGrokResponses 路径，不应被过滤。
 	// 复用前置权限与并发阶段在未修改 body 上确认的显式生图意图，避免大 tools 请求重复扫描。
 	// 该判断已排除 Codex 被动 image_gen namespace，避免 CC-only 账号被误过滤（#4476）。
-	needsResponses := nativeV2 || legacyCompact
+	needsResponses := nativeV2 || legacyCompact || opaqueRecovery
 	requiredCapability := openAIResponsesRequiredCapabilityForRequest(imageIntent, needsResponses, requestPlatform)
 
 	// 分组利润控制：请求级装配定价上下文——pricingAt 固定本请求的
@@ -849,7 +864,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
-			if managedRecovery && previousAliasWinner != nil && previousResponseID != "" && len(previousAliasWinner.Snapshot) > 0 {
+			if opaqueRecovery && (errors.Is(err, service.ErrOpenAIOpaqueRouteUnavailable) || service.OpenAIOpaqueRecoveryRoutePinned(c.Request.Context())) {
+				h.handleOpenAIOpaqueRecoveryFailure(c, lastFailoverErr, "route_unavailable", streamStarted)
+				return
+			}
+			if managedRecovery && !opaqueRecovery && previousAliasWinner != nil && previousResponseID != "" && len(previousAliasWinner.Snapshot) > 0 {
 				if rebuildErr := rebuildManagedContinuation(); rebuildErr == nil {
 					continue
 				} else {
@@ -928,6 +947,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				if selection.ReleaseFunc != nil {
 					selection.ReleaseFunc()
 				}
+				if opaqueRecovery {
+					h.handleOpenAIOpaqueRecoveryFailure(c, lastFailoverErr, "route_unavailable", streamStarted)
+					return
+				}
 				if managedRecovery {
 					if rebuildErr := rebuildManagedContinuation(); rebuildErr == nil {
 						continue
@@ -993,12 +1016,21 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// never send the winner's response ID through a newly changed route.
 		if previousAliasWinner != nil && previousResponseID != "" && !openAIManagedContinuationRouteMatches(account, previousAliasWinner) {
 			releaseAccount()
+			if opaqueRecovery {
+				h.handleOpenAIOpaqueRecoveryFailure(c, lastFailoverErr, "route_unavailable", streamStarted)
+				return
+			}
 			if managedRecovery {
 				if rebuildErr := rebuildManagedContinuation(); rebuildErr == nil {
 					continue
 				}
 			}
 			h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "session_state_unavailable", "Conversation session route is unavailable", streamStarted)
+			return
+		}
+		if routeErr := service.ValidateOpenAIOpaqueRecoveryRoute(c.Request.Context(), account); routeErr != nil {
+			releaseAccount()
+			h.handleOpenAIOpaqueRecoveryFailure(c, lastFailoverErr, "route_unavailable", streamStarted)
 			return
 		}
 		if decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
@@ -1043,7 +1075,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// 跨 passthrough 边界的 failover：从 Kiro 等透传账号切到 Bedrock 等非透传账号前，
 		// 从不可变的 canonical forwardBody 派生本次尝试 body 并整块剔除上游私有的加密
 		// reasoning item（含耦合的 id/summary），避免非透传上游 400 拒绝 Kiro reasoning 形态。
-		attemptBody := h.deriveOpenAIForwardAttemptBody(reqLog, forwardBody, account, &passthroughFailoverState)
+		attemptBody := forwardBody
+		if !opaqueRecovery {
+			attemptBody = h.deriveOpenAIForwardAttemptBody(reqLog, forwardBody, account, &passthroughFailoverState)
+		}
 		if managedRecovery {
 			maxEffort, mappings, overLimit, _ := openAIReasoningEffortPolicyForRequest(c, apiKey)
 			var policyErr error
@@ -1136,6 +1171,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				submitResponsesUsage(result)
 				return
 			}
+			if errors.Is(err, service.ErrOpenAIOpaqueRouteUnavailable) {
+				submitResponsesUsage(result)
+				h.handleOpenAIOpaqueRecoveryFailure(c, lastFailoverErr, "route_unavailable", streamStarted || c.Writer.Written())
+				return
+			}
 			if openAIRequestBudgetExpired(c) {
 				submitResponsesUsage(result)
 				h.handleOpenAIRequestBudgetExhausted(c, streamStarted || c.Writer.Written())
@@ -1216,6 +1256,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					if opaqueRecovery && service.OpenAIOpaqueRecoveryRoutePinned(c.Request.Context()) && (failoverErr.Reason == "invalid_encrypted_content" || failoverErr.IsOpenAISessionBlocked() || (previousResponseID != "" && (previousAliasWinner == nil || len(previousAliasWinner.Snapshot) == 0))) {
+						h.handleOpenAIOpaqueRecoveryFailure(c, failoverErr, "opaque_context_rejected", streamStarted)
+						return
+					}
 					if !failoverErr.ShouldRetryNextAccount() {
 						if managedWriter != nil {
 							managedWriter.SetStopReason("retry_not_allowed")
@@ -1228,6 +1272,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 							reqLog.Warn("openai.recovery_attempt_abandon_failed", zap.Error(abandonErr))
 							return
 						}
+					}
+					if opaqueRecovery {
+						lastFailoverErr = failoverErr
 					}
 					if failoverErr.IsOpenAISessionBlocked() {
 						hadPreviousResponseID := previousResponseID != ""
@@ -1321,6 +1368,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					}
 					if service.OpenAIRetryBudgetExpired(c.Request.Context()) {
 						h.handleOpenAIRetryBudgetExhausted(c, streamStarted)
+						return
+					}
+					if opaqueRecovery && service.OpenAIOpaqueRecoveryRoutePinned(c.Request.Context()) {
+						h.handleOpenAIOpaqueRecoveryFailure(c, failoverErr, "retry_budget_exhausted", streamStarted)
 						return
 					}
 					// Consume the bounded first-output budget only when this attempt is

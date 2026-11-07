@@ -84,7 +84,9 @@ func TestOpenAIManagedTextCapabilityGates(t *testing.T) {
 	assert.True(t, openAIManagedResponsesTextSupported([]byte(`{"include":["reasoning.encrypted_content"]}`)))
 	assert.False(t, openAIManagedResponsesTextSupported([]byte(`{"text":{"format":{"type":"json_schema"}}}`)))
 	assert.False(t, openAIManagedResponsesTextSupported([]byte(`{"response_format":{"type":"json_object"}}`)))
-	assert.False(t, openAIManagedResponsesTextSupported([]byte(`{"input":[{"type":"reasoning","encrypted_content":"opaque"}]}`)))
+	assert.True(t, openAIManagedResponsesTextSupported([]byte(`{"input":[{"type":"reasoning","encrypted_content":"opaque"}]}`)))
+	assert.True(t, openAIManagedResponsesOpaqueInput([]byte(`{"input":[{"type":"reasoning","encrypted_content":"opaque"}]}`)))
+	assert.False(t, openAIManagedResponsesOpaqueInput([]byte(`{"include":["reasoning.encrypted_content"]}`)))
 }
 
 func TestOpenAIManagedContinuationRequiresWinnerRoute(t *testing.T) {

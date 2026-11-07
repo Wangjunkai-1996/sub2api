@@ -33,6 +33,11 @@ func RequiredAccountEgressBindingFromContext(ctx context.Context) string {
 		return ""
 	}
 	bindingID, _ := ctx.Value(requiredAccountEgressBindingContextKey{}).(string)
+	if strings.TrimSpace(bindingID) == "" {
+		if route, pinned := openAIOpaqueRecoveryPinnedRoute(ctx); pinned {
+			return route.bindingID
+		}
+	}
 	return strings.TrimSpace(bindingID)
 }
 

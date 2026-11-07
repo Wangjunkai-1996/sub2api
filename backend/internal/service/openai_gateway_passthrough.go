@@ -200,7 +200,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			if c != nil && c.Request != nil {
 				clientHeaders = c.Request.Header
 			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			fpIDs := resolveOpenAIRecoveryFingerprintIDs(ctx, account, clientHeaders)
 			if fpIDs != nil {
 				fpBody, fpChanged, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
 				if fpErr != nil {
@@ -428,9 +428,12 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			}
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
+			if failure := newOpenAIOpaqueContextRejection(ctx, resp.StatusCode, resp.Header, probeBody); failure != nil {
+				return nil, failure
+			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, probeBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize passthrough rejected Responses field retry body: %w", retryErr)
-			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
+			} else if changed && !IsOpenAIOpaqueRecovery(ctx) && rejectedFieldRetryState.Allow(retryBody) {
 				body = retryBody
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying passthrough request after %s (account: %s)", reason, account.Name)
 				releaseAttemptContext()
@@ -1971,6 +1974,11 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 	if len(responseHeaders) > 0 && responseHeaders[0] != nil {
 		headers = responseHeaders[0].Clone()
 	}
+	if c != nil && c.Request != nil {
+		if failure := newOpenAIOpaqueContextRejection(c.Request.Context(), http.StatusBadRequest, headers, payload); failure != nil {
+			return failure
+		}
+	}
 	statusCode, shouldDisable := s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, headers, canonicalModel)
 	// 流内 failed 事件承载于 HTTP 200；使用事件的语义状态更新账号健康，
 	// 再由 failover 引擎按 StatusCode/RetryableOnSameAccount 决定恢复策略。
@@ -2050,6 +2058,11 @@ func (s *OpenAIGatewayService) nonStreamingTerminalFailureFailover(
 ) *UpstreamFailoverError {
 	if account == nil || IsResponseCommitted(c) {
 		return nil
+	}
+	if c != nil && c.Request != nil && resp != nil {
+		if failure := newOpenAIOpaqueContextRejection(c.Request.Context(), resp.StatusCode, resp.Header, payload); failure != nil {
+			return failure
+		}
 	}
 	shouldFailover := openAIStreamFailedEventShouldFailover(payload, message)
 	if terminalType == "error" {
@@ -2394,6 +2407,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				}
 				outputStarted := openAIStreamClientOutputStarted(c, clientOutputStarted)
 				if IsOpenAIManagedRecovery(ctx) && !cyberHit {
+					if failure := newOpenAIOpaqueContextRejection(ctx, resp.StatusCode, resp.Header, dataBytes); failure != nil {
+						return resultWithUsage(), failure
+					}
 					shouldFailover := openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
 					if eventType == "error" {
 						shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
