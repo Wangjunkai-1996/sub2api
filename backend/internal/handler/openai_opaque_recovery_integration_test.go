@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -54,7 +55,8 @@ func TestOpenAIManagedOpaqueResponses(t *testing.T) {
 		{name: "public tool output stops recovery", failure: "after_tool", stopReason: "tool_output_started", wantAccounts: []int64{1}},
 		{name: "changed route cannot dispatch", failure: "before_500", changeRoute: true, stopReason: "route_unavailable", wantAccounts: []int64{1}},
 		{name: "continuation without snapshot succeeds", previous: true, success: true, wantAccounts: []int64{1}},
-		{name: "continuation without snapshot cannot rebuild", previous: true, failure: "before_500", stopReason: "opaque_context_rejected", wantAccounts: []int64{1}},
+		{name: "continuation without snapshot retries original request", previous: true, failure: "before_500", failureAttempts: 1, success: true, wantAccounts: []int64{1, 1}},
+		{name: "continuation without snapshot never switches account", previous: true, failure: "before_500", stopReason: "retry_budget_exhausted", wantAccounts: []int64{1, 1, 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			accounts := []service.Account{
@@ -158,20 +160,27 @@ func TestOpenAIManagedOpaqueUnsentSetupCanFailOverWithoutPhysicalRetry(t *testin
 
 func TestOpenAIManagedOpaqueContinuationPinsWinnerRoute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, changed := range []bool{false, true} {
-		name := "same endpoint"
-		if changed {
-			name = "changed endpoint"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, failure, stopReason   string
+		changed, sessionBlocked     bool
+		wantDispatches, wantRetries int
+	}{
+		{name: "same endpoint", wantDispatches: 1},
+		{name: "empty snapshot retries same route", failure: "before_500", wantDispatches: 2, wantRetries: 1},
+		{name: "invalid ciphertext stops without retry", failure: "invalid_encrypted_content", stopReason: "opaque_context_rejected", wantDispatches: 1},
+		{name: "blocked session stops without retry", sessionBlocked: true, stopReason: "opaque_context_rejected", wantDispatches: 1},
+		{name: "changed endpoint", changed: true, stopReason: "route_unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			accounts := []service.Account{{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": true}}}
-			upstream := &openAIManagedResponsesUpstream{succeedImmediately: true}
+			upstream := &openAIManagedResponsesUpstream{succeedImmediately: true, reasoningOutput: true}
 			h, ctx, _ := newOpenAIManagedOpaqueTestHandler(t, upstream, accounts)
 			c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
 			c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
-			c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":"hello"}`))
+			c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":[{"type":"reasoning","encrypted_content":"opaque"},{"role":"user","content":"hello"}]}`))
 			h.Responses(c)
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Equal(t, []int64{1}, upstream.accounts)
 			var alias string
 			for _, line := range strings.Split(rec.Body.String(), "\n") {
 				event := strings.TrimPrefix(line, "data: ")
@@ -185,22 +194,41 @@ func TestOpenAIManagedOpaqueContinuationPinsWinnerRoute(t *testing.T) {
 			winner, err := h.gatewayService.ResolveOpenAIRecoveryAlias(ctx, scope, alias)
 			require.NoError(t, err)
 			require.NotEmpty(t, winner.RouteFingerprint)
-			if changed {
+			require.Empty(t, winner.Snapshot, "opaque input cannot be rebuilt from a portable snapshot")
+			if tc.changed {
 				accounts[0].Credentials["base_url"] = "https://changed.example.test"
 			}
+			upstream.failure = tc.failure
+			upstream.failureAttempts = 2 // One successful first turn, then one failed continuation attempt.
+			upstream.sessionBlocked = tc.sessionBlocked
 			c, rec = newOpenAIResponsesFailoverTestContext(t, ctx)
+			// This fixture tests recovery; cyber audit billing has separate coverage.
+			c.Set(cyberPolicyRecordedKey, true)
 			c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
-			c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"previous_response_id":"` + alias + `","input":[{"type":"reasoning","encrypted_content":"opaque"},{"role":"user","content":"continue"}]}`))
+			const input = `[{"type":"reasoning","id":"rs_actual","encrypted_content":"private-\u0072easoning","summary":[]},{"role":"user","content":"continue"}]`
+			c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"previous_response_id":"` + alias + `","input":` + input + `}`))
 			h.Responses(c)
-			if changed {
-				assert.Equal(t, []int64{1}, upstream.accounts)
+			require.Len(t, upstream.accounts, 1+tc.wantDispatches, rec.Body.String())
+			for i, body := range upstream.bodies[1:] {
+				assert.Equal(t, int64(1), upstream.accounts[i+1])
+				assert.Equal(t, input, gjson.GetBytes(body, "input").Raw, "opaque input must remain byte-for-byte intact")
+				assert.Equal(t, "resp_actual", gjson.GetBytes(body, "previous_response_id").String())
+				assert.Equal(t, upstream.bodies[1], body, "same-route retry must replay the original wire body")
+			}
+			diagnostics := rec.Header().Get(service.OpenAIRecoveryDiagnosticsHeader)
+			assert.Equal(t, 1, strings.Count(rec.Body.String(), `"kind":"terminal"`)+len(rec.Header().Values(service.OpenAIRecoveryDiagnosticsHeader)))
+			assert.Contains(t, rec.Body.String()+diagnostics, `"account_switches":0`)
+			assert.Contains(t, rec.Body.String()+diagnostics, `"same_account_retries":`+strconv.Itoa(tc.wantRetries))
+			if tc.changed {
 				assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
-				assert.Contains(t, rec.Header().Get(service.OpenAIRecoveryDiagnosticsHeader), `"stop_reason":"route_unavailable"`)
+			}
+			if tc.stopReason != "" {
+				assert.Contains(t, rec.Body.String()+diagnostics, `"stop_reason":"`+tc.stopReason+`"`)
+				assert.NotContains(t, rec.Body.String(), `"type":"response.completed"`)
 			} else {
-				assert.Equal(t, []int64{1, 1}, upstream.accounts)
 				assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-				assert.Equal(t, "resp_actual", gjson.GetBytes(upstream.bodies[1], "previous_response_id").String())
-				assert.Contains(t, rec.Body.String(), `"type":"response.completed"`)
+				assert.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.completed"`))
+				assert.NotContains(t, rec.Body.String(), `"type":"response.failed"`)
 			}
 		})
 	}

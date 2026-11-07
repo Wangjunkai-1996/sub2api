@@ -1256,7 +1256,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
-					if opaqueRecovery && service.OpenAIOpaqueRecoveryRoutePinned(c.Request.Context()) && (failoverErr.Reason == "invalid_encrypted_content" || failoverErr.IsOpenAISessionBlocked() || (previousResponseID != "" && (previousAliasWinner == nil || len(previousAliasWinner.Snapshot) == 0))) {
+					if opaqueRecovery && service.OpenAIOpaqueRecoveryRoutePinned(c.Request.Context()) && (failoverErr.Reason == "invalid_encrypted_content" || failoverErr.IsOpenAISessionBlocked()) {
 						h.handleOpenAIOpaqueRecoveryFailure(c, failoverErr, "opaque_context_rejected", streamStarted)
 						return
 					}
