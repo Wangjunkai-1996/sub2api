@@ -247,6 +247,31 @@ func TestOpsErrorLoggerMiddleware_DoesNotBreakOuterMiddlewares(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+func TestOpsErrorLoggerMiddleware_RestoresWriterAfterManagedStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logSink, restore := captureHandlerStructuredLog(t)
+	defer restore()
+
+	r := gin.New()
+	r.Use(middleware2.RequestLogger(), middleware2.Logger())
+	r.POST("/v1/responses", OpsErrorLoggerMiddleware(nil), func(c *gin.Context) {
+		managed := service.NewOpenAIRecoveryStreamWriter(c.Writer, service.OpenAIRecoveryResponsesSSE, "resp_test", nil, nil)
+		c.Writer = managed
+		require.NoError(t, managed.BeginAttempt(1))
+		managed.WriteHeader(http.StatusOK)
+		_, err := managed.WriteString(": ping\n\n")
+		require.NoError(t, err)
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), ": ping")
+	status, ok := logSink.FieldValueForMessage("http request completed", "status_code")
+	require.True(t, ok)
+	require.EqualValues(t, http.StatusOK, status)
+}
+
 // setupOpsErrorLogTestQueue 阻止 enqueueOpsErrorLog 启动真实 worker，改用可检查的测试队列。
 func setupOpsErrorLogTestQueue(t *testing.T, size int) {
 	t.Helper()
