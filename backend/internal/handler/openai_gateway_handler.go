@@ -647,7 +647,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 	managedRecovery = managedRecovery && requestPlatform == service.PlatformOpenAI
 	if managedRecovery {
-		if imageIntent || legacyCompact || nativeV2 || !openAIManagedResponsesTextSupported(forwardBody) {
+		if imageIntent || legacyCompact || nativeV2 || !openAIManagedResponsesTextSupported(forwardBody) || (opaqueInput && previousResponseID != "") {
 			h.errorResponse(c, http.StatusUnprocessableEntity, "recovery_capability_unavailable", "Managed recovery is unavailable for this response format")
 			return
 		}

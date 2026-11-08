@@ -496,7 +496,7 @@ go test ./relay/channel/openai -run '^TestManagedRecoveryCapturedSub2' -count=1 
 1. 真实目标 SDK/Codex 客户端的增量、最终聚合、alias/turn-state 续聊和工具执行验收尚未完成；fixture 重放不能代替客户端产品行为。
 2. 普通文本 TTFT、工具可执行时间、恢复总耗时及 CPU/内存/I/O 分位未实测，600/300/15 秒与容量初值不能宣称已是性能最优。
 3. 本地临时真 Redis 已验证 `maxmemory-policy=noeviction`、alias 读写与断连失败关闭；仍未读取生产 Redis 的策略、实际 TTL/可用容量，也未做目标生产 Redis 的故障注入和容量验收。开关默认关闭，缺这些证据不得启用。
-4. 只实现有界纯文本快照的跨账号重建；工具/附件/opaque 输入不被伪造为可移植历史。入站直接带 `encrypted_content` 的 Responses 能力门仍保留；旧会话缺历史仅保留合法原号路径，账号/出口能力不满足时明确停止。
+4. 只实现有界纯文本快照的跨账号重建；工具/附件/opaque 输入不被伪造为可移植历史。受管 Responses 仅对没有 `previous_response_id` 的密文输入启用单请求 opaque 恢复；密文与非空 `previous_response_id` 同时出现时维持 422 `recovery_capability_unavailable` 能力门。非受管请求仍走原有转发路径。
 5. 不新增代理 alias 的 `GET/DELETE /responses/:id`，不宣称原生 WS、WS bridge、Anthropic、图像/视频或其他供应商已覆盖。
 
 本地代码完成与生产发布是两个阶段。任何发布须另按两仓维护中的 runbook 完成相应验收，本次文档与代码变更不构成上线证据。
