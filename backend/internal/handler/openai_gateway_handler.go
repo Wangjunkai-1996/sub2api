@@ -1424,6 +1424,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 				fields := []zap.Field{
 					zap.Int64("account_id", account.ID),
+					zap.Bool("managed_recovery", managedRecovery),
+					zap.Bool("opaque_recovery", opaqueRecovery),
 					zap.Bool("fallback_error_response_written", wroteFallback),
 					zap.Bool("upstream_error_response_already_written", upstreamErrorAlreadyCommunicated),
 					zap.Error(err),

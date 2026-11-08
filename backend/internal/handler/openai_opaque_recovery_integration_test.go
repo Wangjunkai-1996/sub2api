@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/alicebob/miniredis/v2"
@@ -20,6 +21,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func newOpenAIManagedOpaqueTestHandler(t *testing.T, upstream service.HTTPUpstream, accounts []service.Account) (*OpenAIGatewayHandler, context.Context, service.OpenAIWSStateStore) {
@@ -34,6 +37,34 @@ func newOpenAIManagedOpaqueTestHandler(t *testing.T, upstream service.HTTPUpstre
 	ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
 	ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
 	return h, ctx, service.NewOpenAIWSStateStore(cache)
+}
+
+func TestOpenAIForwardFailureLogsRecoveryMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name, input     string
+		managed, opaque bool
+	}{
+		{name: "ordinary", input: `"hello"`},
+		{name: "managed text", input: `"hello"`, managed: true},
+		{name: "managed opaque", input: `[{"type":"reasoning","encrypted_content":"opaque"},{"role":"user","content":"hello"}]`, managed: true, opaque: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accounts := []service.Account{{ID: 1, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Credentials: map[string]any{"api_key": "test", "base_url": "://invalid"}}}
+			h, ctx, _ := newOpenAIManagedOpaqueTestHandler(t, &openAIManagedResponsesUpstream{}, accounts)
+			core, observed := observer.New(zap.WarnLevel)
+			c, _ := newOpenAIResponsesFailoverTestContext(t, logger.IntoContext(ctx, zap.New(core)))
+			if tc.managed {
+				c.Request.Header.Set(openAIRecoveryProtocolHeader, "1")
+			}
+			c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":` + tc.input + `}`))
+			h.Responses(c)
+			logs := observed.FilterMessage("openai.forward_failed").All()
+			require.Len(t, logs, 1)
+			assert.Equal(t, tc.managed, logs[0].ContextMap()["managed_recovery"])
+			assert.Equal(t, tc.opaque, logs[0].ContextMap()["opaque_recovery"])
+		})
+	}
 }
 
 func TestOpenAIManagedOpaqueResponses(t *testing.T) {
