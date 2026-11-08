@@ -655,7 +655,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, bool, error) {
 	sessionHash := strings.TrimSpace(req.SessionHash)
-	if sessionHash == "" || s == nil || s.service == nil || (s.service.cache == nil && !(IsOpenAIManagedRecovery(ctx) && req.StickyAccountID > 0)) {
+	if sessionHash == "" || s == nil || s.service == nil || s.service.cache == nil {
 		return nil, false, nil
 	}
 
@@ -3055,40 +3055,6 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	ctx = s.withOpenAIAdvancedSchedulerRequestSettings(ctx, groupID, platform)
-	if route, pinned := openAIOpaqueRecoveryPinnedRoute(ctx); pinned {
-		decision := OpenAIAccountScheduleDecision{}
-		if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
-			return nil, decision, ErrOpenAIOpaqueRouteUnavailable
-		}
-		if route.bindingID != "" {
-			ctx = WithRequiredAccountEgressBinding(ctx, route.bindingID)
-		}
-		retrySessionHash := sessionHash
-		if retrySessionHash == "" {
-			retrySessionHash = "managed_opaque_retry"
-		}
-		scheduler := &defaultOpenAIAccountScheduler{service: s, stats: newOpenAIAccountRuntimeStats()}
-		selection, _, err := scheduler.selectBySessionHash(ctx, OpenAIAccountScheduleRequest{
-			GroupID: groupID, Platform: platform, SessionHash: retrySessionHash,
-			StickyAccountID: route.accountID, PreserveStickyBinding: true, DisableStickyEscape: true,
-			RequestedModel: requestedModel, RequiredTransport: requiredTransport, RequiredCapability: requiredCapability,
-			RequiredImageCapability: requiredImageCapability, RequireCompact: requireCompact,
-			ExcludedIDs: excludedIDs, RequirePrivacySet: s.openAIGroupRequiresPrivacySet(ctx, groupID),
-		})
-		if err != nil || selection == nil || selection.Account == nil {
-			return nil, decision, ErrOpenAIOpaqueRouteUnavailable
-		}
-		if selection.Account.ID != route.accountID || (selection.Acquired && ValidateOpenAIOpaqueRecoveryRoute(ctx, selection.Account) != nil) {
-			if selection.ReleaseFunc != nil {
-				selection.ReleaseFunc()
-			}
-			return nil, decision, ErrOpenAIOpaqueRouteUnavailable
-		}
-		decision.Layer = openAIAccountScheduleLayerSessionSticky
-		decision.SelectedAccountID = selection.Account.ID
-		decision.SelectedAccountType = selection.Account.Type
-		return selection, decision, nil
-	}
 	if selection, decision, handled, err := s.selectBoundOpenAIResponseEgress(
 		ctx,
 		groupID,
@@ -3106,32 +3072,6 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		return selection, decision, err
 	}
 	decision := OpenAIAccountScheduleDecision{}
-	if retryAccountID, _ := ctx.Value(openAIManagedRetryAccountKey{}).(int64); retryAccountID > 0 && IsOpenAIManagedRecovery(ctx) && strings.TrimSpace(previousResponseID) == "" {
-		if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
-			return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
-		}
-		retryScheduler := &defaultOpenAIAccountScheduler{service: s, stats: newOpenAIAccountRuntimeStats()}
-		retrySessionHash := sessionHash
-		if retrySessionHash == "" {
-			retrySessionHash = "managed_retry"
-		}
-		selection, _, err := retryScheduler.selectBySessionHash(ctx, OpenAIAccountScheduleRequest{
-			GroupID: groupID, Platform: platform, SessionHash: retrySessionHash,
-			StickyAccountID: retryAccountID, PreserveStickyBinding: true, DisableStickyEscape: true,
-			RequestedModel: requestedModel, RequiredTransport: requiredTransport, RequiredCapability: requiredCapability,
-			RequiredImageCapability: requiredImageCapability, RequireCompact: requireCompact,
-			ExcludedIDs: excludedIDs, RequirePrivacySet: s.openAIGroupRequiresPrivacySet(ctx, groupID),
-		})
-		if err != nil {
-			return nil, decision, err
-		}
-		if selection != nil && selection.Account != nil {
-			decision.Layer = openAIAccountScheduleLayerSessionSticky
-			decision.SelectedAccountID = selection.Account.ID
-			decision.SelectedAccountType = selection.Account.Type
-			return selection, decision, nil
-		}
-	}
 	preserveGuardianParentBinding := preserveOpenAIGuardianParentBinding(ctx, sessionHash)
 	guardianParentAccountID := int64(0)
 	if strings.TrimSpace(previousResponseID) == "" {

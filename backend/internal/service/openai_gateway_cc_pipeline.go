@@ -16,7 +16,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -203,22 +202,10 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// passed back to the API"。在共用出站点补空格占位，真实明文不覆盖。
 	body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
-	var firstOutputGuard *openAITextFirstOutputGuard
 	if len(firstOutputGuards) > 0 && firstOutputGuards[0] != nil {
 		// The caller already detached and owns the first-output cancellation.
 		releaseUpstreamCtx()
 		upstreamCtx, releaseUpstreamCtx = ctx, func() {}
-		firstOutputGuard = firstOutputGuards[0]
-	} else if IsOpenAIManagedRecovery(ctx) && account.Platform == PlatformOpenAI &&
-		!IsExplicitImageGenerationIntent("/v1/chat/completions", gjson.GetBytes(body, "model").String(), body) {
-		// Responses-to-Chat fallback does not pass a caller-owned guard. Apply
-		// the same per-dispatch text deadline in this shared outbound path.
-		upstreamCtx, firstOutputGuard = newOpenAITextFirstOutputGuard(upstreamCtx, time.Time{}, s.openAITextFirstOutputTimeout())
-		releaseContext := releaseUpstreamCtx
-		releaseUpstreamCtx = func() {
-			firstOutputGuard.close()
-			releaseContext()
-		}
 	}
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -271,18 +258,14 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		proxyURL = account.Proxy.URL()
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
-	if firstOutputGuard.timedOut() {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		releaseUpstreamCtx()
-		return nil, openAIFirstOutputTimeoutFailover(nil)
-	}
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
 		releaseUpstreamCtx()
+		if len(firstOutputGuards) > 0 && firstOutputGuards[0].timedOut() {
+			return nil, err
+		}
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
 	if resp == nil || resp.Body == nil {
@@ -292,11 +275,9 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// The response is consumed by the caller (including streaming fallbacks), so
 	// keep the detached context alive until that body is closed. Releasing it
 	// when this helper returns would cancel the request before the first chunk.
-	firstOutputGuard.setBody(resp.Body)
 	resp.Body = &openAIRequestContextReadCloser{
-		ReadCloser:       resp.Body,
-		cleanup:          releaseUpstreamCtx,
-		firstOutputGuard: firstOutputGuard,
+		ReadCloser: resp.Body,
+		cleanup:    releaseUpstreamCtx,
 	}
 	return resp, nil
 }
@@ -334,10 +315,6 @@ func (s *OpenAIGatewayService) scanCCStream(
 	emit func(*apicompat.ChatCompletionsChunk),
 ) ccStreamScanState {
 	var st ccStreamScanState
-	var firstOutputGuard *openAITextFirstOutputGuard
-	if body, ok := resp.Body.(*openAIRequestContextReadCloser); ok {
-		firstOutputGuard = body.firstOutputGuard
-	}
 
 	scanner := s.newUpstreamSSEScanner(resp.Body)
 	for scanner.Scan() {
@@ -349,11 +326,6 @@ func (s *OpenAIGatewayService) scanCCStream(
 		payload = strings.TrimSpace(payload)
 		if payload == "" {
 			continue
-		}
-		if firstOutputGuard.timedOut() ||
-			(openAIRawChatChunkStartsUsableOutput(payload) && !firstOutputGuard.observeOutput()) {
-			st.Err = openAIFirstOutputTimeoutFailover(resp.Header)
-			return st
 		}
 		if payload == "[DONE]" {
 			st.SawDone = true
@@ -393,10 +365,6 @@ func (s *OpenAIGatewayService) scanCCStream(
 		emit(&chunk)
 	}
 
-	if firstOutputGuard.timedOut() {
-		st.Err = openAIFirstOutputTimeoutFailover(resp.Header)
-		return st
-	}
 	if st.SawDone || st.SawTerminalChunk {
 		// A terminal chunk is a successful observation for the exact admitted
 		// route, even when the scanner reports a trailing transport EOF.
@@ -433,10 +401,6 @@ func (s *OpenAIGatewayService) readCCUpstreamJSONResponse(
 	writeError compatErrorWriter,
 ) (*apicompat.ChatCompletionsResponse, OpenAIUsage, error) {
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
-	if body, ok := resp.Body.(*openAIRequestContextReadCloser); ok && body.firstOutputGuard != nil &&
-		(body.firstOutputGuard.timedOut() || (err == nil && !body.firstOutputGuard.observeOutput())) {
-		return nil, OpenAIUsage{}, openAIFirstOutputTimeoutFailover(resp.Header)
-	}
 	if err != nil {
 		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
 			writeError(c, http.StatusBadGateway, "api_error", "Failed to read upstream response")

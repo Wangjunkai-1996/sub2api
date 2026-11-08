@@ -20,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type nonstreamTransportFailoverUpstream struct {
@@ -63,6 +64,7 @@ func TestOpenAINonstreamHandlerTransportFailover_RequiresUnsentProof(t *testing.
 		name, endpoint, body, response, contentType, want string
 		oauth                                             bool
 		winnerCalls                                       int
+		imageCount                                        int
 		handle                                            func(*OpenAIGatewayHandler, *gin.Context)
 	}{
 		{name: "embeddings", endpoint: "/v1/embeddings", body: `{"model":"text-embedding-3-small","input":"hello"}`,
@@ -74,17 +76,24 @@ func TestOpenAINonstreamHandlerTransportFailover_RequiresUnsentProof(t *testing.
 		{name: "apikey images", endpoint: "/v1/images/generations", body: `{"model":"gpt-image-2","prompt":"test"}`,
 			response: `{"created":1,"data":[{"b64_json":"d2lubmVy"}]}`, want: "d2lubmVy", winnerCalls: 1, handle: (*OpenAIGatewayHandler).Images},
 		{name: "oauth image", endpoint: "/v1/images/generations", body: `{"model":"gpt-image-2","prompt":"test"}`, oauth: true,
-			response: "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"d2lubmVy\"}]}}\n\n", contentType: "text/event-stream", want: "d2lubmVy", winnerCalls: 1, handle: (*OpenAIGatewayHandler).Images},
+			response: `{"created":1,"data":[{"b64_json":"d2lubmVy"}]}`, contentType: "application/json", want: "d2lubmVy", winnerCalls: 1, imageCount: 1, handle: (*OpenAIGatewayHandler).Images},
 		{name: "oauth image batch", endpoint: "/v1/images/generations", body: `{"model":"gpt-image-2","prompt":"test","n":2}`, oauth: true,
-			response: "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"d2lubmVy\"}]}}\n\n", contentType: "text/event-stream", want: "d2lubmVy", winnerCalls: 2, handle: (*OpenAIGatewayHandler).Images},
+			response: `{"created":1,"data":[{"b64_json":"d2lubmVy"},{"b64_json":"d2lubmVyLTI="}]}`, contentType: "application/json", want: "d2lubmVy", winnerCalls: 1, imageCount: 2, handle: (*OpenAIGatewayHandler).Images},
 	} {
 		for _, mode := range []string{"unsent", "sent", "timeout", "body_read", "canceled"} {
 			t.Run(entry.name+"/"+mode, func(t *testing.T) {
 				var receivedMu sync.Mutex
 				var received []string
+				var receivedBodies []string
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
 					receivedMu.Lock()
 					received = append(received, r.Header.Get("X-Test-Account"))
+					receivedBodies = append(receivedBodies, string(body))
 					receivedMu.Unlock()
 					if r.Header.Get("X-Test-Account") == "1" {
 						w.Header().Set("Content-Length", "100")
@@ -125,6 +134,7 @@ func TestOpenAINonstreamHandlerTransportFailover_RequiresUnsentProof(t *testing.
 				upstream.mu.Unlock()
 				receivedMu.Lock()
 				onWire := append([]string(nil), received...)
+				onWireBodies := append([]string(nil), receivedBodies...)
 				receivedMu.Unlock()
 				if mode == "unsent" {
 					wantCalls := []int64{1}
@@ -138,6 +148,12 @@ func TestOpenAINonstreamHandlerTransportFailover_RequiresUnsentProof(t *testing.
 					require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 					require.Contains(t, rec.Body.String(), entry.want)
 					require.NotContains(t, rec.Body.String(), `"error"`)
+					if entry.imageCount > 0 {
+						require.Len(t, gjson.Get(rec.Body.String(), "data").Array(), entry.imageCount)
+						if entry.imageCount > 1 {
+							require.EqualValues(t, entry.imageCount, gjson.Get(onWireBodies[0], "n").Int(), "the native batch must retain its image count")
+						}
+					}
 				} else {
 					require.Equal(t, []int64{1}, calls, rec.Body.String())
 					require.NotContains(t, onWire, "2", "an ambiguous or already-sent request must not reach another account")

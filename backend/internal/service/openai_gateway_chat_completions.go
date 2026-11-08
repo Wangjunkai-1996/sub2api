@@ -339,7 +339,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	defer releaseUpstreamCtx()
 	var firstOutputGuard *openAITextFirstOutputGuard
 	if account.Platform == PlatformOpenAI && !IsExplicitImageGenerationIntent("/v1/chat/completions", originalModel, body) && !isOpenAIImageGenerationModel(upstreamModel) {
-		upstreamCtx, firstOutputGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()), s.openAITextFirstOutputTimeout())
+		upstreamCtx, firstOutputGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()))
 		defer firstOutputGuard.close()
 	}
 	cancelUpstream := func() {}
@@ -922,7 +922,7 @@ func (s *OpenAIGatewayService) newOpenAIChatOutputTimeoutError(
 		c.Request.Context(), c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
 		startTime, model, "", s.openAITextFirstOutputTimeout(), "usable_output", headers,
 	)
-	if outputCommitted && !IsOpenAIManagedRecovery(c.Request.Context()) {
+	if outputCommitted {
 		return newOpenAIUpstreamStreamReadError(fmt.Errorf("first usable output timed out"))
 	}
 	return err
@@ -1089,7 +1089,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			if strings.TrimSpace(event.Type) == "error" {
 				shouldFailover = openAIStreamErrorEventShouldFailover(payloadBytes, message)
 			}
-			if !clientDisconnected && shouldFailover && (!clientOutputStarted || IsOpenAIManagedRecovery(c.Request.Context())) {
+			if !clientOutputStarted && !clientDisconnected && shouldFailover {
 				streamFailoverErr = s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payloadBytes, message, upstreamModel, resp.Header)
 				return true
 			}
@@ -1285,7 +1285,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			}
 			return nil, err
 		}
-		readErr := s.newOpenAICompatReadError(c, account, resp, requestID, err, !clientDisconnected && (!clientOutputStarted || IsOpenAIManagedRecovery(c.Request.Context())))
+		readErr := s.newOpenAICompatReadError(c, account, resp, requestID, err, !clientOutputStarted && !clientDisconnected)
 		var failoverErr *UpstreamFailoverError
 		if errors.As(readErr, &failoverErr) {
 			return nil, readErr

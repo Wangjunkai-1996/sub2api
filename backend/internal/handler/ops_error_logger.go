@@ -1084,8 +1084,8 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 		w := acquireOpsCaptureWriter(originalWriter)
 		w.setContext(c)
 		defer func() {
-			// A handler may leave another writer wrapping w (for example, managed
-			// recovery). Outer middlewares must not read w after its lease ends.
+			// A handler may leave another writer wrapping w. Outer middlewares
+			// must not read w after its lease ends.
 			c.Writer = originalWriter
 			releaseOpsCaptureWriter(w)
 		}()

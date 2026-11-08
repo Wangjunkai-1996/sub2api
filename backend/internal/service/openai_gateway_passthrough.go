@@ -200,7 +200,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			if c != nil && c.Request != nil {
 				clientHeaders = c.Request.Header
 			}
-			fpIDs := resolveOpenAIRecoveryFingerprintIDs(ctx, account, clientHeaders)
+			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
 			if fpIDs != nil {
 				fpBody, fpChanged, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
 				if fpErr != nil {
@@ -380,7 +380,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		var textGuard *openAITextFirstOutputGuard
 		if account.Platform == PlatformOpenAI && !textTimeoutImageIntent && !isOpenAIResponsesCompactPath(c) {
-			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()), s.openAITextFirstOutputTimeout())
+			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(s.openAITextFirstOutputTimeout()))
 		}
 		upstreamCtxReleased := false
 		releaseAttemptContext := func() {
@@ -428,12 +428,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			}
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
-			if failure := newOpenAIOpaqueContextRejection(ctx, resp.StatusCode, resp.Header, probeBody); failure != nil {
-				return nil, failure
-			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, probeBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize passthrough rejected Responses field retry body: %w", retryErr)
-			} else if changed && !IsOpenAIOpaqueRecovery(ctx) && rejectedFieldRetryState.Allow(retryBody) {
+			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
 				body = retryBody
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying passthrough request after %s (account: %s)", reason, account.Name)
 				releaseAttemptContext()
@@ -1974,11 +1971,6 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 	if len(responseHeaders) > 0 && responseHeaders[0] != nil {
 		headers = responseHeaders[0].Clone()
 	}
-	if c != nil && c.Request != nil {
-		if failure := newOpenAIOpaqueContextRejection(c.Request.Context(), http.StatusBadRequest, headers, payload); failure != nil {
-			return failure
-		}
-	}
 	statusCode, shouldDisable := s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, headers, canonicalModel)
 	// 流内 failed 事件承载于 HTTP 200；使用事件的语义状态更新账号健康，
 	// 再由 failover 引擎按 StatusCode/RetryableOnSameAccount 决定恢复策略。
@@ -2002,10 +1994,6 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 		classificationHeaders = nil
 	}
 	failoverErr := s.newOpenAIAccountFailoverErrorWithClassificationHeaders(account, statusCode, headers, classificationHeaders, payload, message, shouldDisable, retryableOnSameAccount)
-	if c != nil && c.Request != nil && IsOpenAIManagedRecovery(c.Request.Context()) && !failoverErr.IsCredentialFailure() && (statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError) {
-		failoverErr.RetryableOnSameAccount = true
-		failoverErr.RequestScopedTransient = true
-	}
 	if failoverErr.IsCredentialFailure() || failoverErr.RequestScopedTransient {
 		return failoverErr
 	}
@@ -2059,11 +2047,6 @@ func (s *OpenAIGatewayService) nonStreamingTerminalFailureFailover(
 	if account == nil || IsResponseCommitted(c) {
 		return nil
 	}
-	if c != nil && c.Request != nil && resp != nil {
-		if failure := newOpenAIOpaqueContextRejection(c.Request.Context(), resp.StatusCode, resp.Header, payload); failure != nil {
-			return failure
-		}
-	}
 	shouldFailover := openAIStreamFailedEventShouldFailover(payload, message)
 	if terminalType == "error" {
 		shouldFailover = openAIStreamErrorEventShouldFailover(payload, message)
@@ -2094,7 +2077,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	if len(textGuards) > 0 {
 		textGuard = textGuards[0]
 	} else if imageIntent, _ := getOpenAIImageIntentHint(c); account != nil && account.Platform == PlatformOpenAI && !imageIntent && !IsImageGenerationIntent(openAIResponsesEndpoint, originalModel, nil) && !isOpenAIResponsesCompactPath(c) {
-		_, textGuard = newOpenAITextFirstOutputGuard(ctx, openAIFirstOutputDeadline(ctx, startTime, s.openAITextFirstOutputTimeout()))
+		_, textGuard = newOpenAITextFirstOutputGuard(ctx, startTime.Add(s.openAITextFirstOutputTimeout()))
 		defer textGuard.close()
 	}
 	textGuard.setBody(resp.Body)
@@ -2363,6 +2346,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				}
 			}
 			eventType := effectiveOpenAISSEEventType(dataBytes, rawEventType)
+			observeOpenAI429RecoveryOutput(ctx, account, dataBytes, eventType)
 			createdAtTracker.Observe(dataBytes, eventType)
 			if codexFailureTerminal && sawBareError && !sawResponseFailed && eventType != "response.failed" {
 				suppressCurrentEvent = true
@@ -2406,18 +2390,6 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					})
 				}
 				outputStarted := openAIStreamClientOutputStarted(c, clientOutputStarted)
-				if IsOpenAIManagedRecovery(ctx) && !cyberHit {
-					if failure := newOpenAIOpaqueContextRejection(ctx, resp.StatusCode, resp.Header, dataBytes); failure != nil {
-						return resultWithUsage(), failure
-					}
-					shouldFailover := openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
-					if eventType == "error" {
-						shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
-					}
-					if shouldFailover {
-						return resultWithUsage(), s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
-					}
-				}
 				if !outputStarted && sessionBlocked {
 					return resultWithUsage(), newOpenAISessionBlockedFailoverError(http.StatusOK, resp.Header, dataBytes)
 				}
@@ -2596,9 +2568,6 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		if !clientOutputStarted {
 			return resultWithUsage(), failoverErr
 		}
-		if IsOpenAIManagedRecovery(ctx) {
-			return resultWithUsage(), failoverErr
-		}
 		// An earlier structural event may already belong to this response. End
 		// this stream explicitly; it must never be replayed on another account.
 		failoverErr.SafeToFailoverAfterWrite = false
@@ -2653,9 +2622,6 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			upstreamRequestID,
 			err,
 		)
-		if IsOpenAIManagedRecovery(ctx) {
-			return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, readMessage, resp.Header)
-		}
 		return resultWithUsage(), newOpenAIUpstreamStreamReadError(err)
 	}
 	if sawFailedEvent {
@@ -2673,9 +2639,6 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 		recordStreamError(nil, "stream_missing_terminal", "OpenAI stream ended before a terminal event")
 		s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
-		if IsOpenAIManagedRecovery(ctx) {
-			return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event", resp.Header)
-		}
 		return resultWithUsage(), errors.New("stream usage incomplete: missing terminal event")
 	}
 	if (sawDone || sawTerminalEvent) && !sawFailedEvent {

@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,6 +114,28 @@ func TestOpenAIPassthroughTextDeadlineDoesNotReplayCommittedStructure(t *testing
 }
 
 func TestOpenAIPassthroughVisibleOutputClassifierIncludesRefusal(t *testing.T) {
-	require.True(t, openAIStreamDataStartsVisibleOutput(`{"type":"response.refusal.done","refusal":"cannot comply"}`, ""))
-	require.True(t, openAIStreamDataStartsVisibleOutput(`{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"refusal","refusal":"cannot comply"}]}}`, ""))
+	for _, tc := range []struct {
+		name, payload string
+	}{
+		{"refusal delta", `{"type":"response.refusal.delta","delta":"Cannot help"}`},
+		{"refusal done", `{"type":"response.refusal.done","refusal":"Cannot help"}`},
+		{"refusal content part", `{"type":"response.content_part.done","part":{"type":"refusal","refusal":"Cannot help"}}`},
+		{"refusal output item", `{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"refusal","refusal":"Cannot help"}]}}`},
+		{"refusal terminal", `{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"refusal","refusal":"Cannot help"}]}]}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.True(t, openAIStreamDataStartsVisibleOutput(tc.payload, ""))
+		})
+	}
+	for _, payload := range []string{
+		`{"type":"response.content_part.added","part":{"type":"refusal","refusal":""}}`,
+		`{"type":"response.content_part.done","part":{"type":"refusal","refusal":null}}`,
+		`{"type":"response.content_part.done","part":{"type":"refusal","refusal":123}}`,
+	} {
+		assert.False(t, openAIStreamDataStartsVisibleOutput(payload, ""), payload)
+	}
+	refusal := "Cannot help"
+	chunk := apicompat.ChatCompletionsChunk{Choices: []apicompat.ChatChunkChoice{{Delta: apicompat.ChatDelta{Refusal: &refusal}}}}
+	assert.True(t, openAIChatChunkStartsUsableOutput(chunk))
+	assert.True(t, openAIRawChatChunkStartsUsableOutput(`{"choices":[{"delta":{"refusal":"Cannot help"}}]}`))
 }

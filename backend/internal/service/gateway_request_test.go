@@ -993,7 +993,10 @@ func TestInitialMessageFiltersPreserveSignedLatestAssistantContentBytes(t *testi
 	out = FilterThinkingBlocks(out, "claude-sonnet-4-5")
 
 	require.Equal(t, wantLatestRaw, gjson.GetBytes(out, "messages.1.content").Raw)
-	require.Empty(t, gjson.GetBytes(out, "messages.0.content").Array())
+	history := gjson.GetBytes(out, "messages.0.content").Array()
+	require.Len(t, history, 1)
+	require.Equal(t, "text", history[0].Get("type").String())
+	require.Equal(t, "(assistant content removed)", history[0].Get("text").String())
 }
 
 func TestInitialMessageFiltersReplaceMultipleHistoricalMessages(t *testing.T) {

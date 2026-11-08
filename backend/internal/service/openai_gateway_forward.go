@@ -19,10 +19,6 @@ import (
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
-	if err := ValidateOpenAIOpaqueRecoveryRoute(ctx, account); err != nil {
-		return nil, err
-	}
-	rememberOpenAIOpaqueRequest(ctx, body)
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
 	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
@@ -187,11 +183,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if account.IsOpenCodeGo() && IsOpenCodeUnsupportedModel(routingModel) {
 		return nil, writeOpenCodeUnsupportedModelError(c, false, routingModel)
 	}
-	upstreamProtocol := s.resolveUpstreamProtocolFor(ctx, account, APIProtocolResponses, routingModel)
-	if IsOpenAIOpaqueRecovery(ctx) && upstreamProtocol != APIProtocolResponses {
-		return nil, ErrOpenAIOpaqueRouteUnavailable
-	}
-	switch upstreamProtocol {
+	switch s.resolveUpstreamProtocolFor(ctx, account, APIProtocolResponses, routingModel) {
 	case APIProtocolAnthropic:
 		// Responses 客户端 × Anthropic 上游：转成 Anthropic 请求走原生端点。不能落到
 		// raw-CC 分支——其 URL 构造会把 anthropic base 当 CC base 用。
@@ -405,7 +397,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Upstream model resolved: %s -> %s (account: %s, type: %s, isCodexCLI: %v)", billingModel, upstreamModel, account.Name, account.Type, isCodexCLI)
 		}
 	}
-	if !IsOpenAIManagedRecovery(ctx) && strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()) == "minimal" {
+	if strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()) == "minimal" {
 		markPatchSet("reasoning.effort", "none")
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Normalized reasoning.effort: minimal -> none (account: %s)", account.Name)
 	}
@@ -562,7 +554,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if c != nil && c.Request != nil {
 				clientHeaders = c.Request.Header
 			}
-			fpIDs := resolveOpenAIRecoveryFingerprintIDs(ctx, account, clientHeaders)
+			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
 			if fpIDs != nil {
 				if applyCodexFingerprintClientMetadata(decoded, fpIDs) {
 					markDecodedModified()
@@ -645,7 +637,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if clampedCap, ok := ollamaCloudResponsesMaxOutputTokensClamp(account, upstreamModel, body); ok {
 		markPatchSet("max_output_tokens", clampedCap)
 	}
-	if !IsOpenAIOpaqueRecovery(ctx) && wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 &&
+	if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 &&
 		!account.IsOpenAIApiKey() && gjson.GetBytes(body, "previous_response_id").Exists() {
 		markPatchDelete("previous_response_id")
 	}
@@ -755,7 +747,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	lineageGroupID := getOpenAIGroupIDFromContext(c)
 	lineageEntryBody := body
 	lineageSessionHash := ""
-	if stateStore := s.getOpenAIWSStateStore(); !IsOpenAIOpaqueRecovery(ctx) && stateStore != nil && stateStore.HasAnySessionInvalidEncryptedContent() {
+	if stateStore := s.getOpenAIWSStateStore(); stateStore != nil && stateStore.HasAnySessionInvalidEncryptedContent() {
 		lineageSessionHash = s.GenerateSessionHash(c, body)
 		if invalidDigests := stateStore.GetSessionInvalidEncryptedContentDigests(lineageGroupID, lineageSessionHash); len(invalidDigests) > 0 {
 			strippedBody, strippedCount := s.stripSessionInvalidEncryptedContentLogged(
@@ -1067,7 +1059,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		var headerGuard *openAIFirstOutputHeaderGuard
 		var textGuard *openAITextFirstOutputGuard
 		if nonStreamTextTimeout > 0 {
-			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(nonStreamTextTimeout), nonStreamTextTimeout)
+			upstreamCtx, textGuard = newOpenAITextFirstOutputGuard(upstreamCtx, startTime.Add(nonStreamTextTimeout))
 		}
 		upstreamCtxReleased := false
 		releaseAttemptContext := func() {
@@ -1081,7 +1073,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		if firstOutputTimeout > 0 {
 			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
-				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout), firstOutputTimeout,
+				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
 			)
 		}
 		upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, reqStream, promptCacheKey, isCodexCLI)
@@ -1187,9 +1179,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					strings.Contains(upstreamMsg, "The encrypted content") &&
 					strings.Contains(upstreamMsg, "could not be verified") &&
 					strings.Contains(upstreamMsg, "could not be decrypted or parsed"))
-			if failure := newOpenAIOpaqueContextRejection(ctx, resp.StatusCode, resp.Header, respBody); failure != nil {
-				return nil, failure
-			}
 			if !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && invalidEncryptedContentError {
 				decoded, decodeErr := ensureReqBody()
 				if decodeErr != nil {
@@ -1217,7 +1206,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize rejected Responses field retry body: %w", retryErr)
-			} else if changed && !IsOpenAIOpaqueRecovery(ctx) && rejectedFieldRetryState.Allow(retryBody) {
+			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
 				body = retryBody
 				requestView = newOpenAIRequestView(body)
 				reqBody = nil

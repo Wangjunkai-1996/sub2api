@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,8 +13,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,6 +37,74 @@ func (u *responsesLocalHTTPUpstream) Do(req *http.Request, _ string, accountID i
 	forward.URL = &destination
 	forward.Host = destination.Host
 	return u.client.Do(forward)
+}
+
+type responsesFlushObserver struct {
+	gin.ResponseWriter
+	onFlush func()
+}
+
+func (w *responsesFlushObserver) Flush() {
+	w.ResponseWriter.Flush()
+	w.onFlush()
+}
+
+func TestOpenAIResponsesRetiredRecoveryHeaderPreservesNativeStream(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		for _, tc := range []struct{ name, event, marker string }{
+			{"text", `{"type":"response.output_text.delta","delta":"visible-text"}`, "visible-text"},
+			{"tool", `{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"native_tool","arguments":"{}"}}`, "native_tool"},
+		} {
+			t.Run(fmt.Sprintf("passthrough_%t/%s", passthrough, tc.name), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				ctx = context.WithValue(ctx, ctxkey.NewAPIUserID, int64(1))
+				ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(2))
+				ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "newapi")
+				visible := make(chan struct{})
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.Copy(io.Discard, r.Body)
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_native\"}}\n\ndata: "+tc.event+"\n\n")
+					w.(http.Flusher).Flush()
+					// The upstream terminal cannot arrive until real output is flushed.
+					select {
+					case <-visible:
+						_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_native\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+					case <-ctx.Done():
+					}
+				}))
+				defer upstream.Close()
+				destination, err := url.Parse(upstream.URL)
+				require.NoError(t, err)
+				accounts := []service.Account{{
+					ID: 1, Name: "native", Platform: service.PlatformOpenAI,
+					Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
+					Credentials: map[string]any{"api_key": "test", "base_url": "https://api.example.test"},
+					Extra:       map[string]any{"openai_passthrough": passthrough},
+				}}
+				h := newOpenAIFailoverTestHandlerWithAccounts(t, &responsesLocalHTTPUpstream{client: upstream.Client(), url: destination}, accounts)
+				c, rec := newOpenAIResponsesFailoverTestContext(t, ctx)
+				c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5.1","stream":true,"input":"hello"}`))
+				c.Request.Header.Set("X-KKAI-Recovery-Protocol", "1")
+				var once sync.Once
+				c.Writer = &responsesFlushObserver{ResponseWriter: c.Writer, onFlush: func() {
+					if strings.Contains(rec.Body.String(), tc.marker) {
+						once.Do(func() { close(visible) })
+					}
+				}}
+				h.Responses(c)
+				require.NoError(t, ctx.Err(), "visible output must arrive before the upstream terminal")
+				assert.Equal(t, http.StatusOK, rec.Code)
+				assert.Contains(t, rec.Body.String(), `"id":"resp_native"`)
+				assert.Contains(t, rec.Body.String(), "response.completed")
+				assert.NotContains(t, rec.Body.String(), "resp_lr_")
+				assert.NotContains(t, rec.Body.String(), "kkai.recovery")
+				assert.Empty(t, rec.Header().Get("X-KKAI-Recovery-Protocol"))
+				assert.Empty(t, rec.Header().Get("X-KKAI-Recovery-Diagnostics"))
+			})
+		}
+	}
 }
 
 func TestOpenAIResponsesRealHTTPFailover(t *testing.T) {

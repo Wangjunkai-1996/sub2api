@@ -247,7 +247,7 @@ func TestOpsErrorLoggerMiddleware_DoesNotBreakOuterMiddlewares(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 
-func TestOpsErrorLoggerMiddleware_RestoresWriterAfterManagedStream(t *testing.T) {
+func TestOpsErrorLoggerMiddleware_RestoresWriterAfterNestedStream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logSink, restore := captureHandlerStructuredLog(t)
 	defer restore()
@@ -255,11 +255,9 @@ func TestOpsErrorLoggerMiddleware_RestoresWriterAfterManagedStream(t *testing.T)
 	r := gin.New()
 	r.Use(middleware2.RequestLogger(), middleware2.Logger())
 	r.POST("/v1/responses", OpsErrorLoggerMiddleware(nil), func(c *gin.Context) {
-		managed := service.NewOpenAIRecoveryStreamWriter(c.Writer, service.OpenAIRecoveryResponsesSSE, "resp_test", nil, nil)
-		c.Writer = managed
-		require.NoError(t, managed.BeginAttempt(1))
-		managed.WriteHeader(http.StatusOK)
-		_, err := managed.WriteString(": ping\n\n")
+		c.Writer = &struct{ gin.ResponseWriter }{c.Writer}
+		c.Writer.WriteHeader(http.StatusOK)
+		_, err := c.Writer.WriteString(": ping\n\n")
 		require.NoError(t, err)
 	})
 
