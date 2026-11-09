@@ -425,6 +425,13 @@ func (c *openAIWSPassthroughFirstOutputFrameConn) ReadFrame(ctx context.Context)
 	for {
 		select {
 		case result := <-readResultCh:
+			state := c.deadlineState()
+			if ctx.Err() == nil && state.armed && state.deadline.timeout > 0 && !time.Now().Before(state.deadline.startedAt.Add(state.deadline.timeout)) {
+				if state.deadline.phase == openAIWSPassthroughDeadlinePhaseActiveRead {
+					return coderws.MessageText, nil, &openAIWSPassthroughActiveTurnTimeoutError{}
+				}
+				return coderws.MessageText, nil, &openAIWSPassthroughFirstOutputTimeoutError{deadline: state.deadline}
+			}
 			if result.err == nil {
 				c.observeUpstreamActivity(result.msgType, result.payload)
 			}
@@ -576,12 +583,8 @@ func openAIWSPassthroughStartsSemanticOutput(payload []byte) bool {
 	switch eventType {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		return true
-	case "", "response.created", "response.in_progress", "response.output_item.added", "response.output_item.done":
-		return false
 	}
-	return strings.Contains(eventType, ".delta") ||
-		strings.HasPrefix(eventType, "response.output_text") ||
-		strings.HasPrefix(eventType, "response.output")
+	return openAIStreamDataStartsVisibleOutput(string(payload), eventType)
 }
 
 func openAIWSPassthroughIsTerminalOutput(payload []byte) bool {
@@ -685,6 +688,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
@@ -807,6 +811,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	// goroutine）之间同步当前 turn 的 usage metadata。
 	usageMeta.initFromFirstFrame(firstClientMessage, capturedSessionModel)
 	usageMeta.captureRequestedReasoningEffort(originalFirstClientMessage, capturedSessionModel)
+	var sessionImageTools atomic.Bool
+	var sessionImageChoice atomic.Bool
 	_, initialUpstreamModel := usageMeta.turnModels(initialRequestModel)
 	SetOpsUpstreamModel(c, initialUpstreamModel)
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -930,16 +936,19 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if current := usageMeta.reasoningEffort.Load(); current != nil {
 				reasoningEffort = *current
 			}
-			timeout := s.openAIFirstOutputTimeout(reasoningEffort)
-			if timeout <= 0 {
-				timeout = s.openAIWSPassthroughIdleTimeout()
-			}
 			model := openAIWSPassthroughRequestModelForFrame(payload)
 			if model == "" {
 				model = usageMeta.requestModelForFrame(payload)
 			}
 			if model == "" {
 				model = requestModel
+			}
+			timeout := s.openAITextFirstOutputTimeout()
+			if sessionImageTools.Load() || sessionImageChoice.Load() || IsExplicitImageGenerationIntent(openAIResponsesEndpoint, model, payload) {
+				timeout = s.openAIFirstOutputTimeout(reasoningEffort)
+				if timeout <= 0 {
+					timeout = s.openAIWSPassthroughIdleTimeout()
+				}
 			}
 			return openAIWSPassthroughFirstOutputDeadline{
 				timeout:         timeout,
@@ -985,6 +994,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			responseCreateAt := time.Time{}
 			acceptedTurn := false
 			if isResponseCreate {
+
 				responseCreateAt = time.Now()
 				if !turnLifecycle.beginResponseCreate(clientFrameConn.markTurnStarted) {
 					err := errors.New("overlapping response.create is not supported")
@@ -1021,6 +1031,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 				if accountScoped {
 					payload = accountScopedPayload
+				}
+			}
+			if eventType == "session.update" {
+				if tools := gjson.GetBytes(payload, "session.tools"); tools.Exists() {
+					sessionImageTools.Store(openAIJSONToolsContainNativeImageGeneration(tools))
+				}
+				if choice := gjson.GetBytes(payload, "session.tool_choice"); choice.Exists() {
+					sessionImageChoice.Store(openAIJSONToolChoiceSelectsExplicitImageGeneration(choice))
 				}
 			}
 			if isResponseCreate {
@@ -1111,6 +1129,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     覆盖（Store(nil)），因为 OpenAI 上游对该帧实际不传
 			//     service_tier 时按 default 处理，billing 应如实反映。
 			if policyErr == nil && blocked == nil && isResponseCreate {
+				if hooks != nil && hooks.BeforeTurn != nil {
+					if err := hooks.BeforeTurn(turnNo); err != nil {
+						return out, nil, err
+					}
+				}
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
@@ -1165,6 +1188,19 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	firstTurnStartedAt := time.Time{}
 	if hooks != nil {
 		firstTurnStartedAt = hooks.InitialTurnStartedAt
+	}
+	lastBoundResponseID := ""
+	bindResponseRouting := func(responseID string) {
+		responseID = strings.TrimSpace(responseID)
+		if responseID == "" || responseID == lastBoundResponseID {
+			return
+		}
+		lastBoundResponseID = responseID
+		bindingID := ""
+		if account.SelectedEgress != nil {
+			bindingID = account.SelectedEgress.BindingID
+		}
+		s.bindOpenAIResponseRouting(ctx, c, account, responseID, bindingID, "")
 	}
 	failureAccountSideEffectsApplied := false
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
@@ -1224,6 +1260,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					Stream:                        true,
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
+					UpstreamTerminalStatusCode:    openAIWSTerminalHealthStatus(turn.TerminalPayload),
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
 					Duration:                      turn.Duration,
 					FirstTokenMs:                  turn.FirstTokenMs,
@@ -1247,6 +1284,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 			},
 			BeforeClientWrite: func(msgType coderws.MessageType, payload []byte) {
+				if msgType == coderws.MessageText {
+					observeOpenAI429RecoveryOutput(ctx, account, payload, "")
+				}
 				if msgType == coderws.MessageText && openAIWSPassthroughIsTerminalOutput(payload) {
 					turnLifecycle.beginTerminalWrite()
 				}
@@ -1279,20 +1319,18 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				if msgType != coderws.MessageText {
 					return nil
 				}
-				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
+				eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(payload)
 				if eventType == "response.created" {
 					failureAccountSideEffectsApplied = false
 				}
 				if (eventType == "error" || eventType == "response.failed") && markOpenAIWSV2PassthroughCyberPolicy(c, payload) {
+					bindResponseRouting(eventResponseID)
 					return nil
 				}
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
 				isPreOutputRateLimit := eventType == "error" && !wroteDownstream && isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw)
 				if (eventType == "error" || eventType == "response.failed") && !failureAccountSideEffectsApplied && !isPreOutputRateLimit {
 					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, capturedSessionModel, handshakeHeaders, payload)
-				}
-				if eventType != "error" {
-					return nil
 				}
 				if wroteDownstream || !isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw) {
 					return nil
@@ -1366,6 +1404,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		Stream:                        true,
 		OpenAIWSMode:                  true,
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
+		UpstreamTerminalStatusCode:    openAIWSTerminalHealthStatus(relayResult.TerminalPayload),
 		ResponseHeaders:               cloneHeader(handshakeHeaders),
 		Duration:                      relayResult.Duration,
 		FirstTokenMs:                  relayResult.FirstTokenMs,
@@ -1423,7 +1462,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			deadline.requestModel,
 			deadline.reasoningEffort,
 			deadline.timeout,
-			"websocket_first_semantic_output",
+			"websocket_first_usable_output",
 			handshakeHeaders,
 		)
 		if turnCount == 0 && !relayExit.WroteDownstream {

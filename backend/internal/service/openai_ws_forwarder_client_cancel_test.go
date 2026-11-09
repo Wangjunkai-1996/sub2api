@@ -77,7 +77,7 @@ func TestForwardOpenAIWSV2_ClientCancellationDrainsWithoutSyntheticFailure(t *te
 		},
 	}
 
-	result, err := svc.Forward(ctx, c, account, []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"input_text","text":"hello"}]}`))
+	result, err := svc.Forward(ctx, c, account, []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"stream":true,"input":[{"type":"input_text","text":"hello"}]}`))
 
 	require.NoError(t, err, "client cancellation must not surface as an upstream failure")
 	require.NotNil(t, result)
@@ -85,6 +85,8 @@ func TestForwardOpenAIWSV2_ClientCancellationDrainsWithoutSyntheticFailure(t *te
 	require.Equal(t, "resp_cancel_1", result.RequestID)
 	require.Equal(t, 3, result.Usage.InputTokens)
 	require.Equal(t, 5, result.Usage.OutputTokens)
+	require.NotNil(t, result.RequestedReasoningEffort)
+	require.Equal(t, "high", *result.RequestedReasoningEffort)
 	require.NotContains(t, writer.body.String(), "response.failed")
 }
 

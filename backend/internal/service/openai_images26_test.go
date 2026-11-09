@@ -230,7 +230,7 @@ func TestGPTImage26StreamedJSONEdits(t *testing.T) {
 	for _, model := range []string{"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"} {
 		for _, disconnect := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/disconnect=%t", model, disconnect), func(t *testing.T) {
-				body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"edit","images":[{"image_url":"data:image/png;base64,AA=="}],"n":2,"stream":true,"response_format":"url"}`, model))
+				body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"edit","images":[{"image_url":"data:image/png;base64,AA=="}],"n":1,"stream":true,"response_format":"url"}`, model))
 				c, rec := newOpenAIImagesTestContext(t, body)
 				c.Request.URL.Path = openAIImagesEditsEndpoint
 				if disconnect {

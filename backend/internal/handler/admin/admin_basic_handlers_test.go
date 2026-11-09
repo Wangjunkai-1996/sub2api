@@ -48,6 +48,7 @@ func setupAdminRouter() (*gin.Engine, *stubAdminService) {
 
 	router.GET("/api/v1/admin/proxies", proxyHandler.List)
 	router.GET("/api/v1/admin/proxies/all", proxyHandler.GetAll)
+	router.GET("/api/v1/admin/proxies/options", proxyHandler.GetOptions)
 	router.GET("/api/v1/admin/proxies/:id", proxyHandler.GetByID)
 	router.POST("/api/v1/admin/proxies", proxyHandler.Create)
 	router.PUT("/api/v1/admin/proxies/:id", proxyHandler.Update)
@@ -275,6 +276,11 @@ func TestProxyHandlerEndpoints(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/proxies/options", nil)
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/proxies/all", nil)
 	router.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -328,6 +334,22 @@ func TestProxyHandlerEndpoints(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/proxies/4/accounts", nil)
 	router.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestProxyOptionsNeverExposeCredentials(t *testing.T) {
+	router, adminSvc := setupAdminRouter()
+	adminSvc.proxyCounts[0].Username = "secret-user"
+	adminSvc.proxyCounts[0].Password = "secret-password"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/proxies/options", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotContains(t, rec.Body.String(), "secret-user")
+	require.NotContains(t, rec.Body.String(), "secret-password")
+	require.Contains(t, rec.Body.String(), `"display_endpoint":"http://127.0.0.1:8080"`)
+	require.Contains(t, rec.Body.String(), `"selectable":true`)
 }
 
 func TestRedeemHandlerEndpoints(t *testing.T) {

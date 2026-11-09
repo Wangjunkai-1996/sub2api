@@ -504,6 +504,8 @@ type agentIdentityForwardRepo struct {
 	account *Account
 }
 
+var _ OpenAICredentialCASRepository = (*agentIdentityForwardRepo)(nil)
+
 type agentIdentityWSInvalidationRecorder struct {
 	accountIDs []int64
 }
@@ -518,6 +520,8 @@ type accountTestAgentIdentityRepo struct {
 	setErrorCalls int
 }
 
+var _ OpenAICredentialCASRepository = (*accountTestAgentIdentityRepo)(nil)
+
 func (r *accountTestAgentIdentityRepo) GetByID(_ context.Context, _ int64) (*Account, error) {
 	return r.account, nil
 }
@@ -525,6 +529,16 @@ func (r *accountTestAgentIdentityRepo) GetByID(_ context.Context, _ int64) (*Acc
 func (r *accountTestAgentIdentityRepo) UpdateCredentials(_ context.Context, _ int64, credentials map[string]any) error {
 	r.account.Credentials = credentials
 	return nil
+}
+
+func (r *accountTestAgentIdentityRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	_ context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	return applyOpenAITestCredentialsCAS(r.account, id, expectedCredentials, expectedProxyID, credentials), nil
 }
 
 func (r *accountTestAgentIdentityRepo) UpdateExtra(_ context.Context, _ int64, _ map[string]any) error {
@@ -543,4 +557,14 @@ func (r *agentIdentityForwardRepo) GetByID(_ context.Context, _ int64) (*Account
 func (r *agentIdentityForwardRepo) UpdateCredentials(_ context.Context, _ int64, credentials map[string]any) error {
 	r.account.Credentials = credentials
 	return nil
+}
+
+func (r *agentIdentityForwardRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	_ context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	return applyOpenAITestCredentialsCAS(r.account, id, expectedCredentials, expectedProxyID, credentials), nil
 }

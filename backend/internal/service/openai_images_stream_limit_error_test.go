@@ -82,7 +82,7 @@ func TestImageStreamTransportLimitEmitsErrorAndPreservesUsage(t *testing.T) {
 					var count int
 					var err error
 					if route == "responses" {
-						usage, count, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, time.Now(), "b64_json", "image_generation", "gpt-image-2")
+						usage, count, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, nil, time.Now(), "b64_json", "image_generation", "gpt-image-2")
 					} else {
 						var direct *OpenAIImagesRequest
 						if route == "direct" {
@@ -153,7 +153,7 @@ func TestImageStreamTransportLimitSkipsDisconnectedClient(t *testing.T) {
 				svc := &OpenAIGatewayService{cfg: cfg}
 				var err error
 				if oauth {
-					_, _, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, time.Now(), "b64_json", "image_generation", "gpt-image-2")
+					_, _, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, nil, time.Now(), "b64_json", "image_generation", "gpt-image-2")
 				} else {
 					_, _, _, _, err = svc.handleOpenAIImagesStreamingResponse(resp, c, time.Now(), nil)
 				}
@@ -189,7 +189,7 @@ func TestImageStreamTransportLimitDoesNotRetryFailedClientWriter(t *testing.T) {
 				var usage OpenAIUsage
 				var err error
 				if route == "responses" {
-					usage, _, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, time.Now(), "b64_json", "image_generation", "gpt-image-2")
+					usage, _, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, nil, time.Now(), "b64_json", "image_generation", "gpt-image-2")
 				} else {
 					var direct *OpenAIImagesRequest
 					if route == "direct" {

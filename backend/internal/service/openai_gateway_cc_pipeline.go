@@ -195,6 +195,7 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	bearerToken string,
 	userAgent string,
 	grokCacheIdentity string,
+	firstOutputGuards ...*openAITextFirstOutputGuard,
 ) (*http.Response, error) {
 	// DeepSeek thinking mode 要求历史 assistant 回传 reasoning_content。
 	// Responses→CC 回退在加密-only / 缺 reasoning item 且缓存未命中时会漏掉该
@@ -202,9 +203,14 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// passed back to the API"。在共用出站点补空格占位，真实明文不覆盖。
 	body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	if len(firstOutputGuards) > 0 && firstOutputGuards[0] != nil {
+		// The caller already detached and owns the first-output cancellation.
+		releaseUpstreamCtx()
+		upstreamCtx, releaseUpstreamCtx = ctx, func() {}
+	}
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
-	releaseUpstreamCtx()
 	if err != nil {
+		releaseUpstreamCtx()
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
 	// 记录本次实际选择的协议端点，供错误日志和用量日志在没有
@@ -254,7 +260,25 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		releaseUpstreamCtx()
+		if len(firstOutputGuards) > 0 && firstOutputGuards[0].timedOut() {
+			return nil, err
+		}
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	}
+	if resp == nil || resp.Body == nil {
+		releaseUpstreamCtx()
+		return resp, nil
+	}
+	// The response is consumed by the caller (including streaming fallbacks), so
+	// keep the detached context alive until that body is closed. Releasing it
+	// when this helper returns would cancel the request before the first chunk.
+	resp.Body = &openAIRequestContextReadCloser{
+		ReadCloser: resp.Body,
+		cleanup:    releaseUpstreamCtx,
 	}
 	return resp, nil
 }
@@ -268,6 +292,10 @@ type ccStreamScanState struct {
 	FirstTokenMs *int
 	// SawDone 表示上游发出了 [DONE] 哨兵。
 	SawDone bool
+	// SawTerminalChunk 表示收到 usage 或 finish_reason 终止 chunk。部分
+	// OpenAI-compatible 上游不发送 [DONE]，但该 chunk 仍代表正常完成；
+	// 只有没有任何终止信号的读错误才应计入 proxy stream circuit。
+	SawTerminalChunk bool
 	// Err 为 scanner 读错误（客户端 context 取消不属于此类，会原样带出）。
 	// 非 nil 时调用方必须跳过 finalize 并返回 usage-incomplete 错误，避免
 	// 把上游截断伪装成正常收尾。
@@ -281,6 +309,7 @@ type ccStreamScanState struct {
 func (s *OpenAIGatewayService) scanCCStream(
 	c *gin.Context,
 	resp *http.Response,
+	account *Account,
 	logPrefix string,
 	requestID string,
 	startTime time.Time,
@@ -312,6 +341,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 
 		if u := extractCCStreamUsage(payload); u != nil {
 			st.Usage = *u
+			st.SawTerminalChunk = true
 		}
 
 		var chunk apicompat.ChatCompletionsChunk
@@ -322,6 +352,13 @@ func (s *OpenAIGatewayService) scanCCStream(
 			)
 			continue
 		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != "" {
+				st.SawTerminalChunk = true
+				break
+			}
+		}
+		observeOpenAI429RecoveryOutput(c.Request.Context(), account, []byte(payload), "")
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
 			ms := int(time.Since(startTime).Milliseconds())
 			st.FirstTokenMs = &ms
@@ -329,6 +366,11 @@ func (s *OpenAIGatewayService) scanCCStream(
 		emit(&chunk)
 	}
 
+	if st.SawDone || st.SawTerminalChunk {
+		// A terminal chunk is a successful observation for the exact admitted
+		// route, even when the scanner reports a trailing transport EOF.
+		s.clearOpenAIProxyStreamDisconnect(account)
+	}
 	if err := scanner.Err(); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			logger.L().Warn(logPrefix+": stream read error",
@@ -337,6 +379,10 @@ func (s *OpenAIGatewayService) scanCCStream(
 			)
 		}
 		st.Err = err
+		if !st.SawDone && !st.SawTerminalChunk &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			s.recordOpenAIProxyStreamDisconnect(account, err, requestID)
+		}
 	}
 	return st
 }

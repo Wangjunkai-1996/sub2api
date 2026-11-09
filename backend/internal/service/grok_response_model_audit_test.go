@@ -375,6 +375,7 @@ func TestGrokResponseAuditConvertedAggregateKeepsNonGrokTerminalOnly(t *testing.
 			Name:        "openai-oauth",
 			Platform:    PlatformOpenAI,
 			Type:        AccountTypeOAuth,
+			Status:      StatusActive,
 			Concurrency: 1,
 			Credentials: map[string]any{
 				"access_token":       "oauth-token",

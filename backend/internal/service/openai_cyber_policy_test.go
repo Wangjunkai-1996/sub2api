@@ -86,3 +86,44 @@ func TestDetectOpenAICyberPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAISessionBlockedCyberPolicyMessageClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		blocked bool
+	}{
+		{
+			name:    "ordinary request refusal",
+			message: "Request blocked by upstream cyber-security policy",
+		},
+		{
+			name:    "session must be replaced",
+			message: "This session is blocked by the cyber-security policy. Please start a new session.",
+			blocked: true,
+		},
+		{
+			name:    "session disabled but no replacement instruction",
+			message: "This session is disabled by the cyber-security policy.",
+		},
+		{
+			name:    "chinese session replacement",
+			message: "此会话已被网络安全策略拦截，请开始新会话。",
+			blocked: true,
+		},
+		{
+			name:    "unrelated cyber wording",
+			message: "The request mentions a session and cyber-security policy, but was not blocked.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.blocked, isOpenAISessionBlockedCyberPolicyMessage(tt.message))
+		})
+	}
+}
+
+func TestIsOpenAISessionBlockedCyberPolicyRequiresCyberCode(t *testing.T) {
+	require.False(t, isOpenAISessionBlockedCyberPolicy([]byte(`{"error":{"message":"This session is blocked by the cyber-security policy. Please start a new session."}}`)))
+	require.True(t, isOpenAISessionBlockedCyberPolicy([]byte(`{"error":{"code":"cyber_policy","message":"This session is blocked by the cyber-security policy. Please start a new session."}}`)))
+}

@@ -191,10 +191,15 @@ func TestDashboardAggregationRepositoryCleanupUsageLogsNonPartitionedInvalidates
 	mock.ExpectQuery(`SELECT EXISTS`).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT tableoid::oid, ctid::text, created_at FROM usage_logs.*FOR UPDATE`).
+		WithArgs(cutoff, usageLogsCleanupBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{"tableoid", "ctid", "created_at"}).
+			AddRow(int64(12345), "(0,1)", earliestDeletedAt.Add(time.Hour)).
+			AddRow(int64(12345), "(0,2)", earliestDeletedAt))
 	mock.ExpectQuery(`SELECT id FROM usage_group_rollup_state.*FOR UPDATE`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-	mock.ExpectQuery(`(?s)DELETE FROM usage_logs.*RETURNING created_at`).
-		WithArgs(cutoff, usageLogsCleanupBatchSize).
+	mock.ExpectQuery(`DELETE FROM usage_logs.*tableoid = \$1::oid.*ctid = ANY\(\$2::tid\[\]\).*RETURNING created_at`).
+		WithArgs(int64(12345), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at"}).
 			AddRow(earliestDeletedAt.Add(time.Hour)).
 			AddRow(earliestDeletedAt))
@@ -240,6 +245,8 @@ func TestDashboardAggregationRepositoryCleanupUsageLogsPartitionedSortsAndInvali
 		{name: "usage_logs_202606", start: juneStart},
 	} {
 		mock.ExpectBegin()
+		mock.ExpectExec(`LOCK TABLE "` + partition.name + `" IN ACCESS EXCLUSIVE MODE`).
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery(`SELECT id FROM usage_group_rollup_state.*FOR UPDATE`).
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 		mock.ExpectExec(`UPDATE usage_group_rollup_state`).
@@ -252,10 +259,14 @@ func TestDashboardAggregationRepositoryCleanupUsageLogsPartitionedSortsAndInvali
 	// The boundary partition is pruned by exact timestamp. tableoid is required
 	// because ctid alone can also identify a retained row in another partition.
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT tableoid::oid, ctid::text, created_at FROM usage_logs.*FOR UPDATE`).
+		WithArgs(cutoff, usageLogsCleanupBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{"tableoid", "ctid", "created_at"}).
+			AddRow(int64(23456), "(0,1)", cutoff.Add(-time.Hour)))
 	mock.ExpectQuery(`SELECT id FROM usage_group_rollup_state.*FOR UPDATE`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-	mock.ExpectQuery(`(?s)SELECT tableoid, ctid.*WHERE created_at < \$1.*WHERE \(tableoid, ctid\) IN.*RETURNING created_at`).
-		WithArgs(cutoff, usageLogsCleanupBatchSize).
+	mock.ExpectQuery(`DELETE FROM usage_logs.*tableoid = \$1::oid.*ctid = ANY\(\$2::tid\[\]\).*RETURNING created_at`).
+		WithArgs(int64(23456), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at"}).AddRow(cutoff.Add(-time.Hour)))
 	mock.ExpectExec(`UPDATE usage_group_rollup_state`).
 		WithArgs(cutoff.Add(-time.Hour), "Asia/Shanghai").
@@ -281,10 +292,14 @@ func TestDashboardAggregationRepositoryCleanupUsageLogsNonPartitionedFailureRoll
 	mock.ExpectQuery(`SELECT EXISTS`).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT tableoid::oid, ctid::text, created_at FROM usage_logs.*FOR UPDATE`).
+		WithArgs(cutoff, usageLogsCleanupBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{"tableoid", "ctid", "created_at"}).
+			AddRow(int64(34567), "(0,1)", deletedAt))
 	mock.ExpectQuery(`SELECT id FROM usage_group_rollup_state.*FOR UPDATE`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-	mock.ExpectQuery(`(?s)SELECT tableoid, ctid.*ORDER BY created_at ASC, id ASC.*DELETE FROM usage_logs.*RETURNING created_at`).
-		WithArgs(cutoff, usageLogsCleanupBatchSize).
+	mock.ExpectQuery(`DELETE FROM usage_logs.*tableoid = \$1::oid.*ctid = ANY\(\$2::tid\[\]\).*RETURNING created_at`).
+		WithArgs(int64(34567), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at"}).AddRow(deletedAt))
 	mock.ExpectExec(`UPDATE usage_group_rollup_state`).
 		WithArgs(deletedAt, "Asia/Shanghai").
@@ -311,6 +326,8 @@ func TestDashboardAggregationRepositoryCleanupUsageLogsPartitionFailureRollsBack
 			AddRow("usage_logs_202606").
 			AddRow("usage_logs_202604"))
 	mock.ExpectBegin()
+	mock.ExpectExec(`LOCK TABLE "usage_logs_202604" IN ACCESS EXCLUSIVE MODE`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(`SELECT id FROM usage_group_rollup_state.*FOR UPDATE`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectExec(`UPDATE usage_group_rollup_state`).

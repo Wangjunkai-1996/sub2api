@@ -102,6 +102,7 @@ func runOpenAIOAuthImageActualSizeTest(t *testing.T, stream bool) openAIOAuthIma
 	require.NoError(t, err)
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       1,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,

@@ -2,10 +2,32 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetRequestCredential_OpenAIMissingTokenReturnsAccountFailover(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	account := &Account{
+		ID:       7,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		Credentials: map[string]any{
+			"expires_at": "2000-01-01T00:00:00Z",
+		},
+	}
+
+	_, _, err := svc.getRequestCredential(context.Background(), nil, account)
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, GatewayFailureStageAccountAuth, failoverErr.Stage)
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.Equal(t, NextAccountRetry, failoverErr.NextAccountAction)
+	require.False(t, failoverErr.RetryableOnSameAccount)
+}
 
 // TestGetAccessToken_SparkShadowResolvesToParent 验证对影子账号调用 GetAccessToken
 // 时能透明地解析到母账号的凭据，防止 refresh_token 脱钩。

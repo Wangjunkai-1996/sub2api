@@ -39,5 +39,6 @@ func TestAPIKeyAuthSnapshotGroupCodexModelsManifestRoundtrip(t *testing.T) {
 	require.True(t, materialized.Group.CodexModelsManifestConfig.Enabled)
 	require.Equal(t, []int64{7, 8}, materialized.Group.CodexModelsManifestConfig.AccountIDs)
 	require.True(t, materialized.Group.CodexModelsManifestConfig.FallbackToScheduler)
-	require.Equal(t, apiKeyAuthSnapshotVersion, cached.Snapshot.Version)
+	require.Equal(t, apiKeyAuthSnapshotBridgeWireVersion, cached.Snapshot.Version)
+	require.Equal(t, apiKeyAuthSnapshotVersion, cached.Snapshot.CompletenessVersion)
 }

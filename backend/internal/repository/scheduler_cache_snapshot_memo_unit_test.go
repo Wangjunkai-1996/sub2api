@@ -4,6 +4,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -846,6 +847,99 @@ func TestSchedulerCacheSnapshotMemoMaxAgeBoundsUnversionedWrites(t *testing.T) {
 
 	clock.Advance(time.Millisecond)
 	require.Equal(t, "new", memoRead(t, cache, bucket)[0].Name)
+}
+
+func TestSchedulerCacheSnapshotMemoLegacyProjectionAfterWarmRead(t *testing.T) {
+	for _, versioned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("projection_marker=%t", versioned), func(t *testing.T) {
+			ctx := context.Background()
+			cache, _, _ := newSchedulerCacheMemoUnit(t, defaultSchedulerSnapshotWriteChunkSize)
+			clock := &memoTestClock{now: time.Date(2026, 10, 27, 8, 0, 0, 0, time.UTC)}
+			cache.now = clock.Now
+			bucket := service.SchedulerBucket{GroupID: 130, Platform: service.PlatformOpenAI, Mode: service.SchedulerModeSingle}
+			account := memoTestAccountOn(service.PlatformOpenAI, 181, "before")
+			account.Extra = map[string]any{"openai_oauth_passthrough": true}
+			memoPublish(t, cache, bucket, account)
+			require.True(t, memoRead(t, cache, bucket)[0].IsOpenAIPassthroughEnabled())
+
+			// Both rollback generations omit revisions; older ones also omit the
+			// projection marker and passthrough fields. Neither write is immediate.
+			account.Extra = map[string]any{"openai_oauth_passthrough": false}
+			var payload []byte
+			var err error
+			if versioned {
+				payload, err = marshalSchedulerMetadataAccount(account)
+			} else {
+				account.Extra = nil
+				payload, err = json.Marshal(buildSchedulerMetadataAccount(account))
+			}
+			require.NoError(t, err)
+			globalBefore := memoRevision(t, cache, schedulerAccountMetaRevisionKey)
+			platformKey := schedulerAccountMetaRevisionKeyForPlatform(service.PlatformOpenAI)
+			platformBefore := memoRevision(t, cache, platformKey)
+			require.NoError(t, cache.rdb.Set(ctx, schedulerAccountMetaKey("181"), payload, 0).Err())
+			require.Equal(t, globalBefore, memoRevision(t, cache, schedulerAccountMetaRevisionKey))
+			require.Equal(t, platformBefore, memoRevision(t, cache, platformKey))
+
+			clock.Advance(schedulerSnapshotCacheMaxAge - time.Millisecond)
+			require.True(t, memoRead(t, cache, bucket)[0].IsOpenAIPassthroughEnabled())
+			clock.Advance(time.Millisecond)
+			if versioned {
+				require.False(t, memoRead(t, cache, bucket)[0].IsOpenAIPassthroughEnabled())
+			} else {
+				memoRequireMiss(t, cache, bucket)
+				require.Nil(t, cache.lookupSnapshotEntry(bucket.String()), "incompatible projections must evict the old master")
+			}
+
+			account.Extra = map[string]any{"openai_oauth_passthrough": true}
+			require.NoError(t, cache.SetAccount(ctx, &account))
+			require.True(t, memoRead(t, cache, bucket)[0].IsOpenAIPassthroughEnabled())
+		})
+	}
+}
+
+func TestSchedulerCacheSnapshotMemoEgressRequestCloneDoesNotMutateMaster(t *testing.T) {
+	cache, _, recorder := newSchedulerCacheMemoUnit(t, defaultSchedulerSnapshotWriteChunkSize)
+	bucket := service.SchedulerBucket{GroupID: 131, Platform: service.PlatformOpenAI, Mode: service.SchedulerModeSingle}
+	account := memoTestAccountOn(service.PlatformOpenAI, 191, "egress")
+	account.EgressMode = service.EgressModePool
+	account.EgressRevision = 7
+	identityID := int64(301)
+	account.EgressBindings = []service.AccountEgressBinding{{
+		BindingID: "191:41", AccountID: account.ID, RouteID: 41,
+		Status: service.AccountEgressBindingStatusActive,
+		Route: &service.EgressRoute{
+			ID: 41, Kind: service.EgressRouteKindProxy,
+			State: service.EgressRouteStateActive, Revision: 13,
+			ExpectedIdentityID: &identityID,
+			ExpectedIdentity:   &service.EgressIdentity{ID: identityID, Status: service.EgressIdentityStatusActive},
+			Proxy:              &service.Proxy{Host: "private-proxy.example", Password: "private-password"},
+		},
+	}}
+	memoPublish(t, cache, bucket, account)
+	first := memoRead(t, cache, bucket)[0]
+	require.Nil(t, first.EgressBindings[0].Route.Proxy)
+
+	// Egress selection decorates only the existing request clone, preserving
+	// the shallow memo read's shared route and identity values for other calls.
+	request := first.CloneForRequest()
+	request.EgressRevision++
+	request.EgressBindings[0].Route.Revision++
+	request.EgressBindings[0].Route.ExpectedIdentity.ID++
+	*request.EgressBindings[0].Route.ExpectedIdentityID = identityID + 1
+	request.SelectedEgress = &service.ResolvedAccountEgress{BindingID: "191:41", RouteID: 41}
+	request.Extra["session_window_utilization"] = 0.9
+
+	recorder.reset()
+	second := memoRead(t, cache, bucket)[0]
+	require.Zero(t, recorder.countPrefix("zrange "), "the check must reuse the shared master")
+	require.Equal(t, int64(7), second.EgressRevision)
+	require.Equal(t, int64(13), second.EgressBindings[0].Route.Revision)
+	require.Equal(t, identityID, second.EgressBindings[0].Route.ExpectedIdentity.ID)
+	require.Equal(t, identityID, *second.EgressBindings[0].Route.ExpectedIdentityID)
+	require.Nil(t, second.EgressBindings[0].Route.Proxy)
+	require.Nil(t, second.SelectedEgress)
+	require.Equal(t, 0.25, second.Extra["session_window_utilization"])
 }
 
 func TestSchedulerCacheSnapshotMemoEvictsLongIdleEntries(t *testing.T) {

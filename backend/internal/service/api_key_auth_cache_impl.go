@@ -14,7 +14,12 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 27 // v27: group require_privacy_set (OpenAI scheduling reads it from ctx)
+const (
+	// V28 includes official v27 policy fields and the KKAI authorization contract.
+	apiKeyAuthSnapshotVersion = 28
+	// The previous KKAI slots accept native v25 payloads during blue-green rollout.
+	apiKeyAuthSnapshotBridgeWireVersion = 25
+)
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -325,7 +330,12 @@ func (s *APIKeyService) applyAuthCacheEntry(key string, entry *APIKeyAuthCacheEn
 	if entry.Snapshot == nil {
 		return nil, false, nil
 	}
-	if entry.Snapshot.Version != apiKeyAuthSnapshotVersion {
+	// A bridge payload uses the previous KKAI slot's v25 wire contract plus the
+	// current completeness marker. Older payloads lack the merged privacy,
+	// image billing, or group RPM lookup fields and must be reloaded.
+	if entry.Snapshot.Version != apiKeyAuthSnapshotVersion &&
+		(entry.Snapshot.Version != apiKeyAuthSnapshotBridgeWireVersion ||
+			entry.Snapshot.CompletenessVersion != apiKeyAuthSnapshotVersion) {
 		return nil, false, nil
 	}
 	return s.snapshotToAPIKey(key, entry.Snapshot), true, nil
@@ -336,20 +346,21 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 		return nil
 	}
 	snapshot := &APIKeyAuthSnapshot{
-		Version:     apiKeyAuthSnapshotVersion,
-		APIKeyID:    apiKey.ID,
-		UserID:      apiKey.UserID,
-		GroupID:     apiKey.GroupID,
-		Name:        apiKey.Name,
-		Status:      apiKey.Status,
-		IPWhitelist: apiKey.IPWhitelist,
-		IPBlacklist: apiKey.IPBlacklist,
-		Quota:       apiKey.Quota,
-		QuotaUsed:   apiKey.QuotaUsed,
-		ExpiresAt:   apiKey.ExpiresAt,
-		RateLimit5h: apiKey.RateLimit5h,
-		RateLimit1d: apiKey.RateLimit1d,
-		RateLimit7d: apiKey.RateLimit7d,
+		Version:             apiKeyAuthSnapshotBridgeWireVersion,
+		CompletenessVersion: apiKeyAuthSnapshotVersion,
+		APIKeyID:            apiKey.ID,
+		UserID:              apiKey.UserID,
+		GroupID:             apiKey.GroupID,
+		Name:                apiKey.Name,
+		Status:              apiKey.Status,
+		IPWhitelist:         apiKey.IPWhitelist,
+		IPBlacklist:         apiKey.IPBlacklist,
+		Quota:               apiKey.Quota,
+		QuotaUsed:           apiKey.QuotaUsed,
+		ExpiresAt:           apiKey.ExpiresAt,
+		RateLimit5h:         apiKey.RateLimit5h,
+		RateLimit1d:         apiKey.RateLimit1d,
+		RateLimit7d:         apiKey.RateLimit7d,
 		User: APIKeyAuthUserSnapshot{
 			ID:                         apiKey.User.ID,
 			Status:                     apiKey.User.Status,
