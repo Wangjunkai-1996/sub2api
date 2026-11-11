@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
@@ -68,6 +67,7 @@ func TestForwardAlphaSearchOAuthPreservesWire(t *testing.T) {
 	}}
 	service := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          42,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -137,6 +137,7 @@ func TestForwardAlphaSearchPATUsesResponsesWebSearchFallback(t *testing.T) {
 	}}
 	service := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          43,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -222,6 +223,7 @@ func TestForwardAlphaSearchPATBackfillsMissingChatGPTAccountMetadata(t *testing.
 		openAITokenProvider: NewOpenAITokenProvider(nil, nil, oauthService),
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          45,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -324,7 +326,7 @@ func TestForwardAlphaSearchReturnsFailoverBeforeWriting(t *testing.T) {
 	require.Empty(t, recorder.Body.String())
 }
 
-func TestForwardAlphaSearchSetupToken429CarriesSameAccountRetryWindow(t *testing.T) {
+func TestForwardAlphaSearchSetupToken429SwitchesWithoutSameAccountRetry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"id":"search-session","model":"gpt-5.6-sol","commands":{}}`)
 	recorder := httptest.NewRecorder()
@@ -345,22 +347,23 @@ func TestForwardAlphaSearchSetupToken429CarriesSameAccountRetryWindow(t *testing
 		ID:          81,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeSetupToken,
+		Status:      StatusActive,
 		Concurrency: 1,
 		Credentials: map[string]any{
 			"access_token":       "oauth-token",
 			"chatgpt_account_id": "chatgpt-account",
 		},
 	}
-	startedAt := time.Now()
 
 	result, err := service.ForwardAlphaSearch(context.Background(), c, account, body)
 
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.Equal(t, time.Second, failoverErr.SameAccountRetryDelay)
-	require.WithinDuration(t, startedAt.Add(openAIOAuth429RetryWindow), failoverErr.SameAccountRetryDeadline, time.Second)
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.Zero(t, failoverErr.SameAccountRetryDelay)
+	require.True(t, failoverErr.SameAccountRetryDeadline.IsZero())
+	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode, "unexpected failover: %+v", failoverErr)
 	require.Equal(t, "req_alpha_oauth_429", failoverErr.ResponseHeaders.Get("x-request-id"))
 	require.False(t, c.Writer.Written())
 }
@@ -382,6 +385,7 @@ func TestForwardAlphaSearchAccessStateUsesTypedFailover(t *testing.T) {
 	}}
 	service := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          11,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -417,6 +421,7 @@ func TestForwardAlphaSearchPATFallbackAccessStateUsesTypedFailover(t *testing.T)
 	}}
 	service := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          12,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -472,6 +477,7 @@ func TestForwardAlphaSearchUnauthorizedDoesNotMarkAccountError(t *testing.T) {
 		rateLimitService: NewRateLimitService(repo, nil, cfg, nil, nil),
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          44,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -515,6 +521,7 @@ func TestForwardAlphaSearchPATResponsesFallbackUnauthorizedDoesNotMarkAccountErr
 		rateLimitService: NewRateLimitService(repo, nil, cfg, nil, nil),
 	}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          46,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,
@@ -602,6 +609,7 @@ func TestForwardAlphaSearchOAuthNotFoundPassesThrough(t *testing.T) {
 	}}
 	service := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 	account := &Account{
+		Status:      StatusActive,
 		ID:          10,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeOAuth,

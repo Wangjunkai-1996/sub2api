@@ -94,6 +94,7 @@ func provideCleanup(
 	opsIngressReject *service.OpsIngressRejectAggregator,
 	apiKeyService *service.APIKeyService,
 	authCacheInvalidationWorker *service.AuthCacheInvalidationWorker,
+	egressIdentityVerificationWorker *service.EgressIdentityVerificationWorker,
 	schedulerSnapshot *service.SchedulerSnapshotService,
 	tokenRefresh *service.TokenRefreshService,
 	accountExpiry *service.AccountExpiryService,
@@ -154,6 +155,12 @@ func provideCleanup(
 			{"BalanceNotifyService", func() error {
 				if balanceNotify != nil {
 					balanceNotify.Stop()
+				}
+				return nil
+			}},
+			{"EgressIdentityVerificationWorker", func() error {
+				if egressIdentityVerificationWorker != nil {
+					egressIdentityVerificationWorker.Stop()
 				}
 				return nil
 			}},

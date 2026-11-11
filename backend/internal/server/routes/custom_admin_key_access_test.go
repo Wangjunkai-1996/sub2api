@@ -411,10 +411,10 @@ func TestScopedAdminRegisteredRoutesExcludeForkOnlyEndpoints(t *testing.T) {
 	for _, route := range r.Routes() {
 		paths[route.Method+" "+route.Path] = true
 	}
-	for _, path := range []string{"GET /api/v1/admin/model-catalog", "GET /api/v1/admin/proxies/options", "GET /api/v1/admin/groups/:id/models-list-candidates"} {
+	for _, path := range []string{"GET /api/v1/admin/model-catalog", "GET /api/v1/admin/groups/:id/models-list-candidates"} {
 		require.False(t, paths[path], path)
 	}
-	for _, path := range []string{"GET /api/v1/admin/proxies", "GET /api/v1/admin/proxies/all", "GET /api/v1/admin/groups/:id/model-allowlist-candidates", "POST /api/v1/admin/accounts/import/codex-session"} {
+	for _, path := range []string{"GET /api/v1/admin/proxies", "GET /api/v1/admin/proxies/all", "GET /api/v1/admin/proxies/options", "GET /api/v1/admin/groups/:id/model-allowlist-candidates", "POST /api/v1/admin/accounts/import/codex-session"} {
 		require.True(t, paths[path], path)
 	}
 }

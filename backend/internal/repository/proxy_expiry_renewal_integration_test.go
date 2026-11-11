@@ -24,10 +24,6 @@ func (s *ProxyExpirySuite) TestSweep_SkipsChangedSnapshot() {
 			account := s.mkAccountWithProxy(source)
 			snapshot, err := s.repo.GetByID(s.ctx, source)
 			s.Require().NoError(err)
-			target, change := service.ResolveProxyFallbackTarget(*snapshot, map[int64]service.Proxy{
-				backup: {ID: backup, Status: service.StatusActive, ExpiresAt: &future},
-			}, now)
-			s.Require().True(change)
 			updated := *snapshot
 			switch edit {
 			case "renew":
@@ -45,7 +41,7 @@ func (s *ProxyExpirySuite) TestSweep_SkipsChangedSnapshot() {
 			s.Require().NoError(s.repo.Update(s.ctx, &updated))
 			var eventsBefore int64
 			s.Require().NoError(scanSingleRow(s.ctx, s.tx, `SELECT COUNT(*) FROM scheduler_outbox`, nil, &eventsBefore))
-			changed, err := s.repo.sweepOneExpiredProxy(s.ctx, *snapshot, now, target, change)
+			changed, err := s.repo.sweepOneExpiredProxy(s.ctx, source, now)
 			s.Require().NoError(err)
 			s.Empty(changed)
 			got, err := s.repo.GetByID(s.ctx, source)
@@ -72,7 +68,7 @@ func (s *ProxyExpirySuite) TestSweep_ChangedModeIsUsedOnNextScan() {
 	updated := *snapshot
 	updated.FallbackMode = service.FallbackModeNone
 	s.Require().NoError(s.repo.Update(s.ctx, &updated))
-	changed, err := s.repo.sweepOneExpiredProxy(s.ctx, *snapshot, now, nil, true)
+	changed, err := s.repo.sweepOneExpiredProxy(s.ctx, source, now)
 	s.Require().NoError(err)
 	s.Empty(changed)
 	_, err = s.repo.SweepExpiredProxies(s.ctx, now)

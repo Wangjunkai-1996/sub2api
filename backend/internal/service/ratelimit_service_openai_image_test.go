@@ -101,6 +101,7 @@ func TestOpenAIGatewayServiceForwardImages_ImageRateLimitReturnsFailoverAndCools
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{
+		Status:   StatusActive,
 		ID:       204,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -150,6 +151,7 @@ func TestOpenAIGatewayServiceForwardImages_TextFallbackDoesNotCoolImageCapabilit
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{
+		Status:   StatusActive,
 		ID:       205,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -202,6 +204,7 @@ func TestOpenAIGatewayServiceForwardImages_StructuredUnavailableCoolsImageCapabi
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{
+		Status:   StatusActive,
 		ID:       206,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,
@@ -265,6 +268,7 @@ func TestOpenAIGatewayServiceForwardImages_CapabilityLossCoolsImageScope(t *test
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.NoError(t, err)
 	account := &Account{
+		Status:   StatusActive,
 		ID:       205,
 		Name:     "openai-oauth",
 		Platform: PlatformOpenAI,

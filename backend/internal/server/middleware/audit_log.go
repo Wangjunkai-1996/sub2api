@@ -60,6 +60,7 @@ var auditExtraAllowedKeys = map[string]struct{}{
 	"http_status": {}, "latency_ms": {}, "token_applied": {}, "retryable": {},
 	"event_id": {}, "requested_count": {}, "deleted_events": {}, "deleted_jobs": {},
 	"matched_count": {}, "snapshot_max_id": {}, "filter_hash": {}, "confirm": {},
+	"operation": {},
 }
 
 // SetAuditExtra adds allowlisted, scalar details to the current audit entry.
@@ -144,6 +145,8 @@ var auditActionOverrides = map[string]string{
 	"POST /api/v1/admin/prompt-audit/events/batch-delete":     "admin.prompt_audit.events.batch_delete",
 	"POST /api/v1/admin/prompt-audit/events/delete-preview":   "admin.prompt_audit.events.delete_preview",
 	"POST /api/v1/admin/prompt-audit/events/delete-by-filter": "admin.prompt_audit.events.filter_delete",
+	"POST /api/v1/admin/egress-routes/verify":                 "admin.egress_routes.verify",
+	"POST /api/v1/admin/egress-routes/:id/confirm-identity":   "admin.egress_routes.confirm_identity",
 }
 
 // auditBodyOmittedRoutes 请求体几乎整体由凭证构成的路由（如整块粘贴 auth JSON 的导入接口）。
@@ -159,6 +162,8 @@ var auditBodyOmittedRoutes = map[string]struct{}{
 	"POST /api/v1/admin/prompt-audit/events/batch-delete":       {},
 	"POST /api/v1/admin/prompt-audit/events/delete-preview":     {},
 	"POST /api/v1/admin/prompt-audit/events/delete-by-filter":   {},
+	"POST /api/v1/admin/egress-routes/verify":                   {},
+	"POST /api/v1/admin/egress-routes/:id/confirm-identity":     {},
 }
 
 // NewAuditLogMiddleware 创建审计中间件。

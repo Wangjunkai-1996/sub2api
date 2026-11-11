@@ -165,7 +165,7 @@ func TestForwardAsAnthropic_StreamingGenericBareErrorBeforeOutputIsNotHiddenByFa
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	ssePayload := "event: error\n" +
-		`data: {"type":"error","error":{"type":"server_error","code":"upstream_error","message":"mixed tools failed"}}` + "\n\n" +
+		`data: {"type":"error","error":{"type":"upstream_error","code":"upstream_error","message":"mixed tools failed"}}` + "\n\n" +
 		"data: [DONE]\n\n"
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,

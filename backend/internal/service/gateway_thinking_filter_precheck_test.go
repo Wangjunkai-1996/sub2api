@@ -40,6 +40,10 @@ func TestThinkingBlocksNeedFilteringMatchesDecodingPath(t *testing.T) {
 		`{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","\u0073ignature":""}]}]}`,
 		`{"thinking":{"type":"enabled"},"messages":[{"role":"\u0061ssistant","content":[{"type":"\u0074hinking","thinking":"t","signature":"\u0073ig"}]}]}`,
 		`{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"\u0000"}]}]}`,
+		// KKAI preserves the latest signed content, but rejects a broken 5.5 chain.
+		`{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque"},{"thinking":"untyped"}]}]}`,
+		`{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":"valid"}]},{"role":"assistant","content":[{"type":"thinking","signature":" "}]}]}`,
+		`{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":"","signature":"valid"}]}]}`,
 		// Shapes the decoder rejects or ignores.
 		`{"thinking":{"type":"enabled"},"messages":"none"}`,
 		`{"thinking":{"type":"enabled"},"messages":[null,1,{"role":"assistant","content":null},{"role":"assistant","content":[null,"x"]}]}`,

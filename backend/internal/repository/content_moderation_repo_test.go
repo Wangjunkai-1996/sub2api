@@ -67,6 +67,14 @@ func TestBuildContentModerationLogWhere_BlockedIncludesAllBlockActions(t *testin
 	require.NotContains(t, sql, "l.action = 'block'")
 }
 
+func TestBuildContentModerationLogWhereSearchesVerifiedIdentity(t *testing.T) {
+	where, args := buildContentModerationLogWhere(service.ContentModerationLogFilter{Search: "verified_newapi_user_id=4835"})
+
+	require.Contains(t, strings.Join(where, " AND "), "l.error ILIKE $6")
+	require.Len(t, args, 6)
+	require.Equal(t, "%verified_newapi_user_id=4835%", args[5])
+}
+
 func TestContentModerationRepositoryCountFlaggedByUserSince_ExcludesHashBlock(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
