@@ -11,7 +11,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -114,47 +113,8 @@ func TestOpenAIGatewayHandlerImages_ServerErrorFailsOverAndReturnsClearErrorWhen
 			Credentials: map[string]any{"access_token": "token-2"},
 		},
 	}
-	accountRepo := openAIImagesFailoverAccountRepo{accounts: accounts}
 	upstream := &openAIImagesFailoverHTTPUpstream{}
-	cfg := &config.Config{RunMode: config.RunModeSimple}
-	gatewayService := service.NewOpenAIGatewayService(
-		accountRepo,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		cfg,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		upstream,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-	)
-	billingService := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
-	t.Cleanup(billingService.Stop)
-	concurrencyService := service.NewConcurrencyService(nil)
-	handler := NewOpenAIGatewayHandler(
-		gatewayService,
-		concurrencyService,
-		billingService,
-		service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg),
-		nil,
-		nil,
-		nil,
-		nil,
-		cfg,
-	)
+	handler := newOpenAIImagesFailureHandler(t, accounts, upstream)
 	handler.maxAccountSwitches = 10
 
 	body := []byte(`{"model":"gpt-image-1","prompt":"draw a cat","quality":"high","size":"1536x1024"}`)
@@ -192,6 +152,7 @@ func TestOpenAIGatewayHandlerImages_ServerErrorFailsOverAndReturnsClearErrorWhen
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
 	require.Equal(t, "Upstream service temporarily unavailable", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
+	require.Empty(t, gjson.GetBytes(rec.Body.Bytes(), "error.code").String(), "OAuth has no new terminal proof")
 
 	rawEvents, ok := c.Get(service.OpsUpstreamErrorsKey)
 	require.True(t, ok)

@@ -4083,11 +4083,21 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 
 	// 记录原始上游状态码，以便 ops 错误日志捕获真实的上游错误
 	upstreamMsg := service.ExtractUpstreamErrorMessage(responseBody)
+	if failoverErr.ImageFailureMessage != "" {
+		upstreamMsg = failoverErr.ImageFailureMessage
+	}
 	service.SetOpsUpstreamError(c, statusCode, upstreamMsg, "")
 
 	// 使用默认的错误映射
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+	if failoverErr.ImageFailureMessage != "" {
+		errMsg = service.SanitizeOpenAIImagesFailureMessage(failoverErr.ImageFailureMessage)
+	}
 	service.MarkOpsUpstreamFinalOutcome(c, failoverErr, status, "failover_exhausted")
+	if failoverErr.ImageOutcomeDefinitive && status == http.StatusBadGateway {
+		h.handleStreamingAwareErrorWithCode(c, status, "upstream_error", "image_provider_error", errMsg, streamStarted, true)
+		return
+	}
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -4121,8 +4131,14 @@ func (h *OpenAIGatewayHandler) applyOpenAIFailoverPassthroughRule(
 	}
 
 	msg := service.ExtractUpstreamErrorMessage(responseBody)
+	if failoverErr.ImageFailureMessage != "" {
+		msg = failoverErr.ImageFailureMessage
+	}
 	if !rule.PassthroughBody && rule.CustomMessage != nil {
 		msg = *rule.CustomMessage
+	}
+	if failoverErr.ImageFailureMessage != "" {
+		msg = service.SanitizeOpenAIImagesFailureMessage(msg)
 	}
 
 	if rule.SkipMonitoring {
@@ -4130,6 +4146,10 @@ func (h *OpenAIGatewayHandler) applyOpenAIFailoverPassthroughRule(
 	}
 
 	service.MarkOpsUpstreamFinalOutcome(c, failoverErr, respCode, "error_passthrough")
+	if failoverErr.ImageOutcomeDefinitive && respCode == http.StatusBadGateway {
+		h.handleStreamingAwareErrorWithCode(c, respCode, "upstream_error", "image_provider_error", msg, streamStarted, true)
+		return true
+	}
 	h.handleStreamingAwareError(c, respCode, "upstream_error", msg, streamStarted)
 	return true
 }

@@ -109,6 +109,9 @@ type OpenAIImagesRequest struct {
 	MarkupUpload       *OpenAIImagesUpload
 	Body               []byte
 	bodyHash           string
+	// Sticky across account attempts; OAuth/SSE do not supply this protocol's
+	// terminal proof. Never infer a safe replay from this flag.
+	hasUnprovenOutcome bool
 }
 
 // Keep SVG author options separate from the image model and its complexity.
@@ -777,6 +780,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 		if resp == nil && sendState.mayFailover(ctx, c, err) {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 		}
+		parsed.hasUnprovenOutcome = true
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
 		setOpsUpstreamError(c, 0, safeErr, "")
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
@@ -793,12 +797,21 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 		return nil, fmt.Errorf("upstream request failed: %s", safeErr)
 	}
 	if resp.StatusCode >= 400 {
-		respBody := s.readUpstreamErrorBody(resp)
+		respBody, readErr := readUpstreamResponseBodyLimited(resp.Body, openAIUpstreamErrorBodyReadLimitForConfig(s.cfg))
 		_ = resp.Body.Close()
+		if readErr != nil {
+			parsed.hasUnprovenOutcome = true
+			setOpsUpstreamError(c, resp.StatusCode, "Image provider error response could not be read completely", "")
+			return nil, fmt.Errorf("image provider error response incomplete: %w", readErr)
+		}
+		definitive := openAIImagesDefinitiveFailure(respBody)
+		if !definitive {
+			parsed.hasUnprovenOutcome = true
+		}
 		respBody = s.redactAgentIdentitySensitiveBody(upstreamCtx, account, respBody)
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
 		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
-		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
+		upstreamMsg = sanitizeOpenAIImagesFailureMessage(upstreamMsg, token, account.GetCredential("base_url"), proxyURL)
 		if isOpenAIImagesInsufficientBalance(respBody) {
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 				ProxyID:            opsUpstreamProxyID(account),
@@ -836,9 +849,13 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			if isOpenAIHTTPUpstreamAccessStateError(resp.StatusCode, upstreamMsg, respBody) {
 				return nil, newOpenAIUpstreamFailoverError(resp.StatusCode, resp.Header, respBody, upstreamMsg, retryableOnSameAccount)
 			}
-			return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: respBody, RetryableOnSameAccount: retryableOnSameAccount}
+			return nil, &UpstreamFailoverError{
+				StatusCode: resp.StatusCode, ResponseBody: respBody, RetryableOnSameAccount: retryableOnSameAccount,
+				ImageOutcomeDefinitive: definitive && !parsed.hasUnprovenOutcome,
+				ImageFailureMessage:    upstreamMsg,
+			}
 		}
-		return s.handleOpenAIImagesErrorResponse(upstreamCtx, resp, c, account, upstreamModel)
+		return s.handleOpenAIImagesErrorResponse(upstreamCtx, resp, c, account, []string{token, account.GetCredential("base_url"), proxyURL}, upstreamModel)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -847,6 +864,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	var firstTokenMs *int
 	upstreamStream := parsed.Stream && !forceNonStreamingBatch
 	if upstreamStream && isEventStreamResponse(resp.Header) {
+		parsed.hasUnprovenOutcome = true
 		streamUsage, streamCount, streamSizes, ttft, err := s.handleOpenAIImagesStreamingResponse(resp, c, startTime, nil)
 		if err != nil {
 			if streamCount > 0 {
@@ -890,7 +908,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			ImageOutputSizes: imageOutputSizes,
 		}, nil
 	} else {
-		nonStreamUsage, nonStreamCount, nonStreamSizes, err := s.handleOpenAIImagesNonStreamingResponse(upstreamCtx, resp, c, account, parsed)
+		nonStreamUsage, nonStreamCount, nonStreamSizes, err := s.handleOpenAIImagesNonStreamingResponse(upstreamCtx, resp, c, account, parsed, token, proxyURL)
 		if err != nil {
 			return nil, err
 		}
@@ -1091,25 +1109,47 @@ func (s *OpenAIGatewayService) handleOpenAIImagesNonStreamingResponse(
 	c *gin.Context,
 	account *Account,
 	parsed *OpenAIImagesRequest,
+	token string,
+	proxyURL string,
 ) (OpenAIUsage, int, []string, error) {
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
+		parsed.hasUnprovenOutcome = true
 		return OpenAIUsage{}, 0, nil, err
 	}
-	body = s.backfillOpenAIImagesB64JSON(ctx, account, parsed, body)
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		errorObject := gjson.GetBytes(body, "error")
-		if errorObject.IsObject() && (errorObject.Get("type").Exists() || errorObject.Get("code").Exists() || errorObject.Get("message").Exists()) {
-			upstreamError := openAIImagesUpstreamErrorFromGJSON(errorObject, strings.TrimSpace(resp.Header.Get("x-request-id")))
-			upstreamMessage := sanitizeUpstreamErrorMessage(upstreamError.Message)
-			providerType := sanitizeUpstreamErrorMessage(upstreamError.ErrorType)
-			providerCode := sanitizeUpstreamErrorMessage(upstreamError.Code)
-			providerDetails := make([]string, 0, 2)
-			if providerType != "" {
-				providerDetails = append(providerDetails, "provider_error_type="+providerType)
+		if errorObject.IsObject() && extractOpenAIImageCountFromJSONBytes(body) == 0 {
+			definitive := openAIImagesDefinitiveFailure(body)
+			if !definitive {
+				parsed.hasUnprovenOutcome = true
 			}
-			if providerCode != "" {
-				providerDetails = append(providerDetails, "provider_error_code="+providerCode)
+			upstreamError := openAIImagesUpstreamErrorFromGJSON(errorObject, strings.TrimSpace(resp.Header.Get("x-request-id")))
+			// gjson.String() also renders objects and numbers. Only actual
+			// string fields may select a dedicated client error contract.
+			if errorObject.Get("type").Type != gjson.String {
+				upstreamError.ErrorType = ""
+			}
+			if errorObject.Get("code").Type != gjson.String {
+				upstreamError.Code = ""
+			}
+			upstreamError.StatusCode = openAIImagesSSEErrorStatus(upstreamError.ErrorType, upstreamError.Code)
+			upstreamMessage := "Image provider returned an error"
+			if message := errorObject.Get("message"); message.Type == gjson.String {
+				upstreamMessage = sanitizeOpenAIImagesFailureMessage(message.Str, token, account.GetCredential("base_url"), proxyURL)
+			}
+			policyError := isOpenAIImagesContentPolicyRefusal(upstreamError.ErrorType + " " + upstreamError.Code)
+			if policyError {
+				upstreamMessage = "Image generation was blocked by the provider's content policy"
+			}
+			providerDetails := make([]string, 0, 2)
+			for _, field := range []struct{ name, value string }{
+				{"provider_error_type", upstreamError.ErrorType},
+				{"provider_error_code", upstreamError.Code},
+			} {
+				if value := safeOpenAIImagesFailureIdentifier(field.value, token, account.GetCredential("base_url"), proxyURL); value != "" {
+					providerDetails = append(providerDetails, field.name+"="+value)
+				}
 			}
 			detail := strings.Join(providerDetails, " ")
 			if upstreamMessage == "" {
@@ -1128,11 +1168,34 @@ func (s *OpenAIGatewayService) handleOpenAIImagesNonStreamingResponse(
 			})
 
 			clientError := &OpenAIImagesUpstreamError{
-				StatusCode:        http.StatusBadGateway,
-				ErrorType:         "upstream_error",
-				Code:              "image_provider_error",
-				Message:           "Image provider returned an error",
-				UpstreamRequestID: strings.TrimSpace(resp.Header.Get("x-request-id")),
+				StatusCode:             http.StatusBadGateway,
+				ErrorType:              "upstream_error",
+				Message:                upstreamMessage,
+				UpstreamRequestID:      strings.TrimSpace(resp.Header.Get("x-request-id")),
+				ImageOutcomeDefinitive: definitive && !parsed.hasUnprovenOutcome,
+			}
+			if clientError.ImageOutcomeDefinitive {
+				clientError.Code = "image_provider_error"
+			} else if upstreamError.StatusCode < http.StatusInternalServerError {
+				// Keep structured policy/auth/validation errors on their own
+				// contract instead of turning them into generic image failures.
+				clientError.StatusCode = upstreamError.StatusCode
+				if value := safeOpenAIImagesFailureIdentifier(upstreamError.ErrorType, token, account.GetCredential("base_url"), proxyURL); value != "" {
+					clientError.ErrorType = value
+				}
+				if value := safeOpenAIImagesFailureIdentifier(upstreamError.Code, token, account.GetCredential("base_url"), proxyURL); value != "" && !strings.EqualFold(value, "image_provider_error") {
+					clientError.Code = value
+				}
+			}
+			if isOpenAIImagesInsufficientBalance(body) {
+				clientError.StatusCode = http.StatusPaymentRequired
+				clientError.Code = OpenAIImagesInsufficientBalanceCode
+				clientError.Message = OpenAIImagesInsufficientBalanceMessage
+			}
+			if policyError {
+				clientError.StatusCode = http.StatusBadRequest
+				clientError.ErrorType = "image_generation_user_error"
+				clientError.Code = "content_policy_violation"
 			}
 			responseAlreadyCommitted := c != nil && c.Writer != nil && c.Writer.Written()
 			writeOpenAIImagesUpstreamErrorResponse(c, clientError)
@@ -1148,7 +1211,17 @@ func (s *OpenAIGatewayService) handleOpenAIImagesNonStreamingResponse(
 			}
 			return OpenAIUsage{}, 0, nil, clientError
 		}
+		if errorObject.Exists() && extractOpenAIImageCountFromJSONBytes(body) > 0 {
+			// Deliverable images take precedence over a contradictory error.
+			// In particular, do not forward a provider-supplied terminal marker
+			// beside successful output to a consumer that checks errors first.
+			body, err = sjson.DeleteBytes(body, "error")
+			if err != nil {
+				return OpenAIUsage{}, 0, nil, err
+			}
+		}
 	}
+	body = s.backfillOpenAIImagesB64JSON(ctx, account, parsed, body)
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	contentType := "application/json"
 	if s.cfg != nil && !s.cfg.Security.ResponseHeaders.Enabled {
@@ -1242,6 +1315,22 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 				dataBytes, _ = sjson.SetBytes(dataBytes, "size", size)
 			}
 		}
+		if sanitized, changed := stripUnprovenImageFailureCode(dataBytes); changed {
+			dataBytes = sanitized
+			if direct == nil {
+				wroteData := false
+				for index, line := range pendingRawLines {
+					if _, isData := extractOpenAISSEDataLine(strings.TrimRight(line, "\r\n")); !isData {
+						continue
+					}
+					pendingRawLines[index] = ""
+					if !wroteData {
+						pendingRawLines[index] = "data: " + string(dataBytes) + "\n"
+						wroteData = true
+					}
+				}
+			}
+		}
 		mergeOpenAIUsage(&usage, dataBytes)
 		imageCounter.AddSSEData(dataBytes)
 		if direct == nil || string(dataBytes) == "[DONE]" {
@@ -1294,8 +1383,8 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 	}
 
 	flushSSEEvent := func() {
-		flushRawEvent()
 		sseData.Flush(processSSEData)
+		flushRawEvent()
 	}
 
 	processLine := func(line []byte) {
@@ -1310,12 +1399,12 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 		trimmedLine := strings.TrimRight(rawLine, "\r\n")
 		if !clientDisconnected && direct == nil {
 			pendingRawLines = append(pendingRawLines, rawLine)
-			if trimmedLine == "" {
-				flushRawEvent()
-			}
 		}
 		if _, ok := extractOpenAISSEDataLine(trimmedLine); ok || strings.TrimSpace(trimmedLine) == "" {
 			sseData.AddLine(trimmedLine, processSSEData)
+			if strings.TrimSpace(trimmedLine) == "" {
+				flushRawEvent()
+			}
 			return
 		}
 		if !seenSSEData && !fallbackTooLarge {
