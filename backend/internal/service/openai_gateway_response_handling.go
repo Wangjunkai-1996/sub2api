@@ -45,17 +45,24 @@ type openaiNonStreamingResult struct {
 }
 
 func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel string) (*openaiStreamingResult, error) {
-	return s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, mappedModel, "")
+	imageIntent, _ := getOpenAIImageIntentHint(c)
+	imageIntent = imageIntent || isOpenAIImageGenerationModel(mappedModel) || IsImageGenerationIntent(openAIResponsesEndpoint, originalModel, nil)
+	return s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, mappedModel, "", imageIntent)
 }
 
-func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string) (*openaiStreamingResult, error) {
+func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string, imageIntents ...bool) (*openaiStreamingResult, error) {
+	imageIntent := len(imageIntents) > 0 && imageIntents[0]
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
 	}
 	firstOutputTimeout := time.Duration(0)
+	textFirstOutput := account != nil && account.Platform == PlatformOpenAI && !imageIntent && !isOpenAIResponsesCompactPath(c)
 	if account != nil && account.Platform == PlatformOpenAI {
 		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffort)
+		if textFirstOutput {
+			firstOutputTimeout = s.openAITextFirstOutputTimeout()
+		}
 	}
 	guardFirstOutput := firstOutputTimeout > 0
 	stageFirstOutput := account != nil && account.Platform == PlatformOpenAI
@@ -131,6 +138,17 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 		}()
 	}
+	responseID := ""
+	responseRoutingBound := false
+	bindResponseRouting := func() {
+		if responseRoutingBound || strings.TrimSpace(responseID) == "" {
+			return
+		}
+		responseRoutingBound = true
+		// Bind before exposing the response ID so previous_response_id
+		// continuations keep the selected account and route.
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	}
 	writePendingString := func(value string) (int, error) {
 		if firstOutputStage != nil && !firstOutputStage.closed {
 			return firstOutputStage.WriteString(value)
@@ -145,6 +163,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 	flushBuffered := func() error {
 		if firstOutputStage != nil && !firstOutputStage.closed {
+			bindResponseRouting()
 			if err := firstOutputStage.CommitTo(w); err != nil {
 				return err
 			}
@@ -159,7 +178,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 
 	usage := &OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
-	responseID := ""
 	var firstOutputScanGuard atomic.Bool
 	firstOutputScanGuard.Store(stageFirstOutput)
 	scanner := bufio.NewScanner(resp.Body)
@@ -555,6 +573,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 			if responseID == "" {
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
+				if !stageFirstOutput || clientOutputStarted {
+					bindResponseRouting()
+				}
 			}
 			forceFlushFailedEvent := false
 			if !capacityFailoverSuppressedLogged && account != nil && account.Platform == PlatformOpenAI &&
@@ -1692,9 +1713,22 @@ func openAICacheCreationTTLTokensFromUsage(value gjson.Result, aggregate int) (i
 }
 
 func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
+	return s.handleNonStreamingResponseWithGuard(ctx, resp, c, account, originalModel, mappedModel, nil)
+}
+
+func (s *OpenAIGatewayService) handleNonStreamingResponseWithGuard(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string, guard *openAITextFirstOutputGuard) (*openaiNonStreamingResult, error) {
+	if guard != nil && guard.timedOut() {
+		return nil, context.DeadlineExceeded
+	}
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
+		if guard != nil && guard.timedOut() {
+			return nil, context.DeadlineExceeded
+		}
 		return nil, err
+	}
+	if guard != nil && !guard.observeOutput() {
+		return nil, context.DeadlineExceeded
 	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
@@ -1775,6 +1809,8 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 			contentType = upstreamType
 		}
 	}
+	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
+	s.bindHTTPResponseAccount(ctx, c, account, responseID)
 
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		c.Data(resp.StatusCode, contentType, body)
@@ -1783,7 +1819,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	return &openaiNonStreamingResult{
 		OpenAIUsage:      usage,
 		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
+		responseID:       responseID,
 		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
 		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 		searchCount:      countGrokNativeSearchCallsFromJSONBytes(body),
@@ -1888,6 +1924,8 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			contentType = "text/event-stream"
 		}
 	}
+	responseID := strings.TrimSpace(extractOpenAIResponseIDFromJSONBytes(body))
+	s.bindHTTPResponseAccount(c.Request.Context(), c, account, responseID)
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
 		// 上游的 Content-Type（text/event-stream）已复制到响应头，而 c.Data
 		// 不会覆盖已存在的 Content-Type，这里需显式设置为聚合后的类型。
@@ -1898,7 +1936,7 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	return &openaiNonStreamingResult{
 		OpenAIUsage:      usage,
 		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
+		responseID:       responseID,
 		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
 		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
 		searchCount:      countGrokNativeSearchCallsFromSSEBody(bodyText),

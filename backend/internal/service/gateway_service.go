@@ -564,6 +564,13 @@ type GatewayCache interface {
 	GetReasoningContent(ctx context.Context, itemID string) (string, error)
 }
 
+// GatewaySessionBindingCompareDeleter is an optional GatewayCache capability
+// used when invalidating an upstream continuation. Production Redis implements
+// the comparison atomically so an older request cannot delete a newer binding.
+type GatewaySessionBindingCompareDeleter interface {
+	CompareAndDeleteSessionAccountID(ctx context.Context, groupID int64, sessionHash string, expectedAccountID int64) (bool, error)
+}
+
 // derefGroupID safely dereferences *int64 to int64, returning 0 if nil
 func derefGroupID(groupID *int64) int64 {
 	if groupID == nil {
@@ -638,9 +645,13 @@ type AccountWaitPlan struct {
 
 type AccountSelectionResult struct {
 	Account     *Account
+	Egress      *ResolvedAccountEgress
 	Acquired    bool
 	ReleaseFunc func()
 	WaitPlan    *AccountWaitPlan // nil means no wait allowed
+	// preserveStickyBinding is request-local: transient saturation may spill this
+	// request to another account without migrating its durable account/route affinity.
+	preserveStickyBinding bool
 	// stickySessionHit 标记账号来自会话粘性绑定命中，供非高级调度路径回填决策标签。
 	stickySessionHit bool
 	// profitGate 携带本次选号真实生效的利润门（无门为 nil）。门安装在调度栈的
@@ -747,6 +758,7 @@ const (
 	GatewayFailureScopeAccount  GatewayFailureScope = "account"
 	GatewayFailureScopeProvider GatewayFailureScope = "provider"
 	GatewayFailureScopeRequest  GatewayFailureScope = "request"
+	GatewayFailureScopeSession  GatewayFailureScope = "session"
 )
 
 // NextAccountAction is tri-state for backwards compatibility. The zero value
@@ -765,6 +777,9 @@ type GatewayFailureReason string
 // trigger account failover. Additive metadata keeps existing composite literals
 // source-compatible and preserves their legacy retry-next-account behavior.
 type UpstreamFailoverError struct {
+	// Images-only proof; zero values preserve all other gateway error paths.
+	ImageOutcomeDefinitive   bool
+	ImageFailureMessage      string
 	StatusCode               int
 	ResponseBody             []byte        // 上游响应体，用于错误透传规则匹配
 	ResponseHeaders          http.Header   // 上游响应头，用于透传 cf-ray/cf-mitigated/content-type 等诊断信息
@@ -776,6 +791,7 @@ type UpstreamFailoverError struct {
 	RequestScopedTransient   bool          // 故障因素与账号无关（如上游按客户端身份/模型容量降载）：可同账号重试，但不得据此对账号做临时封禁
 	SafeToFailoverAfterWrite bool          // 仅写出 SSE 注释等非语义字节时，仍可在同一客户端流中切换账号
 	BoundUpstreamPassthrough bool          // 绑定显式缓存的请求在上游网关账号上收到的 429 / 5xx：反映持有缓存的上游账号状态，原样回写不走错误映射
+	FirstOutputTimeout       bool          // Only dedicated first-output deadlines consume the timeout switch allowance.
 	Stage                    GatewayFailureStage
 	Scope                    GatewayFailureScope
 	Reason                   GatewayFailureReason
@@ -801,10 +817,13 @@ func (e *UpstreamFailoverError) IsCredentialFailure() bool {
 }
 
 // ShouldReportAccountScheduleFailure prevents provider- and request-scoped
-// credential failures from being misattributed to the selected account. Legacy
-// and inference failures retain their existing scheduler-health behavior.
+// credential failures and request-scoped transients from being misattributed
+// to the selected account. Other inference failures retain their behavior.
 func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	if e == nil {
+		return false
+	}
+	if e.RequestScopedTransient || e.Scope == GatewayFailureScopeSession {
 		return false
 	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount

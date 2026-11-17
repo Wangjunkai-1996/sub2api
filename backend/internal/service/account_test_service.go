@@ -951,10 +951,18 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		proxyURL = account.Proxy.URL()
 	}
 
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return s.sendErrorAndEnd(c, "账号出口租约已失效")
+		}
+		defer releaseUse()
+	}
 	resp, err := s.doOpenAIAccountTestUpstream(req, proxyURL, account, true)
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	if isOAuth && s.accountRepo != nil {

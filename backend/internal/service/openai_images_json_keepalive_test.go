@@ -170,7 +170,7 @@ func TestOpenAIImagesJSONKeepalive_KeepsOAuthNonStreamResponseValid(t *testing.T
 		Body:       reader,
 	}
 	svc := &OpenAIGatewayService{}
-	_, imageCount, _, err := svc.handleOpenAIImagesOAuthNonStreamingResponse(resp, c, "b64_json", "gpt-image-2")
+	_, imageCount, _, err := svc.handleOpenAIImagesOAuthNonStreamingResponse(resp, c, nil, "b64_json", "gpt-image-2")
 	stop()
 
 	require.NoError(t, err)
@@ -242,6 +242,7 @@ func TestOpenAIImagesJSONKeepalive_HeartbeatBeforeForwardStillFailsOver(t *testi
 	waitForOpenAIImagesJSONKeepalive(t, c)
 
 	account := &Account{
+		Status:   StatusActive,
 		ID:       22,
 		Name:     "openai-oauth-heartbeat-failover",
 		Platform: PlatformOpenAI,

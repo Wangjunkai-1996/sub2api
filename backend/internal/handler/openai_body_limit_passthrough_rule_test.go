@@ -77,6 +77,7 @@ func TestOpenAIBodyLimitFailoverExhausted_PassthroughRuleOverridesBuiltInMapping
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
 
 	h := newBodyLimitPassthroughHandler(t, newBodyLimitPassthroughRule(http.StatusBadRequest, "Request body exceeds the upstream limit"))
+	c.Set(service.OpsUpstreamErrorsKey, []*service.OpsUpstreamErrorEvent{{UpstreamStatusCode: http.StatusRequestEntityTooLarge}})
 
 	h.handleFailoverExhausted(c, bodyLimitFailoverTestError(), false)
 
@@ -88,6 +89,9 @@ func TestOpenAIBodyLimitFailoverExhausted_PassthroughRuleOverridesBuiltInMapping
 	require.Equal(t, "upstream_error", errBody["type"])
 	require.Equal(t, "Request body exceeds the upstream limit", errBody["message"])
 	require.NotContains(t, rec.Body.String(), "must-not-leak")
+	events := c.MustGet(service.OpsUpstreamErrorsKey).([]*service.OpsUpstreamErrorEvent)
+	require.Equal(t, "error_passthrough", events[0].FinalOutcome)
+	require.Equal(t, http.StatusBadRequest, events[0].FinalClientStatusCode)
 }
 
 // The override must also apply once the SSE stream has already started.

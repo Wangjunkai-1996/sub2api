@@ -165,6 +165,29 @@ func TestAccountTestService_OpenAIOAuthTestNormalizesGPT56Alias(t *testing.T) {
 	require.Equal(t, "gpt-5.6-sol", gjson.GetBytes(body, "model").String())
 }
 
+func TestAccountTestService_OpenAIRetiredTicketsNeverGateOrInject(t *testing.T) {
+	for _, legacyState := range []string{"", "retired-state"} {
+		t.Run(legacyState, func(t *testing.T) {
+			ctx, _ := newTestContext()
+			upstream := &queuedHTTPUpstream{responses: []*http.Response{
+				newJSONResponse(http.StatusOK, "data: {\"type\":\"response.completed\"}\n\n"),
+			}}
+			svc := &AccountTestService{httpUpstream: upstream, openaiGatewayService: &OpenAIGatewayService{}}
+			account := &Account{
+				ID: 91, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+				Credentials: map[string]any{"access_token": "test-token"},
+				Extra: map[string]any{
+					"codex_ticket_config":           map[string]any{"enabled": true, "model": "gpt-6-astra"},
+					"codex_turn_ticket:gpt-6-astra": map[string]any{"state": legacyState},
+				},
+			}
+			require.NoError(t, svc.testOpenAIAccountConnection(ctx, account, "gpt-6-astra", "", ""))
+			require.Len(t, upstream.requests, 1)
+			require.Empty(t, upstream.requests[0].Header.Get(openAICodexTurnStateHeader))
+		})
+	}
+}
+
 func TestAccountTestService_OpenAIShadowUsesParentCredentialsAndShadowModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, recorder := newTestContext()

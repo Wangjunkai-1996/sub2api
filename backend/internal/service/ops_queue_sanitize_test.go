@@ -3,6 +3,8 @@ package service
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestSanitizeOpsUpstreamErrorsForQueueBoundsAndRedacts(t *testing.T) {
@@ -198,4 +200,20 @@ func TestSanitizeOpsUpstreamErrorsForQueueIgnoresCallerSuppliedDropCount(t *test
 	if len(events) != 1 || events[0].DroppedEarlierAttempts != 0 {
 		t.Fatalf("caller-supplied drop count must be reset: %+v", events[0])
 	}
+}
+
+func TestSanitizeOpsUpstreamErrorsForQueueBoundsFinalOutcome(t *testing.T) {
+	entry := &OpsInsertErrorLogInput{UpstreamErrors: []*OpsUpstreamErrorEvent{
+		{FinalClientStatusCode: 999, FinalOutcome: strings.Repeat("x", 100), ProxyName: opsProxyNameDirect},
+		{FinalClientStatusCode: 503, FinalOutcome: "capacity_shed", ProxyName: opsProxyNameDirect},
+	}}
+	require.NoError(t, SanitizeOpsUpstreamErrorsForQueue(entry))
+
+	events, err := ParseOpsUpstreamErrors(*entry.UpstreamErrorsJSON)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	require.Zero(t, events[0].FinalClientStatusCode)
+	require.Len(t, events[0].FinalOutcome, 64)
+	require.Equal(t, 503, events[1].FinalClientStatusCode)
+	require.Equal(t, "capacity_shed", events[1].FinalOutcome)
 }

@@ -275,11 +275,14 @@ type OpenAIForwardResult struct {
 	// UpstreamTerminalEvent is the normalized terminal event observed on an
 	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
 	UpstreamTerminalEvent string
-	ResponseHeaders       http.Header
-	Duration              time.Duration
-	FirstTokenMs          *int
-	ClientDisconnect      bool
-	ImageCount            int
+	// UpstreamTerminalStatusCode preserves request, auth, quota, and server-error
+	// semantics without retaining the complete upstream WebSocket event body.
+	UpstreamTerminalStatusCode int
+	ResponseHeaders            http.Header
+	Duration                   time.Duration
+	FirstTokenMs               *int
+	ClientDisconnect           bool
+	ImageCount                 int
 	// ImageEndpoint 标记请求来自专用图片端点；分组 image_count_billing 开关
 	// 只对这类请求生效，混合 Responses/Chat/WS 请求仍按 token 计费。
 	ImageEndpoint      bool
@@ -479,6 +482,7 @@ type OpenAIGatewayService struct {
 	openaiWSPoolOnce               sync.Once
 	openaiWSStateStoreOnce         sync.Once
 	openaiSchedulerOnce            sync.Once
+	openaiSchedulerMu              sync.RWMutex
 	openaiProxyStreamCircuitOnce   sync.Once
 	openaiWSPassthroughDialerOnce  sync.Once
 	openaiModelTransientOnce       sync.Once
@@ -497,8 +501,9 @@ type OpenAIGatewayService struct {
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockLocks      sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiAccountRuntimeBlockGeneration sync.Map // key: int64(accountID), value: uint64
+	openaiCyberCooldownPending          sync.Map // key: int64(accountID), value: int reference count
+	openaiLocalCooldownRuntimeUntil     sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockSequence   atomic.Uint64
-	openaiOAuth429RetryStartedAt        sync.Map // key: int64(accountID), value: time.Time
 	grokCredentialMutationLocks         sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiOAuth429WindowStartUnixNano   atomic.Int64
 	openaiOAuth429WindowCount           atomic.Int64
@@ -508,6 +513,10 @@ type OpenAIGatewayService struct {
 	openAIModelsCache                   openAIModelsCache
 	openaiCompatSessionResponses        sessionMemoryCache
 	openaiCompatAnthropicDigestSessions sessionMemoryCache
+	// liveEgressLeases tracks which claimed controllers own each process-local
+	// Live egress lease. Redis remains the source of truth across processes.
+	liveEgressLeaseMu sync.Mutex
+	liveEgressLeases  map[string]*liveEgressLeaseState
 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。

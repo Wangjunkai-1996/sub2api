@@ -64,6 +64,9 @@ const (
 	// schedulerSharedLoadTimeout 是合并加载（快照条目、last_used）的上下文时限，约束取连接与重试；
 	// 单次套接字读取另受 Redis 客户端读超时约束。合并加载不随单个调用方取消。
 	schedulerSharedLoadTimeout = 10 * time.Second
+	// Metadata records are intentionally versioned: old writers may omit the
+	// egress projection marker and must be treated as cache misses.
+	schedulerMetadataProjectionVersion = 1
 
 	schedulerAccountMetaRevisionBytes        = 16
 	schedulerAccountMetaRevisionWriteTimeout = 3 * time.Second
@@ -495,9 +498,13 @@ func (c *schedulerCache) loadSnapshotEntry(ctx context.Context, bucket service.S
 			payloads[i] = previous.payloads[j]
 			continue
 		}
-		account, err := decodeCachedAccountPayload(payload)
+		account, compatible, err := decodeSchedulerMetadataAccount(payload)
 		if err != nil {
 			return nil, err
+		}
+		if !compatible {
+			c.dropSnapshotEntry(bucketKey)
+			return nil, nil
 		}
 		// 母本发布进缓存前由本 goroutine 完成预处理，发布后只读。
 		account.PrepareSharedSnapshot()
@@ -1176,6 +1183,30 @@ func decodeCachedAccount(val any) (*service.Account, error) {
 	return decodeCachedAccountPayload(payload)
 }
 
+type schedulerMetadataPayload struct {
+	service.Account
+	ProjectionVersion int `json:"_scheduler_metadata_projection_version"`
+}
+
+func decodeSchedulerMetadataAccount(val any) (*service.Account, bool, error) {
+	payload, ok := val.(string)
+	if !ok {
+		var err error
+		payload, err = schedulerCachePayload(val)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	var metadata schedulerMetadataPayload
+	if err := json.Unmarshal([]byte(payload), &metadata); err != nil {
+		return nil, false, err
+	}
+	if metadata.ProjectionVersion != schedulerMetadataProjectionVersion {
+		return nil, false, nil
+	}
+	return &metadata.Account, true, nil
+}
+
 // schedulerCachePayload 取出 Redis 返回的账号记录原文。
 func schedulerCachePayload(val any) (string, error) {
 	switch raw := val.(type) {
@@ -1345,11 +1376,14 @@ func newSchedulerAccountMetaRevision() string {
 }
 
 func marshalSchedulerCacheAccount(account service.Account) ([]byte, []byte, error) {
-	fullPayload, err := json.Marshal(account)
+	fullPayload, err := json.Marshal(buildSchedulerFullAccount(account))
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal account: %w", err)
 	}
-	metaPayload, err := json.Marshal(buildSchedulerMetadataAccount(account))
+	metaPayload, err := json.Marshal(schedulerMetadataPayload{
+		Account:           buildSchedulerMetadataAccount(account),
+		ProjectionVersion: schedulerMetadataProjectionVersion,
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal account metadata: %w", err)
 	}
@@ -1394,6 +1428,9 @@ func buildSchedulerMetadataAccount(account service.Account) service.Account {
 		Name:                    account.Name,
 		Platform:                account.Platform,
 		Type:                    account.Type,
+		EgressMode:              account.EgressMode,
+		EgressRevision:          account.EgressRevision,
+		EgressBindings:          buildSchedulerEgressBindings(account.EgressBindings),
 		Concurrency:             account.Concurrency,
 		LoadFactor:              account.LoadFactor,
 		Priority:                account.Priority,
@@ -1418,6 +1455,48 @@ func buildSchedulerMetadataAccount(account service.Account) service.Account {
 		Credentials:             filterSchedulerCredentials(account.Credentials),
 		Extra:                   filterSchedulerExtra(account.Extra),
 	}
+}
+
+func buildSchedulerFullAccount(account service.Account) service.Account {
+	account.EgressBindings = buildSchedulerEgressBindings(account.EgressBindings)
+	account.SelectedEgress = nil
+	account.EgressPoolWrite = nil
+	return account
+}
+
+func buildSchedulerEgressBindings(bindings []service.AccountEgressBinding) []service.AccountEgressBinding {
+	if bindings == nil {
+		return nil
+	}
+	projected := make([]service.AccountEgressBinding, 0, len(bindings))
+	for i := range bindings {
+		binding := bindings[i]
+		out := service.AccountEgressBinding{BindingID: binding.BindingID, AccountID: binding.AccountID, RouteID: binding.RouteID, Position: binding.Position, IsPrimary: binding.IsPrimary, Status: binding.Status}
+		if binding.Route != nil {
+			route := binding.Route
+			out.Route = &service.EgressRoute{ID: route.ID, Kind: route.Kind, ProxyID: cloneSchedulerInt64(route.ProxyID), RuntimeScope: cloneSchedulerString(route.RuntimeScope), ExpectedIdentityID: cloneSchedulerInt64(route.ExpectedIdentityID), State: route.State, Revision: route.Revision}
+			if route.ExpectedIdentity != nil {
+				out.Route.ExpectedIdentity = &service.EgressIdentity{ID: route.ExpectedIdentity.ID, Status: route.ExpectedIdentity.Status}
+			}
+		}
+		projected = append(projected, out)
+	}
+	return projected
+}
+
+func cloneSchedulerInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+func cloneSchedulerString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func filterSchedulerAccountGroups(accountGroups []service.AccountGroup) []service.AccountGroup {

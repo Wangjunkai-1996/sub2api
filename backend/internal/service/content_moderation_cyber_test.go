@@ -109,6 +109,10 @@ func TestRecordCyberPolicyEvent_WritesLogWhenEnabled(t *testing.T) {
 	)
 
 	svc.RecordCyberPolicyEvent(context.Background(), CyberPolicyRecordInput{
+		NewAPIRequestID: "newapi-request",
+		NewAPIOrigin:    "https://newapi.internal",
+		NewAPIUserID:    4835,
+		NewAPITokenID:   17265,
 		UserID:          1,
 		UserEmail:       "u@x.com",
 		Model:           "gpt-5",
@@ -126,6 +130,9 @@ func TestRecordCyberPolicyEvent_WritesLogWhenEnabled(t *testing.T) {
 	require.True(t, log.Flagged)
 	require.Equal(t, "cyber_policy", log.HighestCategory)
 	require.Contains(t, log.Error, "flagged")
+	require.Contains(t, log.Error, "verified_newapi_user_id=4835")
+	require.Contains(t, log.Error, "verified_newapi_token_id=17265")
+	require.Contains(t, log.Error, "newapi_request_id=newapi-request")
 	require.False(t, log.AutoBanned)
 	// emailService is nil, so EmailSent must be false
 	require.False(t, log.EmailSent)
@@ -260,8 +267,11 @@ func TestRecordCyberPolicyEvent_RuntimeSnapshotRefreshFailureKeepsStaleScope(t *
 		SettingKeyRiskControlEnabled:      "true",
 		SettingKeyContentModerationConfig: `{"all_groups":true,"model_filter":{"type":"include","models":["gpt-5"]}}`,
 	}}
-	svc := NewContentModerationService(settingRepo, repo, nil, nil, nil, nil, nil, nil)
+	// This path is synchronous, so avoid starting queue workers before the test
+	// installs its short runtime-cache TTL.
+	svc := NewContentModerationService(settingRepo, nil, nil, nil, nil, nil, nil, nil)
 	svc.runtimeCacheTTL = time.Minute
+	svc.repo = repo
 
 	_, err := svc.loadRuntimeSnapshot(context.Background())
 	require.NoError(t, err)

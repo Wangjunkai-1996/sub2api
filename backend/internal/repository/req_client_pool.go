@@ -15,10 +15,11 @@ import (
 
 // reqClientOptions 定义 req 客户端的构建参数
 type reqClientOptions struct {
-	ProxyURL    string        // 代理 URL（支持 http/https/socks5）
-	Timeout     time.Duration // 请求超时时间
-	Impersonate bool          // 是否模拟浏览器指纹（当前为 Firefox，Chrome 伪装会被 chatgpt.com 的 Cloudflare 质询）
-	ForceHTTP2  bool          // 是否强制使用 HTTP/2
+	ProxyURL         string        // 代理 URL（支持 http/https/socks5）
+	Timeout          time.Duration // 请求超时时间
+	Impersonate      bool          // 是否模拟 Firefox 浏览器指纹
+	ForceHTTP2       bool          // 是否强制使用 HTTP/2
+	DisableRedirects bool          // 是否拒绝 credential-bearing 重定向
 }
 
 // sharedReqClients 存储按配置参数缓存的 req 客户端实例
@@ -57,6 +58,12 @@ func getSharedReqClient(opts reqClientOptions) (*req.Client, error) {
 		// 在同一出口 IP 下稳定通过，故改用 Firefox 指纹。
 		client = client.ImpersonateFirefox()
 	}
+	if opts.DisableRedirects {
+		// OAuth/privacy/quota requests carry bearer credentials. Configure the
+		// underlying client once at construction time instead of mutating a
+		// shared client per request (which would race with concurrent callers).
+		client = client.SetRedirectPolicy(req.NoRedirectPolicy())
+	}
 	trimmed, _, err := proxyurl.Parse(opts.ProxyURL)
 	if err != nil {
 		return nil, err
@@ -85,21 +92,23 @@ func instrumentReqClient(client *req.Client) *req.Client {
 }
 
 func buildReqClientKey(opts reqClientOptions) string {
-	return fmt.Sprintf("%s|%s|%t|%t",
+	return fmt.Sprintf("%s|%s|%t|%t|%t",
 		strings.TrimSpace(opts.ProxyURL),
 		opts.Timeout.String(),
 		opts.Impersonate,
 		opts.ForceHTTP2,
+		opts.DisableRedirects,
 	)
 }
 
 // CreatePrivacyReqClient creates an HTTP client for OpenAI privacy settings API
 // This is exported for use by OpenAIPrivacyService
-// Uses Chrome TLS fingerprint impersonation to bypass Cloudflare checks
+// Uses Firefox TLS fingerprint impersonation to bypass Cloudflare checks
 func CreatePrivacyReqClient(proxyURL string) (*req.Client, error) {
 	return getSharedReqClient(reqClientOptions{
-		ProxyURL:    proxyURL,
-		Timeout:     30 * time.Second,
-		Impersonate: true, // Enable browser TLS fingerprint impersonation (Firefox, see getSharedReqClient)
+		ProxyURL:         proxyURL,
+		Timeout:          30 * time.Second,
+		Impersonate:      true, // Enable Firefox TLS fingerprint impersonation
+		DisableRedirects: true,
 	})
 }

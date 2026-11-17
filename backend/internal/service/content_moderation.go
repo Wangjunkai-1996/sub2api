@@ -3039,6 +3039,10 @@ func maskSecretTail(secret string) string {
 type CyberPolicyRecordInput struct {
 	LogOnly         bool // Trusted platform user: retain evidence without penalties or notifications.
 	RequestID       string
+	NewAPIRequestID string
+	NewAPIOrigin    string
+	NewAPIUserID    int64
+	NewAPITokenID   int64
 	UserID          int64
 	UserEmail       string
 	APIKeyID        int64
@@ -3083,6 +3087,10 @@ func (s *ContentModerationService) RecordCyberPolicyEvent(ctx context.Context, i
 		apiKeyID = &in.APIKeyID
 	}
 	errBody := strings.TrimSpace(in.UpstreamMessage)
+	if in.NewAPIUserID > 0 && in.NewAPITokenID > 0 && in.NewAPIOrigin != "" {
+		errBody = fmt.Sprintf("verified_newapi_origin=%s verified_newapi_user_id=%d verified_newapi_token_id=%d newapi_request_id=%s\n%s",
+			in.NewAPIOrigin, in.NewAPIUserID, in.NewAPITokenID, in.NewAPIRequestID, errBody)
+	}
 	if b := strings.TrimSpace(in.UpstreamBody); b != "" {
 		// 原始 body 不在此预脱敏；写入 log.Error 前由 redactContentModerationSecrets 统一脱敏。
 		errBody = strings.TrimSpace(errBody + "\n" + b)

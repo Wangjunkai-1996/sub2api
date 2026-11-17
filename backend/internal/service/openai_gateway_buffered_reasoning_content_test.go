@@ -39,11 +39,13 @@ data: {"type":"response.completed","response":{"id":"resp_reasoning","model":"re
 			}
 			account := &Account{ID: 40, Name: "responses-api-key", Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 			svc := &OpenAIGatewayService{}
-			handle := svc.handleChatBufferedStreamingResponse
+			var result *OpenAIForwardResult
+			var err error
 			if path == "/v1/messages" {
-				handle = svc.handleAnthropicBufferedStreamingResponse
+				result, err = svc.handleAnthropicBufferedStreamingResponse(resp, c, account, "reasoning-model", "reasoning-model", "reasoning-model", time.Now())
+			} else {
+				result, err = svc.handleChatBufferedStreamingResponse(resp, c, account, "reasoning-model", "reasoning-model", "reasoning-model", time.Now())
 			}
-			result, err := handle(resp, c, account, "reasoning-model", "reasoning-model", "reasoning-model", time.Now())
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			require.Equal(t, http.StatusOK, rec.Code)
