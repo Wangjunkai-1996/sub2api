@@ -14,13 +14,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestV0221MigrationsUpgradePreservesLedgerDataAndDefaults(t *testing.T) {
+func TestV0222MigrationsUpgradePreservesLedgerDataAndDefaults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	db := newV0220MigrationDatabase(t, ctx)
 	added := map[string]bool{
-		"249_add_usage_logs_api_key_cost_index_notx.sql": true,
-		"250_openai_cache_write_ttl.sql":                 true,
+		"251_group_force_openai_ultrafast.sql":         true,
+		"251_group_usage_rollup_nonblocking_build.sql": true,
 	}
 	legacy := fstest.MapFS{}
 	names, err := fs.Glob(migrations.FS, "*.sql")
@@ -32,10 +32,10 @@ func TestV0221MigrationsUpgradePreservesLedgerDataAndDefaults(t *testing.T) {
 			legacy[name] = &fstest.MapFile{Data: data}
 		}
 	}
-	require.Len(t, legacy, 320, "the upgrade fixture must represent the v0.2.20 KKAI ledger")
+	require.Len(t, legacy, 322, "the upgrade fixture must represent the v0.2.21 KKAI ledger")
 	require.NoError(t, applyIntegrationMigrationsFS(ctx, db, legacy))
 	beforeLedger := readV0220MigrationLedger(t, ctx, db)
-	require.Len(t, beforeLedger, 320)
+	require.Len(t, beforeLedger, 322)
 	for _, name := range []string{
 		"249_mcp_oauth.sql", "249_retire_kkai_fork_features.sql",
 		"250_purge_retired_kkai_fork_data.sql", "255_enable_gemini_image_generation_groups.sql",
@@ -68,9 +68,12 @@ JOIN channel_account_stats_pricing_rules r ON r.id = p.rule_id WHERE r.name = 'v
 
 	require.NoError(t, ApplyMigrations(ctx, db))
 	afterLedger := readV0220MigrationLedger(t, ctx, db)
-	require.Len(t, afterLedger, 322)
+	require.Len(t, afterLedger, 324)
 	for name, entry := range beforeLedger {
 		require.Equal(t, entry, afterLedger[name], "historical checksum or applied_at changed: %s", name)
+	}
+	for name := range added {
+		require.Contains(t, afterLedger, name)
 	}
 	freshLedger := readV0220MigrationLedger(t, ctx, integrationDB)
 	for name, entry := range afterLedger {

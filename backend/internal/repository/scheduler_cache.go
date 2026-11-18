@@ -1380,14 +1380,18 @@ func marshalSchedulerCacheAccount(account service.Account) ([]byte, []byte, erro
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal account: %w", err)
 	}
-	metaPayload, err := json.Marshal(schedulerMetadataPayload{
-		Account:           buildSchedulerMetadataAccount(account),
-		ProjectionVersion: schedulerMetadataProjectionVersion,
-	})
+	metaPayload, err := marshalSchedulerMetadataAccount(account)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal account metadata: %w", err)
 	}
 	return fullPayload, metaPayload, nil
+}
+
+func marshalSchedulerMetadataAccount(account service.Account) ([]byte, error) {
+	return json.Marshal(schedulerMetadataPayload{
+		Account:           buildSchedulerMetadataAccount(account),
+		ProjectionVersion: schedulerMetadataProjectionVersion,
+	})
 }
 
 func (c *schedulerCache) mgetChunked(ctx context.Context, keys []string) ([]any, error) {

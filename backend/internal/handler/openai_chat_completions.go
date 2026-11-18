@@ -80,7 +80,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
-	auditBody := body
 	if cappedBody, changed, err := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); err != nil {
 		respondOpenAIReasoningEffortPolicyError(c, err, h.errorResponse)
 		return
@@ -105,6 +104,14 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	setOpsRequestContext(c, reqModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
+
+	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIChat, reqModel, body); decision != nil && !decision.AllowNextStage {
+		h.openAISecurityAuditError(c, decision)
+		return
+	}
+	if h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatChat) {
+		return
+	}
 
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
@@ -254,28 +261,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				accountReleaseFunc()
 				accountReleaseFunc = nil
 			}
-		}
-		if decision := h.checkSecurityAuditForSelectedOpenAIProAccount(
-			c,
-			reqLog,
-			apiKey,
-			subject,
-			account,
-			service.ContentModerationProtocolOpenAIChat,
-			reqModel,
-			auditBody,
-		); decision != nil && !decision.AllowNextStage {
-			releaseAccount()
-			h.handleStreamingAwareErrorWithCode(
-				c,
-				securityAuditStatus(decision),
-				securityAuditErrorType(decision),
-				securityAuditErrorCode(decision),
-				securityAuditMessage(decision),
-				streamStarted,
-				false,
-			)
-			return
 		}
 
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())

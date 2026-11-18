@@ -27,6 +27,23 @@ func (h *OpenAIGatewayHandler) openAISecurityAuditError(c *gin.Context, decision
 	}})
 }
 
+func (h *OpenAIGatewayHandler) anthropicSecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
+	if decision == nil {
+		return
+	}
+	if decision.Legacy != nil && decision.Legacy.Blocked {
+		h.anthropicErrorResponse(c, securityAuditStatus(decision), securityAuditErrorCode(decision), securityAuditMessage(decision))
+		return
+	}
+	errType := "api_error"
+	if decision.Kind == securityaudit.DecisionBlock {
+		errType = "permission_error"
+	}
+	c.JSON(securityAuditStatus(decision), gin.H{"type": "error", "error": gin.H{
+		"type": errType, "code": securityAuditErrorCode(decision), "message": securityAuditMessage(decision),
+	}})
+}
+
 func (h *GatewayHandler) openAISecurityAuditError(c *gin.Context, decision *securityaudit.Decision) {
 	if decision == nil {
 		return

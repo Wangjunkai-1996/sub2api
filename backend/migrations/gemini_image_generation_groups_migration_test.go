@@ -29,8 +29,9 @@ func TestEnableGeminiImageGenerationGroupsMigration(t *testing.T) {
 func TestV0218MigrationPreservesKKAILedger(t *testing.T) {
 	// Freeze the names and bytes from release/v0.2.17-kkai at 3478a5458.
 	// Reintroducing an upstream name for an already-renumbered migration would
-	// rerun it against an existing database. v0.2.20 adds three new files and
-	// v0.2.21 adds two; their interleaved names are outside this frozen baseline.
+	// rerun it against an existing database. v0.2.20 adds three new files,
+	// v0.2.21 adds two, and v0.2.22 adds two; their interleaved names are
+	// outside this frozen baseline.
 	names, err := fs.Glob(FS, "*.sql")
 	require.NoError(t, err)
 	legacy := sha256.New()
@@ -40,7 +41,8 @@ func TestV0218MigrationPreservesKKAILedger(t *testing.T) {
 		}
 		switch name {
 		case "247_scoped_admin_api_keys.sql", "248_group_image_count_billing.sql", "249_mcp_oauth.sql",
-			"249_add_usage_logs_api_key_cost_index_notx.sql", "250_openai_cache_write_ttl.sql":
+			"249_add_usage_logs_api_key_cost_index_notx.sql", "250_openai_cache_write_ttl.sql",
+			"251_group_force_openai_ultrafast.sql", "251_group_usage_rollup_nonblocking_build.sql":
 			continue
 		}
 		content, err := FS.ReadFile(name)

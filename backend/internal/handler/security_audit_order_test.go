@@ -25,6 +25,9 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 		{file: "gateway_handler_responses.go", function: "Responses", auditToken: "checkSecurityAudit"},
 		{file: "gemini_v1beta_handler.go", function: "GeminiV1BetaModels", auditToken: "checkSecurityAudit"},
 		{file: "gemini_cached_contents_handler.go", function: "GeminiCachedContentsCreate", auditToken: "checkSecurityAudit"},
+		{file: "openai_gateway_handler.go", function: "Responses", auditToken: "checkSecurityAudit"},
+		{file: "openai_gateway_handler.go", function: "Messages", auditToken: "checkSecurityAudit"},
+		{file: "openai_chat_completions.go", function: "ChatCompletions", auditToken: "checkSecurityAudit"},
 		{file: "openai_images.go", function: "Images", auditToken: "checkSecurityAudit"},
 		{file: "grok_media.go", function: "handleGrokMedia", auditToken: "checkSecurityAudit"},
 	}
@@ -48,46 +51,6 @@ func TestPromptAuditGatePrecedesAccountBillingAndUpstreamSideEffects(t *testing.
 				require.Lessf(t, auditIndex, index, "%s must run before %s", tt.auditToken, sideEffect)
 			}
 			require.True(t, foundSideEffect, "coverage case must contain a downstream side effect")
-		})
-	}
-}
-
-func TestOpenAISelectedAccountAuditRunsAfterSlotBeforeForward(t *testing.T) {
-	tests := []struct {
-		file         string
-		function     string
-		forwardToken string
-	}{
-		{file: "openai_gateway_handler.go", function: "Responses", forwardToken: "h.gatewayService.Forward("},
-		{file: "openai_gateway_handler.go", function: "Messages", forwardToken: "h.gatewayService.ForwardAsAnthropic("},
-		{file: "openai_chat_completions.go", function: "ChatCompletions", forwardToken: "h.gatewayService.ForwardAsChatCompletions("},
-	}
-	for _, tt := range tests {
-		t.Run(tt.file+"/"+tt.function, func(t *testing.T) {
-			source := stripGoComments(goFunctionSource(t, tt.file, tt.function))
-			selectionIndex := strings.Index(source, "SelectAccountWithSchedulerForCapability(")
-			slotIndex := strings.Index(source, "acquireResponsesAccountSlot(")
-			slotSuccessIndex := strings.Index(source, "if slotResult != openAISlotAcquireOK")
-			refreshedAccountIndex := -1
-			if slotSuccessIndex >= 0 {
-				if offset := strings.Index(source[slotSuccessIndex:], "account = selection.Account"); offset >= 0 {
-					refreshedAccountIndex = slotSuccessIndex + offset
-				}
-			}
-			auditIndex := strings.Index(source, "checkSecurityAuditForSelectedOpenAIProAccount(")
-			forwardIndex := strings.Index(source, tt.forwardToken)
-
-			require.NotEqual(t, -1, selectionIndex, "missing final account selection")
-			require.NotEqual(t, -1, slotIndex, "missing account concurrency acquisition")
-			require.NotEqual(t, -1, slotSuccessIndex, "missing successful account-slot gate")
-			require.NotEqual(t, -1, refreshedAccountIndex, "missing final account snapshot refresh")
-			require.NotEqual(t, -1, auditIndex, "missing selected-account Prompt Audit gate")
-			require.NotEqual(t, -1, forwardIndex, "missing upstream forward")
-			require.Less(t, selectionIndex, slotIndex, "account selection must precede slot acquisition")
-			require.Less(t, slotIndex, slotSuccessIndex, "slot acquisition must precede its success gate")
-			require.Less(t, slotSuccessIndex, refreshedAccountIndex, "final account snapshot must be read only after the account slot is held")
-			require.Less(t, refreshedAccountIndex, auditIndex, "selected-account audit must use the final account snapshot")
-			require.Less(t, auditIndex, forwardIndex, "selected-account audit must run before the first upstream forward")
 		})
 	}
 }
@@ -140,7 +103,6 @@ func TestOtherOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 			source := stripGoComments(goFunctionSource(t, tt.file, tt.function))
 			for _, forbidden := range []string{
 				"checkSecurityAudit",
-				"checkSecurityAuditForSelectedOpenAIProAccount",
 				"ensureSecurityAuditForAccount",
 				"newOpenAIAccountAuditState",
 			} {
@@ -152,7 +114,6 @@ func TestOtherOpenAIEntryPointsDoNotRunPromptAudit(t *testing.T) {
 
 func TestOpenAIWebSocketPreservesSubsequentTurnAudit(t *testing.T) {
 	source := stripGoComments(goFunctionSource(t, "openai_gateway_handler.go", "ResponsesWebSocket"))
-	require.NotContains(t, source, "checkSecurityAuditForSelectedOpenAIProAccount(")
 	require.Contains(t, source, "if turn == 1 {")
 	require.Contains(t, source, `checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, model, payload, "subsequent_turn")`)
 	require.Contains(t, source, "writeSecurityAuditWSError(ctx, wsConn, decision)")

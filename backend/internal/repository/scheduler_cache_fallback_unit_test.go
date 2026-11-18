@@ -27,6 +27,14 @@ type schedulerFallbackAccountRepo struct {
 }
 
 func (r *schedulerFallbackAccountRepo) ListSchedulableByGroupIDAndPlatform(ctx context.Context, _ int64, _ string) ([]service.Account, error) {
+	return r.list(ctx)
+}
+
+func (r *schedulerFallbackAccountRepo) ListModelAvailabilityCandidates(ctx context.Context, _ *int64, _ []string, _ bool) ([]service.Account, error) {
+	return r.list(ctx)
+}
+
+func (r *schedulerFallbackAccountRepo) list(ctx context.Context) ([]service.Account, error) {
 	r.calls.Add(1)
 	r.enteredOnce.Do(func() { close(r.entered) })
 	select {

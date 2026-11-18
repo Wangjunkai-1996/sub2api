@@ -24,6 +24,7 @@ const (
 	openAIFirstOutputStageMemoryLimit        = 64 * 1024
 	openAIFirstOutputStageMaxBytes           = 8 * 1024 * 1024
 	openAIFirstOutputScannerFramingAllowance = 64
+	openAIFirstOutputGuardQueueSize          = 1
 	openAIFirstOutputTypeProbeBytes          = 64 * 1024
 	openAIDefaultStreamQueueSize             = 16
 )
@@ -60,6 +61,13 @@ func newOpenAIFirstOutputStage(limit int64) *openAIFirstOutputStage {
 
 func newDefaultOpenAIFirstOutputStage() *openAIFirstOutputStage {
 	return newOpenAIFirstOutputStage(openAIFirstOutputStageMaxBytes)
+}
+
+func openAIFirstOutputEventQueueSize(guardFirstOutput bool) int {
+	if guardFirstOutput {
+		return openAIFirstOutputGuardQueueSize
+	}
+	return openAIDefaultStreamQueueSize
 }
 
 func openAIFirstOutputDynamicScanLines(guardActive *atomic.Bool) bufio.SplitFunc {

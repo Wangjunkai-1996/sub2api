@@ -616,7 +616,7 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	if err != nil {
 		var readErr *openAICompatBufferedReadError
 		if errors.As(err, &readErr) && readErr != nil {
-			return nil, readErr.cause
+			return nil, s.newOpenAICompatBufferedReadFailoverError(c, account, resp, requestID, err)
 		}
 		return nil, err
 	}
@@ -997,7 +997,7 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 				zap.String("request_id", requestID),
 				zap.Duration("interval", streamInterval),
 			)
-			return nil, usage, acc, prior, fmt.Errorf("stream data interval timeout")
+			return nil, usage, acc, prior, &openAICompatBufferedReadError{cause: fmt.Errorf("stream data interval timeout")}
 		}
 	}
 }
@@ -1225,7 +1225,13 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 					)
 					continue
 				}
-				if err := emit(sse, isTerminalEvent || evt.Type == "content_block_delta"); err != nil {
+				// A tool block start carries the callable name and ID and is already
+				// meaningful client output; release it so a later transport failure
+				// cannot replay the turn onto another account. Reasoning and empty
+				// text starts remain staged until their first content delta.
+				release := isTerminalEvent || evt.Type == "content_block_delta" ||
+					(evt.Type == "content_block_start" && evt.ContentBlock != nil && evt.ContentBlock.Type == "tool_use")
+				if err := emit(sse, release); err != nil {
 					clientDisconnected = true
 					logger.L().Info("openai messages stream: client disconnected, continuing to drain upstream for billing",
 						zap.String("request_id", requestID),
@@ -1245,7 +1251,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	// finalizeStream sends any remaining Anthropic events and returns the result.
 	finalizeStream := func() (*OpenAIForwardResult, error) {
 		if streamFailoverErr != nil {
-			return resultWithUsage(), streamFailoverErr
+			return nil, streamFailoverErr
 		}
 		if streamNonFailoverErr != nil {
 			return resultWithUsage(), streamNonFailoverErr
@@ -1282,11 +1288,20 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 		}
 	}
 	streamReadError := func(err error) (*OpenAIForwardResult, error) {
-		readErr := s.newOpenAICompatReadError(c, account, resp, requestID, err, !clientOutputStarted && !clientDisconnected)
+		allowFailover := !clientOutputStarted && !clientDisconnected
+		if !errors.Is(err, ErrOpenAIUpstreamStreamTruncated) && !firstChunk {
+			allowFailover = false
+		}
+		readErr := s.newOpenAICompatReadError(c, account, resp, requestID, err, allowFailover)
 		var failoverErr *UpstreamFailoverError
 		if errors.As(readErr, &failoverErr) {
 			return nil, readErr
 		}
+		// If the error is terminal for this attempt, release any translated
+		// prelude that was held while waiting for semantic output. Failover
+		// errors intentionally keep it buffered so the next account can start
+		// with a clean stream.
+		releaseHeld()
 		return resultWithUsage(), readErr
 	}
 	missingTerminalErr := func() (*OpenAIForwardResult, error) {

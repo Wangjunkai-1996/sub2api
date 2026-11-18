@@ -80,10 +80,7 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 		for _, filename := range files {
 			source, readErr := os.ReadFile(filepath.Join("..", "..", "handler", filename))
 			require.NoError(t, readErr)
-			sourceText := string(source)
-			hasDirectAudit := strings.Contains(sourceText, "checkSecurityAudit(")
-			hasSelectedAccountAudit := strings.Contains(sourceText, "checkSecurityAuditForSelectedOpenAIProAccount")
-			require.Truef(t, hasDirectAudit || hasSelectedAccountAudit, "%s route handler %s bypasses Coordinator", route, filename)
+			require.Containsf(t, string(source), "checkSecurityAudit", "%s route handler %s bypasses Coordinator", route, filename)
 		}
 	}
 

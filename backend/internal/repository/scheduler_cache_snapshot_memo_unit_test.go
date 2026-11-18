@@ -1138,7 +1138,7 @@ func TestSchedulerCacheSnapshotMemoLegacyProjectionAfterWarmRead(t *testing.T) {
 
 			clock.Advance(schedulerSnapshotCacheMaxAge - time.Millisecond)
 			require.True(t, memoRead(t, cache, bucket)[0].IsOpenAIPassthroughEnabled())
-			clock.Advance(time.Millisecond)
+			clock.Advance(time.Millisecond + schedulerSnapshotCacheStaleGrace)
 			if versioned {
 				require.False(t, memoRead(t, cache, bucket)[0].IsOpenAIPassthroughEnabled())
 			} else {
