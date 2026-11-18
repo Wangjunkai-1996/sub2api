@@ -20,12 +20,18 @@ func TestRequestLogRetention_PartitionBoundaryKeepsRecentRows(t *testing.T) {
 		CREATE TEMP TABLE retention_august PARTITION OF usage_logs FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
 		INSERT INTO usage_logs VALUES
 			(1, '2026-07-17 23:59:59+00'),
+			(1, '2026-08-01 00:00:00+00'),
 			(2, '2026-07-18 00:00:00+00'),
 			(3, '2026-08-01 00:00:00+00');
 	`)
 	require.NoError(t, err)
 	var collidingCTIDs bool
-	require.NoError(t, tx.QueryRowContext(ctx, `SELECT a.ctid = b.ctid FROM usage_logs a, usage_logs b WHERE a.id = 1 AND b.id = 3`).Scan(&collidingCTIDs))
+	require.NoError(t, tx.QueryRowContext(ctx, `
+		SELECT a.ctid = b.ctid
+		FROM usage_logs a, usage_logs b
+		WHERE a.id = 1
+		  AND a.created_at = '2026-07-17 23:59:59+00'
+		  AND b.id = 3`).Scan(&collidingCTIDs))
 	require.True(t, collidingCTIDs, "fixture must exercise identical row locations in different partitions")
 	repo := newDashboardAggregationRepositoryWithSQL(tx)
 	cutoff := time.Date(2026, 7, 18, 0, 0, 0, 0, time.UTC)
@@ -41,6 +47,6 @@ func TestRequestLogRetention_PartitionBoundaryKeepsRecentRows(t *testing.T) {
 		}
 		require.NoError(t, rows.Err())
 		require.NoError(t, rows.Close())
-		require.Equal(t, []int64{2, 3}, ids)
+		require.Equal(t, []int64{1, 3}, ids)
 	}
 }

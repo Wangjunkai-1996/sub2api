@@ -104,6 +104,15 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurnDoesNotFailOverAfterDownstreamOutpu
 }
 
 func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t *testing.T) {
+	runOpenAIWSHTTPBridgeLaterTurnReplacement(t, false)
+}
+
+func TestOpenAIWSHTTPBridgeLaterTurnPrivateFailureRetriesCurrentTurnOnReplacementAccount(t *testing.T) {
+	runOpenAIWSHTTPBridgeLaterTurnReplacement(t, true)
+}
+
+func runOpenAIWSHTTPBridgeLaterTurnReplacement(t *testing.T, privateStreamFailure bool) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	cfg := &config.Config{}
@@ -140,6 +149,16 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 			)),
 		},
 	}}
+	if privateStreamFailure {
+		upstream.responses[1] = &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_private_failed\"}}\n\n" +
+					"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_private_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Please try again later\"}}}\n\n",
+			)),
+		}
+	}
 	svc := &OpenAIGatewayService{
 		cfg:              cfg,
 		httpUpstream:     upstream,

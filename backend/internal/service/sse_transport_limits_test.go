@@ -300,7 +300,7 @@ func TestImageStreamLimitDoesNotFinalizePendingTerminal(t *testing.T) {
 				defer func() { _ = resp.Body.Close() }()
 				var err error
 				if oauth {
-					_, _, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, time.Now(), "b64_json", "image_generation", "gpt-image-2")
+					_, _, _, _, err = svc.handleOpenAIImagesOAuthStreamingResponse(resp, c, nil, time.Now(), "b64_json", "image_generation", "gpt-image-2")
 				} else {
 					_, _, _, _, err = svc.handleOpenAIImagesStreamingResponse(resp, c, time.Now(), &OpenAIImagesRequest{Model: "gpt-image-2", ResponseFormat: "b64_json"})
 				}

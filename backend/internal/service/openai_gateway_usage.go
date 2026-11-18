@@ -602,6 +602,11 @@ func (s *OpenAIGatewayService) calculateOpenAIRecordUsageCost(
 	modelLongContextExempt bool,
 	pricingAt time.Time,
 ) (*CostBreakdown, error) {
+	// Dedicated image requests are billable only after an image was produced.
+	// Mixed Responses/Chat/WS requests retain their real token usage.
+	if result != nil && result.ImageEndpoint && result.ImageCount <= 0 {
+		return &CostBreakdown{BillingMode: string(BillingModeImage)}, nil
+	}
 	billingModel := firstUsageBillingModel(billingModels)
 	if result != nil && result.WebSearchCalls > 0 {
 		// Codex alpha/search 网页搜索按次计费：上游不返回 usage/token 字段，单价只取

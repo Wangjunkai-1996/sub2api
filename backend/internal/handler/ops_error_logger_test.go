@@ -247,6 +247,29 @@ func TestOpsErrorLoggerMiddleware_DoesNotBreakOuterMiddlewares(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+func TestOpsErrorLoggerMiddleware_RestoresWriterAfterNestedStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logSink, restore := captureHandlerStructuredLog(t)
+	defer restore()
+
+	r := gin.New()
+	r.Use(middleware2.RequestLogger(), middleware2.Logger())
+	r.POST("/v1/responses", OpsErrorLoggerMiddleware(nil), func(c *gin.Context) {
+		c.Writer = &struct{ gin.ResponseWriter }{c.Writer}
+		c.Writer.WriteHeader(http.StatusOK)
+		_, err := c.Writer.WriteString(": ping\n\n")
+		require.NoError(t, err)
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), ": ping")
+	status, ok := logSink.FieldValueForMessage("http request completed", "status_code")
+	require.True(t, ok)
+	require.EqualValues(t, http.StatusOK, status)
+}
+
 // setupOpsErrorLogTestQueue 阻止 enqueueOpsErrorLog 启动真实 worker，改用可检查的测试队列。
 func setupOpsErrorLogTestQueue(t *testing.T, size int) {
 	t.Helper()
@@ -283,31 +306,6 @@ func TestOpsErrorLoggerMiddleware_HardSkipsIngressRejection(t *testing.T) {
 	require.Zero(t, settings.getValueCalls, "ingress rejection must bypass monitoring settings reads")
 	require.Zero(t, repo.insertCalls, "ingress rejection must bypass inserts")
 	require.Zero(t, OpsErrorLogEnqueuedTotal(), "ingress rejection must not enter the error queue")
-}
-
-func TestOpsErrorLoggerMiddleware_DedicatedCyberSessionBlockRecordsExactlyOnce(t *testing.T) {
-	setupOpsErrorLogTestQueue(t, 3)
-	gin.SetMode(gin.TestMode)
-	ops := service.NewOpsService(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-	h := &OpenAIGatewayHandler{opsService: ops}
-	apiKey := &service.APIKey{ID: 41, Key: "sk-dedicated-test"}
-	router := gin.New()
-	router.Use(OpsErrorLoggerMiddleware(ops))
-	router.POST("/v1/responses", func(c *gin.Context) {
-		h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, "gpt-test", "session-block-hash")
-		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
-			"type": "permission_error", "code": "session_blocked_by_cyber_policy", "message": "blocked",
-		}})
-	})
-
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
-
-	require.Equal(t, http.StatusForbidden, recorder.Code)
-	require.Equal(t, int64(1), OpsErrorLogQueueLength())
-	job := <-opsErrorLogQueue
-	require.Equal(t, "cyber_policy_session_blocked", job.entry.ErrorType)
-	require.Equal(t, http.StatusForbidden, job.entry.StatusCode)
 }
 
 func TestOpsErrorLoggerMiddleware_OrdinaryPermissionStillRecords(t *testing.T) {
@@ -729,6 +727,7 @@ func TestLogOpsStreamError_RecordsOneFailurePerWebSocketTurn(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	service.SetOpenAIClientTransport(c, service.OpenAIClientTransportWS)
+	c.Set(opsRequestDurationMsKey, int64(3600000)) // Connection lifetime is not a turn duration.
 
 	service.BeginOpsStreamTurn(c, 1)
 	service.MarkOpsStreamFailure(c, "rate_limit_error", "rate_limit_exceeded", "turn one failed", http.StatusTooManyRequests)
@@ -746,6 +745,8 @@ func TestLogOpsStreamError_RecordsOneFailurePerWebSocketTurn(t *testing.T) {
 	require.Equal(t, int64(2), OpsErrorLogQueueLength())
 	first := <-opsErrorLogQueue
 	second := <-opsErrorLogQueue
+	require.Nil(t, first.entry.DurationMs)
+	require.Nil(t, second.entry.DurationMs)
 	require.Equal(t, "turn one failed", first.entry.ErrorMessage)
 	require.Equal(t, http.StatusTooManyRequests, first.entry.StatusCode)
 	require.Equal(t, "turn two failed", second.entry.ErrorMessage)

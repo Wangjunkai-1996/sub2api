@@ -508,40 +508,61 @@ func TestOpenAIGatewayService_Forward_ImageToolBillingDoesNotForceFullDecode(t *
 	require.Equal(t, "gpt-image-2", result.BillingModel)
 }
 
-func TestOpenAIGatewayService_Forward_ImageToolWithImageOnlyModelIsNormalized(t *testing.T) {
+func TestOpenAIGatewayService_Forward_ImageOnlyModelRespectsAccountProtocol(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	upstream := &httpUpstreamRecorder{
-		resp: &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"usage":{"input_tokens":1,"output_tokens":2}}`)),
-		},
+	t.Setenv("SUB2API_IMAGES_MAIN_MODEL", "gpt-5.6-luna")
+	for _, tc := range []struct {
+		name         string
+		accountType  string
+		baseURL      string
+		requestModel string
+		wantModel    string
+	}{
+		{"compatible API key", AccountTypeAPIKey, "https://example.com", "gpt-image-2.5-sunburst", "gpt-image-2.5-sunburst"},
+		{"mapped compatible API key", AccountTypeAPIKey, "https://example.com", "image-alias", "gpt-image-2.5-sunburst"},
+		{"official API key", AccountTypeAPIKey, "https://api.openai.com/v1", "gpt-image-2.5-sunburst", "gpt-5.6-luna"},
+		{"default API key", AccountTypeAPIKey, "", "gpt-image-2.5-sunburst", "gpt-5.6-luna"},
+		{"OAuth", AccountTypeOAuth, "", "gpt-image-2.5-sunburst", "gpt-5.6-luna"},
+		{"setup token", AccountTypeSetupToken, "", "gpt-image-2.5-sunburst", "gpt-5.6-luna"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_image\",\"output\":[{\"id\":\"ig_1\",\"type\":\"image_generation_call\",\"result\":\"test-image\",\"size\":\"1024x1024\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\ndata: [DONE]\n\n")),
+			}}
+			cfg := &config.Config{}
+			cfg.Security.URLAllowlist.Enabled = false
+			svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream}
+			account := &Account{
+				ID: 11, Platform: PlatformOpenAI, Type: tc.accountType,
+				Concurrency: 1, Status: StatusActive,
+				Credentials: map[string]any{
+					"api_key": "sk-test", "access_token": "test-token",
+					"chatgpt_account_id": "test-account", "base_url": tc.baseURL,
+					"model_mapping": map[string]any{tc.requestModel: "gpt-image-2.5-sunburst"},
+				},
+				Extra: map[string]any{"use_responses_api": true},
+			}
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+			SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+			body, err := json.Marshal(map[string]any{
+				"model": tc.requestModel, "stream": true, "input": "draw",
+				"tools": []any{map[string]any{"type": "image_generation", "model": "gpt-image-2.5-sunburst", "size": "1024x1024"}},
+			})
+			require.NoError(t, err)
+			result, err := svc.Forward(context.Background(), c, account, body)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, tc.wantModel, gjson.GetBytes(upstream.lastBody, "model").String())
+			require.Equal(t, "gpt-image-2.5-sunburst", gjson.GetBytes(upstream.lastBody, "tools.0.model").String())
+			require.Equal(t, "gpt-image-2.5-sunburst", result.BillingModel)
+			require.Equal(t, 1, result.ImageCount)
+			require.Contains(t, rec.Body.String(), "image_generation_call")
+		})
 	}
-	cfg := &config.Config{}
-	cfg.Security.URLAllowlist.Enabled = false
-	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream}
-	account := &Account{
-		ID:          11,
-		Name:        "openai-apikey",
-		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
-		Concurrency: 1,
-		Credentials: map[string]any{
-			"api_key":  "sk-test",
-			"base_url": "https://example.com",
-		},
-		Extra: map[string]any{"use_responses_api": true},
-	}
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
-	SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
-
-	body := []byte(`{"model":"gpt-image-2","stream":false,"tools":[{"type":"image_generation","model":"gpt-image-2"}],"input":"draw"}`)
-	result, err := svc.Forward(context.Background(), c, account, body)
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Equal(t, openAIImagesResponsesMainModel, gjson.GetBytes(upstream.lastBody, "model").String())
 }
 
 func TestOpenAIGatewayService_Forward_HTTPRetryRecoveryDoesNotDecodeBeforeError(t *testing.T) {
@@ -881,7 +902,7 @@ func TestOpenAIRequestBodyMayContainEmptyBase64InputImageSeesEscapedInputPrefix(
 	require.True(t, openAIRequestBodyMayContainEmptyBase64InputImage(body))
 }
 
-func TestOpenAIGatewayService_Forward_ImageOnlyModelKeepsSupportedVerbosity(t *testing.T) {
+func TestOpenAIGatewayService_Forward_OfficialImageOnlyModelKeepsSupportedVerbosity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstream := &httpUpstreamRecorder{
 		resp: &http.Response{
@@ -895,13 +916,13 @@ func TestOpenAIGatewayService_Forward_ImageOnlyModelKeepsSupportedVerbosity(t *t
 	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream}
 	account := &Account{
 		ID:          6,
-		Name:        "openai-apikey",
+		Name:        "openai-official-apikey",
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeAPIKey,
 		Concurrency: 1,
 		Credentials: map[string]any{
 			"api_key":  "sk-test",
-			"base_url": "https://example.com",
+			"base_url": "https://api.openai.com",
 		},
 		Extra: map[string]any{"use_responses_api": true},
 	}

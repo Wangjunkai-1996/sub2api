@@ -32,6 +32,7 @@ func TestChatCompletionsBufferedResponsesReadErrorReturnsFailover(t *testing.T) 
 	}{
 		{name: "unexpected_eof", err: io.ErrUnexpectedEOF, expectedCode: OpenAIUpstreamStreamReadErrorCode},
 		{name: "http2_reset", err: errors.New("stream error: stream ID 7; INTERNAL_ERROR; received from peer"), expectedCode: OpenAIUpstreamHTTP2StreamErrorCode},
+		{name: "attempt_deadline", err: context.DeadlineExceeded, expectedCode: OpenAIUpstreamStreamReadErrorCode},
 	}
 
 	for _, readError := range readErrors {
@@ -94,7 +95,7 @@ func TestChatCompletionsBufferedResponsesReadErrorDoesNotFailoverAfterClientCanc
 	require.Empty(t, rec.Body.String())
 }
 
-func TestChatCompletionsBufferedResponsesOversizedLineDoesNotFailover(t *testing.T) {
+func TestChatCompletionsBufferedResponsesOversizedLineReturnsFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
@@ -116,13 +117,67 @@ func TestChatCompletionsBufferedResponsesOversizedLineDoesNotFailover(t *testing
 		time.Now(),
 	)
 
-	require.ErrorIs(t, err, bufio.ErrTooLong)
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
-	require.NotErrorAs(t, err, &failoverErr)
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, OpenAIUpstreamStreamReadErrorCode, gjson.GetBytes(failoverErr.ResponseBody, "error.code").String())
+	require.Empty(t, rec.Body.String())
+	require.False(t, c.Writer.Written())
 }
 
-func TestAnthropicBufferedResponsesReadErrorKeepsExistingBehavior(t *testing.T) {
+func TestOpenAICompatBufferedAttemptFailureRequiresLiveRoot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, endpoint := range []string{"chat", "messages"} {
+		for _, tc := range []struct {
+			name     string
+			err      error
+			deadline bool
+			failover bool
+		}{
+			{name: "attempt_deadline", err: context.DeadlineExceeded, failover: true},
+			{name: "line_limit", err: bufio.ErrTooLong, failover: true},
+			{name: "root_deadline", err: context.DeadlineExceeded, deadline: true},
+			{name: "line_limit_root_deadline", err: bufio.ErrTooLong, deadline: true},
+			{name: "canceled_read", err: context.Canceled},
+			{name: "response_limit", err: ErrUpstreamResponseBodyTooLarge},
+		} {
+			t.Run(endpoint+"/"+tc.name, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(rec)
+				ctx := context.Background()
+				if tc.deadline {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+					defer cancel()
+				}
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/"+endpoint, nil).WithContext(ctx)
+				resp := &http.Response{Header: make(http.Header), Body: &openAICompatBufferedReadErrorCloser{err: tc.err}}
+				result, err := runOpenAICompatStreamForTest(&OpenAIGatewayService{}, endpoint, true, c, resp)
+				require.Nil(t, result)
+				var failoverErr *UpstreamFailoverError
+				if tc.failover {
+					require.ErrorAs(t, err, &failoverErr)
+				} else {
+					require.NotErrorAs(t, err, &failoverErr)
+					require.ErrorIs(t, err, tc.err)
+				}
+				require.Empty(t, rec.Body.String())
+				require.False(t, c.Writer.Written())
+			})
+		}
+	}
+}
+
+func TestOpenAICompatAttemptFailureWithoutRootDoesNotFailover(t *testing.T) {
+	for _, cause := range []error{context.DeadlineExceeded, bufio.ErrTooLong} {
+		err := (&OpenAIGatewayService{}).newOpenAICompatReadError(nil, nil, nil, "", cause, true)
+		var failoverErr *UpstreamFailoverError
+		require.NotErrorAs(t, err, &failoverErr)
+		require.ErrorIs(t, err, cause)
+	}
+}
+
+func TestAnthropicBufferedResponsesReadErrorReturnsFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
@@ -144,9 +199,10 @@ func TestAnthropicBufferedResponsesReadErrorKeepsExistingBehavior(t *testing.T) 
 		time.Now(),
 	)
 
-	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-	require.Equal(t, io.ErrUnexpectedEOF, err, "Messages 路径必须保持原始读取错误，不引入 Chat failover 包装")
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
-	require.NotErrorAs(t, err, &failoverErr)
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, OpenAIUpstreamStreamReadErrorCode, gjson.GetBytes(failoverErr.ResponseBody, "error.code").String())
+	require.Empty(t, rec.Body.String())
+	require.False(t, c.Writer.Written())
 }

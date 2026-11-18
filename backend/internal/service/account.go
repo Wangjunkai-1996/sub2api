@@ -32,6 +32,13 @@ type Account struct {
 	ProxyID                 *int64
 	ProxyFallbackOriginID   *int64
 	ProxyFallbackOriginName *string // 仅展示用
+	EgressMode              string
+	EgressRevision          int64
+	EgressBindings          []AccountEgressBinding
+	SelectedEgress          *ResolvedAccountEgress        `json:"-"` // request-local only; never persisted or cached
+	LegacyEgressAdmission   *LegacyAccountEgressAdmission `json:"-"` // request-local rollout-off identity fence
+	OpenAI429Attempt        *OpenAI429Attempt             `json:"-"` // request-local recovery generation and probe lease
+	EgressPoolWrite         *ReplaceAccountPoolInput      `json:"-"` // request-local admin write intent
 	Concurrency             int
 	Priority                int
 	// RateMultiplier 账号计费倍率（>=0，允许 0 表示该账号计费为 0）。
@@ -189,6 +196,36 @@ func (a *Account) EffectiveLoadFactor() int {
 		return a.Concurrency
 	}
 	return 1
+}
+
+func (a *Account) ConcurrencyPerEgress() int {
+	if a == nil {
+		return 0
+	}
+	return a.Concurrency
+}
+
+// EffectiveEgressCapacity is separate from EffectiveLoadFactor so rollout-off
+// schedulers keep their existing behavior. Pool capacity counts only distinct,
+// fully active public IP identities.
+func (a *Account) EffectiveEgressCapacity() int {
+	if a == nil {
+		return 0
+	}
+	if a.EgressMode != EgressModePool {
+		return a.Concurrency
+	}
+	identities := make(map[int64]struct{}, len(a.EgressBindings))
+	for i := range a.EgressBindings {
+		binding := &a.EgressBindings[i]
+		if binding.Status != AccountEgressBindingStatusActive || binding.Route == nil ||
+			binding.Route.State != EgressRouteStateActive || binding.Route.ExpectedIdentity == nil ||
+			binding.Route.ExpectedIdentity.Status != EgressIdentityStatusActive {
+			continue
+		}
+		identities[binding.Route.ExpectedIdentity.ID] = struct{}{}
+	}
+	return len(identities) * a.ConcurrencyPerEgress()
 }
 
 func (a *Account) IsSchedulable() bool {

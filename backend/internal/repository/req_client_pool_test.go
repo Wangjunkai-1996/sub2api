@@ -85,7 +85,16 @@ func TestGetSharedReqClient_ImpersonateAndProxy(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, client)
-	require.Equal(t, "http://proxy.local:8080|4s|true|false", buildReqClientKey(opts))
+	require.Equal(t, "http://proxy.local:8080|4s|true|false|false", buildReqClientKey(opts))
+}
+
+func TestCreatePrivacyReqClientDisablesRedirects(t *testing.T) {
+	sharedReqClients = sync.Map{}
+	client, err := CreatePrivacyReqClient("http://proxy.local:8080")
+	require.NoError(t, err)
+	require.NotNil(t, client.GetClient().CheckRedirect)
+	err = client.GetClient().CheckRedirect(&http.Request{}, nil)
+	require.ErrorIs(t, err, http.ErrUseLastResponse)
 }
 
 func TestGetSharedReqClient_InvalidProxyURL(t *testing.T) {
@@ -115,6 +124,9 @@ func TestCreateOpenAIReqClient_Timeout120Seconds(t *testing.T) {
 	client, err := createOpenAIReqClient("http://proxy.local:8080")
 	require.NoError(t, err)
 	require.Equal(t, 120*time.Second, client.GetClient().Timeout)
+	require.NotNil(t, client.GetClient().CheckRedirect)
+	err = client.GetClient().CheckRedirect(&http.Request{}, nil)
+	require.ErrorIs(t, err, http.ErrUseLastResponse)
 }
 
 func TestCreateGeminiReqClient_ForceHTTP2Disabled(t *testing.T) {

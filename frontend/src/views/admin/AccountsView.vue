@@ -14,7 +14,7 @@
           <AccountTableActions
             :loading="loading"
             @refresh="handleManualRefresh"
-            @create="showCreate = true"
+            @create="openCreate"
           >
             <template #after>
               <!-- Auto Refresh Dropdown -->
@@ -327,18 +327,46 @@
             />
           </template>
           <template #cell-proxy="{ row }">
-            <div class="flex flex-col gap-1">
-              <div v-if="row.proxy" class="flex items-center gap-2">
-                <span class="text-sm text-gray-700 dark:text-gray-300">{{ row.proxy.name }}</span>
-                <span v-if="row.proxy.country_code" class="text-xs text-gray-500 dark:text-gray-400">
-                  ({{ row.proxy.country_code }})
+            <div class="flex min-w-[9rem] flex-col gap-1">
+              <span
+                v-if="isInheritedEgress(row)"
+                class="inline-flex w-fit items-center gap-1 rounded bg-sky-50 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-300"
+              >
+                <Icon name="link" size="xs" />
+                {{ t('admin.accounts.egressPool.inherited') }}
+              </span>
+              <div v-if="accountEgressRoutes(row).length" class="flex max-w-[15rem] flex-wrap gap-1">
+                <span
+                  v-for="route in accountEgressRoutes(row).slice(0, 2)"
+                  :key="route.id"
+                  class="inline-flex min-w-0 max-w-[7rem] items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-700 dark:bg-dark-700 dark:text-gray-200"
+                  :title="egressRouteTitle(route)"
+                >
+                  <Icon :name="route.kind === 'direct' ? 'server' : 'globe'" size="xs" class="shrink-0" />
+                  <span class="truncate">{{ route.name }}</span>
+                </span>
+                <span
+                  v-if="accountEgressRoutes(row).length > 2"
+                  class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600 dark:bg-dark-700 dark:text-gray-300"
+                >
+                  +{{ accountEgressRoutes(row).length - 2 }}
                 </span>
               </div>
-              <span v-else class="text-sm text-gray-400 dark:text-dark-500">-</span>
-              <div v-if="row.proxy && row.proxy.expires_at" class="flex items-center gap-2 text-xs">
-                <span class="text-gray-600 dark:text-gray-300">{{ formatDateTime(row.proxy.expires_at) }}</span>
-                <span :class="proxyExpiryBadge(row.proxy)">{{ proxyExpiryText(row.proxy) }}</span>
+              <span v-else-if="configuredEgressCount(row) > 0" class="text-xs text-gray-600 dark:text-gray-300">
+                {{ t('admin.accounts.egressPool.routeCount', { count: configuredEgressCount(row) }) }}
+              </span>
+              <div v-else-if="row.proxy" class="flex items-center gap-2">
+                <span class="text-sm text-gray-700 dark:text-gray-300">{{ row.proxy.name }}</span>
+                <span v-if="row.proxy.country_code" class="text-xs text-gray-500 dark:text-gray-400">({{ row.proxy.country_code }})</span>
               </div>
+              <span v-else class="text-sm text-gray-400 dark:text-dark-500">-</span>
+              <span
+                v-if="degradedEgressCount(row) > 0"
+                class="inline-flex w-fit items-center gap-1 text-xs text-amber-700 dark:text-amber-300"
+              >
+                <Icon name="exclamationTriangle" size="xs" />
+                {{ t('admin.accounts.egressPool.degraded') }}
+              </span>
               <div v-if="row.proxy_fallback_origin_id" class="flex items-center gap-1">
                 <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" :title="t('admin.accounts.fallbackActiveTip', { origin: row.proxy_fallback_origin_name })">
                   {{ t('admin.accounts.fallbackActive') }}
@@ -454,8 +482,33 @@
       </template>
       <template #pagination><Pagination v-if="pagination.total > 0" :page="pagination.page" :total="pagination.total" :page-size="pagination.page_size" @update:page="handlePageChange" @update:pageSize="handlePageSizeChange" /></template>
     </TablePageLayout>
-    <CreateAccountModal :show="showCreate" :proxies="proxies" :groups="groups" @close="showCreate = false" @created="reload" />
-    <EditAccountModal :show="showEdit" :account="edAcc" :proxies="proxies" :groups="groups" @close="showEdit = false" @updated="handleAccountUpdated" />
+    <CreateAccountModal
+      :show="showCreate"
+      :proxies="proxyOptions"
+      :egress-routes="egressRoutes"
+      :default-egress-route-id="egressDefaultRouteId"
+      :default-egress-concurrency="egressDefaultConcurrency"
+      :egress-mutation-enabled="egressMutationEnabled"
+      :egress-verifying-route-id="egressVerifyingRouteId"
+      :egress-verify-errors="egressVerifyErrors"
+      :groups="groups"
+      @close="showCreate = false"
+      @created="reload"
+      @verify-egress-route="verifyEgressRoute"
+    />
+    <EditAccountModal
+      :show="showEdit"
+      :account="edAcc"
+      :proxies="proxyOptions"
+      :egress-routes="egressRoutes"
+      :egress-mutation-enabled="egressMutationEnabled"
+      :egress-verifying-route-id="egressVerifyingRouteId"
+      :egress-verify-errors="egressVerifyErrors"
+      :groups="groups"
+      @close="showEdit = false"
+      @updated="handleAccountUpdated"
+      @verify-egress-route="verifyEgressRoute"
+    />
     <ReAuthAccountModal :show="showReAuth" :account="reAuthAcc" @close="closeReAuthModal" @reauthorized="handleAccountUpdated" />
     <AccountTestModal :show="showTest" :account="testingAcc" @close="closeTestModal" />
     <AccountStatsModal :show="showStats" :account="statsAcc" @close="closeStatsModal" />
@@ -469,10 +522,17 @@
       :selected-platforms="selPlatforms"
       :selected-types="selTypes"
       :target="bulkEditTarget ?? undefined"
-      :proxies="proxies"
+      :proxies="proxyOptions"
+      :egress-routes="egressRoutes"
+      :default-egress-route-id="egressDefaultRouteId"
+      :default-egress-concurrency="egressDefaultConcurrency"
+      :egress-mutation-enabled="egressMutationEnabled"
+      :egress-verifying-route-id="egressVerifyingRouteId"
+      :egress-verify-errors="egressVerifyErrors"
       :groups="groups"
       @close="showBulkEdit = false"
       @updated="handleBulkUpdated"
+      @verify-egress-route="verifyEgressRoute"
     />
     <TempUnschedStatusModal :show="showTempUnsched" :account="tempUnschedAcc" @close="showTempUnsched = false" @reset="handleTempUnschedReset" />
     <ConfirmDialog :show="showDeleteDialog" :title="t('admin.accounts.deleteAccount')" :message="t('admin.accounts.deleteConfirm', { name: deletingAcc?.name })" :confirm-text="t('common.delete')" :cancel-text="t('common.cancel')" :danger="true" @confirm="confirmDelete" @cancel="showDeleteDialog = false" />
@@ -500,6 +560,7 @@ import { CONCRETE_PLATFORM_OPTIONS } from '@/constants/platforms'
 import { useTableLoader } from '@/composables/useTableLoader'
 import { useSwipeSelect, type SwipeSelectVirtualContext } from '@/composables/useSwipeSelect'
 import { useTableSelection } from '@/composables/useTableSelection'
+import { useAccountEgressCatalog } from '@/composables/useAccountEgressCatalog'
 import { useStepUp, isStepUpBlocked, isStepUpCancelled, stepUpBlockReason } from '@/composables/useStepUp'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
 import AppLayout from '@/components/layout/AppLayout.vue'
@@ -533,18 +594,31 @@ import TLSFingerprintProfilesModal from '@/components/admin/TLSFingerprintProfil
 import { fetchAllAccountIds } from '@/utils/accountSelection'
 import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { formatDateTime, formatRelativeTime } from '@/utils/format'
-import { proxyExpiryBadgeClass, proxyExpiryLabelKey } from '@/utils/proxyExpiry'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
-import { formatMultiplier } from '@/utils/formatters'
-import type { Account, AccountListItem, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
+import { formatMultiplier, maskIPAddress } from '@/utils/formatters'
+import type { Account, AccountListItem, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, AccountUsageRequestResult, AssignableEgressRoute, AdminGroup, ProxyOption, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
 const appStore = useAppStore()
 const authStore = useAuthStore()
 
-const proxies = ref<AccountProxy[]>([])
+const {
+  routes: egressRoutes,
+  capabilities: egressCapabilities,
+  defaultRouteId: egressDefaultRouteId,
+  defaultConcurrency: egressDefaultConcurrency,
+  loading: egressCatalogLoading,
+  verifyingRouteId: egressVerifyingRouteId,
+  verifyErrors: egressVerifyErrors,
+  refresh: refreshAssignableEgressRoutes,
+  verify: verifyEgressRoute
+} = useAccountEgressCatalog()
+const egressMutationEnabled = computed(
+  () => !egressCatalogLoading.value && egressCapabilities.value.mutation_enabled
+)
+const proxyOptions = ref<ProxyOption[]>([])
 const groups = ref<AdminGroup[]>([])
 const groupsByID = computed(() => new Map(groups.value.map(group => [group.id, group])))
 const accountGroupsForRow = (account: Pick<AccountListItem, 'group_ids'>): AdminGroup[] => {
@@ -750,9 +824,36 @@ const usageBatchRequestTokenByAccountId = ref<Record<string, number>>({})
 const usageBatchCache = new Map<number, { data: AccountUsageInfo; ts: number }>()
 const USAGE_BATCH_CACHE_TTL = 5 * 60 * 1000
 const pendingUsageBatchIds = new Set<number>()
+const usageBatchWaiters = new Map<
+  number,
+  Array<{ token: number; resolve: (result: AccountUsageRequestResult) => void }>
+>()
 let usageBatchFlushTimer: ReturnType<typeof setTimeout> | null = null
 let queuedUsageBatchForce = false
 let usageBatchRequestToken = 0
+
+const settleUsageBatchWaiters = (
+  accountID: number,
+  requestToken: number,
+  result: AccountUsageRequestResult
+) => {
+  const waiters = usageBatchWaiters.get(accountID)
+  if (!waiters?.length) return
+
+  const pending = [] as typeof waiters
+  for (const waiter of waiters) {
+    if (waiter.token <= requestToken) {
+      waiter.resolve(result)
+    } else {
+      pending.push(waiter)
+    }
+  }
+  if (pending.length > 0) {
+    usageBatchWaiters.set(accountID, pending)
+  } else {
+    usageBatchWaiters.delete(accountID)
+  }
+}
 
 const buildDefaultTodayStats = (): WindowStats => ({
   requests: 0,
@@ -835,6 +936,10 @@ const flushQueuedUsageBatch = async () => {
       } else {
         usageBatchCache.delete(accountID)
       }
+      settleUsageBatchWaiters(accountID, requestTokensByAccount[key], {
+        usage,
+        error: nextErrors[key]
+      })
     }
 
     usageBatchByAccountId.value = nextUsage
@@ -850,6 +955,10 @@ const flushQueuedUsageBatch = async () => {
       }
       nextErrors[key] = 'Failed'
       nextLoading[key] = false
+      settleUsageBatchWaiters(accountID, requestTokensByAccount[key], {
+        usage: null,
+        error: 'Failed'
+      })
     }
     usageBatchErrorByAccountId.value = nextErrors
     usageBatchLoadingByAccountId.value = nextLoading
@@ -857,9 +966,13 @@ const flushQueuedUsageBatch = async () => {
   }
 }
 
-const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
-  if (!isDesktopViewport.value) return
-  if (!accountSupportsBatchUsage(account)) return
+const queueBatchedUsage = (
+  account: Account,
+  options?: { force?: boolean }
+): Promise<AccountUsageRequestResult> => {
+  if (!isDesktopViewport.value || !accountSupportsBatchUsage(account)) {
+    return Promise.resolve({ usage: null, error: null })
+  }
 
   const force = options?.force === true
   const cacheKey = account.id
@@ -872,7 +985,7 @@ const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
     if (cached && Date.now() - cached.ts < USAGE_BATCH_CACHE_TTL) {
       setUsageBatchState(cacheKey, cached.data, null)
       setUsageBatchLoading(cacheKey, false)
-      return
+      return Promise.resolve({ usage: cached.data, error: null })
     }
   }
 
@@ -880,18 +993,27 @@ const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
     ...usageBatchErrorByAccountId.value,
     [key]: null
   }
+  const requestToken = ++usageBatchRequestToken
   usageBatchRequestTokenByAccountId.value = {
     ...usageBatchRequestTokenByAccountId.value,
-    [key]: ++usageBatchRequestToken
+    [key]: requestToken
   }
   setUsageBatchLoading(cacheKey, true)
   pendingUsageBatchIds.add(cacheKey)
   queuedUsageBatchForce = queuedUsageBatchForce || force
 
-  if (usageBatchFlushTimer !== null) return
-  usageBatchFlushTimer = setTimeout(() => {
-    void flushQueuedUsageBatch()
-  }, 0)
+  const completion = new Promise<AccountUsageRequestResult>((resolve) => {
+    const waiters = usageBatchWaiters.get(cacheKey) ?? []
+    waiters.push({ token: requestToken, resolve })
+    usageBatchWaiters.set(cacheKey, waiters)
+  })
+
+  if (usageBatchFlushTimer === null) {
+    usageBatchFlushTimer = setTimeout(() => {
+      void flushQueuedUsageBatch()
+    }, 0)
+  }
+  return completion
 }
 
 const refreshTodayStatsBatch = async () => {
@@ -1424,10 +1546,19 @@ const inAutoRefreshSilentWindow = () => {
   return Date.now() < autoRefreshSilentUntil.value
 }
 
+const egressCapacityBreakdownKey = (account: Account) => (
+  JSON.stringify(account.egress_summary?.bindings ?? [])
+)
+
 const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
   return (
     current.updated_at !== next.updated_at ||
     current.current_concurrency !== next.current_concurrency ||
+    current.egress_summary?.current_concurrency !== next.egress_summary?.current_concurrency ||
+    current.egress_summary?.effective_capacity !== next.egress_summary?.effective_capacity ||
+    current.egress_summary?.eligible_route_count !== next.egress_summary?.eligible_route_count ||
+    egressCapacityBreakdownKey(current) !== egressCapacityBreakdownKey(next) ||
+    current.egress_revision !== next.egress_revision ||
     current.current_window_cost !== next.current_window_cost ||
     current.active_sessions !== next.active_sessions ||
     current.schedulable !== next.schedulable ||
@@ -1837,7 +1968,7 @@ const allColumns = computed(() => {
   }
   c.push({ key: 'usage', label: t('admin.accounts.columns.usageWindows'), sortable: false })
   c.push(
-    { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
+    { key: 'proxy', label: t('admin.accounts.columns.egress'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },
     { key: 'scheduler_score', label: t('admin.accounts.columns.schedulerScore'), sortable: false },
     { key: 'rate_multiplier', label: t('admin.accounts.columns.billingRateMultiplier'), sortable: true },
@@ -1863,6 +1994,34 @@ const cols = computed(() =>
   )
 )
 
+const refreshProxyOptions = async () => {
+  try {
+    const options = await adminAPI.proxies.getOptions()
+    proxyOptions.value = options
+  } catch (error) {
+    proxyOptions.value = []
+    throw error
+  }
+}
+
+const refreshAccountAssignmentCatalogs = async () => {
+  const [catalogResult, proxyResult] = await Promise.allSettled([
+    refreshAssignableEgressRoutes(),
+    refreshProxyOptions()
+  ])
+  if (catalogResult.status === 'rejected') {
+    console.error('Failed to load assignable egress routes:', catalogResult.reason)
+  }
+  if (proxyResult.status === 'rejected') {
+    console.error('Failed to load proxy options:', proxyResult.reason)
+  }
+}
+
+const openCreate = async () => {
+  await refreshAccountAssignmentCatalogs()
+  showCreate.value = true
+}
+
 const accountDetailLoading = new Set<number>()
 const loadAccountDetails = async (account: Pick<AccountListItem, 'id'>): Promise<Account | null> => {
   if (accountDetailLoading.has(account.id)) return null
@@ -1878,10 +2037,29 @@ const loadAccountDetails = async (account: Pick<AccountListItem, 'id'>): Promise
   }
 }
 
-const handleEdit = async (a: AccountListItem) => {
-  const account = await loadAccountDetails(a)
-  if (!account) return
-  edAcc.value = account
+let editRequestGeneration = 0
+const handleEdit = async (a: Account) => {
+  const requestGeneration = ++editRequestGeneration
+  const [catalogResult, proxyResult, accountResult] = await Promise.allSettled([
+    refreshAssignableEgressRoutes(),
+    refreshProxyOptions(),
+    adminAPI.accounts.getById(a.id)
+  ])
+  if (requestGeneration !== editRequestGeneration) return
+
+  if (catalogResult.status === 'rejected') {
+    console.error('Failed to load assignable egress routes:', catalogResult.reason)
+  }
+  if (proxyResult.status === 'rejected') {
+    console.error('Failed to load proxy options:', proxyResult.reason)
+  }
+  if (accountResult.status === 'rejected') {
+    console.error('Failed to load account details:', accountResult.reason)
+    appStore.showError(extractApiErrorMessage(accountResult.reason, t('admin.accounts.failedToLoad')))
+    return
+  }
+
+  edAcc.value = accountResult.value
   showEdit.value = true
 }
 const openMenu = (a: Account, e: MouseEvent) => {
@@ -2133,7 +2311,8 @@ const collectSelectionMetadata = (rows: Account[]) => {
   return { selectedPlatforms, selectedTypes }
 }
 
-const openBulkEditSelected = () => {
+const openBulkEditSelected = async () => {
+  await refreshAccountAssignmentCatalogs()
   bulkEditTarget.value = {
     mode: 'selected',
     accountIds: [...selIds.value],
@@ -2145,7 +2324,10 @@ const openBulkEditSelected = () => {
 
 const openBulkEditFiltered = async () => {
   const filters = buildBulkEditFilterSnapshot()
-  const preview = await adminAPI.accounts.list(1, 100, filters)
+  const [preview] = await Promise.all([
+    adminAPI.accounts.list(1, 100, filters),
+    refreshAccountAssignmentCatalogs()
+  ])
   const { selectedPlatforms, selectedTypes } = collectSelectionMetadata(preview.items)
   bulkEditTarget.value = {
     mode: 'filtered',
@@ -2222,8 +2404,10 @@ const accountMatchesCurrentFilters = (account: Account) => {
 const mergeRuntimeFields = (oldAccount: Account, updatedAccount: Account): Account => ({
   ...updatedAccount,
   current_concurrency: updatedAccount.current_concurrency ?? oldAccount.current_concurrency,
+  egress_summary: updatedAccount.egress_summary ?? oldAccount.egress_summary,
+  egress_pool: updatedAccount.egress_pool ?? oldAccount.egress_pool,
   current_window_cost: updatedAccount.current_window_cost ?? oldAccount.current_window_cost,
-  active_sessions: updatedAccount.active_sessions ?? oldAccount.active_sessions
+  active_sessions: updatedAccount.active_sessions ?? oldAccount.active_sessions,
 })
 
 const syncPaginationAfterLocalRemoval = () => {
@@ -2259,6 +2443,7 @@ const patchAccountInList = (updatedAccount: Account) => {
   accounts.value = nextAccounts
   syncAccountRefs(mergedAccount)
 }
+
 const patchUpstreamBillingSnapshot = (accountID: number, snapshot: UpstreamBillingProbeSnapshot) => {
   const account = accounts.value.find(item => item.id === accountID)
   if (!account) return
@@ -2531,11 +2716,43 @@ const isExpired = (value: number | null) => {
   if (!value) return false
   return value * 1000 <= Date.now()
 }
-// 所绑定代理的有效期(逻辑同 /admin/proxies,见 utils/proxyExpiry)
-const proxyExpiryBadge = (p: AccountProxy): string => proxyExpiryBadgeClass(p.expires_at, p.status)
-const proxyExpiryText = (p: AccountProxy): string => {
-  const { key, params } = proxyExpiryLabelKey(p.expires_at, p.status)
-  return params ? t(key, params) : t(key)
+const accountEgressRoutes = (account: Account): AssignableEgressRoute[] => {
+  const embedded = account.egress_summary?.routes ?? account.egress_pool?.routes ?? []
+  if (embedded.length > 0) return embedded
+  const routeIDs = account.egress_pool?.route_ids ?? []
+  return routeIDs
+    .map((id) => egressRoutes.value.find((route) => route.id === id))
+    .filter((route): route is AssignableEgressRoute => route != null)
+}
+
+const configuredEgressCount = (account: Account): number =>
+  account.egress_summary?.configured_route_count
+  ?? account.egress_pool?.route_ids?.length
+  ?? accountEgressRoutes(account).length
+
+const degradedEgressCount = (account: Account): number => {
+  if (account.egress_summary?.degraded_route_count != null) {
+    return account.egress_summary.degraded_route_count
+  }
+  const configured = account.egress_summary?.configured_route_count
+  const eligible = account.egress_summary?.eligible_route_count
+  return configured != null && eligible != null ? Math.max(0, configured - eligible) : 0
+}
+
+const isInheritedEgress = (account: Account): boolean =>
+  account.parent_account_id != null
+  || account.egress_mode === 'inherited'
+  || account.egress_summary?.inherited === true
+  || account.egress_pool?.inherited === true
+
+const egressRouteTitle = (route: AssignableEgressRoute): string => {
+  const parts = [
+    route.name,
+    maskIPAddress(route.observed_ip || route.public_ip || route.ip_address),
+    route.country_code || route.country
+  ]
+  if (route.probe_latency_ms != null) parts.push(`${route.probe_latency_ms}ms`)
+  return parts.filter((part): part is string => Boolean(part)).join(' / ')
 }
 
 // 表格滚动时关闭行操作菜单，并让顶部工具菜单继续贴紧触发按钮。
@@ -2576,14 +2793,16 @@ onMounted(async () => {
 
   load()
   loadUpstreamBillingProbeGlobalState()
-  const [proxiesResult, groupsResult] = await Promise.allSettled([
-    adminAPI.proxies.getAll(),
+  const [egressResult, proxyResult, groupsResult] = await Promise.allSettled([
+    refreshAssignableEgressRoutes(),
+    refreshProxyOptions(),
     adminAPI.groups.getAll()
   ])
-  if (proxiesResult.status === 'fulfilled') {
-    proxies.value = proxiesResult.value
-  } else {
-    console.error('Failed to load proxies:', proxiesResult.reason)
+  if (egressResult.status === 'rejected') {
+    console.error('Failed to load assignable egress routes:', egressResult.reason)
+  }
+  if (proxyResult.status === 'rejected') {
+    console.error('Failed to load proxy options:', proxyResult.reason)
   }
   if (groupsResult.status === 'fulfilled') {
     groups.value = groupsResult.value

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
+	"github.com/Wei-Shaw/sub2api/migrations"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -35,10 +37,11 @@ const (
 )
 
 var (
-	integrationDB        *sql.DB
-	integrationDSN       string
-	integrationEntClient *dbent.Client
-	integrationRedis     *redisclient.Client
+	integrationDB          *sql.DB
+	integrationDSN         string
+	integrationPostgresDSN string
+	integrationEntClient   *dbent.Client
+	integrationRedis       *redisclient.Client
 
 	redisNamespaceSeq uint64
 )
@@ -93,12 +96,13 @@ func TestMain(m *testing.M) {
 	}
 
 	integrationDSN = dsn
+	integrationPostgresDSN = dsn
 	integrationDB, err = openSQLWithRetry(ctx, dsn, 30*time.Second)
 	if err != nil {
 		log.Printf("failed to open sql db: %v", err)
 		os.Exit(1)
 	}
-	if err := ApplyMigrations(ctx, integrationDB); err != nil {
+	if err := applyIntegrationMigrations(ctx, integrationDB); err != nil {
 		log.Printf("failed to apply db migrations: %v", err)
 		os.Exit(1)
 	}
@@ -134,6 +138,39 @@ func TestMain(m *testing.M) {
 	_ = integrationDB.Close()
 
 	os.Exit(code)
+}
+
+func applyIntegrationMigrations(ctx context.Context, db *sql.DB) error {
+	return applyIntegrationMigrationsFS(ctx, db, migrations.FS)
+}
+
+func applyIntegrationMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+	err := applyMigrationsFS(ctx, db, fsys)
+	if err == nil || !strings.Contains(err.Error(), "248_account_egress_direct_default.sql: pq: sys1-ipv4 proxy route is required") {
+		return err
+	}
+
+	_, err = db.ExecContext(ctx, `
+WITH proxy AS (
+    INSERT INTO proxies (name, protocol, host, port)
+    VALUES ('sys1-ipv4', 'http', '192.0.2.248', 80)
+    RETURNING id
+), identity AS (
+    INSERT INTO egress_identities (public_ip, status)
+    VALUES ('192.0.2.248', 'active')
+    RETURNING id
+)
+INSERT INTO egress_routes (
+    kind, proxy_id, state, expected_identity_id,
+    last_observed_ip, last_probed_at, verified_at
+)
+SELECT 'proxy', proxy.id, 'active', identity.id,
+       '192.0.2.248', now(), now()
+FROM proxy CROSS JOIN identity`)
+	if err != nil {
+		return fmt.Errorf("seed migration 248 integration route: %w", err)
+	}
+	return applyMigrationsFS(ctx, db, fsys)
 }
 
 func dockerIsAvailable(ctx context.Context) bool {

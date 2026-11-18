@@ -23,6 +23,16 @@ func (s *ProxyProbeServiceSuite) SetupTest() {
 	s.ctx = context.Background()
 	s.prober = &proxyProbeService{
 		allowPrivateHosts: true,
+		configuredProbeURLs: []configuredProbeTarget{
+			{url: "http://ip-api.com/json/?lang=zh-CN", parser: "ip-api"},
+			{url: "http://api64.ipify.org?format=json", parser: "ipify"},
+		},
+	}
+}
+
+func (s *ProxyProbeServiceSuite) TestDefaultProbeURLsUseHTTPS() {
+	for _, probe := range probeURLs {
+		require.True(s.T(), strings.HasPrefix(probe.url, "https://"), probe.url)
 	}
 }
 
@@ -101,6 +111,11 @@ func (s *ProxyProbeServiceSuite) TestProbeProxy_AllFailed() {
 	_, _, err := s.prober.ProbeProxy(s.ctx, s.proxySrv.URL)
 	require.Error(s.T(), err)
 	require.ErrorContains(s.T(), err, "all probe URLs failed")
+}
+
+func (s *ProxyProbeServiceSuite) TestAggregateProbeErrorsPreservesEarlierHTTPStatus() {
+	err := aggregateProbeErrors([]string{"request failed with status: 503"}, io.ErrUnexpectedEOF)
+	require.ErrorContains(s.T(), err, "status: 503")
 }
 
 func (s *ProxyProbeServiceSuite) TestProbeProxy_InvalidJSON() {

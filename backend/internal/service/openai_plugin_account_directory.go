@@ -109,8 +109,12 @@ func accountReadableSnapshotJSON(account *Account) []byte {
 	}
 	clone := *account
 	clone.Credentials = nil
+	clone.Extra = FilterRetiredAccountExtra(account.Extra)
 	clone.Groups = nil
 	clone.AccountGroups = nil
+	clone.EgressMode = ""
+	clone.EgressRevision = 0
+	clone.EgressBindings = nil
 	data, err := json.Marshal(&clone)
 	if err != nil {
 		return nil
