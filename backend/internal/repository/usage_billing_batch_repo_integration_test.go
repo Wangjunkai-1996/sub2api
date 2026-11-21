@@ -233,6 +233,48 @@ func TestUsageBillingRepositoryApplyBatch_DuplicateAndConflictingRequests(t *tes
 	require.Equal(t, 3, state.dedupRows)
 }
 
+func TestUsageBillingRepositoryApplyAndApplyBatchSameRequestIDAreIdempotent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := testEntClient(t)
+	repo := NewUsageBillingRepository(client, integrationDB)
+	f := newBatchBillingFixture(t, client, 10)
+
+	steps := []batchBillingStep{{key: 'B', balance: 1}}
+	legacyCmd := f.commands("mixed-version-same-request", steps)[0]
+	batchCmd := f.commands("mixed-version-same-request", steps)[0]
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var legacyResult *service.UsageBillingApplyResult
+	var legacyErr error
+	var batchResults []service.UsageBillingBatchOutcome
+	var batchErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		legacyResult, legacyErr = repo.Apply(ctx, legacyCmd)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		batchResults, batchErr = repo.ApplyBatch(ctx, []*service.UsageBillingCommand{batchCmd})
+	}()
+	close(start)
+	wg.Wait()
+
+	require.NoError(t, legacyErr)
+	require.NoError(t, batchErr)
+	require.Len(t, batchResults, 1)
+	require.NoError(t, batchResults[0].Err)
+	require.NotEqual(t, legacyResult.Applied, batchResults[0].Result.Applied)
+
+	state := readBatchBillingState(t, ctx, f)
+	require.Equal(t, "9.00000000", state.balance)
+	require.Equal(t, 1, state.dedupRows)
+}
+
 func TestUsageBillingRepositoryApplyBatch_ArchivedRequestsAreNotReapplied(t *testing.T) {
 	ctx := context.Background()
 	client := testEntClient(t)

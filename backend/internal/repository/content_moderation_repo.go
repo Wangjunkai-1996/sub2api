@@ -290,9 +290,9 @@ func buildContentModerationLogWhere(filter service.ContentModerationLogFilter) (
 	}
 	if search := strings.TrimSpace(filter.Search); search != "" {
 		like := "%" + search + "%"
-		args = append(args, like, like, like, like, like)
-		idx := len(args) - 4
-		where = append(where, fmt.Sprintf("(l.request_id ILIKE $%d OR l.user_email ILIKE $%d OR l.api_key_name ILIKE $%d OR l.model ILIKE $%d OR l.input_excerpt ILIKE $%d)", idx, idx+1, idx+2, idx+3, idx+4))
+		args = append(args, like, like, like, like, like, like)
+		idx := len(args) - 5
+		where = append(where, fmt.Sprintf("(l.request_id ILIKE $%d OR l.user_email ILIKE $%d OR l.api_key_name ILIKE $%d OR l.model ILIKE $%d OR l.input_excerpt ILIKE $%d OR l.error ILIKE $%d)", idx, idx+1, idx+2, idx+3, idx+4, idx+5))
 	}
 	if filter.From != nil && !filter.From.IsZero() {
 		add("l.created_at >= $%d", *filter.From)

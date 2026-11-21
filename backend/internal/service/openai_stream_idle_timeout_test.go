@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -78,7 +79,8 @@ func TestRelayStallsIdleFailoverBoundary(t *testing.T) {
 				require.Contains(t, rec.Body.String(), "stream_timeout")
 			} else {
 				require.ErrorAs(t, err, &failover)
-				require.True(t, failover.SafeToFailoverAfterWrite, "idle failover must share the one-switch first-output budget")
+				require.True(t, failover.SafeToFailoverAfterWrite)
+				require.True(t, failover.FirstOutputTimeout, "idle failover must share the one-switch first-output budget")
 				require.Empty(t, rec.Body.String())
 			}
 		})
@@ -105,8 +107,35 @@ func TestRelayStallsIdleFailoverAfterKeepaliveOnly(t *testing.T) {
 	var failover *UpstreamFailoverError
 	require.ErrorAs(t, err, &failover)
 	require.True(t, failover.SafeToFailoverAfterWrite)
+	require.True(t, failover.FirstOutputTimeout)
 	body := rec.Body.String()
 	require.NotEmpty(t, body, "keepalive comments should have committed the stream")
 	require.Empty(t, strings.ReplaceAll(body, ":\n\n", ""), "only keepalive comments may precede the failover")
 	require.Equal(t, -1, OpenAICompactKeepaliveAdjustedWrittenSize(c), "keepalive bytes must not count as client output")
+}
+
+func TestRelayStallsIdleResumesAfterLateOutput(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 1, OpenAIFirstOutputTimeoutSeconds: 5,
+		}}}
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		defer writer.Close()
+		go func() {
+			time.Sleep(1500 * time.Millisecond)
+			_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n")
+		}()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		start := time.Now()
+		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: reader}
+		_, err := svc.handleStreamingResponse(ctx.Request.Context(), resp, ctx, &Account{ID: 1, Platform: PlatformOpenAI}, start, "model", "model")
+		var failover *UpstreamFailoverError
+		require.ErrorContains(t, err, "stream data interval timeout")
+		require.False(t, errors.As(err, &failover))
+		require.Equal(t, 2500*time.Millisecond, time.Since(start))
+		require.Contains(t, rec.Body.String(), `"delta":"late"`)
+	})
 }

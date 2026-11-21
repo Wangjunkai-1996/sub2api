@@ -966,3 +966,76 @@ func TestOpenAITokenProvider_NoRefreshTokenExpired_DisablesAccount(t *testing.T)
 	require.Equal(t, account.ID, blocker.accounts[0].ID)
 	require.Equal(t, "missing_refresh_token", blocker.reasons[0])
 }
+
+func newOpenAIProviderRefreshTest(t *testing.T, fresh *Account, executor *refreshAPIExecutorStub) *OpenAITokenProvider {
+	t.Helper()
+	repo := &refreshAPIAccountRepo{account: fresh}
+	provider := NewOpenAITokenProvider(repo, nil, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, nil), executor)
+	return provider
+}
+
+func openAIRefreshTestAccount(status string, expiresIn time.Duration) *Account {
+	return &Account{
+		ID:       2300,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   status,
+		Credentials: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+			"expires_at":    time.Now().Add(expiresIn).UTC().Format(time.RFC3339),
+		},
+	}
+}
+
+func TestOpenAITokenProvider_RefreshInvalidGrantReturnsImmediately(t *testing.T) {
+	account := openAIRefreshTestAccount(StatusActive, time.Minute)
+	executor := &refreshAPIExecutorStub{needsRefresh: true, err: errors.New("invalid_grant: refresh token revoked")}
+	provider := newOpenAIProviderRefreshTest(t, account, executor)
+
+	_, err := provider.GetAccessToken(withOAuthRefreshRequestPath(context.Background()), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid_grant")
+	require.Equal(t, 1, executor.refreshCalls)
+}
+
+func TestOpenAITokenProvider_RefreshDisabledAccountReturnsStateChanged(t *testing.T) {
+	caller := openAIRefreshTestAccount(StatusActive, time.Minute)
+	fresh := openAIRefreshTestAccount(StatusError, time.Minute)
+	provider := newOpenAIProviderRefreshTest(t, fresh, &refreshAPIExecutorStub{needsRefresh: true})
+
+	_, err := provider.GetAccessToken(withOAuthRefreshRequestPath(context.Background()), caller)
+	require.ErrorIs(t, err, errOAuthRefreshAccountStateChanged)
+}
+
+func TestOpenAITokenProvider_TransientRefreshUsesStillValidToken(t *testing.T) {
+	account := openAIRefreshTestAccount(StatusActive, time.Minute)
+	executor := &refreshAPIExecutorStub{needsRefresh: true, err: errors.New("temporary OAuth provider unavailable")}
+	provider := newOpenAIProviderRefreshTest(t, account, executor)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "old-access-token", token)
+}
+
+func TestOpenAITokenProvider_TransientRefreshDoesNotUseExpiredToken(t *testing.T) {
+	account := openAIRefreshTestAccount(StatusActive, -time.Minute)
+	executor := &refreshAPIExecutorStub{needsRefresh: true, err: errors.New("temporary OAuth provider unavailable")}
+	provider := newOpenAIProviderRefreshTest(t, account, executor)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "temporary OAuth provider unavailable")
+	require.Empty(t, token)
+}
+
+func TestOpenAITokenProvider_RefreshCancellationIsReturnedUnchanged(t *testing.T) {
+	account := openAIRefreshTestAccount(StatusActive, time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	provider := newOpenAIProviderRefreshTest(t, account, &refreshAPIExecutorStub{needsRefresh: true})
+
+	_, err := provider.GetAccessToken(withOAuthRefreshRequestPath(ctx), account)
+	require.ErrorIs(t, err, context.Canceled)
+}

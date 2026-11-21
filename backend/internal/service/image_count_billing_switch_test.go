@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -20,6 +21,57 @@ func TestImageCountBillingApplies(t *testing.T) {
 	require.False(t, imageCountBillingApplies(enabled, false), "混合请求不能受开关影响")
 	require.False(t, imageCountBillingApplies(disabled, true))
 	require.False(t, imageCountBillingApplies(nil, true))
+}
+
+func TestImageEndpointBillingPreservesActualOutputBoundary(t *testing.T) {
+	const model = "gpt-image-2"
+	groupID := int64(905)
+	for _, perImage := range []bool{false, true} {
+		for _, test := range []struct {
+			name          string
+			imageEndpoint bool
+			imageCount    int
+			wantZero      bool
+		}{
+			{name: "positive_images", imageEndpoint: true, imageCount: 2},
+			{name: "no_images_with_residual_tokens", imageEndpoint: true, wantZero: true},
+			{name: "mixed_text_without_images"},
+		} {
+			t.Run(fmt.Sprintf("per_image=%t/%s", perImage, test.name), func(t *testing.T) {
+				resolver := newOpenAITokenImageChannelPricingResolverForTest(t, groupID, model)
+				apiKey := &APIKey{ID: 5, GroupID: &groupID, Group: &Group{
+					ID: groupID, Platform: PlatformOpenAI, Status: StatusActive, Hydrated: true,
+					AllowImageGeneration: true, ImageCountBilling: perImage, ImagePrice1K: f64p(0.4),
+				}}
+				openAIService := &OpenAIGatewayService{billingService: resolver.billingService, resolver: resolver}
+				openAICost, err := openAIService.calculateOpenAIRecordUsageCost(context.Background(), &OpenAIForwardResult{
+					Model: model, ImageEndpoint: test.imageEndpoint, ImageCount: test.imageCount, ImageSize: "1K",
+				}, apiKey, []string{model}, 1, 1, 1, 1,
+					UsageTokens{InputTokens: 1_000_000, OutputTokens: 10_000, ImageOutputTokens: 1000},
+					"", nil, false, time.Time{})
+				require.NoError(t, err)
+				gateway := &GatewayService{billingService: resolver.billingService, resolver: resolver}
+				gatewayCost := gateway.calculateRecordUsageCost(context.Background(), &ForwardResult{
+					Model: model, ImageEndpoint: test.imageEndpoint, ImageCount: test.imageCount, ImageSize: "1K",
+					Usage: ClaudeUsage{InputTokens: 1_000_000, OutputTokens: 10_000, ImageOutputTokens: 1000},
+				}, apiKey, model, 1, 1, time.Time{})
+				for _, cost := range []*CostBreakdown{openAICost, gatewayCost} {
+					require.NotNil(t, cost)
+					if test.wantZero {
+						require.Equal(t, &CostBreakdown{BillingMode: string(BillingModeImage)}, cost)
+					} else {
+						require.Greater(t, cost.ActualCost, 0.0)
+						if test.imageEndpoint && perImage {
+							require.InDelta(t, 0.8, cost.ActualCost, 1e-12)
+							require.Equal(t, string(BillingModeImage), cost.BillingMode)
+						} else {
+							require.Equal(t, string(BillingModeToken), cost.BillingMode)
+						}
+					}
+				}
+			})
+		}
+	}
 }
 
 // F1：composite 分组配置了 token 定价又开启按张计费时，图片不能按 $0 结算。

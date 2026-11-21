@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,6 +251,55 @@ func TestWriteOpenAIPassthroughResponseHeaders_RelaysAndClearsTurnState(t *testi
 	// 上游缺失时清除残留（failover 换号防串扰）
 	writeOpenAIPassthroughResponseHeaders(dst, http.Header{"Content-Type": []string{"application/json"}}, nil)
 	require.Empty(t, dst.Get("X-Codex-Turn-State"))
+}
+
+type turnStateCommitHeartbeatWriter struct {
+	gin.ResponseWriter
+	keepalive *openAICompactSSEKeepalive
+	checked   bool
+	beat      bool
+}
+
+func (w *turnStateCommitHeartbeatWriter) Written() bool {
+	written := w.ResponseWriter.Written()
+	if !w.checked {
+		w.checked = true
+		// Reproduce the heartbeat winning immediately after an uncommitted check.
+		w.beat = w.keepalive.beat()
+	}
+	return written
+}
+
+func TestPassthroughCommitStopsCompactHeartbeatBeforeHeaders(t *testing.T) {
+	for _, contentType := range []string{"application/json", "text/event-stream"} {
+		t.Run(contentType, func(t *testing.T) {
+			c, rec := newTurnStateTestContext(t, 7, "sess-commit-race")
+			MarkOpenAICompactClientStream(c)
+			stop := startOpenAISSEKeepalive(c, time.Hour)
+			defer stop()
+			raw, ok := c.Get(openAICompactSSEKeepaliveKey)
+			require.True(t, ok)
+			writer := &turnStateCommitHeartbeatWriter{ResponseWriter: c.Writer, keepalive: raw.(*openAICompactSSEKeepalive)}
+			c.Writer = writer
+			body := `{"id":"resp_winner","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"winner"}]}]}`
+			if contentType == "text/event-stream" {
+				body = "data: {\"type\":\"response.completed\",\"response\":" + body + "}\n\n"
+			}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{
+				"Content-Type": {contentType}, "X-Codex-Turn-State": {"winner-turn"},
+			}, Body: io.NopCloser(strings.NewReader(body))}
+			svc := &OpenAIGatewayService{}
+			_, err := svc.handleNonStreamingResponsePassthrough(c.Request.Context(), resp, c,
+				&Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, "model", "model")
+			require.NoError(t, err)
+			require.True(t, writer.checked)
+			require.False(t, writer.beat, "commit must stop the heartbeat before checking Written")
+			require.Equal(t, []string{"winner-turn"}, rec.Result().Header.Values("X-Codex-Turn-State"))
+			origin, recorded := svc.openaiCodexTurnStateOrigins.Load(openAICodexTurnStateSeed(c))
+			require.True(t, recorded)
+			require.Equal(t, int64(42), origin.(openAICodexTurnStateOrigin).accountID)
+		})
+	}
 }
 
 func TestWriteOpenAIPassthroughResponseHeaders_RelaysReasoningIncluded(t *testing.T) {

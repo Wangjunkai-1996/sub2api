@@ -653,7 +653,7 @@ func TestOpenAIWSConnReaderLoop_DataWhileIdleRejectsBlockingAcquire(t *testing.T
 	fake.messages <- []byte(`{"type":"response.output_text.delta"}`)
 	require.Eventually(t, conn.readerLoopPending, time.Second, 5*time.Millisecond)
 
-	require.ErrorIs(t, conn.acquire(context.Background()), errOpenAIWSConnClosed)
+	require.ErrorIs(t, conn.acquire(context.Background(), nil), errOpenAIWSConnClosed)
 	require.True(t, conn.isUnusable(), "脏连接应标记为不可用，由池在锁外关闭")
 	require.False(t, conn.tryAcquire(), "脏连接的令牌不应归还")
 }

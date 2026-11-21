@@ -21,6 +21,7 @@ import (
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	dbaccount "github.com/Wei-Shaw/sub2api/ent/account"
+	dbaccountegressbinding "github.com/Wei-Shaw/sub2api/ent/accountegressbinding"
 	dbaccountgroup "github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	dbgroup "github.com/Wei-Shaw/sub2api/ent/group"
 	dbpredicate "github.com/Wei-Shaw/sub2api/ent/predicate"
@@ -72,7 +73,38 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"session_window_utilization": {},
 }
 
+// These keys are written by billing, quota and scheduling hot paths. Account
+// edits start from a potentially stale snapshot, so the locked database row is
+// authoritative for them. User-editable configuration keys are intentionally
+// excluded.
+var accountRuntimeManagedExtraKeyPrefixes = []string{
+	"codex_primary_",
+	"codex_secondary_",
+	"codex_5h_",
+	"codex_7d_",
+	"codex_reset_credit_",
+	"passive_usage_",
+}
+
+var accountRuntimeManagedExtraKeys = map[string]struct{}{
+	"quota_used":                               {},
+	"quota_daily_used":                         {},
+	"quota_daily_start":                        {},
+	"quota_weekly_used":                        {},
+	"quota_weekly_start":                       {},
+	"model_rate_limits":                        {},
+	"grok_billing_snapshot":                    {},
+	service.OpenAIAutoResetCreditStateExtraKey: {},
+	"session_window_utilization":               {},
+	"codex_usage_updated_at":                   {},
+}
+
 const postgresParameterBatchSize = 50000
+
+// Eager-loading egress routes adds a second IN query for route IDs. Keep this
+// batch comfortably below the PostgreSQL parameter limit even when an account
+// uses the maximum configured route count.
+const accountEgressHydrationBatchSize = 1000
 
 const codexFingerprintSeedCanonicalPattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 const codexFingerprintNilSeed = "00000000-0000-0000-0000-000000000000"
@@ -149,13 +181,19 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 		SetPlatform(account.Platform).
 		SetType(account.Type).
 		SetCredentials(normalizeJSONMap(account.Credentials)).
-		SetExtra(normalizeJSONMap(account.Extra)).
+		SetExtra(normalizeJSONMap(service.FilterRetiredAccountExtra(account.Extra))).
 		SetConcurrency(account.Concurrency).
 		SetPriority(account.Priority).
 		SetStatus(account.Status).
 		SetErrorMessage(account.ErrorMessage).
 		SetSchedulable(account.Schedulable).
 		SetAutoPauseOnExpired(account.AutoPauseOnExpired)
+	if account.EgressMode != "" {
+		builder.SetEgressMode(dbaccount.EgressMode(account.EgressMode))
+	}
+	if account.EgressRevision > 0 {
+		builder.SetEgressRevision(account.EgressRevision)
+	}
 
 	if account.RateMultiplier != nil {
 		builder.SetRateMultiplier(*account.RateMultiplier)
@@ -205,6 +243,8 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	account.ID = created.ID
 	account.CreatedAt = created.CreatedAt
 	account.UpdatedAt = created.UpdatedAt
+	account.EgressMode = string(created.EgressMode)
+	account.EgressRevision = created.EgressRevision
 	return nil
 }
 
@@ -254,6 +294,9 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 	}
 	account.GroupIDs = groupIDs
 	account.AccountGroups = append([]service.AccountGroup(nil), groups...)
+	if err := applyAccountEgressWrite(ctx, txClient, account); err != nil {
+		return err
+	}
 	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(groupIDs)); err != nil {
 		return err
 	}
@@ -330,6 +373,10 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 	if err != nil {
 		return nil, err
 	}
+	egressBindingsByAccount, egressSourcesByAccount, err := r.loadAccountEgressHydration(ctx, entAccounts)
+	if err != nil {
+		return nil, err
+	}
 
 	outByID := make(map[int64]*service.Account, len(entAccounts))
 	for _, entAcc := range entAccounts {
@@ -342,6 +389,7 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		if entAcc.Edges.Proxy != nil {
 			out.Proxy = proxyEntityToService(entAcc.Edges.Proxy)
 		}
+		applyAccountEgressHydration(out, entAcc, egressBindingsByAccount, egressSourcesByAccount)
 
 		if groups, ok := groupsByAccount[entAcc.ID]; ok {
 			out.Groups = groups
@@ -504,6 +552,9 @@ func (r *accountRepository) updateAccount(
 		explicitRateMultiplier,
 	)
 	if err != nil {
+		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
+	}
+	if err := applyAccountEgressWrite(ctx, client, account); err != nil {
 		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
 	}
 	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(account.GroupIDs)); err != nil {
@@ -682,7 +733,8 @@ func lockAndMergeAccountProbeExtra(
 			extra -> 'opencode_go_usage_auto_refresh',
 			extra -> 'opencode_go_usage_snapshot',
 			extra -> 'grok_observed_models',
-			extra -> 'upstream_model_metadata'
+			extra -> 'upstream_model_metadata',
+			COALESCE(extra, '{}'::jsonb)
 		FROM accounts
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -702,13 +754,14 @@ func lockAndMergeAccountProbeExtra(
 		identityUnchanged              bool
 		ollamaGroupIdentityUnchanged   bool
 		ollamaProxyIdentityUnchanged   bool
-		opencodeGroupIdentityUnchanged bool
 		currentEnabled                 []byte
 		currentRateSyncEnabled         []byte
 		currentSnapshot                []byte
 		currentOllamaSession           []byte
 		currentOllamaAutoRefresh       []byte
 		currentOllamaSnapshot          []byte
+		currentExtraJSON               []byte
+		opencodeGroupIdentityUnchanged bool
 		currentOpenCodeAutoRefresh     []byte
 		currentOpenCodeSnapshot        []byte
 		currentGrokObservedModels      []byte
@@ -729,6 +782,7 @@ func lockAndMergeAccountProbeExtra(
 		&currentOpenCodeSnapshot,
 		&currentGrokObservedModels,
 		&currentUpstreamModelMetadata,
+		&currentExtraJSON,
 	); err != nil {
 		return nil, err
 	}
@@ -736,7 +790,32 @@ func lockAndMergeAccountProbeExtra(
 		return nil, err
 	}
 
-	extra := copyJSONMap(normalizeJSONMap(account.Extra))
+	// extra 理论上恒为 JSON 对象，但历史数据若存成非对象（数组/标量），在此硬失败
+	// 会让该账号的任何编辑都保存不了——而这条路径覆盖所有平台的账号更新。
+	// 解析失败时沿用空对象回退，允许修复历史账号；不输出可能包含凭据的原始数据。
+	var currentExtra map[string]any
+	if len(currentExtraJSON) > 0 {
+		if err := json.Unmarshal(currentExtraJSON, &currentExtra); err != nil {
+			logger.LegacyPrintf("repository.account",
+				"[Account] current extra is not an object; using empty runtime metadata: id=%d err=%v",
+				account.ID, err)
+			currentExtra = nil
+		}
+	}
+	extra := service.FilterRetiredAccountExtra(copyJSONMap(normalizeJSONMap(account.Extra)))
+	// Runtime quota and scheduler fields are authoritative in the locked row.
+	// Preserve them so a stale account edit cannot overwrite server-managed state.
+	lockedExtra := currentExtra
+	for key := range extra {
+		if isAccountRuntimeManagedExtraKey(key) {
+			delete(extra, key)
+		}
+	}
+	for key, value := range lockedExtra {
+		if isAccountRuntimeManagedExtraKey(key) {
+			extra[key] = value
+		}
+	}
 	for _, key := range []string{
 		service.UpstreamBillingProbeEnabledExtraKey,
 		service.UpstreamBillingRateSyncEnabledExtraKey,
@@ -858,6 +937,18 @@ func lockAndMergeAccountProbeExtra(
 		}
 	}
 	return extra, nil
+}
+
+func isAccountRuntimeManagedExtraKey(key string) bool {
+	if _, ok := accountRuntimeManagedExtraKeys[key]; ok {
+		return true
+	}
+	for _, prefix := range accountRuntimeManagedExtraKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeAccountExtraJSON(raw []byte) (any, bool, error) {
@@ -2527,7 +2618,7 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 	client := clientFromContext(ctx, r.client)
 	result, err := client.ExecContext(
 		ctx,
-		`UPDATE accounts SET 
+		`UPDATE accounts SET
 			extra = jsonb_set(
 				jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
 				ARRAY['model_rate_limits', $1]::text[],
@@ -2826,21 +2917,53 @@ func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64
 }
 
 func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
+	if r == nil || r.sql == nil {
+		return errors.New("account repository SQL executor is not configured")
+	}
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.SetSchedulable(ctx, id, schedulable)
 	}
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetSchedulable(schedulable).
-		Save(ctx)
+	// Commit the routing change and its propagation event together, including
+	// when the caller disconnects immediately after the statement completes.
+	dedupKey := schedulerOutboxDedupKey(service.SchedulerOutboxEventAccountChanged, &id, nil, nil)
+	rows, err := r.sql.QueryContext(ctx, `
+		WITH updated AS (
+			UPDATE accounts
+			SET schedulable = $1, updated_at = NOW()
+			WHERE id = $2 AND deleted_at IS NULL
+			RETURNING id
+			), enqueued AS (
+			INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload, dedup_key)
+			SELECT $3, updated.id, NULL, NULL, $4 FROM updated
+			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+			RETURNING account_id
+		)
+		SELECT id FROM updated
+	`, schedulable, id, service.SchedulerOutboxEventAccountChanged, dedupKey)
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
-		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue schedulable change failed: account=%d err=%v", id, err)
+	var updatedID int64
+	if !rows.Next() {
+		rowsErr := rows.Err()
+		closeErr := rows.Close()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return service.ErrAccountNotFound
+	}
+	if err := rows.Scan(&updatedID); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if !schedulable {
-		r.syncSchedulerAccountSnapshot(ctx, id)
+		r.syncSchedulerAccountSnapshotDetached(ctx, id)
 	}
 	return nil
 }
@@ -2890,7 +3013,7 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.UpdateExtra(ctx, id, updates)
 	}
-	updates = stripCodexFingerprintSeedFromExtraUpdate(updates)
+	updates = service.FilterRetiredAccountExtra(stripCodexFingerprintSeedFromExtraUpdate(updates))
 	if len(updates) == 0 {
 		return nil
 	}
@@ -3167,7 +3290,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	updates.Extra = stripCodexFingerprintSeedFromExtraUpdate(updates.Extra)
+	updates.Extra = service.FilterRetiredAccountExtra(stripCodexFingerprintSeedFromExtraUpdate(updates.Extra))
 
 	setClauses := make([]string, 0, 8)
 	args := make([]any, 0, 8)
@@ -3551,6 +3674,10 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 	if err != nil {
 		return nil, err
 	}
+	egressBindingsByAccount, egressSourcesByAccount, err := r.loadAccountEgressHydration(ctx, accounts)
+	if err != nil {
+		return nil, err
+	}
 
 	outAccounts := make([]service.Account, 0, len(accounts))
 	for _, acc := range accounts {
@@ -3570,6 +3697,7 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 				out.ProxyFallbackOriginName = &n
 			}
 		}
+		applyAccountEgressHydration(out, acc, egressBindingsByAccount, egressSourcesByAccount)
 		if groups, ok := groupsByAccount[acc.ID]; ok {
 			out.Groups = groups
 		}
@@ -3771,6 +3899,146 @@ func buildSchedulerGroupPayload(groupIDs []int64) any {
 	return map[string]any{"group_ids": groupIDs}
 }
 
+// loadAccountEgressHydration loads every source account and binding set in two
+// batched queries. Linked shadows read their parent's routes, but the bindings
+// are rewritten to the shadow account ID so concurrency remains isolated.
+func (r *accountRepository) loadAccountEgressHydration(
+	ctx context.Context,
+	accounts []*dbent.Account,
+) (map[int64][]service.AccountEgressBinding, map[int64]*dbent.Account, error) {
+	bindingsByRuntimeAccount := make(map[int64][]service.AccountEgressBinding, len(accounts))
+	sourcesByRuntimeAccount := make(map[int64]*dbent.Account, len(accounts))
+	if len(accounts) == 0 {
+		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+	}
+
+	allSourceIDs := make([]int64, 0, len(accounts))
+	sourceIDsToLoad := make([]int64, 0, len(accounts))
+	seenSourceIDs := make(map[int64]struct{}, len(accounts))
+	sourceByID := make(map[int64]*dbent.Account, len(accounts))
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		sourceID := account.ID
+		if account.ParentAccountID != nil {
+			sourceID = *account.ParentAccountID
+		} else {
+			// The caller already loaded this entity and accountsToService loaded
+			// its proxy separately. Only shadows require another account query.
+			sourceByID[sourceID] = account
+		}
+		if _, exists := seenSourceIDs[sourceID]; exists {
+			continue
+		}
+		seenSourceIDs[sourceID] = struct{}{}
+		allSourceIDs = append(allSourceIDs, sourceID)
+		if account.ParentAccountID != nil {
+			sourceIDsToLoad = append(sourceIDsToLoad, sourceID)
+		}
+	}
+	if len(allSourceIDs) == 0 {
+		return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+	}
+
+	// Keep each IN list below PostgreSQL's bind-parameter limit. This path is
+	// used by scheduler pages as well as admin bulk reads, so a large page must
+	// not fail merely because parent/shadow source IDs were accumulated into a
+	// single query.
+	for start := 0; start < len(sourceIDsToLoad); start += accountEgressHydrationBatchSize {
+		end := start + accountEgressHydrationBatchSize
+		if end > len(sourceIDsToLoad) {
+			end = len(sourceIDsToLoad)
+		}
+		sources, err := r.client.Account.Query().
+			Where(dbaccount.IDIn(sourceIDsToLoad[start:end]...)).
+			WithProxy().
+			All(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, source := range sources {
+			sourceByID[source.ID] = source
+		}
+	}
+
+	poolSourceIDs := make([]int64, 0, len(sourceByID))
+	for _, sourceID := range allSourceIDs {
+		if source := sourceByID[sourceID]; source != nil && string(source.EgressMode) == service.EgressModePool {
+			poolSourceIDs = append(poolSourceIDs, sourceID)
+		}
+	}
+
+	bindingsBySource := make(map[int64][]*dbent.AccountEgressBinding, len(poolSourceIDs))
+	for start := 0; start < len(poolSourceIDs); start += accountEgressHydrationBatchSize {
+		end := start + accountEgressHydrationBatchSize
+		if end > len(poolSourceIDs) {
+			end = len(poolSourceIDs)
+		}
+		bindings, err := r.client.AccountEgressBinding.Query().
+			Where(dbaccountegressbinding.AccountIDIn(poolSourceIDs[start:end]...)).
+			Order(
+				dbent.Asc(dbaccountegressbinding.FieldAccountID),
+				dbent.Asc(dbaccountegressbinding.FieldPosition),
+				dbent.Asc(dbaccountegressbinding.FieldRouteID),
+			).
+			WithRoute(func(q *dbent.EgressRouteQuery) {
+				q.WithExpectedIdentity().WithProxy()
+			}).
+			All(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, binding := range bindings {
+			bindingsBySource[binding.AccountID] = append(bindingsBySource[binding.AccountID], binding)
+		}
+	}
+
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		sourceID := account.ID
+		if account.ParentAccountID != nil {
+			sourceID = *account.ParentAccountID
+		}
+		source := sourceByID[sourceID]
+		if source == nil {
+			continue
+		}
+		sourcesByRuntimeAccount[account.ID] = source
+		runtimeBindings := make([]service.AccountEgressBinding, 0, len(bindingsBySource[sourceID]))
+		for _, binding := range bindingsBySource[sourceID] {
+			runtimeBindings = append(runtimeBindings, accountEgressBindingEntityToService(binding, account.ID))
+		}
+		bindingsByRuntimeAccount[account.ID] = runtimeBindings
+	}
+	return bindingsByRuntimeAccount, sourcesByRuntimeAccount, nil
+}
+
+func applyAccountEgressHydration(
+	out *service.Account,
+	entity *dbent.Account,
+	bindingsByAccount map[int64][]service.AccountEgressBinding,
+	sourcesByAccount map[int64]*dbent.Account,
+) {
+	if out == nil || entity == nil {
+		return
+	}
+	if source := sourcesByAccount[entity.ID]; source != nil {
+		out.EgressMode = string(source.EgressMode)
+		out.ProxyID = source.ProxyID
+		if source.Edges.Proxy != nil {
+			out.Proxy = proxyEntityToService(source.Edges.Proxy)
+		} else if source.ProxyID == nil {
+			out.Proxy = nil
+		}
+	}
+	if bindings, exists := bindingsByAccount[entity.ID]; exists {
+		out.EgressBindings = bindings
+	}
+}
+
 func accountEntityToService(m *dbent.Account) *service.Account {
 	if m == nil {
 		return nil
@@ -3788,6 +4056,8 @@ func accountEntityToService(m *dbent.Account) *service.Account {
 		Extra:                   copyJSONMap(m.Extra),
 		ProxyID:                 m.ProxyID,
 		ProxyFallbackOriginID:   m.ProxyFallbackOriginID,
+		EgressMode:              string(m.EgressMode),
+		EgressRevision:          m.EgressRevision,
 		Concurrency:             m.Concurrency,
 		Priority:                m.Priority,
 		RateMultiplier:          &rateMultiplier,

@@ -906,7 +906,7 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 				releaseRate()
 			}
 			attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
-			if err == nil && hasOpenAIRefreshCredentials(attemptedAccount, newCredentials) {
+			if err == nil && attemptedAccount.IsOpenAIOAuth() && newCredentials != nil {
 				var durableAccount *Account
 				durableAccount, credentialsPersisted, err = persistOpenAIRefreshCredentials(attemptCtx, s.accountRepo, attemptedAccount, newCredentials)
 				if err == nil {

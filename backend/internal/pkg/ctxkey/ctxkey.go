@@ -26,6 +26,9 @@ const (
 	// ClientRequestID 客户端请求的唯一标识，用于追踪请求全生命周期（用于 Ops 监控与排障）。
 	ClientRequestID Key = "ctx_client_request_id"
 
+	// RequestStartTime is the server-side ingress clock shared by access and Ops logs.
+	RequestStartTime Key = "ctx_request_start_time"
+
 	// Model 请求模型标识（用于统一请求链路日志字段）。
 	Model Key = "ctx_model"
 
@@ -62,6 +65,13 @@ const (
 	// UserID 认证后的 Sub2API 用户 ID，由 API Key 认证中间件设置。
 	// 供 service 层执行用户级策略，不能使用客户端请求体中的 user 标识替代。
 	UserID Key = "ctx_user_id"
+
+	// NewAPIUserID is a positive end-user ID from a verified NewAPI signature.
+	// It never replaces UserID for Sub2API billing or authorization.
+	NewAPIUserID    Key = "ctx_newapi_user_id"
+	NewAPITokenID   Key = "ctx_newapi_token_id"
+	NewAPIOrigin    Key = "ctx_newapi_origin"
+	NewAPIRequestID Key = "ctx_newapi_request_id"
 
 	// IsMaxTokensOneHaikuRequest 标识当前请求是否为 max_tokens=1 + haiku 模型的探测请求
 	// 用于 ClaudeCodeOnly 验证绕过（绕过 system prompt 检查，但仍需验证 User-Agent）

@@ -484,7 +484,7 @@ func TestSelectAccountWithScheduler_PreviousResponseAccountUnderSizeRouting(t *t
 
 			selectWithSize := func(size string) int64 {
 				ctx := WithOpenAIImageSizeRouting(context.Background(), size)
-				selection, _, err := svc.SelectAccountWithScheduler(ctx, &groupID, "resp_image_size", "", "gpt-5.4", nil, OpenAIUpstreamTransportAny, false)
+				selection, _, err := svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "resp_image_size", "", "gpt-5.4", nil, OpenAIUpstreamTransportAny, "", false, true, true)
 				require.NoError(t, err)
 				if selection.ReleaseFunc != nil {
 					selection.ReleaseFunc()
@@ -493,6 +493,13 @@ func TestSelectAccountWithScheduler_PreviousResponseAccountUnderSizeRouting(t *t
 			}
 			require.Equal(t, int64(81102), selectWithSize(""), "unspecified size keeps the previous_response account")
 			require.Equal(t, int64(81101), selectWithSize("3840x2160"), "explicit 4K leaves a 1K/2K-only previous_response account")
+			ctx := WithOpenAIImageSizeRouting(context.Background(), "3840x2160")
+			selection, _, err := svc.SelectAccountWithScheduler(ctx, &groupID, "resp_image_size", "", "gpt-5.4", nil, OpenAIUpstreamTransportAny, false)
+			require.ErrorIs(t, err, ErrAccountEgressNoRoute, "non-movable continuations must not switch accounts to satisfy a size")
+			require.Nil(t, selection)
+			boundID, err := svc.getOpenAIWSStateStore().GetResponseAccount(context.Background(), groupID, "resp_image_size")
+			require.NoError(t, err)
+			require.Equal(t, int64(81102), boundID, "a size mismatch must preserve the continuation binding")
 		})
 	}
 }
