@@ -407,13 +407,6 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 	return result, nil
 }
 
-func stringValueOrDefault(value *string, fallback string) string {
-	if value == nil {
-		return fallback
-	}
-	return *value
-}
-
 func parseCodexSessionImportEntries(req CodexSessionImportRequest) ([]codexImportEntry, error) {
 	contents := make([]string, 0, 1+len(req.Contents))
 	if strings.TrimSpace(req.Content) != "" {

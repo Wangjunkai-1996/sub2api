@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"net/netip"
 	"slices"
 	"sort"
@@ -1654,8 +1653,4 @@ func canonicalInetHost(value string) string {
 		return prefix.Addr().Unmap().String()
 	}
 	return value
-}
-
-func egressPoolError(reason string) error {
-	return fmt.Errorf("%w: %s", service.ErrEgressPoolInvalid, reason)
 }

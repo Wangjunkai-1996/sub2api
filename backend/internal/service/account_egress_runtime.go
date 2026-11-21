@@ -416,58 +416,6 @@ func findAccountEgressBinding(account *Account, resolved *ResolvedAccountEgress)
 	return nil
 }
 
-// OpenAIAccountControlProxyURL resolves account-scoped OAuth/control traffic
-// without consuming business capacity. Pool accounts are fenced to their one
-// verified primary route; an incomplete projection fails closed instead of
-// falling back to direct.
-func OpenAIAccountControlProxyURL(account *Account) (string, error) {
-	if account == nil || account.Platform != PlatformOpenAI {
-		return "", ErrAccountEgressNoRoute
-	}
-	now := time.Now()
-	if account.EgressMode != EgressModePool {
-		if account.Proxy == nil {
-			return "", nil
-		}
-		if !account.Proxy.IsActive() || account.Proxy.IsExpired(now) {
-			return "", ErrAccountEgressNoRoute
-		}
-		return account.Proxy.URL(), nil
-	}
-
-	var primary *AccountEgressBinding
-	for i := range account.EgressBindings {
-		binding := &account.EgressBindings[i]
-		if !binding.IsPrimary {
-			continue
-		}
-		if primary != nil {
-			return "", ErrAccountEgressConfigStale
-		}
-		primary = binding
-	}
-	if primary == nil || primary.Status != AccountEgressBindingStatusActive || primary.Route == nil ||
-		primary.Route.State != EgressRouteStateActive || primary.Route.ExpectedIdentity == nil ||
-		primary.Route.ExpectedIdentity.Status != EgressIdentityStatusActive ||
-		!IsEgressIdentityVerificationFresh(primary.Route.VerifiedAt, now) {
-		return "", ErrAccountEgressNoRoute
-	}
-	switch primary.Route.Kind {
-	case EgressRouteKindDirect:
-		if primary.Route.RuntimeScope == nil || strings.TrimSpace(*primary.Route.RuntimeScope) != DefaultDirectEgressRuntimeScope {
-			return "", ErrAccountEgressNoRoute
-		}
-		return "", nil
-	case EgressRouteKindProxy:
-		if primary.Route.ProxyID == nil || primary.Route.Proxy == nil || !primary.Route.Proxy.IsActive() || primary.Route.Proxy.IsExpired(now) {
-			return "", ErrAccountEgressNoRoute
-		}
-		return primary.Route.Proxy.URL(), nil
-	default:
-		return "", ErrAccountEgressNoRoute
-	}
-}
-
 func ContextWithSelectedAccountEgress(ctx context.Context, account *Account) context.Context {
 	if account == nil {
 		return ctx
