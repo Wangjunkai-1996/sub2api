@@ -528,7 +528,7 @@ func newOpenAISessionBlockedFailoverError(statusCode int, responseHeaders http.H
 		Stage:                    GatewayFailureStageInference,
 		Scope:                    GatewayFailureScopeSession,
 		Reason:                   OpenAISessionBlockedReason,
-		NextAccountAction:        NextAccountRetry,
+		NextAccountAction:        NextAccountStop,
 		ClientStatusCode:         http.StatusConflict,
 		ClientMessage:            OpenAIConversationSessionExpiredClientMessage,
 	}
@@ -655,7 +655,7 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 	body = s.redactAgentIdentitySensitiveBody(ctx, account, body)
 
 	// 普通 cyber_policy 仍原样透传。只有明确要求开启新会话的 session-blocked
-	// 事件才在尚未写出客户端响应时返回类型化 failover，由 handler 决定能否安全重建。
+	// 事件在尚未写出客户端响应时交由 handler 封存续接并返回错误。
 	if hit, code, cyberMsg := detectOpenAICyberPolicy(body); hit {
 		MarkOpsCyberPolicy(c, CyberPolicyMark{
 			Code:           code,

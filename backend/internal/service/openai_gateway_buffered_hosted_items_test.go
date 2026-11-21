@@ -57,7 +57,7 @@ var bufferedHostedItemsSSE = bufferedItemsSSE(
 
 func bufferedHostedItemsOAuthAccount() *Account {
 	return &Account{
-		ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+		ID: 1, Name: "openai-oauth", Status: StatusActive, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
 		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
 	}
 }

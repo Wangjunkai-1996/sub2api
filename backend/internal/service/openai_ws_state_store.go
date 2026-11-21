@@ -58,6 +58,7 @@ type openAIWSEgressBinding struct {
 }
 
 type openAIWSTurnStateBinding struct {
+	accountID int64
 	turnState string
 	expiresAt time.Time
 }
@@ -591,13 +592,6 @@ func getOpenAIWSSessionEgress(store OpenAIWSStateStore, ctx context.Context, gro
 	return "", false
 }
 
-func deleteOpenAIWSSessionEgress(store OpenAIWSStateStore, ctx context.Context, groupID int64, sessionHash string) error {
-	if typed, ok := store.(openAIWSEgressStateStore); ok {
-		return typed.DeleteSessionEgress(ctx, groupID, sessionHash)
-	}
-	return nil
-}
-
 func (s *defaultOpenAIWSStateStore) BindResponseEgress(
 	ctx context.Context,
 	groupID int64,
@@ -789,7 +783,19 @@ func (s *defaultOpenAIWSStateStore) DeleteResponseConn(responseID string) {
 	s.responseToConnMu.Unlock()
 }
 
+func bindOpenAIWSTurnStateForAccount(store OpenAIWSStateStore, groupID int64, sessionHash, turnState string, ttl time.Duration, accountID int64) {
+	if owned, ok := store.(*defaultOpenAIWSStateStore); ok {
+		owned.bindSessionTurnState(groupID, sessionHash, turnState, ttl, accountID)
+		return
+	}
+	store.BindSessionTurnState(groupID, sessionHash, turnState, ttl)
+}
+
 func (s *defaultOpenAIWSStateStore) BindSessionTurnState(groupID int64, sessionHash, turnState string, ttl time.Duration) {
+	s.bindSessionTurnState(groupID, sessionHash, turnState, ttl, 0)
+}
+
+func (s *defaultOpenAIWSStateStore) bindSessionTurnState(groupID int64, sessionHash, turnState string, ttl time.Duration, accountID int64) {
 	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
 	state := strings.TrimSpace(turnState)
 	if key == "" || state == "" {
@@ -801,6 +807,7 @@ func (s *defaultOpenAIWSStateStore) BindSessionTurnState(groupID int64, sessionH
 	s.sessionToTurnStateMu.Lock()
 	ensureBindingCapacity(s.sessionToTurnState, key, openAIWSStateStoreMaxEntriesPerMap)
 	s.sessionToTurnState[key] = openAIWSTurnStateBinding{
+		accountID: accountID,
 		turnState: state,
 		expiresAt: time.Now().Add(ttl),
 	}
@@ -1014,6 +1021,34 @@ func (s *defaultOpenAIWSStateStore) GetSessionEgress(ctx context.Context, groupI
 	s.sessionToEgress[key] = openAIWSEgressBinding{bindingID: bindingID, expiresAt: now.Add(time.Minute)}
 	s.sessionToEgressMu.Unlock()
 	return bindingID, true
+}
+
+// The other account may have rebound the same session while the rejected request was in flight.
+func (s *defaultOpenAIWSStateStore) clearSessionRoutingForAccount(ctx context.Context, groupID int64, sessionHash string, accountID int64) error {
+	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
+	s.sessionToTurnStateMu.Lock()
+	turn := s.sessionToTurnState[key]
+	if turn.accountID == accountID || (turn.accountID == 0 && s.cache == nil) {
+		delete(s.sessionToTurnState, key)
+	}
+	s.sessionToTurnStateMu.Unlock()
+	s.sessionToEgressMu.Lock()
+	owner, _, _ := parseStableAccountEgressBindingID(s.sessionToEgress[key].bindingID)
+	if owner == accountID {
+		delete(s.sessionToEgress, key)
+	}
+	s.sessionToEgressMu.Unlock()
+	if s.cache == nil {
+		return nil
+	}
+	cache, ok := s.cache.(GatewaySessionBindingCompareDeleter)
+	if !ok {
+		return errors.New("conditional session egress cleanup is unavailable")
+	}
+	// The route hint is readable only with its owner. Its TTL handles expiry and
+	// the next bind replaces it. Deleting it separately could erase a newer route.
+	_, err := cache.CompareAndDeleteSessionAccountID(ctx, groupID, openAIWSEgressCacheKey(openAIWSSessionEgressAccountCachePrefix, sessionHash), accountID)
+	return err
 }
 
 func (s *defaultOpenAIWSStateStore) DeleteSessionEgress(ctx context.Context, groupID int64, sessionHash string) error {

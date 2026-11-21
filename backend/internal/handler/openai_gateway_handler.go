@@ -558,6 +558,16 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "previous_response_id is not available for this user")
 			return
 		}
+		reason, stateErr := h.gatewayService.GetOpenAIHTTPContinuationInvalidReason(c.Request.Context(), groupID, previousResponseID)
+		if stateErr != nil {
+			reqLog.Warn("openai.previous_response_invalid_state_lookup_failed", zap.Error(stateErr))
+			h.errorResponse(c, http.StatusServiceUnavailable, "session_state_unavailable", "Conversation session state is temporarily unavailable")
+			return
+		}
+		if reason != "" {
+			h.errorResponse(c, http.StatusConflict, "conversation_session_expired", service.OpenAIConversationSessionExpiredClientMessage)
+			return
+		}
 	}
 	service.SetOpenAIHTTPResponseOwner(c, subject.UserID, apiKey.ID)
 
@@ -931,6 +941,28 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					).Error("openai.record_usage_failed", zap.Error(err))
 				}
 			})
+		}
+		var sessionErr *service.UpstreamFailoverError
+		typedBlock := errors.As(err, &sessionErr) && sessionErr.IsOpenAISessionBlocked()
+		if typedBlock || service.GetOpsCyberPolicy(c).IsSessionBlocked() {
+			groupID := int64(0)
+			if apiKey.GroupID != nil {
+				groupID = *apiKey.GroupID
+			}
+			stateErr := h.gatewayService.InvalidateOpenAIHTTPContinuation(c.Request.Context(), c, groupID, previousResponseID, sessionHash, account.ID)
+			submitResponsesUsage(result)
+			if stateErr != nil {
+				reqLog.Warn("openai.session_blocked_state_write_failed", zap.Int64("account_id", account.ID), zap.Error(stateErr))
+			}
+			// A streamed rejection may already contain the provider's terminal event.
+			if typedBlock || !c.Writer.Written() {
+				if stateErr != nil {
+					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "session_state_unavailable", "Conversation session state is temporarily unavailable", streamStarted || c.Writer.Written())
+				} else {
+					h.handleStreamingAwareError(c, http.StatusConflict, "conversation_session_expired", service.OpenAIConversationSessionExpiredClientMessage, streamStarted || c.Writer.Written())
+				}
+			}
+			return
 		}
 		if err != nil {
 			if openAIRequestBudgetExpired(c) {
@@ -2873,21 +2905,28 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 	var currentUserRelease func()
 	var currentAccountRelease func()
+	var poolLease *service.AccountEgressLease
 	releaseAccountSlot := func() {
 		if currentAccountRelease != nil {
 			currentAccountRelease()
 			currentAccountRelease = nil
 		}
+		poolLease = nil
 	}
 	releaseTurnSlots := func() {
-		releaseAccountSlot()
+		if poolLease == nil {
+			releaseAccountSlot()
+		}
 		if currentUserRelease != nil {
 			currentUserRelease()
 			currentUserRelease = nil
 		}
 	}
 	// 必须尽早注册，确保任何 early return 都能释放已获取的并发槽位。
-	defer releaseTurnSlots()
+	defer func() {
+		releaseAccountSlot()
+		releaseTurnSlots()
+	}()
 
 	userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
 	if err != nil {
@@ -3158,6 +3197,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// captured by the previous failover account before credential lookup.
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
+		if shouldHoldOpenAIWSPoolLease(selection, currentAccountRelease) {
+			poolLease = selection.Egress.Lease
+		}
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.websocket_bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
@@ -3339,20 +3381,22 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if !userAcquired {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "too many concurrent requests, please retry later", nil)
 				}
+				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
+				if poolLease != nil {
+					if leaseErr := context.Cause(poolLease.Context()); leaseErr != nil {
+						return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account egress lease was lost, please reconnect", leaseErr)
+					}
+					return checkSimpleModeTurnBilling()
+				}
 				accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
 				if err != nil {
-					if userReleaseFunc != nil {
-						userReleaseFunc()
-					}
+					releaseTurnSlots()
 					return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire account concurrency slot", err)
 				}
 				if !accountAcquired {
-					if userReleaseFunc != nil {
-						userReleaseFunc()
-					}
+					releaseTurnSlots()
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is busy, please retry later", nil)
 				}
-				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
 				currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
 				return checkSimpleModeTurnBilling()
 			},
@@ -4880,6 +4924,12 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 			gwSvc.MarkCyberSessionBlocked(blockCtx, sessionBlockKey)
 			cancel()
 		}
+	}
+	if gwSvc != nil {
+		gwSvc.ApplyCyberPolicyAccountCooldown(requestCtx, account, service.OpenAICyberAccountCooldownEvent{
+			RequestID: requestID, ClientRequestID: clientRequestID, RequestPayloadHash: requestPayloadHash,
+			Code: mark.Code, UpstreamStatus: mark.UpstreamStatus, UpstreamBody: mark.Body, ObservedAt: mark.ObservedAt,
+		})
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

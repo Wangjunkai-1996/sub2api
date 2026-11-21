@@ -24,7 +24,7 @@ func (s *OpenAIGatewayService) GetOpenAIHTTPContinuationInvalidReason(
 	store := s.getOpenAIWSStateStore()
 	invalidStore, ok := store.(openAIHTTPResponseInvalidStateStore)
 	if !ok {
-		return "", nil
+		return "", fmt.Errorf("%w: invalidation store is unsupported", ErrOpenAIContinuationStateUnavailable)
 	}
 	reason, invalid, err := invalidStore.GetHTTPResponseInvalidReason(ctx, groupID, responseID)
 	if err != nil {
@@ -37,8 +37,7 @@ func (s *OpenAIGatewayService) GetOpenAIHTTPContinuationInvalidReason(
 }
 
 // InvalidateOpenAIHTTPContinuation fences a blocked response ID before removing
-// its routing state. Every later step is fail-closed: the handler may switch
-// accounts only after the durable marker and conditional sticky cleanup succeed.
+// its routing state. Persist the provider decision even if the client disconnects.
 func (s *OpenAIGatewayService) InvalidateOpenAIHTTPContinuation(
 	ctx context.Context,
 	c *gin.Context,
@@ -50,6 +49,8 @@ func (s *OpenAIGatewayService) InvalidateOpenAIHTTPContinuation(
 	if s == nil || expectedAccountID <= 0 {
 		return fmt.Errorf("%w: invalid account", ErrOpenAIContinuationStateUnavailable)
 	}
+	ctx, cancel := openAIAccountStateContext(ctx)
+	defer cancel()
 	store := s.getOpenAIWSStateStore()
 	if store == nil {
 		return fmt.Errorf("%w: state store is nil", ErrOpenAIContinuationStateUnavailable)
@@ -74,7 +75,11 @@ func (s *OpenAIGatewayService) InvalidateOpenAIHTTPContinuation(
 
 	sessionHash = strings.TrimSpace(sessionHash)
 	if sessionHash != "" {
-		store.DeleteSessionTurnState(groupID, sessionHash)
+		if owned, ok := store.(*defaultOpenAIWSStateStore); ok {
+			if err := owned.clearSessionRoutingForAccount(ctx, groupID, sessionHash, expectedAccountID); err != nil {
+				return fmt.Errorf("%w: conditionally clear session routing: %v", ErrOpenAIContinuationStateUnavailable, err)
+			}
+		}
 	}
 	if sessionHash != "" && s.cache != nil {
 		compareDeleter, ok := s.cache.(GatewaySessionBindingCompareDeleter)
@@ -91,15 +96,6 @@ func (s *OpenAIGatewayService) InvalidateOpenAIHTTPContinuation(
 		if legacyKey != "" {
 			if _, err := compareDeleter.CompareAndDeleteSessionAccountID(ctx, groupID, legacyKey, expectedAccountID); err != nil {
 				return fmt.Errorf("%w: conditionally delete legacy sticky account binding: %v", ErrOpenAIContinuationStateUnavailable, err)
-			}
-		}
-
-		if bindingID, found := getOpenAIWSSessionEgress(store, ctx, groupID, sessionHash); found {
-			boundAccountID, _, valid := parseStableAccountEgressBindingID(bindingID)
-			if valid && boundAccountID == expectedAccountID {
-				if err := deleteOpenAIWSSessionEgress(store, ctx, groupID, sessionHash); err != nil {
-					return fmt.Errorf("%w: delete session egress binding: %v", ErrOpenAIContinuationStateUnavailable, err)
-				}
 			}
 		}
 	}

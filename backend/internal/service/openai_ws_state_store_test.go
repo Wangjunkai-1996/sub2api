@@ -654,6 +654,23 @@ func TestInvalidateOpenAIHTTPContinuationClearsLocalTurnStateWithoutCache(t *tes
 	require.False(t, found)
 }
 
+func TestInvalidateOpenAIHTTPContinuationPreservesReboundSession(t *testing.T) {
+	const groupID, previous, next = int64(42), int64(101), int64(102)
+	store := NewOpenAIWSStateStore(nil).(*defaultOpenAIWSStateStore)
+	ctx := context.Background()
+	bindOpenAIWSTurnStateForAccount(store, groupID, "session", "new-turn", time.Minute, next)
+	bindingID := StableAccountEgressBindingID(next, 12)
+	require.NoError(t, store.BindSessionEgress(ctx, groupID, "session", bindingID, time.Minute))
+	svc := &OpenAIGatewayService{openaiWSStateStore: store}
+	require.NoError(t, svc.InvalidateOpenAIHTTPContinuation(ctx, nil, groupID, "resp_old", "session", previous))
+	state, ok := store.GetSessionTurnState(groupID, "session")
+	require.True(t, ok)
+	require.Equal(t, "new-turn", state)
+	route, ok := store.GetSessionEgress(ctx, groupID, "session")
+	require.True(t, ok)
+	require.Equal(t, bindingID, route)
+}
+
 func TestWithOpenAIWSStateStoreRedisTimeout_WithParentContext(t *testing.T) {
 	ctx, cancel := withOpenAIWSStateStoreRedisTimeout(context.Background())
 	defer cancel()

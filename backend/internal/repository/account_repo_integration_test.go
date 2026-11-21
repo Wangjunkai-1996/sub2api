@@ -1286,6 +1286,30 @@ func (s *AccountRepoSuite) TestSetGrokOAuthErrorIfCredentialsUnchanged_SkipsConc
 	s.Require().Zero(outboxCount, "a lost compare-and-set race must not enqueue a stale account change")
 }
 
+func (s *AccountRepoSuite) TestOpenAIOAuthRotationPublishesOneOutboxEvent() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name: "openai-refresh-cas", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Status: service.StatusActive, Credentials: map[string]any{"refresh_token": "initial"},
+	})
+	observed, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	cache := &schedulerCacheRecorder{}
+	s.repo.schedulerCache = cache
+	rotated := map[string]any{"access_token": "new-access", "refresh_token": "rotated"}
+	for _, want := range []bool{true, false} {
+		applied, err := s.repo.UpdateOpenAIOAuthCredentialsIfUnchanged(s.ctx, account.ID, observed.Credentials, observed.ProxyID, rotated)
+		s.Require().NoError(err)
+		s.Require().Equal(want, applied)
+	}
+	s.Require().Len(cache.setAccounts, 1)
+	s.Require().Equal("rotated", cache.setAccounts[0].GetOpenAIRefreshToken())
+	var count int
+	s.Require().NoError(scanSingleRow(s.ctx, s.repo.sql,
+		"SELECT COUNT(*) FROM scheduler_outbox WHERE event_type = $1 AND account_id = $2",
+		[]any{service.SchedulerOutboxEventAccountChanged, account.ID}, &count))
+	s.Require().Equal(1, count)
+}
+
 func (s *AccountRepoSuite) TestUpdateGrokOAuthCredentialsIfUnchanged_AppliesAndPublishesSchedulerState() {
 	account := mustCreateAccount(s.T(), s.client, &service.Account{
 		Name:        "grok-refresh-success-cas-applied",

@@ -53,10 +53,7 @@ const toolSearchCallSSE = "data: {\"type\":\"response.created\",\"response\":{\"
 	"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ts\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
 
 func TestForwardAsAnthropic_CodexOAuthUsesNativeToolSearch(t *testing.T) {
-	account := &Account{
-		ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
-		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
-	}
+	account := codexOAuthToolSearchAccount()
 	upstream, rec := forwardMessagesToolSearch(t, account, messagesToolSearchBody, toolSearchCallSSE, "gpt-6-astra")
 
 	tools := gjson.GetBytes(upstream.lastBody, "tools").Array()
@@ -95,10 +92,7 @@ func TestForwardAsAnthropic_NonCodexAccountKeepsFunctionToolSearch(t *testing.T)
 // A Codex OAuth model without supports_search_tool keeps ToolSearch and the
 // deferred tools as plain function tools.
 func TestForwardAsAnthropic_CodexOAuthModelWithoutSearchSupportKeepsFunctionToolSearch(t *testing.T) {
-	account := &Account{
-		ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
-		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
-	}
+	account := codexOAuthToolSearchAccount()
 	completed := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fn\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
 	body := strings.Replace(messagesToolSearchBody, `"model":"gpt-6-astra"`, `"model":"gpt-5.5"`, 1)
 	upstream, _ := forwardMessagesToolSearch(t, account, body, completed, "gpt-5.5")
@@ -114,7 +108,7 @@ func TestForwardAsAnthropic_CodexOAuthModelWithoutSearchSupportKeepsFunctionTool
 
 func codexOAuthToolSearchAccount() *Account {
 	return &Account{
-		ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+		ID: 1, Name: "openai-oauth", Status: StatusActive, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
 		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
 	}
 }
@@ -191,10 +185,7 @@ func TestForwardAsAnthropic_CodexOAuthForcedHiddenToolKeepsFunctionTools(t *test
 // Claude Code also sends stream:false turns; their upstream stream can end
 // with an empty terminal output, rebuilt from the buffered output items.
 func TestForwardAsAnthropic_CodexOAuthNonStreamingRestoresToolSearchCall(t *testing.T) {
-	account := &Account{
-		ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
-		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
-	}
+	account := codexOAuthToolSearchAccount()
 	body := strings.Replace(messagesToolSearchBody, `"stream":true`, `"stream":false`, 1)
 	_, rec := forwardMessagesToolSearch(t, account, body, toolSearchCallSSE, "gpt-6-astra")
 

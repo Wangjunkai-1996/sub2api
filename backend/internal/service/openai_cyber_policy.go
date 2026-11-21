@@ -31,6 +31,10 @@ type CyberPolicyMark struct {
 	ObservedAt     time.Time // 首次识别该真实上游事件的时间，用于生成稳定的事件指纹
 }
 
+func (m *CyberPolicyMark) IsSessionBlocked() bool {
+	return m != nil && isOpenAISessionBlockedCyberPolicyMessage(m.Message)
+}
+
 // MarkOpsCyberPolicy 记录 cyber 标记；首个写入生效，后续忽略（同一 turn 只记一次）。
 // WS 多轮场景由 handler 在每个 turn 结束后调用 ClearOpsCyberPolicy 重置。
 func MarkOpsCyberPolicy(c *gin.Context, mark CyberPolicyMark) {

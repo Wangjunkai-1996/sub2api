@@ -184,10 +184,21 @@ describe('AccountUsageCell', () => {
     const older: AccountUsageInfo = { ...emptyWindows, five_hour: { utilization: 19, resets_at: null, remaining_seconds: 0 } }
     const requestBatchedUsage = batch ? vi.fn().mockResolvedValue({ usage: null, error: null }) : null
     getUsage.mockReturnValueOnce(oldRead).mockResolvedValue(newer)
-    const wrapper = mount(AccountUsageCell, { props: { account, requestBatchedUsage } })
+    const wrapper = mount(AccountUsageCell, {
+      props: { account, requestBatchedUsage },
+      global: batch ? {
+        stubs: {
+          OpenAIQuotaResetCell: {
+            template: '<div><slot name="pre-actions" /></div>'
+          }
+        }
+      } : undefined
+    })
     await flushPromises()
     if (requestBatchedUsage) {
       requestBatchedUsage.mockImplementationOnce(() => oldRead.then(usage => ({ usage, error: null })))
+      await wrapper.get('[data-testid="openai-cached-usage-refresh"]').trigger('click')
+    } else {
       await wrapper.setProps({ manualRefreshToken: 1 })
     }
     await wrapper.setProps({ account: { ...account, updated_at: 'new-revision' }, batchedUsage: batch ? newer : null })

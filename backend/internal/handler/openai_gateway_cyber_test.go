@@ -4,12 +4,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
@@ -113,6 +118,74 @@ func TestRecordCyberPolicyIfMarkedOnlyProtectsSharedNewAPIUser(t *testing.T) {
 			require.Equal(t, test.wantCount, log.ViolationCount)
 		})
 	}
+}
+
+type cyberCooldownHandlerAccountRepo struct {
+	service.AccountRepository
+	mu     sync.Mutex
+	calls  int
+	until  time.Time
+	reason string
+}
+
+func (r *cyberCooldownHandlerAccountRepo) SetTempUnschedulable(_ context.Context, _ int64, until time.Time, reason string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.until = until
+	r.reason = reason
+	return nil
+}
+
+func (r *cyberCooldownHandlerAccountRepo) snapshot() (int, time.Time, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls, r.until, r.reason
+}
+
+func TestRecordCyberPolicyIfMarkedAppliesOpenAICooldownOnce(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+
+	settings := service.NewSettingService(&contentModerationHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAICyberAccountCooldownEnabled:          "true",
+		service.SettingKeyOpenAICyberAccountCooldownWindowSeconds:    "86400",
+		service.SettingKeyOpenAICyberAccountCooldownFirstSeconds:     "3600",
+		service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: "86400",
+		service.SettingKeyOpenAICyberAccountCooldownGroupIDs:         "[12]",
+	}}, &config.Config{})
+	repo := &cyberCooldownHandlerAccountRepo{}
+	gateway := service.NewOpenAIGatewayService(
+		repo, nil, nil, nil, nil, nil, repository.NewGatewayCache(redisClient),
+		&config.Config{}, nil, nil, nil, nil, nil, nil, &service.DeferredService{},
+		nil, nil, nil, nil, nil, settings, nil,
+	)
+	handler := &OpenAIGatewayHandler{gatewayService: gateway}
+	account := &service.Account{
+		ID:          9101,
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "pro"},
+		GroupIDs:    []int64{12},
+	}
+	groupID := int64(12)
+	apiKey := &service.APIKey{ID: 9102, GroupID: &groupID}
+	c := newTestGinContext()
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{
+		Message:        "Session blocked by cyber-security policy",
+		Body:           `{"error":{"code":"cyber_policy"}}`,
+		UpstreamStatus: http.StatusForbidden,
+	})
+
+	handler.recordCyberPolicyIfMarked(c, apiKey, account, nil, "gpt-5.1", true, nil, service.ChannelUsageFields{}, "")
+	handler.recordCyberPolicyIfMarked(c, apiKey, account, nil, "gpt-5.1", true, nil, service.ChannelUsageFields{}, "")
+
+	calls, until, reason := repo.snapshot()
+	require.Equal(t, 1, calls)
+	require.True(t, until.After(time.Now()))
+	require.Contains(t, reason, "upstream_cyber_policy")
 }
 
 // TestClearCyberPolicyTurnState verifies F1 at the handler level: after a turn
