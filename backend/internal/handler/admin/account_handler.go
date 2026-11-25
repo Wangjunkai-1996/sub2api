@@ -1440,6 +1440,27 @@ type TestAccountRequest struct {
 	AudioDataURL string `json:"audio_data_url"`
 }
 
+// Probe verifies an OpenAI OAuth text account without the successful test's
+// runtime recovery. A concurrent 401 must remain visible to the AUTH monitor.
+// Keep a separate route so older servers reject it instead of silently clearing
+// state when they ignore an unfamiliar request option.
+func (h *AccountHandler) Probe(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "Invalid account ID")
+		return
+	}
+	var req struct {
+		ModelID string `json:"model_id" binding:"required"`
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 8<<10)
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.ModelID) == "" {
+		response.BadRequest(c, "model_id is required")
+		return
+	}
+	_ = h.accountTestService.ProbeOpenAIOAuthAccount(c, accountID, strings.TrimSpace(req.ModelID))
+}
+
 type SyncFromCRSRequest struct {
 	BaseURL            string   `json:"base_url" binding:"required"`
 	Username           string   `json:"username" binding:"required"`
