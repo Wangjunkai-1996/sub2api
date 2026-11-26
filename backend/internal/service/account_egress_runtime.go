@@ -56,19 +56,6 @@ func PreferredAccountEgressBindingFromContext(ctx context.Context) string {
 	return strings.TrimSpace(bindingID)
 }
 
-func AccountEgressLeaseLost(account *Account) bool {
-	if account == nil {
-		return false
-	}
-	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil &&
-		(errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseLost) ||
-			errors.Is(context.Cause(account.SelectedEgress.Lease.Context()), ErrAccountEgressLeaseFenced)) {
-		return true
-	}
-	return account.LegacyEgressAdmission != nil && account.LegacyEgressAdmission.Lease != nil &&
-		errors.Is(context.Cause(account.LegacyEgressAdmission.Lease.Context()), ErrAccountEgressLeaseLost)
-}
-
 // CloneForRequest returns an account value that callers may safely decorate
 // with a selected egress without mutating a scheduler or repository snapshot.
 func (a *Account) CloneForRequest() *Account {

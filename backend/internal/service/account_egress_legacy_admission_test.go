@@ -133,17 +133,14 @@ func legacyEgressTestAccount() *Account {
 }
 
 func TestLegacyEgressAdmissionUsesIdentityCacheInOffAndShadow(t *testing.T) {
-	for _, rollout := range []AccountEgressPoolRolloutMode{
-		AccountEgressPoolRolloutOff,
-		AccountEgressPoolRolloutShadow,
-	} {
-		t.Run(string(rollout), func(t *testing.T) {
+	for _, rollout := range []string{"off", "shadow"} {
+		t.Run(rollout, func(t *testing.T) {
 			cache := &legacyEgressConcurrencyCacheStub{
 				legacyAcquireResult: true,
 				legacyRefreshResult: true,
 			}
 			concurrency := NewConcurrencyService(cache)
-			settings := NewSettingService(accountEgressSettingRepoStub{value: string(rollout)}, nil)
+			settings := NewSettingService(accountEgressSettingRepoStub{value: rollout}, nil)
 
 			result, err := acquireAccountSlotForSelection(
 				context.Background(),

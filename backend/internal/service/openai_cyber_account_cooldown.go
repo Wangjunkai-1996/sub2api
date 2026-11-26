@@ -114,13 +114,6 @@ func openAICyberAccountCooldownRedisContext(ctx context.Context) (context.Contex
 	return context.WithTimeout(base, openAICyberAccountCooldownRedisTimeout)
 }
 
-// isOpenAICyberAccountCooldownEligible limits this policy to the dedicated
-// Pro OAuth pool. Group membership can come from either repository-hydrated
-// AccountGroups or the scheduler snapshot's flattened GroupIDs.
-func isOpenAICyberAccountCooldownEligible(account *Account) bool {
-	return isOpenAICyberAccountCooldownEligibleForPolicy(account, conservativeOpenAICyberAccountCooldownPolicy())
-}
-
 func isPotentialOpenAICyberAccountCooldownEligible(account *Account) bool {
 	return account != nil && account.ID > 0 && account.Platform == PlatformOpenAI &&
 		account.Type == AccountTypeOAuth && strings.EqualFold(strings.TrimSpace(account.GetCredential("plan_type")), "pro")

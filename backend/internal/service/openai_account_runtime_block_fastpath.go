@@ -336,16 +336,6 @@ func (s *OpenAIGatewayService) openAICyberCooldownClassificationPendingLocked(ac
 	return ok && pending > 0
 }
 
-func (s *OpenAIGatewayService) isOpenAICyberCooldownClassificationPending(accountID int64) bool {
-	if s == nil || accountID <= 0 {
-		return false
-	}
-	mu := s.openAIAccountRuntimeBlockLock(accountID)
-	mu.Lock()
-	defer mu.Unlock()
-	return s.openAICyberCooldownClassificationPendingLocked(accountID)
-}
-
 func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, reason string) (uint64, bool) {
 	generation := s.openaiAccountRuntimeBlockSequence.Add(1)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)

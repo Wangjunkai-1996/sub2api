@@ -13,7 +13,6 @@ type AccountEgressPoolRolloutMode string
 
 const (
 	AccountEgressPoolRolloutOff     AccountEgressPoolRolloutMode = "off"
-	AccountEgressPoolRolloutShadow  AccountEgressPoolRolloutMode = "shadow"
 	AccountEgressPoolRolloutEnforce AccountEgressPoolRolloutMode = "enforce"
 
 	accountEgressRolloutCacheTTL = 2 * time.Second
@@ -26,14 +25,10 @@ type cachedAccountEgressRolloutMode struct {
 }
 
 func NormalizeAccountEgressPoolRolloutMode(value string) AccountEgressPoolRolloutMode {
-	switch AccountEgressPoolRolloutMode(strings.ToLower(strings.TrimSpace(value))) {
-	case AccountEgressPoolRolloutShadow:
-		return AccountEgressPoolRolloutShadow
-	case AccountEgressPoolRolloutEnforce:
+	if strings.EqualFold(strings.TrimSpace(value), string(AccountEgressPoolRolloutEnforce)) {
 		return AccountEgressPoolRolloutEnforce
-	default:
-		return AccountEgressPoolRolloutOff
 	}
+	return AccountEgressPoolRolloutOff
 }
 
 // GetAccountEgressPoolRolloutMode is fail closed on cold start and for an
@@ -84,9 +79,4 @@ func (s *SettingService) GetAccountEgressPoolRolloutMode(ctx context.Context) Ac
 		hasSuccessfulRead: hasSuccessfulRead,
 	})
 	return mode
-}
-
-func (s *SettingService) IsAccountEgressPoolEnforced(ctx context.Context, account *Account) bool {
-	return account != nil && account.EgressMode == EgressModePool &&
-		s.GetAccountEgressPoolRolloutMode(ctx) == AccountEgressPoolRolloutEnforce
 }

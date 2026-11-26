@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -48,6 +49,74 @@ var accountEgressV2SyncConfigScript = redis.NewScript(`
 	end
 	return 'OK'
 `)
+
+// These scripts reproduce rollout markers written by earlier deployments.
+var (
+	accountEgressBeginPoolTransitionScript = redis.NewScript(`
+		local modeKey = KEYS[1]
+		local poolTotalKey = KEYS[2]
+		local legacyRegularKey = KEYS[3]
+		local legacyLiveKey = KEYS[4]
+		local poolTTL = tonumber(ARGV[1])
+		local legacyRegularTTL = tonumber(ARGV[2])
+		local legacyLiveTTL = tonumber(ARGV[3])
+		local timeResult = redis.call('TIME')
+		local nowSeconds = tonumber(timeResult[1])
+		local nowMillis = nowSeconds * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyRegularKey, '-inf', nowSeconds - legacyRegularTTL)
+		redis.call('ZREMRANGEBYSCORE', legacyLiveKey, '-inf', nowSeconds - legacyLiveTTL)
+		local legacyActive = redis.call('ZCARD', legacyRegularKey) + redis.call('ZCARD', legacyLiveKey)
+		if legacyActive > 0 then
+			redis.call('SET', modeKey, 'transition')
+			return 'transition'
+		end
+		redis.call('SET', modeKey, 'pool')
+		return 'pool'
+	`)
+
+	accountEgressBeginLegacyTransitionScript = redis.NewScript(`
+		local modeKey = KEYS[1]
+		local poolTotalKey = KEYS[2]
+		local poolTTL = tonumber(ARGV[1])
+		local timeResult = redis.call('TIME')
+		local nowMillis = tonumber(timeResult[1]) * 1000 + math.floor(tonumber(timeResult[2]) / 1000)
+		redis.call('ZREMRANGEBYSCORE', poolTotalKey, '-inf', nowMillis - poolTTL)
+		if redis.call('ZCARD', poolTotalKey) > 0 then
+			redis.call('SET', modeKey, 'to_legacy')
+			return 'to_legacy'
+		end
+		redis.call('SET', modeKey, 'legacy')
+		return 'legacy'
+	`)
+)
+
+// BeginAccountEgressPoolTransition fences new legacy admissions before pool
+// selection starts. Existing legacy leases remain refreshable while their
+// admission-time identity mirrors are drained or bridged.
+func (c *concurrencyCache) BeginAccountEgressPoolTransition(ctx context.Context, accountID int64) (string, error) {
+	if c == nil || c.rdb == nil || accountID <= 0 {
+		return "", errors.New("account egress redis cache is unavailable")
+	}
+	return accountEgressBeginPoolTransitionScript.Run(ctx, c.rdb, []string{
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+		accountEgressLegacyRegularKey(accountID),
+		accountEgressLegacyLiveKey(accountID),
+	}, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL), c.slotTTLSeconds, liveLeaseTTLSeconds).Text()
+}
+
+// BeginAccountEgressLegacyTransition fences new pool and legacy admissions
+// until existing pool leases drain. The final pool release advances to legacy.
+func (c *concurrencyCache) BeginAccountEgressLegacyTransition(ctx context.Context, accountID int64) (string, error) {
+	if c == nil || c.rdb == nil || accountID <= 0 {
+		return "", errors.New("account egress redis cache is unavailable")
+	}
+	return accountEgressBeginLegacyTransitionScript.Run(ctx, c.rdb, []string{
+		accountEgressModeKey(accountID),
+		accountEgressTotalKey(accountID),
+	}, accountEgressDurationMilliseconds(service.AccountEgressLeaseTTL)).Text()
+}
 
 func newAccountEgressCacheTest(t *testing.T) (*concurrencyCache, *miniredis.Miniredis) {
 	t.Helper()

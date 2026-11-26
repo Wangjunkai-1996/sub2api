@@ -205,29 +205,6 @@ func (a *Account) ConcurrencyPerEgress() int {
 	return a.Concurrency
 }
 
-// EffectiveEgressCapacity is separate from EffectiveLoadFactor so rollout-off
-// schedulers keep their existing behavior. Pool capacity counts only distinct,
-// fully active public IP identities.
-func (a *Account) EffectiveEgressCapacity() int {
-	if a == nil {
-		return 0
-	}
-	if a.EgressMode != EgressModePool {
-		return a.Concurrency
-	}
-	identities := make(map[int64]struct{}, len(a.EgressBindings))
-	for i := range a.EgressBindings {
-		binding := &a.EgressBindings[i]
-		if binding.Status != AccountEgressBindingStatusActive || binding.Route == nil ||
-			binding.Route.State != EgressRouteStateActive || binding.Route.ExpectedIdentity == nil ||
-			binding.Route.ExpectedIdentity.Status != EgressIdentityStatusActive {
-			continue
-		}
-		identities[binding.Route.ExpectedIdentity.ID] = struct{}{}
-	}
-	return len(identities) * a.ConcurrencyPerEgress()
-}
-
 func (a *Account) IsSchedulable() bool {
 	if !a.IsActive() || !a.Schedulable {
 		return false

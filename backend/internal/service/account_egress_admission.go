@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"strings"
-
-	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"go.uber.org/zap"
 )
 
 func acquireAccountSlotForSelection(
@@ -37,19 +34,6 @@ func acquireAccountSlotForSelectionWithBinding(
 	rollout := AccountEgressPoolRolloutOff
 	if settings != nil {
 		rollout = settings.GetAccountEgressPoolRolloutMode(ctx)
-	}
-	if accountSupportsEgressPoolRuntime(account) && account.EgressMode == EgressModePool && rollout == AccountEgressPoolRolloutShadow {
-		if config, err := AccountEgressPoolConfigForRuntime(account, 0); err != nil {
-			logger.L().Warn("account_egress_shadow_config_invalid",
-				zap.Int64("account_id", account.ID),
-				zap.Error(err),
-			)
-		} else {
-			logger.L().Debug("account_egress_shadow_evaluated",
-				zap.Int("effective_capacity", config.EffectiveCapacity()),
-				zap.Int("candidate_count", len(config.Candidates)),
-			)
-		}
 	}
 	if !accountSupportsEgressPoolRuntime(account) || account.EgressMode != EgressModePool || rollout != AccountEgressPoolRolloutEnforce {
 		if concurrency == nil {
@@ -107,7 +91,7 @@ func accountUsesLegacyEgressMirror(
 ) bool {
 	if concurrency == nil || concurrency.cache == nil || !accountSupportsEgressPoolRuntime(account) ||
 		account.EgressMode != EgressModePool ||
-		(rollout != AccountEgressPoolRolloutOff && rollout != AccountEgressPoolRolloutShadow) {
+		rollout != AccountEgressPoolRolloutOff {
 		return false
 	}
 	_, supported := concurrency.cache.(AccountEgressLegacySlotCache)

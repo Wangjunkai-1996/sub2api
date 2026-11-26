@@ -989,17 +989,6 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	return hydrated, nil
 }
 
-// selectAccountForModelWithExclusionsStickyHit preserves the official sticky-hit
-// metadata while reusing KKAI's egress-aware selector. The durable
-// binding flag remains controlled by the caller-specific wrapper above.
-func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, bool, error) {
-	account, err := s.selectAccountForModelWithExclusions(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability, preferLowUpstreamRate, false)
-	if err != nil || account == nil {
-		return account, false, err
-	}
-	return account, stickyAccountID > 0 && account.ID == stickyAccountID, nil
-}
-
 // tryStickySessionHit 尝试从粘性会话获取账号。
 // 如果命中且账号可用则返回账号；如果账号不可用则清理会话并返回 nil。
 //

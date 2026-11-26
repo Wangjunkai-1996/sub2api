@@ -137,6 +137,16 @@ func openAICyberCooldownEligibleAccount() *Account {
 	}
 }
 
+func (s *OpenAIGatewayService) isOpenAICyberCooldownClassificationPending(accountID int64) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.openAICyberCooldownClassificationPendingLocked(accountID)
+}
+
 func TestOpenAICyberAccountCooldownEligibility(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -195,7 +205,7 @@ func TestOpenAICyberAccountCooldownEligibility(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, isOpenAICyberAccountCooldownEligible(tc.account))
+			require.Equal(t, tc.want, isOpenAICyberAccountCooldownEligibleForPolicy(tc.account, conservativeOpenAICyberAccountCooldownPolicy()))
 		})
 	}
 }

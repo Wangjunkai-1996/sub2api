@@ -4761,10 +4761,6 @@ func (h *OpenAIGatewayHandler) rejectIfCyberSessionBlocked(c *gin.Context, apiKe
 	return true
 }
 
-func buildCyberSessionBlock(apiKeyID int64, c *gin.Context, body []byte) string {
-	return service.CyberSessionExplicitBlockKey(apiKeyID, c, body)
-}
-
 func findBlockedCyberSessionKey(ctx context.Context, gatewayService *service.OpenAIGatewayService, apiKeyID int64, c *gin.Context, body []byte) string {
 	if gatewayService == nil {
 		return ""

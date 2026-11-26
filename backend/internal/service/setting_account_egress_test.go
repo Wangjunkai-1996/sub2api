@@ -48,7 +48,7 @@ func TestAccountEgressPoolRolloutModeFailClosed(t *testing.T) {
 		want  AccountEgressPoolRolloutMode
 	}{
 		{name: "enforce", value: " enforce ", want: AccountEgressPoolRolloutEnforce},
-		{name: "shadow", value: "SHADOW", want: AccountEgressPoolRolloutShadow},
+		{name: "retired shadow", value: " SHADOW ", want: AccountEgressPoolRolloutOff},
 		{name: "invalid", value: "enabled", want: AccountEgressPoolRolloutOff},
 		{name: "read error", err: errors.New("database unavailable"), want: AccountEgressPoolRolloutOff},
 	}
@@ -85,6 +85,7 @@ func TestAccountEgressPoolRolloutModeExplicitOffOverridesStaleValue(t *testing.T
 		err   error
 	}{
 		{name: "not found", err: ErrSettingNotFound},
+		{name: "retired shadow", value: "shadow"},
 		{name: "invalid", value: "enabled"},
 	}
 	for _, tt := range tests {

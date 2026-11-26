@@ -239,18 +239,24 @@ func TestSelectionAccountPrefersFreshLegacyAccountAndResolvedPoolAccount(t *test
 	}, fresh))
 }
 
-func TestAccountEgressLeaseLostRecognizesOnlyAllocatorLoss(t *testing.T) {
-	leaseCtx, cancel := context.WithCancelCause(context.Background())
-	account := &Account{SelectedEgress: &ResolvedAccountEgress{Lease: &AccountEgressLease{ctx: leaseCtx}}}
+func TestAccountEgressRequestContextPreservesCancellationCause(t *testing.T) {
+	for _, cause := range []error{ErrAccountEgressLeaseLost, ErrAccountEgressLeaseFenced, context.Canceled} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			leaseCtx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			account := &Account{SelectedEgress: &ResolvedAccountEgress{Lease: &AccountEgressLease{ctx: leaseCtx}}}
+			requestCtx := ContextWithSelectedAccountEgress(t.Context(), account)
+			require.NoError(t, requestCtx.Err())
 
-	require.False(t, AccountEgressLeaseLost(account))
-	cancel(ErrAccountEgressLeaseLost)
-	require.True(t, AccountEgressLeaseLost(account))
-
-	canceledCtx, cancelCanceled := context.WithCancelCause(context.Background())
-	cancelCanceled(context.Canceled)
-	account.SelectedEgress.Lease = &AccountEgressLease{ctx: canceledCtx}
-	require.False(t, AccountEgressLeaseLost(account), "ordinary request cancellation is not allocator lease loss")
+			cancel(cause)
+			select {
+			case <-requestCtx.Done():
+				require.ErrorIs(t, context.Cause(requestCtx), cause)
+			case <-time.After(time.Second):
+				t.Fatal("request context stayed active after its egress lease ended")
+			}
+		})
+	}
 }
 
 func timePointer(value time.Time) *time.Time {
