@@ -15,8 +15,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// openAIWSIngressCapacityShedRepo 补齐 SetError，避免非容量类错误（如
-// workspace_suspended）走到账号状态副作用时打空指针。
+// openAIWSIngressCapacityShedRepo 补齐错误状态写入，避免非容量类错误
+// 走到账号状态副作用时打空指针。
 type openAIWSIngressCapacityShedRepo struct {
 	stubOpenAIAccountRepo
 }
@@ -37,7 +37,8 @@ func (r *openAIWSIngressCapacityShedRepo) UpdateExtra(context.Context, int64, ma
 // server_error：Codex 按闭集判定，server_is_overloaded / slow_down 属致命集，
 // 客户端会打印 "Selected model is at capacity" 并直接终止会话而不是退避重试。
 //
-// 第二个用例锁住改写范围：非容量类错误码必须原样下发，客户端依赖原码各自处理。
+// 其余用例锁住改写范围和时机：非容量类错误码必须原样下发；已有语义输出后
+// 的容量错误不能再 failover，但仍要把致命容量码改写成客户端可重试的 server_error。
 func TestProxyResponsesWebSocketFromClient_RewritesCapacityShedCodeForClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -46,30 +47,73 @@ func TestProxyResponsesWebSocketFromClient_RewritesCapacityShedCodeForClient(t *
 		upstreamEvents [][]byte
 		wantContains   []string
 		wantAbsent     []string
+		wantFailover   bool
+		responseID     string
+		serverErrCount int
 	}{
 		{
-			name: "capacity_shed_error_and_failed_are_rewritten",
+			name: "capacity_shed_after_preamble_fails_over_before_client_output",
 			upstreamEvents: [][]byte{
-				[]byte(`{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}`),
+				[]byte(`{"type":"response.created","response":{"id":"resp_shed","status":"in_progress"}}`),
 				[]byte(`{"type":"response.failed","response":{"id":"resp_shed","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}`),
 			},
-			wantContains: []string{
-				`"code":"server_error"`,
-				"Our servers are currently overloaded",
-			},
-			wantAbsent: []string{"server_is_overloaded"},
+			wantAbsent:   []string{"response.created", "server_is_overloaded"},
+			wantFailover: true,
+			responseID:   "resp_shed",
 		},
 		{
-			name: "non_capacity_error_code_is_passed_through",
+			name: "capacity_shed_after_json_heartbeats_fails_over_before_client_output",
 			upstreamEvents: [][]byte{
-				[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"workspace_suspended","message":"workspace is suspended"}}`),
-				[]byte(`{"type":"response.failed","response":{"id":"resp_suspended","status":"failed","error":{"code":"workspace_suspended","message":"workspace is suspended"}}}`),
+				[]byte(`{"type":"response.created","response":{"id":"resp_heartbeat","status":"in_progress"}}`),
+				[]byte(`{"type":"keepalive"}`),
+				[]byte(`{"type":"ping"}`),
+				[]byte(`{"type":"keepalive","timestamp":1789608992,"sequence_number":3}`),
+				[]byte(`{"type":"response.failed","response":{"id":"resp_heartbeat","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}`),
+			},
+			wantAbsent:   []string{"response.created", "keepalive", "ping", "server_is_overloaded"},
+			wantFailover: true,
+			responseID:   "resp_heartbeat",
+		},
+		{
+			name: "keepalive_with_output_does_not_allow_replay",
+			upstreamEvents: [][]byte{
+				[]byte(`{"type":"response.created","response":{"id":"resp_heartbeat_output","status":"in_progress"}}`),
+				[]byte(`{"type":"keepalive","delta":"hello"}`),
+				[]byte(`{"type":"response.failed","response":{"id":"resp_heartbeat_output","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}`),
+			},
+			wantContains:   []string{`"delta":"hello"`, `"code":"server_error"`},
+			wantAbsent:     []string{"server_is_overloaded"},
+			responseID:     "resp_heartbeat_output",
+			serverErrCount: 1,
+		},
+		{
+			name: "non_retryable_policy_error_is_passed_through",
+			upstreamEvents: [][]byte{
+				[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"content_policy_violation","message":"request blocked by content policy"}}`),
+				[]byte(`{"type":"response.failed","response":{"id":"resp_policy","status":"failed","error":{"type":"invalid_request_error","code":"content_policy_violation","message":"request blocked by content policy"}}}`),
 			},
 			wantContains: []string{
-				`"code":"workspace_suspended"`,
-				"workspace is suspended",
+				`"code":"content_policy_violation"`,
+				"request blocked by content policy",
 			},
 			wantAbsent: []string{"server_error"},
+			responseID: "resp_policy",
+		},
+		{
+			name: "capacity_shed_after_semantic_output_is_rewritten_without_failover",
+			upstreamEvents: [][]byte{
+				[]byte(`{"type":"response.created","response":{"id":"resp_shed_after_output","status":"in_progress"}}`),
+				[]byte(`{"type":"response.output_text.delta","response_id":"resp_shed_after_output","delta":"hello"}`),
+				[]byte(`{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}`),
+				[]byte(`{"type":"response.failed","response":{"id":"resp_shed_after_output","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}`),
+			},
+			wantContains: []string{
+				`"type":"response.output_text.delta"`,
+				`"code":"server_error"`,
+			},
+			wantAbsent:     []string{"server_is_overloaded"},
+			responseID:     "resp_shed_after_output",
+			serverErrCount: 2,
 		},
 	}
 
@@ -105,23 +149,29 @@ func TestProxyResponsesWebSocketFromClient_RewritesCapacityShedCodeForClient(t *
 				Credentials: map[string]any{"api_key": "sk-test"},
 				Extra:       map[string]any{"responses_websockets_v2_enabled": true},
 			}
+			account.SelectedEgress = &ResolvedAccountEgress{
+				BindingID: StableAccountEgressBindingID(account.ID, 93),
+				RouteID:   93,
+			}
+			store := newStreamingResponseBindingOrderStore()
 			repo := &openAIWSIngressCapacityShedRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
 			svc := &OpenAIGatewayService{
-				accountRepo:      repo,
-				rateLimitService: &RateLimitService{accountRepo: repo},
-				httpUpstream:     &httpUpstreamRecorder{},
-				cache:            &stubGatewayCache{},
-				cfg:              cfg,
-				openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
-				toolCorrector:    NewCodexToolCorrector(),
-				openaiWSPool:     pool,
+				accountRepo:        repo,
+				rateLimitService:   &RateLimitService{accountRepo: repo},
+				httpUpstream:       &httpUpstreamRecorder{},
+				cache:              &stubGatewayCache{},
+				cfg:                cfg,
+				openaiWSResolver:   NewOpenAIWSProtocolResolver(cfg),
+				toolCorrector:      NewCodexToolCorrector(),
+				openaiWSPool:       pool,
+				openaiWSStateStore: store,
 			}
 
-			serverDone := make(chan struct{})
+			serverResult := make(chan error, 1)
 			wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				defer close(serverDone)
 				conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
 				if err != nil {
+					serverResult <- err
 					return
 				}
 				defer func() { _ = conn.CloseNow() }()
@@ -137,9 +187,10 @@ func TestProxyResponsesWebSocketFromClient_RewritesCapacityShedCodeForClient(t *
 				msgType, firstMessage, readErr := conn.Read(readCtx)
 				cancel()
 				if readErr != nil || (msgType != coderws.MessageText && msgType != coderws.MessageBinary) {
+					serverResult <- readErr
 					return
 				}
-				_ = svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, &account, "sk-test", firstMessage, nil)
+				serverResult <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, &account, "sk-test", firstMessage, nil)
 			}))
 			defer wsServer.Close()
 
@@ -167,17 +218,40 @@ func TestProxyResponsesWebSocketFromClient_RewritesCapacityShedCodeForClient(t *
 			// 本轮已终止，主动断开客户端让 ingress 退出 turn 循环。
 			_ = clientConn.CloseNow()
 
-			require.NotEmpty(t, frames, "客户端应至少收到一个下发事件")
 			joined := strings.Join(frames, "\n")
+			if tt.wantFailover {
+				require.Empty(t, frames, "首个语义输出前的前导事件不得泄露给客户端")
+			} else {
+				require.NotEmpty(t, frames, "客户端应至少收到一个下发事件")
+			}
 			for _, want := range tt.wantContains {
 				require.Contains(t, joined, want, "客户端收到的事件:\n%s", joined)
 			}
 			for _, absent := range tt.wantAbsent {
 				require.NotContains(t, joined, absent, "客户端收到的事件:\n%s", joined)
 			}
+			if tt.serverErrCount > 0 {
+				require.Equal(t, tt.serverErrCount, strings.Count(joined, `"code":"server_error"`), "客户端收到的事件:\n%s", joined)
+			}
 
 			select {
-			case <-serverDone:
+			case proxyErr := <-serverResult:
+				if tt.wantFailover {
+					var failoverErr *UpstreamFailoverError
+					require.ErrorAs(t, proxyErr, &failoverErr)
+					require.True(t, failoverErr.RetryableOnSameAccount)
+					require.True(t, failoverErr.RequestScopedTransient)
+				} else {
+					require.NoError(t, proxyErr)
+					boundAccountID, bindErr := store.GetResponseAccount(context.Background(), 0, tt.responseID)
+					require.NoError(t, bindErr)
+					require.Equal(t, account.ID, boundAccountID)
+					boundEgress, ok := getOpenAIWSResponseEgress(store, context.Background(), 0, tt.responseID)
+					require.True(t, ok)
+					require.Equal(t, account.SelectedEgress.BindingID, boundEgress)
+					_, connBound := store.GetResponseConn(tt.responseID)
+					require.True(t, connBound)
+				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("等待 ingress websocket 结束超时")
 			}

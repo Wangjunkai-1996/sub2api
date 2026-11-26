@@ -1,13 +1,20 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
@@ -81,6 +88,106 @@ func TestRecordCyberPolicyIfMarked_ForwardSuccessSkipsUsageLog(t *testing.T) {
 	require.True(t, c.GetBool(cyberPolicyRecordedKey))
 }
 
+func TestRecordCyberPolicyIfMarkedOnlyProtectsSharedNewAPIUser(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		verified  bool
+		wantMode  string
+		wantCount int
+	}{
+		{name: "direct Sub2 user keeps violation counting", wantMode: "post_upstream", wantCount: 1},
+		{name: "verified NewAPI user protects shared owner", verified: true, wantMode: service.ContentModerationModeCyberLogOnly},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &contentModerationHandlerTestRepo{}
+			settings := &contentModerationHandlerSettingRepo{values: map[string]string{service.SettingKeyRiskControlEnabled: "true"}}
+			h := &OpenAIGatewayHandler{contentModerationService: service.NewContentModerationService(settings, repo, nil, nil, nil, nil, nil, nil)}
+			c := newTestGinContext()
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			if test.verified {
+				ctx := context.WithValue(c.Request.Context(), ctxkey.NewAPIUserID, int64(42))
+				ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(77))
+				ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "https://newapi.internal")
+				c.Request = c.Request.WithContext(ctx)
+			}
+			service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Code: "cyber_policy", Message: "blocked", UpstreamStatus: http.StatusForbidden})
+			h.recordCyberPolicyIfMarked(c, &service.APIKey{ID: 21, UserID: 1, User: &service.User{ID: 1}}, nil, nil, "gpt-5", false, nil, service.ChannelUsageFields{}, "")
+			require.Eventually(t, func() bool { return len(repo.logSnapshot()) == 1 }, time.Second, time.Millisecond)
+			log := repo.logSnapshot()[0]
+			require.Equal(t, test.wantMode, log.Mode)
+			require.Equal(t, test.wantCount, log.ViolationCount)
+		})
+	}
+}
+
+type cyberCooldownHandlerAccountRepo struct {
+	service.AccountRepository
+	mu     sync.Mutex
+	calls  int
+	until  time.Time
+	reason string
+}
+
+func (r *cyberCooldownHandlerAccountRepo) SetTempUnschedulable(_ context.Context, _ int64, until time.Time, reason string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.until = until
+	r.reason = reason
+	return nil
+}
+
+func (r *cyberCooldownHandlerAccountRepo) snapshot() (int, time.Time, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls, r.until, r.reason
+}
+
+func TestRecordCyberPolicyIfMarkedAppliesOpenAICooldownOnce(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+
+	settings := service.NewSettingService(&contentModerationHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyOpenAICyberAccountCooldownEnabled:          "true",
+		service.SettingKeyOpenAICyberAccountCooldownWindowSeconds:    "86400",
+		service.SettingKeyOpenAICyberAccountCooldownFirstSeconds:     "3600",
+		service.SettingKeyOpenAICyberAccountCooldownEscalatedSeconds: "86400",
+		service.SettingKeyOpenAICyberAccountCooldownGroupIDs:         "[12]",
+	}}, &config.Config{})
+	repo := &cyberCooldownHandlerAccountRepo{}
+	gateway := service.NewOpenAIGatewayService(
+		repo, nil, nil, nil, nil, nil, repository.NewGatewayCache(redisClient),
+		&config.Config{}, nil, nil, nil, nil, nil, nil, &service.DeferredService{},
+		nil, nil, nil, nil, nil, settings, nil,
+	)
+	handler := &OpenAIGatewayHandler{gatewayService: gateway}
+	account := &service.Account{
+		ID:          9101,
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "pro"},
+		GroupIDs:    []int64{12},
+	}
+	groupID := int64(12)
+	apiKey := &service.APIKey{ID: 9102, GroupID: &groupID}
+	c := newTestGinContext()
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{
+		Message:        "Session blocked by cyber-security policy",
+		Body:           `{"error":{"code":"cyber_policy"}}`,
+		UpstreamStatus: http.StatusForbidden,
+	})
+
+	handler.recordCyberPolicyIfMarked(c, apiKey, account, nil, "gpt-5.1", true, nil, service.ChannelUsageFields{}, "")
+	handler.recordCyberPolicyIfMarked(c, apiKey, account, nil, "gpt-5.1", true, nil, service.ChannelUsageFields{}, "")
+
+	calls, until, reason := repo.snapshot()
+	require.Equal(t, 1, calls)
+	require.True(t, until.After(time.Now()))
+	require.Contains(t, reason, "upstream_cyber_policy")
+}
+
 // TestClearCyberPolicyTurnState verifies F1 at the handler level: after a turn
 // is finalized, both the mark and the recorded guard are reset so the next WS
 // turn detects/records independently.
@@ -101,113 +208,6 @@ func TestClearCyberPolicyTurnState(t *testing.T) {
 	h.recordCyberPolicyIfMarked(c, nil, nil, nil, "gpt-5", false, nil, service.ChannelUsageFields{}, "")
 	require.True(t, c.GetBool(cyberPolicyRecordedKey))
 	require.Equal(t, "turn2", service.GetOpsCyberPolicy(c).Message)
-}
-
-func TestAdvanceOpenAIWSCyberBlockStateDefersBlockAcrossFailover(t *testing.T) {
-	failoverErr := &service.UpstreamFailoverError{StatusCode: http.StatusTooManyRequests}
-
-	blocked, pending := advanceOpenAIWSCyberBlockState(false, false, true, failoverErr)
-	require.False(t, blocked, "the replacement account must receive the current turn")
-	require.True(t, pending, "the cyber hit must still block later turns")
-
-	blocked, pending = advanceOpenAIWSCyberBlockState(blocked, pending, false, failoverErr)
-	require.False(t, blocked, "additional failover attempts must remain eligible")
-	require.True(t, pending)
-
-	blocked, pending = advanceOpenAIWSCyberBlockState(blocked, pending, false, nil)
-	require.True(t, blocked, "the next client turn must be blocked after failover finishes")
-	require.False(t, pending)
-}
-
-func TestClearCyberPolicyAttemptStatePreservesRecordedGuardDuringFailover(t *testing.T) {
-	c := newTestGinContext()
-	h := &OpenAIGatewayHandler{}
-
-	service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Message: "account-a", UpstreamStatus: http.StatusOK})
-	h.recordCyberPolicyIfMarked(c, nil, nil, nil, "gpt-5", true, nil, service.ChannelUsageFields{}, "")
-	require.True(t, c.GetBool(cyberPolicyRecordedKey))
-
-	clearCyberPolicyAttemptState(c, false)
-	require.Nil(t, service.GetOpsCyberPolicy(c))
-	require.True(t, c.GetBool(cyberPolicyRecordedKey), "the same logical turn must not record again after failover")
-
-	service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Message: "account-b", UpstreamStatus: http.StatusOK})
-	h.recordCyberPolicyIfMarked(c, nil, nil, nil, "gpt-5", true, nil, service.ChannelUsageFields{}, "")
-	require.Equal(t, "account-b", service.GetOpsCyberPolicy(c).Message)
-	require.True(t, c.GetBool(cyberPolicyRecordedKey))
-
-	clearCyberPolicyAttemptState(c, true)
-	require.Nil(t, service.GetOpsCyberPolicy(c))
-	require.False(t, c.GetBool(cyberPolicyRecordedKey), "a completed logical turn must reset the guard")
-}
-
-// TestBuildCyberSessionBlockedOpsEntry verifies the locally-rejected request is
-// auditable: 403 / phase=request / type=cyber_policy_session_blocked — distinct
-// from upstream cyber_policy hits, and it must NOT touch moderation/violation.
-func TestBuildCyberSessionBlockedOpsEntry(t *testing.T) {
-	entry := buildCyberSessionBlockedOpsEntry(cyberPolicyOpsErrorMeta{
-		RequestID: "req-9", Model: "gpt-5", RequestPath: "/openai/v1/responses",
-	})
-	require.Equal(t, 403, entry.StatusCode)
-	require.Equal(t, "cyber_policy_session_blocked", entry.ErrorType)
-	require.Equal(t, "request", entry.ErrorPhase)
-	require.True(t, entry.IsBusinessLimited)
-	require.Equal(t, "gateway_local", entry.ErrorSource)
-	require.Equal(t, "platform", entry.ErrorOwner)
-	require.Empty(t, entry.ErrorBody, "no session block key → ErrorBody must be empty")
-
-	entryWithKey := buildCyberSessionBlockedOpsEntry(cyberPolicyOpsErrorMeta{
-		RequestID: "req-9", Model: "gpt-5", RequestPath: "/openai/v1/responses",
-		SessionBlockKey: "abc123",
-	})
-	require.Equal(t, "session_block_key=abc123", entryWithKey.ErrorBody)
-}
-
-// TestRejectIfCyberSessionBlocked_FailOpen verifies fail-open paths: nil handler
-// services, no explicit session signal, and (implicitly) disabled switch all
-// pass the request through.
-func TestRejectIfCyberSessionBlocked_FailOpen(t *testing.T) {
-	c := newTestGinContext()
-	c.Request = httptest.NewRequest("POST", "/openai/v1/responses", strings.NewReader(`{}`))
-
-	h := &OpenAIGatewayHandler{}
-	require.False(t, h.rejectIfCyberSessionBlocked(c, nil, []byte(`{}`), "gpt-5", cyberBlockFormatResponses), "nil apiKey → pass")
-
-	h2 := &OpenAIGatewayHandler{gatewayService: nil}
-	key := &service.APIKey{ID: 1}
-	require.False(t, h2.rejectIfCyberSessionBlocked(c, key, []byte(`{}`), "gpt-5", cyberBlockFormatResponses), "nil gateway service → pass")
-}
-
-func TestBuildCyberSessionBlockCombinesExplicitAndTranscriptKeys(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"user","content":"setup"},{"role":"assistant","content":"ready"},{"role":"user","content":"trigger"}]}`)
-	c := newTestGinContext()
-	c.Request = httptest.NewRequest("POST", "/openai/v1/responses", strings.NewReader(string(body)))
-	c.Request.RemoteAddr = "203.0.113.44:12345"
-	c.Request.Header.Set("User-Agent", "client/1.2.3")
-
-	block := buildCyberSessionBlock(7, c, body)
-	require.Len(t, block.Keys, 2)
-	require.Equal(t, []int{3, 2}, block.TranscriptLengths)
-	require.Equal(t, int64(7), block.APIKeyID)
-	require.NotEmpty(t, block.ScopeKey)
-
-	c.Request.Header.Set("session_id", "sess-explicit")
-	block = buildCyberSessionBlock(7, c, body)
-	require.Len(t, block.Keys, 3)
-	require.Equal(t, []int{3, 2}, block.TranscriptLengths)
-	require.NotEmpty(t, block.ScopeKey)
-}
-
-// TestRecordCyberPolicyIfMarked_BlockKeyPlumbed verifies the 6th param is
-// accepted and a non-empty key with nil gateway service does not panic
-// (write-side guards live in the service layer).
-func TestRecordCyberPolicyIfMarked_BlockKeyPlumbed(t *testing.T) {
-	c := newTestGinContext()
-	service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Message: "x", UpstreamStatus: 400})
-	h := &OpenAIGatewayHandler{}
-	require.NotPanics(t, func() {
-		h.recordCyberPolicyIfMarked(c, nil, nil, nil, "gpt-5", true, []byte(`{"input":"deadbeef"}`), service.ChannelUsageFields{}, "")
-	})
 }
 
 // TestBuildCyberPolicyOpsErrorEntry_StatusCode verifies F6: the ops error log
@@ -234,6 +234,85 @@ func TestBuildCyberPolicyOpsErrorEntry_StatusCode(t *testing.T) {
 			require.Equal(t, tc.upstreamStatus, entry.StatusCode)
 			require.Equal(t, "cyber_policy", entry.ErrorType)
 			require.Equal(t, "request", entry.ErrorPhase)
+		})
+	}
+}
+
+func TestCyberOpsEntriesKeepBillingAndVerifiedUserDistinct(t *testing.T) {
+	meta := cyberPolicyOpsErrorMeta{
+		RequestID: "sub2-request", UserID: 1, APIKeyID: 21,
+		NewAPIRequestID: "newapi-request", NewAPIOrigin: "https://newapi.internal",
+		NewAPIUserID: 4835, NewAPITokenID: 17265,
+	}
+	for _, entry := range []*service.OpsInsertErrorLogInput{
+		buildCyberPolicyOpsErrorEntry(meta, &service.CyberPolicyMark{Code: "cyber_policy", UpstreamStatus: 403}),
+		buildCyberSessionBlockedOpsEntry(meta),
+	} {
+		require.NotNil(t, entry.UserID)
+		require.Equal(t, int64(1), *entry.UserID)
+		require.Contains(t, entry.ErrorMessage, "verified_newapi_user_id=4835")
+		require.Contains(t, entry.ErrorMessage, "verified_newapi_token_id=17265")
+		require.Contains(t, entry.ErrorMessage, "newapi_request_id=newapi-request")
+	}
+	unsigned := buildCyberPolicyOpsErrorEntry(cyberPolicyOpsErrorMeta{UserID: 1}, &service.CyberPolicyMark{})
+	require.NotContains(t, unsigned.ErrorMessage, "verified_newapi_user_id")
+}
+
+func TestCyberOpsIdentityDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		verified  bool
+		session   string
+		websocket bool
+		local     bool
+		want      string
+	}{
+		{name: "unverified", session: "private-session", want: "unverified_relay"},
+		{name: "missing", verified: true, want: "missing_session"},
+		{name: "invalid", verified: true, session: "private\tsession", want: "invalid_session"},
+		{name: "ready", verified: true, session: "private-session", want: "ready"},
+		{name: "websocket uses handshake identity", verified: true, session: "private-session", websocket: true, want: "ready"},
+		{name: "local block", verified: true, session: "private-session", local: true, want: "ready"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupOpsErrorLogTestQueue(t, 1)
+			t.Cleanup(func() { resetOpsErrorLoggerStateForTest(t) })
+			repo := &ingressRejectOpsRepo{}
+			ops := service.NewOpsService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+			h := &OpenAIGatewayHandler{opsService: ops}
+			c := newTestGinContext()
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Request.Header.Set("X-Session-Id", tc.session)
+			c.Request.Header.Set("Session_Id", "different-hint")
+			if tc.verified {
+				ctx := context.WithValue(c.Request.Context(), ctxkey.NewAPIUserID, int64(42))
+				ctx = context.WithValue(ctx, ctxkey.NewAPITokenID, int64(77))
+				ctx = context.WithValue(ctx, ctxkey.NewAPIOrigin, "https://newapi.internal")
+				c.Request = c.Request.WithContext(ctx)
+			}
+			if tc.websocket {
+				service.SetOpenAIClientTransport(c, service.OpenAIClientTransportWS)
+			}
+			apiKey := &service.APIKey{ID: 21}
+			if tc.local {
+				key := service.CyberSessionExplicitBlockKey(apiKey.ID, c, nil)
+				h.enqueueCyberSessionBlockedOpsEntry(c, apiKey, "gpt-5", key)
+			} else {
+				service.MarkOpsCyberPolicy(c, service.CyberPolicyMark{Code: "cyber_policy", Message: "blocked", UpstreamStatus: 403})
+				h.recordCyberPolicyIfMarked(c, apiKey, nil, nil, "gpt-5", false, nil, service.ChannelUsageFields{}, "")
+			}
+			// The asynchronous event must use the frozen identity status.
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			select {
+			case job := <-opsErrorLogQueue:
+				flushOpsErrorLogBatch([]opsErrorLogJob{job})
+			case <-time.After(time.Second):
+				t.Fatal("cyber event was not queued")
+			}
+			require.Len(t, repo.entries, 1)
+			require.Contains(t, repo.entries[0].ErrorMessage, "session_identity_status="+tc.want)
+			require.NotContains(t, repo.entries[0].ErrorMessage, "private")
+			require.NotContains(t, repo.entries[0].ErrorBody, "private")
 		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ const (
 	openAIFirstOutputStageMaxBytes           = 8 * 1024 * 1024
 	openAIFirstOutputScannerFramingAllowance = 64
 	openAIFirstOutputGuardQueueSize          = 1
+	openAIFirstOutputTypeProbeBytes          = 64 * 1024
 	openAIDefaultStreamQueueSize             = 16
 )
 
@@ -76,18 +78,61 @@ func openAIFirstOutputDynamicScanLines(guardActive *atomic.Bool) bufio.SplitFunc
 		}
 		limit := openAIFirstOutputStageMaxBytes + openAIFirstOutputScannerFramingAllowance
 		if token != nil {
-			if len(token) > limit {
+			if len(token) > limit && !openAIFirstOutputOversizedDataTokenIsSemantic(token) {
 				return 0, nil, errOpenAIFirstOutputScannerLimit
 			}
 			return advance, token, nil
 		}
 		// At the limit with no delimiter, another byte would necessarily exceed
-		// the guarded token budget. Fail before Scanner grows toward MaxLineSize.
-		if len(data) >= limit {
+		// the guarded token budget. A clearly identified semantic event may grow
+		// to MaxLineSize; only replayable preamble remains subject to this cap.
+		if len(data) >= limit && !openAIFirstOutputOversizedDataTokenIsSemantic(data) {
 			return 0, nil, errOpenAIFirstOutputScannerLimit
 		}
 		return advance, token, nil
 	}
+}
+
+func openAIFirstOutputOversizedDataTokenIsSemantic(line []byte) bool {
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return false
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) > openAIFirstOutputTypeProbeBytes {
+		payload = payload[:openAIFirstOutputTypeProbeBytes]
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return false
+	}
+	for field := 0; field < 16 && decoder.More(); field++ {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false
+		}
+		value, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if key == "type" {
+			eventType, _ := value.(string)
+			switch strings.TrimSpace(eventType) {
+			case "", "response.created", "response.in_progress", "response.failed", "error":
+				return false
+			default:
+				return true
+			}
+		}
+		if _, nested := value.(json.Delim); nested {
+			return false
+		}
+	}
+	return false
 }
 
 func (s *openAIFirstOutputStage) Buffered() int64 {
@@ -275,7 +320,7 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 		ProxyName: proxyName,
 		Platform:  account.Platform, AccountID: account.ID, AccountName: account.Name,
 		UpstreamStatusCode: http.StatusGatewayTimeout, UpstreamRequestID: requestID,
-		Kind: "first_output_timeout", Message: "OpenAI upstream produced no semantic output before the deadline",
+		Kind: "first_output_timeout", Message: "OpenAI upstream produced no usable output before the deadline",
 		Detail: fmt.Sprintf("phase=%s elapsed_ms=%d timeout_ms=%d", phase, elapsed.Milliseconds(), timeout.Milliseconds()),
 	})
 	if s.rateLimitService != nil {
@@ -285,6 +330,7 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 		StatusCode:      http.StatusGatewayTimeout,
 		ResponseBody:    []byte(`{"error":{"type":"first_output_timeout","message":"Upstream produced no output before the deadline"}}`),
 		ResponseHeaders: responseHeaders.Clone(), SafeToFailoverAfterWrite: true,
+		FirstOutputTimeout: true,
 	}
 }
 

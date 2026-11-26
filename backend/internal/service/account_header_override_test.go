@@ -122,6 +122,8 @@ func TestGetHeaderOverrides(t *testing.T) {
 			"sec-websocket-key":        "forged",
 			"content-type":             "application/json", // 名单扩充前落库的数据也要被拦截
 			"x-claude-code-session-id": "pinned-session",
+			"X-NewAPI-Request-ID":      "{{request_id}}",
+			"x-newapi-source":          "static",
 			"x-ok":                     "ok",
 		},
 	})
@@ -291,7 +293,7 @@ func TestNormalizeHeaderOverrideCredentials(t *testing.T) {
 			"connection", "accept-encoding", "Sec-WebSocket-Key", "session_id",
 			"conversation_id", "x-codex-turn-state", "chatgpt-account-id",
 			"Content-Type", "Cookie", "x-goog-api-key",
-			"X-Claude-Code-Session-Id", "x-client-request-id",
+			"X-Claude-Code-Session-Id", "x-client-request-id", "X-NewAPI-Request-ID",
 		} {
 			err := NormalizeHeaderOverrideCredentials(map[string]any{
 				credKeyHeaderOverrides: map[string]any{name: "v"},

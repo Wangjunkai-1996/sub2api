@@ -70,7 +70,7 @@ func TestAnthropicConverterOutputCacheFields(t *testing.T) {
 				case "chat buffered":
 					result, err = service.bufferChatCompletionsAsAnthropic(ctx, response, "gpt-5.4", "gpt-5.4", "gpt-5.4", nil, nil, time.Now())
 				case "chat terminal", "chat eof":
-					result, err = service.streamChatCompletionsAsAnthropic(ctx, response, "gpt-5.4", "gpt-5.4", "gpt-5.4", nil, nil, time.Now())
+					result, err = service.streamChatCompletionsAsAnthropic(ctx, response, rawChatCompletionsTestAccount(), "gpt-5.4", "gpt-5.4", "gpt-5.4", nil, nil, time.Now())
 				case "responses buffered":
 					result, err = service.handleAnthropicBufferedStreamingResponse(response, ctx, rawChatCompletionsTestAccount(), "gpt-5.4", "gpt-5.4", "gpt-5.4", time.Now())
 				default:
@@ -82,8 +82,11 @@ func TestAnthropicConverterOutputCacheFields(t *testing.T) {
 					require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
 					require.Empty(t, recorder.Body.String())
 					require.False(t, ctx.Writer.Written())
-				} else if responsesEOF {
-					require.ErrorContains(t, err, "missing terminal event")
+					require.Nil(t, result)
+					return
+				}
+				if responsesEOF {
+					require.ErrorIs(t, err, ErrOpenAIUpstreamStreamTruncated)
 					require.False(t, errors.As(err, &failoverErr))
 					require.True(t, ctx.Writer.Written())
 				} else {
@@ -133,16 +136,9 @@ func TestAnthropicConverterOutputCacheFields(t *testing.T) {
 						stops++
 					}
 				}
-				if beforeOutput {
-					require.Zero(t, starts)
-					require.Zero(t, contentDeltas)
-				} else {
-					require.Equal(t, 1, starts)
-					if responsesEOF {
-						require.Equal(t, 1, contentDeltas)
-					}
-				}
+				require.Equal(t, 1, starts)
 				if responsesEOF {
+					require.Equal(t, 1, contentDeltas)
 					require.Zero(t, deltas)
 					require.Zero(t, stops)
 				} else {

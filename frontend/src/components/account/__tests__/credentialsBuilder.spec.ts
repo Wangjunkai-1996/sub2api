@@ -456,6 +456,7 @@ describe('validateHeaderOverrideRows value/entry limits', () => {
 
 describe('validateHeaderOverrideRows session isolation headers', () => {
   it('rejects per-request session headers', () => {
+    expect(validateHeaderOverrideRows([{ name: 'X-NewAPI-Request-ID', value: '{{request_id}}' }])).toBe('blockedName')
     expect(validateHeaderOverrideRows([{ name: 'session_id', value: '' }])).toBe('blockedName')
     expect(validateHeaderOverrideRows([{ name: 'Conversation_ID', value: '' }])).toBe('blockedName')
     expect(validateHeaderOverrideRows([{ name: 'x-codex-turn-state', value: '' }])).toBe(

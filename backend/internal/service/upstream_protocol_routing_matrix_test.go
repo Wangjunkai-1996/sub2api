@@ -310,6 +310,24 @@ func matchesKnownZhipuNonAPIKeyDifference(tc routingMatrixCase, want, got routin
 		reflect.DeepEqual(got, routingObservation{Error: "account 801 missing api_key", Status: http.StatusOK})
 }
 
+// Missing OAuth tokens now produce a typed credential failure. Both versions
+// reject this fixture before transport; no other routing observation may differ.
+func matchesKnownOpenAICredentialFailureDifference(tc routingMatrixCase, want, got routingObservation) bool {
+	if tc.platform != PlatformOpenAI || tc.accountType != AccountTypeOAuth {
+		return false
+	}
+	prefix := ""
+	switch tc.ingress.name {
+	case "responses":
+	case "chat", "chat_responses_shape", "messages":
+		prefix = "get access token: "
+	default:
+		return false
+	}
+	return reflect.DeepEqual(want, routingObservation{Error: prefix + "access_token not found in credentials", Status: http.StatusOK}) &&
+		reflect.DeepEqual(got, routingObservation{Error: prefix + "credential failure: openai_upstream_access_state (failover)", Status: http.StatusOK})
+}
+
 func TestUpstreamProtocolRoutingMatrixMatchesMainGolden(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	data, err := os.ReadFile(routingMatrixGoldenPath)
@@ -325,6 +343,7 @@ func TestUpstreamProtocolRoutingMatrixMatchesMainGolden(t *testing.T) {
 	var differences []string
 	mismatched := 0
 	knownDifferences := 0
+	credentialDifferences := 0
 	for i, tc := range cases {
 		index := golden.Results[i]
 		require.GreaterOrEqual(t, index, 0)
@@ -338,6 +357,10 @@ func TestUpstreamProtocolRoutingMatrixMatchesMainGolden(t *testing.T) {
 			knownDifferences++
 			continue
 		}
+		if matchesKnownOpenAICredentialFailureDifference(tc, want, got) {
+			credentialDifferences++
+			continue
+		}
 		mismatched++
 		if len(differences) < 12 {
 			differences = append(differences, fmt.Sprintf("%s\nmain: %s\ncurrent: %s", tc.key(), want, got))
@@ -347,4 +370,6 @@ func TestUpstreamProtocolRoutingMatrixMatchesMainGolden(t *testing.T) {
 	// 2 account types × 4 modes × 3 probe states × 4 address configurations ×
 	// 2 model spellings. A disappeared or expanded exception requires review.
 	require.Equal(t, 192, knownDifferences, "unexpected change to the declared Zhipu non-API-Key difference")
+	// 6 protocols × 3 probe states × 4 addresses × 4 ingresses × 2 spellings.
+	require.Equal(t, 576, credentialDifferences, "unexpected change to the declared OpenAI missing-token difference")
 }

@@ -125,99 +125,121 @@
       </ClaudeResetCreditsCell>
     </template>
 
-    <!-- OpenAI OAuth accounts: single source from /usage API -->
-    <template v-else-if="account.platform === 'openai' && account.type === 'oauth'">
-      <div
-        v-if="error || usageInfo?.error || usageInfo?.error_code"
-        role="alert"
-        class="mb-1 text-[10px] text-amber-700 dark:text-amber-300"
-      >
-        {{ t(hasOpenAIQuotaObservation
-          ? 'admin.accounts.usageWindow.quotaRefreshFailedCached'
-          : 'admin.accounts.usageWindow.quotaRefreshFailedUnknown') }}
-      </div>
-      <div v-if="hasOpenAIUsageFallback" class="space-y-1">
-        <UsageProgressBar
-          v-if="usageInfo?.five_hour"
-          label="5h"
-          :utilization="usageInfo.five_hour.utilization"
-          :utilization-unknown="usageInfo.five_hour.utilization_unknown"
-          :resets-at="usageInfo.five_hour.resets_at"
-          :window-stats="usageInfo.five_hour.window_stats"
-          :show-now-when-idle="true"
-          color="indigo"
-        />
-        <UsageProgressBar
-          v-if="usageInfo?.seven_day"
-          label="7d"
-          :utilization="usageInfo.seven_day.utilization"
-          :utilization-unknown="usageInfo.seven_day.utilization_unknown"
-          :resets-at="usageInfo.seven_day.resets_at"
-          :window-stats="usageInfo.seven_day.window_stats"
-          :estimated-total-cost="openAISevenDayEstimatedTotalCost"
-          :show-now-when-idle="true"
-          color="emerald"
-        />
-        <div v-if="hasOpenAIQuotaObservation" class="text-[10px] text-gray-500 dark:text-gray-400">
-          {{ t('admin.accounts.usageWindow.quotaObservedAt') }}
-          <time v-if="usageInfo?.updated_at" :datetime="usageInfo.updated_at">
-            {{ formatDateTime(usageInfo.updated_at) }}
-          </time>
-          <span v-else>{{ t('admin.accounts.usageWindow.quotaObservationUnknown') }}</span>
+    <!-- OpenAI Codex accounts: cached usage snapshots remain OAuth-only. -->
+    <template v-else-if="account.platform === 'openai' && (account.type === 'oauth' || account.type === 'setup-token')">
+      <template v-if="account.type === 'oauth'">
+        <div
+          v-if="error || usageInfo?.error || usageInfo?.error_code"
+          role="alert"
+          class="mb-1 text-[10px] text-amber-700 dark:text-amber-300"
+        >
+          {{ t(hasOpenAIQuotaObservation
+            ? 'admin.accounts.usageWindow.quotaRefreshFailedCached'
+            : 'admin.accounts.usageWindow.quotaRefreshFailedUnknown') }}
         </div>
-        <!--
-          Upstream codex /wham/usage quota query + reset. The local active-sampling
-          refresh button is rendered via the pre-actions slot so the user sees a
-          single row of related buttons instead of two stacked rows.
-        -->
-        <OpenAIQuotaResetCell :account="account" @account-updated="handleQuotaResetAccountUpdated">
-          <template #pre-actions>
-            <button
-              type="button"
-              class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/30 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="activeQueryLoading || loading"
-              @click="loadActiveUsage"
+        <div v-if="loading && !usageInfo" class="space-y-1.5">
+          <div class="flex items-center gap-1">
+            <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
+            <div class="h-1.5 w-8 animate-pulse rounded-full bg-gray-200 dark:bg-gray-700"></div>
+            <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
+          </div>
+          <div class="flex items-center gap-1">
+            <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
+            <div class="h-1.5 w-8 animate-pulse rounded-full bg-gray-200 dark:bg-gray-700"></div>
+            <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
+          </div>
+        </div>
+        <div v-else class="space-y-1">
+          <div v-if="error" class="text-[10px] text-red-600 dark:text-red-400">
+            {{ error }}
+          </div>
+          <template v-if="hasOpenAIUsageFallback">
+            <UsageProgressBar
+              v-if="usageInfo?.five_hour"
+              label="5h"
+              :utilization="usageInfo.five_hour.utilization"
+              :utilization-unknown="usageInfo.five_hour.utilization_unknown"
+              :resets-at="usageInfo.five_hour.resets_at"
+              :window-stats="usageInfo.five_hour.window_stats"
+              :unknown-reset-label="t('admin.accounts.usageWindow.snapshotPendingShort')"
+              :show-now-when-idle="true"
+              color="indigo"
+            />
+            <UsageProgressBar
+              v-if="usageInfo?.seven_day"
+              label="7d"
+              :utilization="usageInfo.seven_day.utilization"
+              :utilization-unknown="usageInfo.seven_day.utilization_unknown"
+              :resets-at="usageInfo.seven_day.resets_at"
+              :window-stats="usageInfo.seven_day.window_stats"
+              :estimated-total-cost="openAISevenDayEstimatedTotalCost"
+              :unknown-reset-label="t('admin.accounts.usageWindow.snapshotPendingShort')"
+              :show-now-when-idle="true"
+              color="emerald"
+            />
+            <div v-if="hasOpenAIQuotaObservation" class="text-[10px] text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.usageWindow.quotaObservedAt') }}
+              <time v-if="usageInfo?.updated_at" :datetime="usageInfo.updated_at">
+                {{ formatDateTime(usageInfo.updated_at) }}
+              </time>
+              <span v-else>{{ t('admin.accounts.usageWindow.quotaObservationUnknown') }}</span>
+            </div>
+            <div
+              v-if="!hasOpenAIValidSnapshot"
+              data-testid="openai-snapshot-pending"
+              class="text-[10px] text-amber-600 dark:text-amber-400"
             >
-              <svg
-                class="h-2.5 w-2.5"
-                :class="{ 'animate-spin': activeQueryLoading || loading }"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                />
-              </svg>
-              {{ t('admin.accounts.usageWindow.activeQuery') }}
-            </button>
+              {{ t('admin.accounts.usageWindow.snapshotPending') }}
+            </div>
           </template>
-        </OpenAIQuotaResetCell>
-      </div>
-      <div v-else-if="loading" class="space-y-1.5">
-        <div class="flex items-center gap-1">
-          <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
-          <div class="h-1.5 w-8 animate-pulse rounded-full bg-gray-200 dark:bg-gray-700"></div>
-          <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
+          <div
+            v-else
+            data-testid="openai-snapshot-pending"
+            class="text-[10px] text-amber-600 dark:text-amber-400"
+          >
+            {{ t('admin.accounts.usageWindow.snapshotPending') }}
+          </div>
+
+          <OpenAIQuotaResetCell :account="account" @account-updated="handleQuotaResetAccountUpdated">
+            <template #pre-actions>
+              <button
+                type="button"
+                data-testid="openai-cached-usage-refresh"
+                class="inline-flex min-w-[62px] items-center justify-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-blue-600 transition-colors hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-50 dark:text-blue-400 dark:hover:bg-blue-900/30"
+                :disabled="activeQueryLoading"
+                :aria-busy="activeQueryLoading"
+                @click="loadOpenAIUsageSnapshot"
+              >
+                <svg
+                  class="h-2.5 w-2.5"
+                  :class="{ 'animate-spin': activeQueryLoading }"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                  />
+                </svg>
+                {{ t(activeQueryLoading
+                  ? 'admin.accounts.usageWindow.cachedQueryLoading'
+                  : 'admin.accounts.usageWindow.cachedQuery') }}
+              </button>
+            </template>
+          </OpenAIQuotaResetCell>
+
+          <div
+            v-if="usageRefreshFeedback"
+            data-testid="openai-cached-usage-feedback"
+            :class="['text-[10px]', usageRefreshFeedbackClass]"
+          >
+            {{ usageRefreshFeedback }}
+          </div>
         </div>
-        <div class="flex items-center gap-1">
-          <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
-          <div class="h-1.5 w-8 animate-pulse rounded-full bg-gray-200 dark:bg-gray-700"></div>
-          <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
-        </div>
-      </div>
-      <div v-else>
-        <div class="text-xs text-gray-400">-</div>
-        <!-- Always allow on-demand upstream quota query, even before local data exists. -->
-        <OpenAIQuotaResetCell
-          :account="account"
-          class="mt-1"
-          @account-updated="handleQuotaResetAccountUpdated"
-        />
-      </div>
+      </template>
     </template>
 
     <!-- Antigravity OAuth accounts: fetch usage from API -->
@@ -380,8 +402,7 @@
       <div v-else class="text-xs text-gray-400">-</div>
 
       <!--
-        Query the upstream now, bypassing the server's usage cache (force=true), like the Claude
-        and OpenAI cells: an account upgraded or reset upstream otherwise shows old figures for
+        Query the upstream now, bypassing the server's usage cache (force=true), like the Claude cell: an account upgraded or reset upstream otherwise shows old figures for
         the cache TTL. Shown in every state, including errors, where a retry matters most.
       -->
       <div v-if="!loading" class="mt-1">
@@ -646,7 +667,7 @@
             color="purple"
           />
         </template>
-        <div v-if="loading && !usageInfo" class="space-y-1">
+        <div v-if="loading" class="space-y-1">
           <div class="flex items-center gap-1">
             <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
             <div class="h-1.5 w-8 animate-pulse rounded-full bg-gray-200 dark:bg-gray-700"></div>
@@ -771,7 +792,13 @@
 import { ref, computed, onMounted, onBeforeUnmount, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import type { Account, AccountUsageInfo, GeminiCredentials, WindowStats } from '@/types'
+import type {
+  Account,
+  AccountUsageInfo,
+  AccountUsageRequestResult,
+  GeminiCredentials,
+  WindowStats
+} from '@/types'
 import { buildAccountUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { enqueueUsageRequest } from '@/utils/usageLoadQueue'
 import { formatCompactNumber, formatDateTime } from '@/utils/format'
@@ -805,7 +832,10 @@ const props = withDefaults(
     batchedUsage?: AccountUsageInfo | null
     batchedUsageError?: string | null
     batchedUsageLoading?: boolean
-    requestBatchedUsage?: ((account: Account, options?: { force?: boolean }) => void) | null
+    requestBatchedUsage?: ((
+      account: Account,
+      options?: { force?: boolean }
+    ) => Promise<AccountUsageRequestResult> | AccountUsageRequestResult | void) | null
   }>(),
   {
     todayStats: null,
@@ -833,6 +863,8 @@ const loading = ref(false)
 const activeQueryLoading = ref(false)
 const error = ref<string | null>(null)
 const usageInfo = ref<AccountUsageInfo | null>(null)
+type UsageRefreshFeedback = 'success' | 'unchanged' | 'no_snapshot' | 'error'
+const usageRefreshFeedbackState = ref<UsageRefreshFeedback | null>(null)
 watch(usageInfo, (usage) => {
   if (usage) emit('usage-loaded', usage)
 })
@@ -842,7 +874,8 @@ const isDesktopViewport = ref(
 )
 const hasEnteredViewport = ref(false)
 const pendingAutoLoad = ref(false)
-const pendingAutoLoadSource = ref<'passive' | 'active' | undefined>(undefined)
+type UsageSource = 'passive' | 'cached' | 'active'
+const pendingAutoLoadSource = ref<UsageSource | undefined>(undefined)
 
 let desktopViewportMediaQuery: MediaQueryList | null = null
 let desktopViewportListener: ((event: MediaQueryListEvent) => void) | null = null
@@ -948,6 +981,57 @@ const openAISevenDayEstimatedTotalCost = computed(() =>
 )
 
 const usageRefreshKey = computed(() => buildAccountUsageRefreshKey(props.account))
+
+const hasFutureReset = (resetsAt?: string | null) => {
+  if (!resetsAt) return false
+  const resetTime = new Date(resetsAt).getTime()
+  return Number.isFinite(resetTime) && resetTime > Date.now()
+}
+
+const hasValidOpenAISnapshot = (usage: AccountUsageInfo | null) => {
+  return hasFutureReset(usage?.five_hour?.resets_at) || hasFutureReset(usage?.seven_day?.resets_at)
+}
+
+const hasOpenAIValidSnapshot = computed(() => hasValidOpenAISnapshot(usageInfo.value))
+
+const usageRefreshFeedback = computed(() => {
+  if (!usageRefreshFeedbackState.value) return ''
+  const keyByState: Record<UsageRefreshFeedback, string> = {
+    success: 'cachedRefreshSuccess',
+    unchanged: 'cachedRefreshUnchanged',
+    no_snapshot: 'cachedRefreshNoSnapshot',
+    error: 'cachedRefreshFailed'
+  }
+  return t(`admin.accounts.usageWindow.${keyByState[usageRefreshFeedbackState.value]}`)
+})
+
+const usageRefreshFeedbackClass = computed(() => {
+  switch (usageRefreshFeedbackState.value) {
+    case 'success':
+      return 'text-emerald-600 dark:text-emerald-400'
+    case 'unchanged':
+      return 'text-gray-500 dark:text-gray-400'
+    case 'no_snapshot':
+      return 'text-amber-600 dark:text-amber-400'
+    default:
+      return 'text-red-600 dark:text-red-400'
+  }
+})
+
+const openAIUsageFingerprint = (usage: AccountUsageInfo | null) => {
+  const normalizeWindow = (window: AccountUsageInfo['five_hour']) => {
+    if (!window) return null
+    return {
+      utilization: window.utilization,
+      resets_at: window.resets_at,
+      window_stats: window.window_stats ?? null
+    }
+  }
+  return JSON.stringify({
+    five_hour: normalizeWindow(usage?.five_hour ?? null),
+    seven_day: normalizeWindow(usage?.seven_day ?? null)
+  })
+}
 
 const shouldAutoLoadUsageOnMount = computed(() => {
   return shouldFetchUsage.value
@@ -1553,9 +1637,34 @@ const isAnthropicOAuthOrSetupToken = computed(() => {
   return props.account.platform === 'anthropic' && (props.account.type === 'oauth' || props.account.type === 'setup-token')
 })
 
-const requestParentBatchUsage = (options?: { force?: boolean }) => {
-  if (!isBatchManaged.value || !shouldFetchUsage.value) return
-  props.requestBatchedUsage?.(props.account, options)
+const isOpenAIOAuth = computed(() => {
+  return props.account.platform === 'openai' && props.account.type === 'oauth'
+})
+
+const defaultUsageSource = computed<UsageSource | undefined>(() => {
+  if (isAnthropicOAuthOrSetupToken.value) return 'passive'
+  if (isOpenAIOAuth.value) return 'cached'
+  return undefined
+})
+
+const requestParentBatchUsage = async (
+  options?: { force?: boolean }
+): Promise<AccountUsageRequestResult> => {
+  if (!isBatchManaged.value || !shouldFetchUsage.value) {
+    return { usage: null, error: null }
+  }
+  try {
+    const result = await props.requestBatchedUsage?.(props.account, options)
+    return result ?? {
+      usage: props.batchedUsage ?? usageInfo.value,
+      error: props.batchedUsageError ?? null
+    }
+  } catch (requestError: any) {
+    return {
+      usage: null,
+      error: requestError?.message || t('common.error')
+    }
+  }
 }
 
 const syncManagedUsageState = () => {
@@ -1565,43 +1674,63 @@ const syncManagedUsageState = () => {
   loading.value = props.batchedUsageLoading === true
 }
 
-const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?: boolean }) => {
-  if (!shouldFetchUsage.value) return
+// Capture both the row and its revision before awaiting either a direct or a batch read.
+let usageRequest = 0
+const beginUsageRequest = () => {
+  const request = ++usageRequest
+  const { id, platform, type } = props.account
+  const key = usageRefreshKey.value
+  const managed = isBatchManaged.value
+  return () => !unmounted.value && request === usageRequest && props.account.id === id &&
+    props.account.platform === platform && props.account.type === type &&
+    usageRefreshKey.value === key && isBatchManaged.value === managed
+}
+
+const loadUsage = async (
+  options?: { source?: UsageSource; bypassCache?: boolean }
+): Promise<AccountUsageInfo | null> => {
+  if (!shouldFetchUsage.value) return null
+  const isCurrent = beginUsageRequest()
+  const account = props.account
+  const refreshKey = usageRefreshKey.value
   if (isBatchManaged.value) {
-    requestParentBatchUsage({ force: options?.bypassCache === true })
-    return
+    error.value = null
+    const result = await requestParentBatchUsage({ force: options?.bypassCache === true })
+    if (!isCurrent()) return null
+    usageInfo.value = result.usage
+    error.value = result.error
+    return result.usage
   }
 
-  // Check cache
   if (!options?.bypassCache) {
-    const cached = _usageCache.get(props.account.id)
-    if (cached && cached.refreshKey === usageRefreshKey.value && Date.now() - cached.ts < USAGE_CACHE_TTL) {
+    const cached = _usageCache.get(account.id)
+    if (cached && cached.refreshKey === refreshKey && Date.now() - cached.ts < USAGE_CACHE_TTL) {
       usageInfo.value = cached.data
       loading.value = false
-      return
+      return cached.data
     }
   }
 
   loading.value = true
   error.value = null
-  const refreshKey = usageRefreshKey.value
-
   try {
-		const fetchFn = () => options?.source
-			? adminAPI.accounts.getUsage(props.account.id, options.source, options.bypassCache === true)
-			: adminAPI.accounts.getUsage(props.account.id)
-    const result = await enqueueUsageRequest(props.account, fetchFn)
-    if (!unmounted.value) {
-      usageInfo.value = result
-      _usageCache.set(props.account.id, { data: result, ts: Date.now(), refreshKey })
-    }
-  } catch (e: any) {
-    if (!unmounted.value) {
+    const result = await enqueueUsageRequest(account, () => {
+      if (!options?.source) return adminAPI.accounts.getUsage(account.id)
+      if (options.source === 'cached' && !options.bypassCache) return adminAPI.accounts.getUsage(account.id, 'cached')
+      return adminAPI.accounts.getUsage(account.id, options.source, options.bypassCache === true)
+    })
+    if (!isCurrent()) return null
+    usageInfo.value = result
+    _usageCache.set(account.id, { data: result, ts: Date.now(), refreshKey })
+    return result
+  } catch (e: unknown) {
+    if (isCurrent()) {
       error.value = t('common.error')
       console.error('Failed to load usage:', e)
     }
+    return null
   } finally {
-    if (!unmounted.value) loading.value = false
+    if (isCurrent()) loading.value = false
   }
 }
 
@@ -1615,7 +1744,7 @@ const flushPendingAutoLoad = () => {
   })
 }
 
-const requestAutoLoad = (source?: 'passive' | 'active') => {
+const requestAutoLoad = (source?: UsageSource) => {
   if (!shouldFetchUsage.value) return
   if (shouldLazyLoadOnMobile.value && !hasEnteredViewport.value) {
     pendingAutoLoad.value = true
@@ -1655,24 +1784,49 @@ const attachVisibilityObserver = () => {
   visibilityObserver.observe(rootRef.value)
 }
 
+let activeQueryRequest = 0
 const loadActiveUsage = async () => {
+  const activeRequest = ++activeQueryRequest
+  const isCurrent = beginUsageRequest()
   const accountID = props.account.id
   const refreshKey = usageRefreshKey.value
+  loading.value = false
   activeQueryLoading.value = true
-  error.value = null
   try {
     const result = await adminAPI.accounts.getUsage(accountID, 'active', true)
-    if (!unmounted.value && props.account.id === accountID) {
+    if (isCurrent()) {
       usageInfo.value = result
       _usageCache.set(accountID, { data: result, ts: Date.now(), refreshKey })
     }
   } catch (e: any) {
-    if (!unmounted.value && props.account.id === accountID) {
-      error.value = t('common.error')
-      console.error('Failed to load active usage:', e)
+    console.error('Failed to load active usage:', e)
+  } finally {
+    if (!unmounted.value && activeRequest === activeQueryRequest) activeQueryLoading.value = false
+  }
+}
+
+const loadOpenAIUsageSnapshot = async () => {
+  if (activeQueryLoading.value) return
+  const activeRequest = ++activeQueryRequest
+  const previousFingerprint = openAIUsageFingerprint(usageInfo.value)
+  usageRefreshFeedbackState.value = null
+  activeQueryLoading.value = true
+  try {
+    const pending = loadUsage({ source: 'cached', bypassCache: true })
+    const request = usageRequest
+    const refreshedUsage = await pending
+    if (request !== usageRequest || unmounted.value) return
+    if (error.value) {
+      usageRefreshFeedbackState.value = 'error'
+    } else if (!hasValidOpenAISnapshot(refreshedUsage)) {
+      usageRefreshFeedbackState.value = 'no_snapshot'
+    } else if (openAIUsageFingerprint(refreshedUsage) === previousFingerprint) {
+      usageRefreshFeedbackState.value = 'unchanged'
+    } else {
+      usageRefreshFeedbackState.value = 'success'
     }
   } finally {
-    if (!unmounted.value) activeQueryLoading.value = false
+    if (!unmounted.value && activeRequest === activeQueryRequest) activeQueryLoading.value = false
   }
 }
 
@@ -1802,7 +1956,7 @@ onMounted(() => {
   }
 
   if (!shouldAutoLoadUsageOnMount.value) return
-  const source = isAnthropicOAuthOrSetupToken.value ? 'passive' : undefined
+  const source = defaultUsageSource.value
   requestAutoLoad(source)
 })
 
@@ -1814,42 +1968,29 @@ watch(
   { immediate: true, deep: true }
 )
 
-watch(isBatchManaged, (managed, wasManaged) => {
-  if (managed && !wasManaged) {
-    syncManagedUsageState()
-    requestParentBatchUsage()
-  }
-})
-
 watch(
-  () => [props.account.id, props.account.platform, props.account.type, isBatchManaged.value] as const,
-  ([accountID, platform, accountType, managed], [previousAccountID, previousPlatform, previousAccountType]) => {
-    if (
-      accountID === previousAccountID &&
-      platform === previousPlatform &&
-      accountType === previousAccountType
-    ) {
+  [() => props.account.id, () => props.account.platform, () => props.account.type, usageRefreshKey, isBatchManaged],
+  ([id, platform, type, key, managed], [oldID, oldPlatform, oldType, oldKey]) => {
+    ++usageRequest
+    ++activeQueryRequest
+    usageRefreshFeedbackState.value = null
+    activeQueryLoading.value = false
+    const changedAccount = id !== oldID || platform !== oldPlatform || type !== oldType
+    if (changedAccount) {
+      usageInfo.value = null
+      error.value = null
+    }
+    loading.value = false
+    if (!shouldFetchUsage.value) return
+    if (managed) {
+      syncManagedUsageState()
+      requestParentBatchUsage(!changedAccount && key !== oldKey && platform === 'openai' ? { force: true } : undefined)
       return
     }
-    if (!managed || !shouldFetchUsage.value) return
-    syncManagedUsageState()
-    requestParentBatchUsage()
-  },
-  { flush: 'post' }
-)
-
-watch(usageRefreshKey, (nextKey, prevKey) => {
-  if (!prevKey || nextKey === prevKey) return
-  if (!shouldFetchUsage.value) return
-
-  if (isBatchManaged.value) {
-    requestParentBatchUsage(props.account.platform === 'openai' ? { force: true } : undefined)
-    return
+    _usageCache.delete(id)
+    requestAutoLoad(defaultUsageSource.value)
   }
-
-  _usageCache.delete(props.account.id)
-  requestAutoLoad(isAnthropicOAuthOrSetupToken.value ? 'passive' : undefined)
-})
+)
 
 watch(
   () => props.manualRefreshToken,
@@ -1862,7 +2003,7 @@ watch(
       return
     }
 
-    const source = isAnthropicOAuthOrSetupToken.value ? 'passive' : undefined
+    const source = defaultUsageSource.value
     _usageCache.delete(props.account.id)
     loadUsage({ source, bypassCache: true }).catch((e) => {
       console.error('Failed to refresh usage after manual refresh:', e)

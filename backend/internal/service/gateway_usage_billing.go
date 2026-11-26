@@ -596,7 +596,13 @@ func detachUpstreamContext(ctx context.Context, drainTimeout ...time.Duration) (
 	if ctx == nil {
 		return context.Background(), func() {}
 	}
-	return pkghttputil.DetachUpstreamContext(ctx, drainTimeout...), func() {}
+	// Keep the original cancellation signal for the bounded billing drain, but
+	// retain the request's hard deadline even when the client stays connected.
+	detached := pkghttputil.DetachUpstreamContext(ctx, drainTimeout...)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(detached, deadline)
+	}
+	return detached, func() {}
 }
 
 // billingDeps 扣费逻辑依赖的服务（由各 gateway service 提供）
@@ -1035,6 +1041,11 @@ func (s *GatewayService) calculateRecordUsageCost(
 	imageMultiplier float64,
 	pricingAt time.Time,
 ) *CostBreakdown {
+	// Dedicated image requests are billable only when an image was returned.
+	// Mixed text/image requests keep their token billing when no image is emitted.
+	if result.ImageEndpoint && result.ImageCount <= 0 {
+		return &CostBreakdown{BillingMode: string(BillingModeImage)}
+	}
 	// 图片生成：渠道定价为 token 计费时走 token 路径，否则走图片计费。
 	// 分组按张计费开关只对专用图片端点生效，混合请求仍按 token 计费。
 	if result.ImageCount > 0 {

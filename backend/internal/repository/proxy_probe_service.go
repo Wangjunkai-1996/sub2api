@@ -63,8 +63,8 @@ var probeURLs = []struct {
 	url    string
 	parser string
 }{
-	{"http://ip-api.com/json/?lang=zh-CN", "ip-api"},
-	{"http://api64.ipify.org?format=json", "ipify"},
+	{"https://chatgpt.com/cdn-cgi/trace", "chatgpt-trace"},
+	{"https://api64.ipify.org?format=json", "ipify"},
 }
 
 type configuredProbeTarget struct {
@@ -93,6 +93,7 @@ func (s *proxyProbeService) ProbeProxy(ctx context.Context, proxyURL string) (*s
 	}
 
 	var lastErr error
+	var statusErrors []string
 	if len(s.configuredProbeURLs) > 0 {
 		for _, probe := range s.configuredProbeURLs {
 			exitInfo, latencyMs, err := s.probeWithURL(ctx, client, probe.url, probe.parser)
@@ -100,8 +101,11 @@ func (s *proxyProbeService) ProbeProxy(ctx context.Context, proxyURL string) (*s
 				return exitInfo, latencyMs, nil
 			}
 			lastErr = err
+			if strings.Contains(err.Error(), "request failed with status:") {
+				statusErrors = append(statusErrors, err.Error())
+			}
 		}
-		return nil, 0, fmt.Errorf("all probe URLs failed, last error: %w", lastErr)
+		return nil, 0, aggregateProbeErrors(statusErrors, lastErr)
 	}
 
 	for _, probe := range probeURLs {
@@ -110,9 +114,18 @@ func (s *proxyProbeService) ProbeProxy(ctx context.Context, proxyURL string) (*s
 			return exitInfo, latencyMs, nil
 		}
 		lastErr = err
+		if strings.Contains(err.Error(), "request failed with status:") {
+			statusErrors = append(statusErrors, err.Error())
+		}
 	}
+	return nil, 0, aggregateProbeErrors(statusErrors, lastErr)
+}
 
-	return nil, 0, fmt.Errorf("all probe URLs failed, last error: %w", lastErr)
+func aggregateProbeErrors(statusErrors []string, lastErr error) error {
+	if len(statusErrors) > 0 {
+		return fmt.Errorf("all probe URLs failed: %s; last error: %w", strings.Join(statusErrors, "; "), lastErr)
+	}
+	return fmt.Errorf("all probe URLs failed, last error: %w", lastErr)
 }
 
 func (s *proxyProbeService) probeWithURL(ctx context.Context, client *http.Client, url string, parser string) (*service.ProxyExitInfo, int64, error) {

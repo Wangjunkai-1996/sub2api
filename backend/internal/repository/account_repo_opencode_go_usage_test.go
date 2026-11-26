@@ -75,8 +75,7 @@ func openCodeGoMergeMockColumns() []string {
 		"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged",
 		"enabled", "rate_sync_enabled", "snapshot",
 		"ollama_session", "ollama_auto", "ollama_snapshot",
-		"opencode_group_unchanged", "opencode_auto", "opencode_snapshot",
-		"grok_observed_models", "upstream_model_metadata", "group_sync_enabled",
+		"opencode_group_unchanged", "opencode_auto", "opencode_snapshot", "grok_observed_models", "upstream_model_metadata", "current_extra",
 	}
 }
 

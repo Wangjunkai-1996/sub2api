@@ -575,3 +575,49 @@ func TestProbeGroupWriteHonorsDisableDuringRequest(t *testing.T) {
 	require.Equal(t, notes, *after.Notes)
 	require.Equal(t, false, after.Extra[service.UpstreamBillingGroupSyncEnabledExtraKey])
 }
+
+func TestUpdateAccountConfigurationGroupSyncAndProxyCommitTogether(t *testing.T) {
+	ctx := t.Context()
+	client := testEntClient(t)
+	repo := newAccountRepositoryWithSQL(client, integrationDB, nil)
+	proxy := mustCreateProxy(t, client, &service.Proxy{Name: "v025-group-sync"})
+	account := mustCreateAccount(t, client, &service.Account{
+		Name: "local account", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "test-only"},
+		Extra:       map[string]any{service.UpstreamBillingProbeEnabledExtraKey: true},
+	})
+	t.Cleanup(func() {
+		require.NoError(t, client.Account.DeleteOneID(account.ID).Exec(context.Background()))
+		require.NoError(t, client.Proxy.DeleteOneID(proxy.ID).Exec(context.Background()))
+	})
+	inFlight, err := repo.GetByID(ctx, account.ID)
+	require.NoError(t, err)
+	desired := *inFlight
+	desired.ProxyID = &proxy.ID
+	enabled := true
+	mutation := service.AccountConfigurationMutation{
+		Desired: &desired, Fields: service.AccountConfigurationFieldMask{ProxyID: true},
+		BillingSettings: service.AccountBillingSettingsUpdate{GroupSyncEnabled: &enabled},
+	}
+	missingGroups := []int64{-1}
+	mutation.GroupIDs = &missingGroups
+	_, err = repo.UpdateAccountConfiguration(ctx, mutation)
+	require.Error(t, err)
+	after, err := repo.GetByID(ctx, account.ID)
+	require.NoError(t, err)
+	require.Nil(t, after.ProxyID)
+	require.NotContains(t, after.Extra, service.UpstreamBillingGroupSyncEnabledExtraKey)
+
+	mutation.GroupIDs = nil
+	after, err = repo.UpdateAccountConfiguration(ctx, mutation)
+	require.NoError(t, err)
+	require.Equal(t, &proxy.ID, after.ProxyID)
+	require.Equal(t, true, after.Extra[service.UpstreamBillingGroupSyncEnabledExtraKey])
+	snapshot := &service.UpstreamBillingProbeSnapshot{Status: service.UpstreamBillingProbeStatusOK}
+	err = repo.UpdateUpstreamBillingProbeSnapshot(ctx, inFlight, snapshot, nil, service.BillingGroupInfo{Name: "old proxy"})
+	require.ErrorIs(t, err, service.ErrUpstreamBillingProbeIdentityChanged)
+	after, err = repo.GetByID(ctx, account.ID)
+	require.NoError(t, err)
+	require.Equal(t, "local account", after.Name)
+	require.NotContains(t, after.Extra, service.UpstreamBillingProbeExtraKey)
+}

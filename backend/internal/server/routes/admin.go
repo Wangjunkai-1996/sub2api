@@ -69,6 +69,9 @@ func RegisterAdminRoutes(
 		// 代理管理
 		registerProxyRoutes(admin, h, stepUpAuth)
 
+		// 出口路由/静态 IP 管理（凭据只在服务端探测，响应为脱敏投影）
+		registerEgressRouteRoutes(admin, h)
+
 		// 卡密管理
 		registerRedeemCodeRoutes(admin, h)
 
@@ -132,6 +135,16 @@ func RegisterAdminRoutes(
 
 		// 操作审计日志
 		registerAuditLogRoutes(admin, h, stepUpAuth)
+	}
+}
+
+func registerEgressRouteRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	egressRoutes := admin.Group("/egress-routes")
+	{
+		egressRoutes.GET("/assignable", h.Admin.EgressRoute.ListAssignable)
+		// Keep the fixed verify path before the parameterized confirmation path.
+		egressRoutes.POST("/verify", h.Admin.EgressRoute.Verify)
+		egressRoutes.POST("/:id/confirm-identity", h.Admin.EgressRoute.ConfirmIdentity)
 	}
 }
 
@@ -397,6 +410,7 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.POST("/:id/opencode-go-usage/refresh", h.Admin.Account.RefreshOpenCodeGoUsage)
 		accounts.DELETE("/:id", h.Admin.Account.Delete)
 		accounts.POST("/:id/test", h.Admin.Account.Test)
+		accounts.POST("/:id/probe", h.Admin.Account.Probe)
 		accounts.POST("/:id/recover-state", h.Admin.Account.RecoverState)
 		accounts.POST("/:id/refresh", h.Admin.Account.Refresh)
 		accounts.POST("/:id/apply-oauth-credentials", h.Admin.Account.ApplyOAuthCredentials)
@@ -526,6 +540,7 @@ func registerProxyRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth
 	{
 		proxies.GET("", h.Admin.Proxy.List)
 		proxies.GET("/all", h.Admin.Proxy.GetAll)
+		proxies.GET("/options", h.Admin.Proxy.GetOptions)
 		// 代理导出泄露账号密码原文——要求 step-up 2FA
 		proxies.GET("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Proxy.ExportData)
 		proxies.POST("/data", h.Admin.Proxy.ImportData)

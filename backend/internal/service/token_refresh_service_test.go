@@ -700,6 +700,7 @@ func TestTokenRefreshService_RefreshWithRetry_OtherPlatformOAuth(t *testing.T) {
 		Platform: PlatformOpenAI, // OpenAI OAuth 账户
 		Type:     AccountTypeOAuth,
 	}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
 	refresher := &tokenRefresherStub{
 		credentials: map[string]any{
 			"access_token": "token",
@@ -732,6 +733,7 @@ func TestTokenRefreshService_RefreshWithRetry_UsesCredentialsUpdater(t *testing.
 			"access_token": "old-token",
 		},
 	}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
 	refresher := &tokenRefresherStub{
 		credentials: map[string]any{
 			"access_token": "new-token",
@@ -1250,7 +1252,7 @@ func TestTokenRefreshService_OpenAIRotationSurvivesAttemptDeadline(t *testing.T)
 			name = "unified"
 		}
 		t.Run(name, func(t *testing.T) {
-			account := openAIRefreshTestAccount()
+			account := openAIRefreshAPITestAccount()
 			repo := &tokenRefreshAccountRepo{snapshotReads: true, respectReadContext: true}
 			repo.accountsByID = map[int64]*Account{account.ID: account}
 			invalidator := &tokenCacheInvalidatorStub{}
@@ -1292,7 +1294,7 @@ func TestTokenRefreshService_OpenAIPersistenceFailureDoesNotRetryUpstream(t *tes
 		for _, expireAttempt := range []bool{false, true} {
 			name := fmt.Sprintf("unified=%t/expired=%t", unified, expireAttempt)
 			t.Run(name, func(t *testing.T) {
-				account := openAIRefreshTestAccount()
+				account := openAIRefreshAPITestAccount()
 				repo := &tokenRefreshAccountRepo{snapshotReads: true, respectReadContext: true, conditionalSuccessErr: errors.New("database unavailable")}
 				repo.accountsByID = map[int64]*Account{account.ID: account}
 				svc := &TokenRefreshService{
@@ -1330,7 +1332,7 @@ func TestTokenRefreshService_OpenAIPersistenceFailureDoesNotRetryUpstream(t *tes
 func TestTokenRefreshService_OpenAIParentCancellationStillPersists(t *testing.T) {
 	for _, unified := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unified=%t", unified), func(t *testing.T) {
-			account := openAIRefreshTestAccount()
+			account := openAIRefreshAPITestAccount()
 			repo := &tokenRefreshAccountRepo{snapshotReads: true, respectReadContext: true}
 			repo.accountsByID = map[int64]*Account{account.ID: account}
 			invalidator := &tokenCacheInvalidatorStub{}

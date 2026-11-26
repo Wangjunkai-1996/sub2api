@@ -198,7 +198,7 @@ export function getHeaderOverrideRowErrors(
       return 'invalidName'
     }
     const lower = name.toLowerCase()
-    if (HEADER_OVERRIDE_BLOCKED_NAMES.has(lower)) return 'blockedName'
+    if (HEADER_OVERRIDE_BLOCKED_NAMES.has(lower) || lower.startsWith('x-newapi-')) return 'blockedName'
     if (seen.has(lower)) return 'duplicateName'
     seen.add(lower)
     if (

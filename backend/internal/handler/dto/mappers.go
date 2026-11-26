@@ -2,6 +2,7 @@
 package dto
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -244,6 +245,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	if state := service.OllamaCloudUsageStateFromAccount(a); state.Eligible {
 		ollamaCloudUsage = state
 	}
+	egressMode, egressPool, egressSummary := AccountEgressViewsFromService(a)
 	var openCodeGoUsage *service.OpenCodeGoUsageState
 	if state := service.OpenCodeGoUsageStateFromAccount(a); state.Eligible {
 		openCodeGoUsage = state
@@ -262,6 +264,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		ProxyID:                 a.ProxyID,
 		ProxyFallbackOriginID:   a.ProxyFallbackOriginID,
 		ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		EgressMode:              egressMode,
+		EgressRevision:          a.EgressRevision,
+		EgressPool:              egressPool,
+		EgressSummary:           egressSummary,
 		Concurrency:             a.Concurrency,
 		LoadFactor:              a.LoadFactor,
 		Priority:                a.Priority,
@@ -422,12 +428,15 @@ func redactAccountManagedExtra(extra map[string]any) map[string]any {
 	}
 	redacted := make(map[string]any, len(extra))
 	for key, value := range extra {
-		switch key {
-		case service.OllamaCloudUsageSessionExtraKey,
-			service.OllamaCloudUsageAutoRefreshExtraKey,
-			service.OllamaCloudUsageSnapshotExtraKey,
-			service.OpenCodeGoUsageAutoRefreshExtraKey,
-			service.OpenCodeGoUsageSnapshotExtraKey:
+		switch {
+		case key == service.OllamaCloudUsageSessionExtraKey,
+			key == service.OllamaCloudUsageAutoRefreshExtraKey,
+			key == service.OllamaCloudUsageSnapshotExtraKey:
+			continue
+		case service.IsRetiredAccountExtraKey(key):
+			continue
+		case key == service.OpenCodeGoUsageAutoRefreshExtraKey,
+			key == service.OpenCodeGoUsageSnapshotExtraKey:
 			continue
 		default:
 			redacted[key] = value
@@ -468,9 +477,11 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 	return &AccountListItem{
 		ID: a.ID, Name: a.Name, Notes: a.Notes, Platform: a.Platform, Type: a.Type,
 		Credentials: a.Credentials, CredentialsStatus: a.CredentialsStatus, Extra: a.Extra,
-		OllamaCloudUsage: a.OllamaCloudUsage, OpenCodeGoUsage: a.OpenCodeGoUsage,
-		ProxyID: a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
-		Concurrency: a.Concurrency, LoadFactor: a.LoadFactor, Priority: a.Priority, RateMultiplier: a.RateMultiplier,
+		OllamaCloudUsage: a.OllamaCloudUsage,
+		ProxyID:          a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
+		EgressMode: a.EgressMode, EgressRevision: a.EgressRevision, EgressPool: a.EgressPool, EgressSummary: a.EgressSummary,
+		OpenCodeGoUsage: a.OpenCodeGoUsage,
+		Concurrency:     a.Concurrency, LoadFactor: a.LoadFactor, Priority: a.Priority, RateMultiplier: a.RateMultiplier,
 		Status: a.Status, ErrorMessage: a.ErrorMessage, LastUsedAt: a.LastUsedAt, ExpiresAt: a.ExpiresAt,
 		AutoPauseOnExpired: a.AutoPauseOnExpired, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 		Schedulable: a.Schedulable, RateLimitedAt: a.RateLimitedAt, RateLimitResetAt: a.RateLimitResetAt,
@@ -495,7 +506,8 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 		QuotaNotifyTotalThreshold: a.QuotaNotifyTotalThreshold, ParentAccountID: a.ParentAccountID,
 		QuotaDimension: a.QuotaDimension, ParentEmail: a.ParentEmail, ParentPlanType: a.ParentPlanType,
 		ParentPrivacyMode: a.ParentPrivacyMode, ParentSubscriptionExpiresAt: a.ParentSubscriptionExpiresAt,
-		ParentChatGPTAccountID: a.ParentChatGPTAccountID, Proxy: a.Proxy, GroupIDs: a.GroupIDs,
+		ParentChatGPTAccountID: a.ParentChatGPTAccountID,
+		Proxy:                  a.Proxy, GroupIDs: a.GroupIDs,
 	}
 }
 
@@ -562,6 +574,30 @@ func ProxyWithAccountCountFromService(p *service.ProxyWithAccountCount) *ProxyWi
 		QualityGrade:   p.QualityGrade,
 		QualitySummary: p.QualitySummary,
 		QualityChecked: p.QualityChecked,
+	}
+}
+
+func ProxyOptionFromService(p *service.ProxyWithAccountCount, now time.Time) *ProxyOption {
+	if p == nil {
+		return nil
+	}
+	status := p.Status
+	selectable := p.Status == service.StatusActive && !p.IsExpired(now)
+	disabledReason := ""
+	if p.IsExpired(now) {
+		status = "expired"
+		disabledReason = "proxy_expired"
+	} else if p.Status != service.StatusActive {
+		disabledReason = "proxy_inactive"
+	}
+	return &ProxyOption{
+		ID:              p.ID,
+		Name:            p.Name,
+		DisplayEndpoint: strings.ToLower(strings.TrimSpace(p.Protocol)) + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port)),
+		Status:          status,
+		Selectable:      selectable,
+		DisabledReason:  disabledReason,
+		AccountCount:    p.AccountCount,
 	}
 }
 

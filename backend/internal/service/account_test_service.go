@@ -361,6 +361,24 @@ func createTestPayload(modelID string) (map[string]any, error) {
 // modelID is optional - if empty, defaults to claude.DefaultTestModel
 // mode is optional - "compact" routes OpenAI accounts to the /responses/compact probe path
 // opts is optional media (image/audio data URLs for real generation / STT).
+// ProbeOpenAIOAuthAccount only performs the bounded text probe used by AUTH.
+// It retains failures and cooldowns and never runs successful-test recovery.
+// Media tests stay on the existing image-role /test route.
+func (s *AccountTestService) ProbeOpenAIOAuthAccount(c *gin.Context, accountID int64, modelID string) error {
+	initAccountTestLogger(c, accountID, modelID, AccountTestModeDefault)
+	account, err := s.accountRepo.GetByID(c.Request.Context(), accountID)
+	if err != nil {
+		return s.sendErrorAndEnd(c, "Account not found")
+	}
+	bindAccountTestPlatform(c, account)
+	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth ||
+		account.IsCredentialShadow() || account.IsOpenAIAgentIdentity() || account.IsSyntheticUITest() ||
+		isOpenAIImageModel(account.GetMappedModel(modelID)) {
+		return s.sendErrorAndEnd(c, "Probe requires an OpenAI OAuth text account")
+	}
+	return s.testOpenAIAccountConnection(c, account, modelID, "", AccountTestModeDefault)
+}
+
 func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int64, modelID string, prompt string, mode string, opts ...AccountTestOptions) error {
 	initAccountTestLogger(c, accountID, modelID, mode)
 	ctx := c.Request.Context()
@@ -960,10 +978,18 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		proxyURL = account.Proxy.URL()
 	}
 
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return s.sendErrorAndEnd(c, "账号出口租约已失效")
+		}
+		defer releaseUse()
+	}
 	resp, err := s.doOpenAIAccountTestUpstream(req, proxyURL, account, true)
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	if isOAuth && s.accountRepo != nil {

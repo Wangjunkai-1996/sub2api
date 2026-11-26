@@ -1445,6 +1445,8 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	serverErrCh := make(chan error, 1)
 	resultCh := make(chan *OpenAIForwardResult, 1)
 	hooks := &OpenAIWSIngressHooks{
+		MaxReasoningEffort:          "medium",
+		MaxReasoningEffortOverLimit: ReasoningEffortOverLimitDowngrade,
 		AfterTurn: func(_ int, result *OpenAIForwardResult, turnErr error) {
 			if turnErr == nil && result != nil {
 				resultCh <- result
@@ -1497,8 +1499,9 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
 	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{
-		"type":"response.create","model":"gpt-5.1","stream":false,
-		"parallel_tool_calls":true,
+			"type":"response.create","model":"gpt-5.1","stream":false,
+			"reasoning":{"effort":"max"},
+			"parallel_tool_calls":true,
 		"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}
 	}`))
 	cancelWrite()
@@ -1536,6 +1539,8 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 		require.Equal(t, 1, result.Usage.OutputTokens)
 		require.Equal(t, 1, result.Usage.CacheReadInputTokens)
 		require.NotNil(t, result.FirstTokenMs)
+		require.NotNil(t, result.RequestedReasoningEffort)
+		require.Equal(t, "max", *result.RequestedReasoningEffort)
 	case <-time.After(2 * time.Second):
 		t.Fatal("未收到 http_bridge turn 结果回调")
 	}
@@ -1544,6 +1549,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRe
 	require.Equal(t, "true", upstream.lastReq.Header.Get(responsesLiteHeader))
 	require.True(t, gjson.GetBytes(upstream.lastBody, "parallel_tool_calls").Exists())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "parallel_tool_calls").Bool())
+	require.Equal(t, "medium", gjson.GetBytes(upstream.lastBody, "reasoning.effort").String())
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ModeOffReturnsPolicyViolation(t *testing.T) {

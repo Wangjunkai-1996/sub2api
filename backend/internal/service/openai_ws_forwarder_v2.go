@@ -28,6 +28,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	decision OpenAIWSProtocolDecision,
 	isCodexCLI bool,
 	reqStream bool,
+	imageIntent bool,
 	originalModel string,
 	mappedModel string,
 	startTime time.Time,
@@ -37,6 +38,17 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 ) (*OpenAIForwardResult, error) {
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
+	}
+	clientLifecycleCtx := ctx
+	ctx = ContextWithSelectedAccountEgress(ctx, account)
+	ctx, releaseProbe := openAI429ProbeContext(ctx, account)
+	defer releaseProbe()
+	if account.SelectedEgress != nil && account.SelectedEgress.Lease != nil {
+		releaseUse, useErr := account.SelectedEgress.Lease.AcquireUse()
+		if useErr != nil {
+			return nil, wrapOpenAIWSFallback("egress_lease", useErr)
+		}
+		defer releaseUse()
 	}
 	responseModelObserver := &upstreamResponseModelObserver{}
 
@@ -206,6 +218,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		Account: account,
 		WSURL:   wsURL,
 		Headers: wsHeaders,
+		RequiredBindingID: func() string {
+			if account.SelectedEgress == nil {
+				return ""
+			}
+			return strings.TrimSpace(account.SelectedEgress.BindingID)
+		}(),
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -321,7 +339,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	)
 	if handshakeTurnState != "" {
 		if stateStore != nil && sessionHash != "" {
-			stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
+			bindOpenAIWSTurnStateForAccount(stateStore, groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL(), account.ID)
 		}
 		if c != nil {
 			c.Header(http.CanonicalHeaderKey(openAIWSTurnStateHeader), handshakeTurnState)
@@ -342,6 +360,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, err
 	}
 
+	if err := takeOpenAIModelDispatch(ctx, account.ID); err != nil {
+		return nil, err
+	}
+	firstOutputStartedAt := time.Now()
 	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
@@ -368,6 +390,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	responseID := ""
+	responseRoutingBound := false
+	bindResponseRouting := func() {
+		if responseRoutingBound || strings.TrimSpace(responseID) == "" {
+			return
+		}
+		responseRoutingBound = true
+		s.bindOpenAIResponseRouting(ctx, c, account, responseID, lease.BindingID(), lease.ConnID())
+	}
 	var finalResponse []byte
 	wroteDownstream := false
 	needModelReplace := originalModel != mappedModel
@@ -384,13 +414,31 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
+	upstreamTerminalStatusCode := 0
 	clientDisconnected := false
 	clientDisconnectDrainStartedAt := time.Time{}
 	readTimeout := s.openAIWSReadTimeout()
+	firstOutputTimeout := time.Duration(0)
+	firstOutputDeadline := time.Time{}
+	if !imageIntent {
+		firstOutputTimeout = s.openAITextFirstOutputTimeout()
+		firstOutputDeadline = firstOutputStartedAt.Add(firstOutputTimeout)
+	}
+	reasoningEffort := ""
+	if value := extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel); value != nil {
+		reasoningEffort = *value
+	}
+	firstUsableOutputObserved := false
 	upstreamReadCtx := ctx
 	upstreamReadDetached := false
+	var releaseDetachedProbe func()
+	defer func() {
+		if releaseDetachedProbe != nil {
+			releaseDetachedProbe()
+		}
+	}()
 	clientRequestCanceled := func() bool {
-		return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+		return clientLifecycleCtx != nil && errors.Is(clientLifecycleCtx.Err(), context.Canceled)
 	}
 	markClientDisconnected := func(cause string) {
 		if clientDisconnected {
@@ -399,7 +447,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		clientDisconnected = true
 		clientDisconnectDrainStartedAt = time.Now()
 		if !upstreamReadDetached {
-			upstreamReadCtx = context.WithoutCancel(ctx)
+			upstreamReadCtx, releaseDetachedProbe = openAI429ProbeContext(context.WithoutCancel(ctx), account)
 			upstreamReadDetached = true
 		}
 		logOpenAIWSModeInfo(
@@ -426,11 +474,15 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			UpstreamResponseModel:         responseModelObserver.Model(),
 			UpstreamResponseModelConflict: responseModelObserver.Conflict(),
 			UpstreamResponseServiceTier:   responseModelObserver.ServiceTier(),
+			ImageCount:                    imageCounter.Count(),
+			ImageOutputSizes:              imageCounter.Sizes(),
 			ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTier(reqBody)),
 			ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
+			RequestedReasoningEffort:      CanonicalRequestedReasoningEffortFromReqBody(reqBody, originalModel, mappedModel),
 			Stream:                        reqStream,
 			OpenAIWSMode:                  true,
 			UpstreamTerminalEvent:         upstreamTerminalEvent,
+			UpstreamTerminalStatusCode:    upstreamTerminalStatusCode,
 			ResponseHeaders:               lease.HandshakeHeaders(),
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
@@ -476,6 +528,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		if clientDisconnected {
 			return
 		}
+		bindResponseRouting()
 		frame := make([]byte, 0, len(message)+8)
 		frame = append(frame, "data: "...)
 		frame = append(frame, message...)
@@ -513,14 +566,41 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			)
 		}
 	}
+	firstOutputExpired := func() (*OpenAIForwardResult, error) {
+		lease.MarkBroken()
+		proxyID, proxyName := opsUpstreamWSProxyAttribution(account)
+		failoverErr := s.newOpenAIFirstOutputTimeoutError(
+			ctx, c, account, proxyID, proxyName, firstOutputStartedAt,
+			originalModel, reasoningEffort,
+			firstOutputTimeout, "websocket_first_usable_output", lease.HandshakeHeaders(),
+		)
+		if !wroteDownstream {
+			return nil, failoverErr
+		}
+		if reqStream && !clientDisconnected {
+			failure := buildOpenAIResponseFailedSSE(responseID, originalModel, 0,
+				[]byte(`{"error":{"code":"first_output_timeout"}}`),
+				"Upstream produced no usable output before the deadline")
+			if _, err := fmt.Fprint(c.Writer, failure); err != nil {
+				markClientDisconnected("downstream_write_error")
+			} else {
+				flusher.Flush()
+			}
+		}
+		MarkResponseCommitted(c)
+		return resultWithUsage(), errors.New("upstream response failed: openai ws first usable output timeout after downstream output")
+	}
 
-	// Keep per-read timeouts unchanged for connected clients. Once a client
-	// disconnects, use the same timeout as a bounded total drain budget.
+	// Bound each pre-output read by the fixed attempt deadline. Once the client
+	// disconnects, use the normal read timeout as a total drain budget.
 	var pendingJSONDocuments [][]byte
 
 readLoop:
 	for {
 		markClientRequestCanceled()
+		if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved && !time.Now().Before(firstOutputDeadline) {
+			return firstOutputExpired()
+		}
 		var message []byte
 		var readErr error
 		readUsedDetachedContext := upstreamReadDetached
@@ -529,6 +609,11 @@ readLoop:
 			pendingJSONDocuments = pendingJSONDocuments[1:]
 		} else {
 			currentReadTimeout := readTimeout
+			if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved {
+				if remaining := time.Until(firstOutputDeadline); remaining < currentReadTimeout {
+					currentReadTimeout = remaining
+				}
+			}
 			if clientDisconnected && !clientDisconnectDrainStartedAt.IsZero() {
 				remaining := readTimeout - time.Since(clientDisconnectDrainStartedAt)
 				if remaining <= 0 {
@@ -555,6 +640,9 @@ readLoop:
 			}
 		}
 		markClientRequestCanceled()
+		if !clientDisconnected && !firstOutputDeadline.IsZero() && !firstUsableOutputObserved && !time.Now().Before(firstOutputDeadline) {
+			return firstOutputExpired()
+		}
 		if readErr == nil && !json.Valid(message) {
 			eventType, _, _ := parseOpenAIWSEventEnvelope(message)
 			if eventType == "" {
@@ -610,6 +698,7 @@ readLoop:
 		}
 
 		eventType, eventResponseID, responseField := parseOpenAIWSEventEnvelope(message)
+		observeOpenAI429RecoveryOutput(ctx, account, message, eventType)
 		if eventType == "" {
 			continue
 		}
@@ -619,12 +708,16 @@ readLoop:
 			firstEventType = eventType
 		}
 		lastEventType = eventType
+		isUsableOutput := openAIStreamDataStartsVisibleOutput(string(message), eventType)
+		if !firstUsableOutputObserved && isUsableOutput {
+			firstUsableOutputObserved = true
+		}
 
 		if responseID == "" && eventResponseID != "" {
 			responseID = eventResponseID
 		}
 
-		isTokenEvent := isOpenAIWSTokenEvent(eventType)
+		isTokenEvent := isOpenAIWSTokenEvent(eventType) && isUsableOutput
 		if isTokenEvent {
 			tokenEventCount++
 		}
@@ -740,9 +833,8 @@ readLoop:
 		}
 
 		if reqStream {
-			// 在首个 token 前先缓冲事件（如 response.created），
-			// 以便上游早期断连时仍可安全回退到 HTTP，不给下游发送半截流。
-			shouldBuffer := firstTokenMs == nil && !isTokenEvent && !isTerminalEvent
+			// Keep replayable preamble private until the first committed output.
+			shouldBuffer := !openAIStreamDataStartsClientOutput(string(message), eventType) && !isTerminalEvent
 			if shouldBuffer {
 				buffered := make([]byte, len(message))
 				copy(buffered, message)
@@ -774,6 +866,7 @@ readLoop:
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
 			}
 			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
+			upstreamTerminalStatusCode = openAIWSTerminalHealthStatus(message)
 			// A terminal event must be the final JSON document in its WS message.
 			// Ignore any tail for the completed client turn, but never reuse the
 			// ambiguous upstream connection for another request.
@@ -814,18 +907,18 @@ readLoop:
 			responseID = strings.TrimSpace(gjson.GetBytes(finalResponse, "id").String())
 		}
 
+		bindResponseRouting()
 		c.Data(http.StatusOK, "application/json", finalResponse)
 	} else {
 		flushStreamWriter(true)
 	}
-
-	if responseID != "" && stateStore != nil {
-		ttl := s.openAIWSResponseStickyTTL()
-		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
-		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
-	}
 	if stateStore != nil && storeDisabled && sessionHash != "" {
-		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), s.openAIWSSessionStickyTTL())
+		ttl := s.openAIWSSessionStickyTTL()
+		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), ttl)
+		bindingID := strings.TrimSpace(lease.BindingID())
+		if bindingID != "" {
+			logOpenAIWSBindSessionEgressWarn(groupID, account.ID, sessionHash, bindingID, bindOpenAIWSSessionEgress(stateStore, ctx, groupID, sessionHash, bindingID, ttl))
+		}
 	}
 	firstTokenMsValue := -1
 	if firstTokenMs != nil {
@@ -850,10 +943,7 @@ readLoop:
 		clientDisconnected,
 	)
 
-	result := resultWithUsage()
-	result.ImageCount = imageCounter.Count()
-	result.ImageOutputSizes = imageCounter.Sizes()
-	return result, nil
+	return resultWithUsage(), nil
 }
 
 // ProxyResponsesWebSocketFromClient 处理客户端入站 WebSocket（OpenAI Responses WS Mode）并转发到上游。

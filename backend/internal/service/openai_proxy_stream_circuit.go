@@ -228,11 +228,71 @@ func (c *openAIProxyStreamCircuit) ensureCapacityLocked(now time.Time) {
 	}
 }
 
+// openAIEffectiveProxyAttribution resolves the proxy actually admitted for the
+// request. Pool accounts may have a non-primary route in SelectedEgress while
+// account.ProxyID still mirrors the durable primary route. Looking only at the
+// latter makes stream failures invisible to the circuit and can send the next
+// request through the same broken pool member.
+func openAIEffectiveProxyAttribution(account *Account) (int64, *Proxy, bool) {
+	if account == nil {
+		return 0, nil, false
+	}
+	if selected := account.SelectedEgress; selected != nil {
+		if binding := findAccountEgressBinding(account, selected); binding != nil && binding.Route != nil {
+			if binding.Route.Kind != EgressRouteKindProxy || binding.Route.ProxyID == nil || *binding.Route.ProxyID <= 0 {
+				return 0, nil, false
+			}
+			return *binding.Route.ProxyID, binding.Route.Proxy, true
+		}
+		// A request-local selection can briefly outlive a redacted account
+		// projection. Only use the account proxy as a fallback when it agrees
+		// with the selected transport; never turn a direct selection into a
+		// proxy circuit entry merely because the account has a stale primary ID.
+		if account.ProxyID != nil && *account.ProxyID > 0 && account.Proxy != nil &&
+			account.Proxy.ID == *account.ProxyID {
+			return *account.ProxyID, account.Proxy, true
+		}
+		return 0, nil, false
+	}
+	if admission := account.LegacyEgressAdmission; admission != nil {
+		if admission.RouteKind != EgressRouteKindProxy || admission.ProxyID == nil || *admission.ProxyID <= 0 {
+			return 0, nil, false
+		}
+		var proxy *Proxy
+		if account.Proxy != nil && account.Proxy.ID == *admission.ProxyID {
+			proxy = account.Proxy
+		}
+		return *admission.ProxyID, proxy, true
+	}
+	// Legacy, non-pool requests retain the existing conservative rule: a
+	// configured ID without a hydrated Proxy does not prove that a proxy was
+	// used by the transport.
+	if account.ProxyID == nil || *account.ProxyID <= 0 || account.Proxy == nil || account.Proxy.ID <= 0 {
+		return 0, nil, false
+	}
+	return account.Proxy.ID, account.Proxy, true
+}
+
 func openAIProxyStreamCircuitProxyID(account *Account) (int64, bool) {
-	if account == nil || account.Platform != PlatformOpenAI || account.ProxyID == nil || *account.ProxyID <= 0 {
+	if account == nil || account.Platform != PlatformOpenAI {
 		return 0, false
 	}
-	return *account.ProxyID, true
+	proxyID, _, ok := openAIEffectiveProxyAttribution(account)
+	if ok {
+		return proxyID, true
+	}
+	// An explicit request-local route is authoritative. If it is direct (or
+	// malformed), do not fall back to a stale durable primary proxy ID.
+	if account.SelectedEgress != nil || account.LegacyEgressAdmission != nil {
+		return 0, false
+	}
+	// The circuit predates hydrated proxy objects and intentionally retains the
+	// account-level ID fallback for OpenAI scheduler snapshots. Ops attribution
+	// remains conservative when the same snapshot has no transport object.
+	if account.ProxyID != nil && *account.ProxyID > 0 {
+		return *account.ProxyID, true
+	}
+	return 0, false
 }
 
 func (s *OpenAIGatewayService) recordOpenAIProxyStreamDisconnect(account *Account, streamErr error, upstreamRequestID string) {

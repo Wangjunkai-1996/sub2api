@@ -1637,3 +1637,31 @@ func TestRelay_IsFirstTokenEventDecidesEveryTurnFirstToken(t *testing.T) {
 		t.Fatal("relay did not stop after cancellation")
 	}
 }
+
+func TestRelay_CacheWriteTTLPreservesSnapshotsAndTurnTotals(t *testing.T) {
+	t.Parallel()
+	client := newPassthroughTestFrameConn(nil, false)
+	upstream := newPassthroughTestFrameConn([]passthroughTestFrame{
+		{msgType: coderws.MessageText, payload: []byte(`{"type":"response.in_progress","response":{"id":"ttl_1","usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cache_write_tokens":10,"cache_write_tokens_details":{"ttl_30m_tokens":4,"ttl_12h_tokens":6}}}}}`)},
+		{msgType: coderws.MessageText, payload: []byte(`{"type":"response.completed","response":{"id":"ttl_1"}}`)},
+		{msgType: coderws.MessageText, payload: []byte(`{"type":"response.in_progress","response":{"id":"ttl_2","usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cache_write_tokens":10,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":10}}}}}`)},
+		{msgType: coderws.MessageText, payload: []byte(`{"type":"response.completed","response":{"id":"ttl_2","usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cache_write_tokens":10,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":9}}}}}`)},
+		{msgType: coderws.MessageText, payload: []byte(`{"type":"response.completed","response":{"id":"ttl_3","usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cache_write_tokens":10,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":10}}}}}`)},
+	}, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var turns []RelayTurnResult
+	result, exit := Relay(ctx, client, upstream, []byte(`{"type":"response.create","model":"gpt-6-luna","input":"hi"}`), RelayOptions{
+		OnTurnComplete: func(turn RelayTurnResult) { turns = append(turns, turn) },
+	})
+	require.Nil(t, exit)
+	require.Len(t, turns, 3)
+	for i, want := range [][2]int{{4, 6}, {0, 0}, {0, 10}} {
+		require.Equal(t, 10, turns[i].Usage.CacheCreationInputTokens)
+		require.Equal(t, want[0], turns[i].Usage.CacheCreation30mInputTokens)
+		require.Equal(t, want[1], turns[i].Usage.CacheCreation12hInputTokens)
+	}
+	require.Equal(t, 30, result.Usage.CacheCreationInputTokens)
+	require.Equal(t, 4, result.Usage.CacheCreation30mInputTokens)
+	require.Equal(t, 16, result.Usage.CacheCreation12hInputTokens)
+}

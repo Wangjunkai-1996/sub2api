@@ -20,12 +20,14 @@ const (
 	defaultDashboardAggregationBackfillTimeout = 30 * time.Minute
 	dashboardAggregationRetentionInterval      = 6 * time.Hour
 
-	// dashboardAggregationLeaderLockKey 保证多副本部署中每个周期只有一个实例执行聚合。
+	// dashboardAggregationLeaderLockKey gates the periodic scheduled aggregation so
+	// that only one instance runs it per cycle in a multi-replica deployment.
 	dashboardAggregationLeaderLockKey = "dashboard:aggregation:leader"
-	// TTL 必须覆盖 dashboard 聚合与分组日汇总两个有界阶段，避免任务中途失锁。
+	// dashboardAggregationLeaderLockTTL must exceed the job's worst-case runtime
+	// (defaultDashboardAggregationTimeout) so the lock never expires mid-run.
 	dashboardAggregationLeaderLockTTL = 5 * time.Minute
-
-	// 启动回填耗时可能远长于周期聚合，因此使用独立锁并让 TTL 严格大于回填超时。
+	// Startup group rollup backfill can run longer than a periodic aggregation,
+	// so it uses an independent lock and a TTL that covers its bounded timeout.
 	dashboardAggregationGroupUsageBackfillLeaderLockKey = "dashboard:aggregation:group-usage-backfill:leader"
 	dashboardAggregationGroupUsageBackfillLeaderLockTTL = defaultDashboardAggregationBackfillTimeout + time.Minute
 )

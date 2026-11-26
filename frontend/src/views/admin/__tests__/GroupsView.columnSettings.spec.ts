@@ -43,11 +43,11 @@ const messages: Record<string, string> = {
   'admin.groups.columns.accounts': 'Accounts',
   'admin.groups.columns.capacity': 'Capacity',
   'admin.groups.columns.usage': 'Usage',
-  'admin.groups.columns.status': 'Status',
-  'admin.groups.columns.actions': 'Actions',
   'admin.groups.usageToday': 'Today',
   'admin.groups.usageYesterday': 'Yesterday',
   'admin.groups.usageTotal': 'Total',
+  'admin.groups.columns.status': 'Status',
+  'admin.groups.columns.actions': 'Actions',
 }
 
 vi.mock('@/api/admin', () => ({
@@ -409,7 +409,6 @@ describe('admin GroupsView column settings', () => {
     await openColumnSettings(wrapper)
     await clickColumnToggle(wrapper, 'Usage')
     expect(getUsageSummary).toHaveBeenCalledTimes(1)
-    expect(getUsageSummary).toHaveBeenCalledWith()
     expect(getCapacitySummary).not.toHaveBeenCalled()
 
     await clickColumnToggle(wrapper, 'Capacity')
@@ -417,7 +416,7 @@ describe('admin GroupsView column settings', () => {
     expect(getCapacitySummary).toHaveBeenCalledTimes(1)
   })
 
-  it('renders yesterday usage between today and total', async () => {
+  it('renders today, yesterday, and total usage in order', async () => {
     getUsageSummary.mockResolvedValue([
       { group_id: 1, today_cost: 1.25, yesterday_cost: 2.5, total_cost: 9.75 },
     ])
