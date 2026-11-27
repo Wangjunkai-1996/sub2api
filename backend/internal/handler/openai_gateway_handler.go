@@ -1816,8 +1816,11 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
 	}
 
 	if validation.HasFunctionCallOutputMissingCallID {
+		items, truncated := service.MissingCallIDItemShapes(body)
 		reqLog.Warn("openai.request_validation_failed",
 			zap.String("reason", "function_call_output_missing_call_id"),
+			zap.Any("missing_call_id_items", items),
+			zap.Bool("missing_call_id_items_truncated", truncated),
 		)
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "function_call_output requires call_id on HTTP requests; continuation via previous_response_id is only supported on Responses WebSocket v2")
 		return false
